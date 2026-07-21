@@ -19,7 +19,7 @@ const HELP = `Informant ${packageJson.version} — background CI on your Macs
 
 Usage:
   informant setup                        Create the GitHub App and configure this machine
-  informant init                         Create .informant.toml
+  informant init                         Create .informant.toml and register origin
   informant repo add [owner/repo]         Register a repository on this machine
   informant repo list                     List registered repositories
   informant repo remove [owner/repo]      Stop handling a repository
@@ -91,6 +91,7 @@ async function repositoryFromGit(): Promise<ReturnType<typeof parseRepository>> 
 async function init(): Promise<void> {
   const path = resolve(CONFIG_FILE);
   if (existsSync(path)) throw new Error(`${CONFIG_FILE} already exists`);
+  const repository = await repositoryFromGit();
   intro("Informant setup");
   let jobs = "bun install --frozen-lockfile && bun test";
   if (process.stdin.isTTY) {
@@ -109,7 +110,12 @@ async function init(): Promise<void> {
     path,
     configTemplate().replace("bun install --frozen-lockfile && bun test", jobs),
   );
-  outro(`Created ${path}`);
+  const added = await addRepository(repository);
+  outro(
+    added
+      ? `Created ${path} and registered ${repository.fullName}`
+      : `Created ${path}; ${repository.fullName} was already registered`,
+  );
 }
 
 async function manualRun(
