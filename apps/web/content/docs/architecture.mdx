@@ -1,0 +1,27 @@
+---
+title: Architecture
+description: How GitHub Checks act as a decentralized work queue.
+---
+
+```text
+GitHub branch ──poll──▶ Mac A ─┐
+                      Mac B ─┼──▶ oldest Check Run wins ──▶ Tart VM
+                      Mac C ─┘                                  │
+                           ▲                                    ▼
+                           └──────── GitHub Checks ◀──── conclusion + log tail
+```
+
+## Claim safety
+
+The Checks API has no compare-and-swap operation. Informant resolves simultaneous claims by creating
+an in-progress Check Run, re-reading all active claims, and electing the smallest GitHub check ID.
+Only that claimant starts a VM; the others complete themselves as cancelled. This removes duplicate
+execution after the race is visible to GitHub while keeping GitHub as the only shared coordination
+system.
+
+Because the Checks API does not offer compare-and-swap, this election is best-effort rather than a
+strict distributed lock. Checks are fetched with `filter=all` and scoped to the configured GitHub App;
+claims left behind by dead workers become retryable after 24 hours.
+
+Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
+already has an older completed result.

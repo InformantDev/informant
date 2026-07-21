@@ -1,0 +1,66 @@
+---
+title: Quickstart
+description: Put one Mac on CI duty in a few minutes.
+---
+
+## Requirements
+
+- macOS 13 or newer on Apple Silicon
+- Homebrew, Git, GitHub CLI, Tart, and `sshpass`
+
+## Install Informant
+
+Install the standalone Informant binary from its Homebrew tap, then install the tools used to clone
+repositories and run Tart VMs:
+
+```bash
+brew install informant-ci/tap/informant
+brew install gh openai/tools/tart cirruslabs/cli/sshpass
+gh auth login
+informant --version
+```
+
+## Create the GitHub App
+
+Run the interactive setup:
+
+```bash
+informant setup
+```
+
+Informant will:
+
+1. Ask whether your account or an organization should own the App.
+2. Open GitHub with **Checks: read/write**, **Contents: read**, and webhooks disabled.
+3. Receive and protect the generated private key automatically.
+4. Open GitHub's installation screen so you can choose repositories.
+5. Detect the installation and register its repositories on this machine.
+6. Offer to start the worker.
+
+The browser steps are limited to approving creation and choosing repository access—GitHub requires
+those decisions from the App owner. Informant stores everything else under `~/.config/informant`;
+there are no environment variables to copy. See [GitHub App credentials](/docs/github-app) for
+headless and environment-variable overrides.
+
+In the repository that needs CI:
+
+```bash
+informant init
+informant repo add # detects owner/repository from the current Git remote
+git add .informant.toml
+git commit -m "Configure Informant CI"
+git push
+informant hook install # supported pre-push hook; waits until the push is visible
+```
+
+Start the worker now and automatically whenever you log in:
+
+```bash
+informant startup enable
+```
+
+Use `informant startup disable` to stop the worker and remove it from login startup. Run
+`informant serve` instead when you want a foreground worker for debugging.
+
+Register more repositories with `informant repo add owner/repository`. Run the same registration and
+serve commands on another Mac to add capacity. There is no shared database to configure.

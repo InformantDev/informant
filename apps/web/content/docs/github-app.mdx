@@ -1,0 +1,159 @@
+---
+title: GitHub App credentials
+description: Configure and persist the credentials Informant uses to read repositories and write Checks.
+---
+
+Informant authenticates as a GitHub App installation. The recommended setup is one command:
+
+```bash
+informant setup
+```
+
+The setup command uses GitHub's App Manifest flow to create the correctly scoped App, capture its
+generated private key over a temporary localhost callback, open the installation page, detect the
+installation, and register every selected repository. It stores the key at
+`~/.config/informant/app-<APP_ID>.pem` with mode `600` and records the IDs in
+`~/.config/informant/config.json`. No environment variables are required.
+
+The only browser actions are approving App creation and selecting repositories. GitHub intentionally
+requires the owner to make those authorization decisions.
+
+## Environment-variable overrides
+
+For headless provisioning or external secret management, environment variables override credentials
+saved by `informant setup`:
+
+| Variable | Meaning | Where to find it |
+| --- | --- | --- |
+| `INFORMANT_GITHUB_APP_ID` | Identifies the GitHub App. | The App's **General** settings page. This is the numeric **App ID**, not the Client ID. |
+| `INFORMANT_GITHUB_INSTALLATION_ID` | Identifies the installation that grants repository access. | The number at the end of the installation settings URL after installing the App. |
+| `INFORMANT_GITHUB_PRIVATE_KEY_FILE` | Absolute path to a PEM private key for the App. | Downloaded after selecting **Generate a private key** on the App's settings page. |
+
+## Manual App creation
+
+[Open GitHub with Informant's permissions preselected →](https://github.com/settings/apps/new?name=Informant%20Local%20CI&description=Runs%20private%20CI%20on%20your%20local%20machines&url=https%3A%2F%2Fgithub.com%2Finformant-ci%2Finformant&public=false&checks=write&contents=read&webhook_active=false)
+
+The registration URL requests only **Checks: read/write** and **Contents: read**, and disables
+webhooks. Informant polls GitHub, so it does not need a webhook URL or a publicly reachable server.
+
+After creating the App:
+
+1. On **General**, copy the numeric **App ID**.
+2. Under **Private keys**, select **Generate a private key**. GitHub downloads a `.pem` file once;
+   keep it secret and do not commit it.
+3. In the left sidebar, select **Install App** and install it on the repositories this worker may run.
+4. Open **Configure** for the installation. Copy the trailing number from its URL. For example,
+   `https://github.com/settings/installations/7890123` has installation ID `7890123`.
+
+For an organization-owned App, create it under the organization's settings. The values and
+environment variables are otherwise identical.
+
+If you cannot use the localhost Manifest flow, create the App manually and then provide its credentials
+using the variables above.
+
+### Store the credentials safely
+
+Move the key out of Downloads and create a small shell file containing the non-secret IDs and key
+path:
+
+```bash
+mkdir -p "$HOME/.config/informant"
+mv "$HOME/Downloads/YOUR-KEY.private-key.pem" "$HOME/.config/informant/app.pem"
+chmod 600 "$HOME/.config/informant/app.pem"
+
+cat > "$HOME/.config/informant/env" <<'EOF'
+export INFORMANT_GITHUB_APP_ID="123456"
+export INFORMANT_GITHUB_INSTALLATION_ID="7890123"
+export INFORMANT_GITHUB_PRIVATE_KEY_FILE="$HOME/.config/informant/app.pem"
+EOF
+chmod 600 "$HOME/.config/informant/env"
+```
+
+The PEM contains the secret. The App and installation IDs are identifiers, not passwords, but keeping
+all three settings in one protected file reduces accidental disclosure and makes worker startup
+repeatable.
+
+Informant also accepts the PEM contents directly through `INFORMANT_GITHUB_PRIVATE_KEY`, but a file is
+recommended: multiline private keys are easy to corrupt in shell configuration and process managers.
+
+### Load variables in a terminal
+
+An `export` affects only the current shell and processes started from it. Load the file before running
+Informant:
+
+```bash
+source "$HOME/.config/informant/env"
+informant doctor
+informant serve
+```
+
+To load it automatically in every Zsh terminal, add this line to `~/.zshrc`:
+
+```bash
+source "$HOME/.config/informant/env"
+```
+
+Then open a new terminal or run `source ~/.zshrc`. Automatic loading is convenient on a dedicated CI
+machine; explicitly sourcing the file exposes the credentials to fewer shell sessions.
+
+### Start automatically at login
+
+macOS services do not normally inherit variables from your interactive shell or `~/.zshrc`. Source
+the environment file, then let Informant install its LaunchAgent:
+
+```bash
+. "$HOME/.config/informant/env"
+informant startup enable
+```
+
+The startup command captures current `INFORMANT_*` overrides in a mode-`600` service definition. Run
+it again after changing those variables. Use `informant startup disable` to unload and remove the
+service. The service user must be able to read the PEM, access the registered repositories, run `gh`,
+and run Tart.
+
+## Add another worker machine
+
+The simplest option is to run `informant setup` on each machine and create a machine-owned App. To
+share one App across workers, the App ID and installation ID remain the same. For easier revocation,
+generate a separate private key from that GitHub App for each machine instead of copying one PEM
+everywhere. On each manually configured machine:
+
+1. Store its private key under `~/.config/informant/app.pem` with mode `600`.
+2. Create and source `~/.config/informant/env`.
+3. Run `informant doctor`.
+4. Register repositories with `informant repo add owner/repository`.
+5. Start `informant serve`.
+
+Deleting one machine's key from the GitHub App settings then revokes that machine without rotating
+every worker.
+
+## Using a pre-minted installation token
+
+`INFORMANT_GITHUB_TOKEN` can provide an existing GitHub App installation token instead of a private
+key and installation ID:
+
+```bash
+export INFORMANT_GITHUB_APP_ID="123456"
+export INFORMANT_GITHUB_TOKEN="ghs_..."
+```
+
+Installation tokens normally expire after one hour. Informant cannot refresh a token when it does not
+have the App private key, so this mode is intended for short-lived commands or an external credential
+manager that restarts Informant with a fresh token. Use App ID, installation ID, and private key for a
+persistent worker.
+
+## Diagnose incorrect values
+
+```bash
+source "$HOME/.config/informant/env"
+informant doctor
+```
+
+Common failures:
+
+- **GitHub App authentication failed:** verify the App ID matches the App that generated the PEM.
+- **Not Found or Resource not accessible:** verify the installation includes the repository and has
+  **Checks: read/write** plus **Contents: read**.
+- **Private key file not found:** use an absolute path or `$HOME`; do not rely on the current directory.
+- **Works in Terminal but not as a service:** source the environment file in your terminal, then rerun
+  `informant startup enable` so the launchd plist captures the current `INFORMANT_*` values.

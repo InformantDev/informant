@@ -1,0 +1,41 @@
+---
+title: TOML configuration
+description: GitHub Actions-like jobs without YAML.
+---
+
+Informant reads `.informant.toml` from the commit it is about to run.
+
+```toml
+version = 1
+poll_interval_seconds = 20
+branches = ["main", "release"]
+
+[vm]
+image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+user = "admin"
+password = "admin"
+cpu = 4
+memory_mb = 8192
+
+[[jobs]]
+name = "test"
+command = "bun install --frozen-lockfile && bun test"
+timeout_minutes = 30
+environment = { CI = "true" }
+
+[[jobs]]
+name = "lint"
+command = "bun run check"
+timeout_minutes = 10
+
+[[jobs]]
+name = "build"
+command = "bun run build"
+timeout_minutes = 20
+needs = ["test", "lint"]
+```
+
+Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh Tart VM and isolated
+checkout mounted at `/Volumes/My Shared Files/workspace`. Use `needs` to make a job wait for one or
+more other jobs. In this example, `test` and `lint` start together; `build` starts only after both pass.
+If a dependency fails or times out, jobs that need it are skipped.

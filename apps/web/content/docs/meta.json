@@ -1,0 +1,4 @@
+{
+  "title": "Field manual",
+  "pages": ["index", "quickstart", "github-app", "configuration", "cli", "architecture"]
+}
