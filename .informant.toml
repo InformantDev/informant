@@ -1,0 +1,35 @@
+version = 1
+poll_interval_seconds = 20
+branches = ["main"]
+
+[vm]
+image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+user = "admin"
+password = "admin"
+cpu = 4
+memory_mb = 8192
+
+[[jobs]]
+name = "test"
+command = "bun install --frozen-lockfile && bun test"
+timeout_minutes = 15
+environment = { CI = "true" }
+
+[[jobs]]
+name = "lint"
+command = "bun install --frozen-lockfile && bun run check"
+timeout_minutes = 15
+environment = { CI = "true" }
+
+[[jobs]]
+name = "typecheck"
+command = "bun install --frozen-lockfile && bun run typecheck"
+timeout_minutes = 20
+environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
+
+[[jobs]]
+name = "build"
+command = "bun install --frozen-lockfile && bun run build"
+timeout_minutes = 30
+environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
+needs = ["test", "lint", "typecheck"]
