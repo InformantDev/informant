@@ -1,0 +1,114 @@
+import { describe, expect, test } from "bun:test";
+import { parseConfig, selectTriggeredJobs } from "./config.ts";
+import { triggerMatches } from "./triggers.ts";
+
+const source = (triggers: string, jobTriggers = "") => `version = 1
+triggers = ${triggers}
+[vm]
+image = "image"
+[[jobs]]
+name = "dependency"
+command = "dep"
+triggers = []
+[[jobs]]
+name = "root"
+command = "root"
+needs = ["dependency"]
+${jobTriggers}`;
+
+describe("trigger configuration", () => {
+  test("jobs inherit, replace, and explicitly disable top-level triggers", () => {
+    const inherited = parseConfig(source('[{ event = "comment" }]'));
+    expect(inherited.jobs[1]?.triggers).toEqual(inherited.triggers);
+    const replaced = parseConfig(
+      source('[{ event = "commit" }]', 'triggers = [{ event = "comment" }]'),
+    );
+    expect(replaced.jobs[1]?.triggers?.[0]?.event).toBe("comment");
+    expect(inherited.jobs[0]?.triggers).toEqual([]);
+  });
+
+  test("validates event and mutually exclusive context", () => {
+    expect(() => parseConfig(source('[{ event = "push" }]'))).toThrow("commit or comment");
+    expect(() =>
+      parseConfig(source('[{ event = "comment", branch = { names = ["main"] } }]')),
+    ).toThrow("comment cannot use branch");
+    expect(() =>
+      parseConfig(
+        source('[{ event = "commit", branch = { names = ["main"] }, pull_request = {} }]'),
+      ),
+    ).toThrow("both branch and pull_request");
+  });
+
+  test("legacy branches normalize and cannot coexist with triggers", () => {
+    const legacy = parseConfig(
+      source('[{ event = "commit" }]').replace(
+        'triggers = [{ event = "commit" }]',
+        'branches = ["release"]',
+      ),
+    );
+    expect(legacy.triggers?.[0]?.branch?.names).toEqual(["release"]);
+    expect(() =>
+      parseConfig(source("[]").replace("triggers = []", 'triggers = []\nbranches = ["main"]')),
+    ).toThrow("cannot both");
+  });
+});
+
+test("matching roots include needs and PR filters are exact", () => {
+  const config = parseConfig(
+    source(
+      '[{ event = "comment", pull_request = { state = "open", draft = false, base_branches = ["main"] } }]',
+    ),
+  );
+  const pr = {
+    number: 1,
+    state: "open" as const,
+    draft: false,
+    baseBranch: "main",
+    headSha: "sha",
+    sameRepository: true,
+  };
+  const context = { type: "comment" as const, pullRequest: pr };
+  const rule = config.triggers?.[0];
+  expect(rule && triggerMatches(rule, context)).toBe(true);
+  expect(
+    selectTriggeredJobs(config, (rule) => triggerMatches(rule, context)).jobs.map(
+      (job) => job.name,
+    ),
+  ).toEqual(["dependency", "root"]);
+  expect(
+    rule &&
+      triggerMatches(rule, {
+        ...context,
+        pullRequest: { ...pr, sameRepository: false },
+      }),
+  ).toBe(false);
+});
+
+test("commit context is optional and PR state, draft, and base filters compose", () => {
+  const branchless = { event: "commit" as const };
+  expect(triggerMatches(branchless, { type: "commit", branch: "release" })).toBe(true);
+
+  const pullRequest = {
+    number: 2,
+    state: "closed" as const,
+    draft: true,
+    baseBranch: "release",
+    headSha: "sha",
+    sameRepository: true,
+  };
+  expect(
+    triggerMatches(
+      {
+        event: "comment",
+        pullRequest: { state: "all", draft: true, baseBranches: ["release"] },
+      },
+      { type: "comment", pullRequest },
+    ),
+  ).toBe(true);
+  expect(
+    triggerMatches(
+      { event: "comment", pullRequest: { state: "open" } },
+      { type: "comment", pullRequest },
+    ),
+  ).toBe(false);
+});

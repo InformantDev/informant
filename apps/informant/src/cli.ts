@@ -137,6 +137,8 @@ async function manualRun(
     sha,
     branchOverride || branch.stdout.trim() || ref,
     config,
+    undefined,
+    { type: "manual", id: sha },
   );
   if (!build) {
     progress.stop("Another machine is already running this commit.");

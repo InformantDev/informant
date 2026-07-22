@@ -12,6 +12,7 @@ describe("configuration", () => {
         timeoutMinutes: 30,
         environment: {},
         needs: [],
+        triggers: [{ event: "commit", branch: { names: ["main"] }, pullRequest: undefined }],
       },
     ]);
   });
@@ -120,16 +121,20 @@ describe("configuration", () => {
     ).toThrow("is not a shell variable");
   });
 
-  test("requires at least one non-empty branch", () => {
-    expect(() =>
-      parseConfig(configTemplate().replace('branches = ["main"]', "branches = []")),
-    ).toThrow("branches must contain at least one non-empty string");
-    expect(() =>
-      parseConfig(configTemplate().replace('branches = ["main"]', 'branches = [""]')),
-    ).toThrow("branches must contain at least one non-empty string");
-    expect(() =>
-      parseConfig(configTemplate().replace('branches = ["main"]', 'branches = ["   "]')),
-    ).toThrow("branches must contain at least one non-empty string");
+  test("requires at least one non-empty legacy branch", () => {
+    const legacy = configTemplate().replace(
+      'triggers = [{ event = "commit", branch = { names = ["main"] } }]',
+      'branches = ["main"]',
+    );
+    expect(() => parseConfig(legacy.replace('branches = ["main"]', "branches = []"))).toThrow(
+      "branch.names must contain non-empty strings",
+    );
+    expect(() => parseConfig(legacy.replace('branches = ["main"]', 'branches = [""]'))).toThrow(
+      "branch.names must contain non-empty strings",
+    );
+    expect(() => parseConfig(legacy.replace('branches = ["main"]', 'branches = ["   "]'))).toThrow(
+      "branch.names must contain non-empty strings",
+    );
   });
 
   test("parses and validates job dependencies", () => {

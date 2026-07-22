@@ -1,7 +1,12 @@
 import { CONFIG_FILE, parseConfig } from "./config.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubClient } from "./github.ts";
+import { readPollState, savePollState } from "./poll-state.ts";
+import { triggerMatches } from "./triggers.ts";
 import type { Repository } from "./types.ts";
+
+const COMMENT_CURSOR_OVERLAP_MS = 1_000;
+const SEEN_COMMENT_LIMIT = 1_000;
 
 export interface ServerOptions {
   once?: boolean;
@@ -13,28 +18,145 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const github = new GitHubClient();
   let intervalSeconds = 20;
   const message = options.onMessage ?? console.log;
-
   do {
     try {
       const defaultBranch = await github.defaultBranch(repository);
-      const bootstrapSha = await github.branchHead(repository, defaultBranch);
-      const bootstrapConfig = parseConfig(
-        await github.fileContent(repository, bootstrapSha, CONFIG_FILE),
+      const defaultSha = await github.branchHead(repository, defaultBranch);
+      const bootstrap = parseConfig(
+        await github.fileContent(repository, defaultSha, CONFIG_FILE),
         `${repository.fullName}/${CONFIG_FILE}`,
       );
-      intervalSeconds = bootstrapConfig.pollIntervalSeconds;
-      for (const branch of bootstrapConfig.branches) {
+      intervalSeconds = bootstrap.pollIntervalSeconds;
+      const [branches, prs] = await Promise.all([
+        github.branches(repository),
+        github.pullRequests(repository),
+      ]);
+      for (const target of [
+        ...branches.map((branch) => ({
+          sha: branch.sha,
+          branch: branch.name,
+          pullRequest: undefined,
+          eventId: `branch:${branch.name}:${branch.sha}`,
+        })),
+        ...prs
+          .filter((pr) => pr.sameRepository)
+          .map((pullRequest) => ({
+            sha: pullRequest.headSha,
+            branch: `pull/${pullRequest.number}`,
+            pullRequest,
+            eventId: `pr:${pullRequest.number}:${pullRequest.headSha}`,
+          })),
+      ]) {
         if (options.signal?.aborted) return;
-        const isDefaultBranch = branch === defaultBranch;
-        const sha = isDefaultBranch ? bootstrapSha : await github.branchHead(repository, branch);
-        const config = isDefaultBranch
-          ? bootstrapConfig
-          : parseConfig(
-              await github.fileContent(repository, sha, CONFIG_FILE),
-              `${repository.fullName}/${CONFIG_FILE}@${sha.slice(0, 7)}`,
+        const context = {
+          type: "commit" as const,
+          branch: target.pullRequest ? undefined : target.branch,
+          pullRequest: target.pullRequest,
+        };
+        try {
+          const config = parseConfig(
+            await github.fileContent(repository, target.sha, CONFIG_FILE),
+            `${repository.fullName}/${CONFIG_FILE}@${target.sha.slice(0, 7)}`,
+          );
+          if (
+            !config.jobs.some((job) =>
+              (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
+            )
+          )
+            continue;
+          const build = await runCommit(
+            github,
+            repository,
+            target.sha,
+            target.branch,
+            config,
+            undefined,
+            { ...context, id: target.eventId },
+          );
+          if (build)
+            message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
+        } catch (error) {
+          message(
+            `${target.branch}@${target.sha.slice(0, 7)} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+
+      const state = await readPollState(repository.fullName);
+      if (!state.cursor) {
+        const latest = await github.latestPullRequestComments(repository);
+        state.cursor = latest.reduce(
+          (cursor, comment) => (comment.updatedAt > cursor ? comment.updatedAt : cursor),
+          new Date(0).toISOString(),
+        );
+        state.seenCommentIds = latest.map((comment) => comment.id);
+        await savePollState(repository.fullName, state);
+      } else {
+        const previousCursor = state.cursor;
+        const overlap = new Date(
+          new Date(previousCursor).getTime() - COMMENT_CURSOR_OVERLAP_MS,
+        ).toISOString();
+        const comments = await github.pullRequestComments(repository, overlap);
+        const known = new Set([...state.seenCommentIds, ...state.pending.map((item) => item.id)]);
+        for (const comment of comments) {
+          if (comment.updatedAt > state.cursor) state.cursor = comment.updatedAt;
+          if (known.has(comment.id) || comment.createdAt < overlap) continue;
+          known.add(comment.id);
+          state.seenCommentIds.push(comment.id);
+          let pr = prs.find((item) => item.number === comment.pullRequestNumber);
+          if (!pr) {
+            try {
+              pr = await github.pullRequest(repository, comment.pullRequestNumber);
+            } catch (error) {
+              if (error instanceof Error && error.message.startsWith("GitHub 404")) continue;
+              throw error;
+            }
+          }
+          if (pr.sameRepository)
+            state.pending.push({
+              id: comment.id,
+              sha: pr.headSha,
+              createdAt: comment.createdAt,
+              pullRequest: pr,
+            });
+        }
+        state.seenCommentIds = state.seenCommentIds.slice(-SEEN_COMMENT_LIMIT);
+        await savePollState(repository.fullName, state);
+      }
+      for (const pending of [...state.pending]) {
+        try {
+          const config = parseConfig(
+            await github.fileContent(repository, pending.sha, CONFIG_FILE),
+            `${repository.fullName}/${CONFIG_FILE}@${pending.sha.slice(0, 7)}`,
+          );
+          const context = {
+            type: "comment" as const,
+            pullRequest: pending.pullRequest,
+            id: `pr:${pending.pullRequest.number}:comment:${pending.id}`,
+          };
+          if (
+            config.jobs.some((job) =>
+              (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
+            )
+          ) {
+            const result = await runCommit(
+              github,
+              repository,
+              pending.sha,
+              `pull/${pending.pullRequest.number}`,
+              config,
+              undefined,
+              context,
             );
-        const build = await runCommit(github, repository, sha, branch, config);
-        if (build) message(`${build.status} ${build.id} ${branch}@${sha.slice(0, 7)}`);
+            if (result === false) continue;
+          }
+          state.pending = state.pending.filter((item) => item.id !== pending.id);
+          await savePollState(repository.fullName, state);
+        } catch (error) {
+          message(
+            `comment ${pending.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
     } catch (error) {
       message(`poll failed: ${error instanceof Error ? error.message : String(error)}`);

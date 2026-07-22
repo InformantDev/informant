@@ -4,12 +4,43 @@ export interface JobConfig {
   timeoutMinutes: number;
   environment: Record<string, string>;
   needs: string[];
+  triggers?: TriggerRule[];
+}
+
+export type TriggerEvent = "commit" | "comment";
+export interface PullRequestFilter {
+  state?: "open" | "closed" | "all";
+  draft?: boolean;
+  baseBranches?: string[];
+}
+export interface TriggerRule {
+  event: TriggerEvent;
+  branch?: { names: string[] };
+  pullRequest?: PullRequestFilter;
+}
+
+export interface PullRequest {
+  number: number;
+  state: "open" | "closed";
+  draft: boolean;
+  baseBranch: string;
+  headSha: string;
+  sameRepository: boolean;
+}
+
+export interface PullRequestComment {
+  id: number;
+  pullRequestNumber: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface InformantConfig {
   version: number;
   pollIntervalSeconds: number;
-  branches: string[];
+  triggers?: TriggerRule[];
+  /** Legacy input compatibility; normalized configs omit this field. */
+  branches?: string[];
   vm: {
     image: string;
     user: string;
@@ -48,4 +79,5 @@ export interface BuildRecord {
   status: "running" | "success" | "failure" | "cancelled";
   logPath: string;
   checkUrl?: string;
+  event?: { type: TriggerEvent | "manual"; id: string };
 }

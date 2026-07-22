@@ -8,7 +8,10 @@ Informant reads `.informant.toml` from the commit it is about to run.
 ```toml
 version = 1
 poll_interval_seconds = 20
-branches = ["main", "release"]
+triggers = [
+  { event = "commit", branch = { names = ["main", "release"] } },
+  { event = "comment", pull_request = { state = "open", draft = false, base_branches = ["main"] } }
+]
 
 [vm]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
@@ -27,6 +30,10 @@ environment = { CI = "true" }
 name = "lint"
 command = "bun run check"
 timeout_minutes = 10
+triggers = [
+  { event = "commit", pull_request = { state = "open", draft = false } },
+  { event = "comment", pull_request = { state = "open" } }
+]
 
 [[jobs]]
 name = "build"
@@ -39,3 +46,20 @@ Like GitHub Actions, jobs run in parallel by default. Each job gets its own fres
 checkout mounted at `/Volumes/My Shared Files/workspace`. Use `needs` to make a job wait for one or
 more other jobs. In this example, `test` and `lint` start together; `build` starts only after both pass.
 If a dependency fails or times out, jobs that need it are skipped.
+
+## Automatic triggers
+
+Events are `commit` and `comment`. A commit rule can filter either exact branch names or pull requests.
+A comment rule can only use the optional pull-request filter and means a newly created PR conversation
+comment—not an edit or line-level review comment. With no branch or pull-request table, a commit
+matches branches and active same-repository PR heads.
+
+Pull-request `state` is `open`, `closed`, or `all`; `draft` and exact `base_branches` are optional.
+Closed PRs are resolved when a new conversation comment arrives, so `state = "closed"` is useful for
+comment triggers. Commit polling considers active PR heads rather than replaying every historical
+closed PR. Fork PR heads are not executed.
+
+Jobs inherit top-level triggers. A job's own `triggers` replaces them; `triggers = []` makes it manual-
+or dependency-only. Matching rules are ORed, and dependencies of matching root jobs are always added.
+Legacy `branches` still becomes commit branch rules (default `main`), but cannot be combined with
+top-level `triggers`. Manual `informant run` ignores trigger eligibility.

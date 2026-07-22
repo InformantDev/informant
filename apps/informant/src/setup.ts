@@ -85,7 +85,7 @@ async function createApp(owner?: string): Promise<ManifestApp> {
         url: "https://github.com/informant-ci/informant",
         redirect_url: callback,
         public: false,
-        default_permissions: { checks: "write", contents: "read" },
+        default_permissions: { checks: "write", contents: "read", pull_requests: "read" },
         default_events: [],
         hook_attributes: { url: callback, active: false },
       })

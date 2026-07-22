@@ -33,14 +33,20 @@ test("readLogTail reads a bounded Unicode-safe tail", async () => {
   expect(tail).toBe("😀".repeat(55_000));
 });
 
-function harness(options: { claim?: boolean; success?: boolean; error?: Error } = {}) {
+function harness(
+  options: { claim?: boolean; success?: boolean; error?: Error; manualRequest?: boolean } = {},
+) {
   const updates: Array<Record<string, unknown>> = [];
   const saved: BuildRecord[] = [];
   const github = {
     claim: async () =>
       options.claim === false
         ? undefined
-        : { check: { id: 42, html_url: "https://example.test/check" }, requestedJobs: [] },
+        : {
+            check: { id: 42, html_url: "https://example.test/check" },
+            requestedJobs: [],
+            manualRequest: options.manualRequest ?? false,
+          },
     updateCheck: async (_repository: Repository, _id: number, values: Record<string, unknown>) => {
       updates.push(values);
       return {};
@@ -83,7 +89,8 @@ describe("runCommit", () => {
       config,
       context.dependencies,
     );
-    expect(record?.status).toBe(status);
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe(status);
     expect(context.updates[0]).toMatchObject({ status: "completed", conclusion });
     expect(context.saved.at(-1)?.status).toBe(status);
   });
@@ -99,6 +106,29 @@ describe("runCommit", () => {
       summary: "tart broke",
     });
     expect(context.saved.at(-1)?.status).toBe("failure");
+  });
+
+  test("an all-jobs manual request bypasses automatic trigger filters", async () => {
+    const context = harness({ manualRequest: true });
+    const manualOnly = {
+      ...config,
+      triggers: [{ event: "commit" as const }],
+      jobs: config.jobs.map((job) => ({ ...job, triggers: [] })),
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      manualOnly,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("success");
+    expect(record.event?.type).toBe("manual");
   });
 
   test("persists failure when the terminal check update throws", async () => {
