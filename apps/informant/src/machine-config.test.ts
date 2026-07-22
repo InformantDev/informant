@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { addRepository, listRepositories, removeRepository } from "./machine-config.ts";
+import {
+  addRepository,
+  getGitHubCredentials,
+  listRepositories,
+  removeRepository,
+  saveGitHubCredentials,
+} from "./machine-config.ts";
 
 test("registers and removes machine repositories without duplicates", async () => {
   const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
@@ -26,6 +32,25 @@ test("rejects unsupported machine configuration versions before rewriting", asyn
     await Bun.write(path, source);
     expect(addRepository(repository, path)).rejects.toThrow("upgrade Informant");
     expect(await Bun.file(path).text()).toBe(source);
+  } finally {
+    await Bun.file(path).delete();
+  }
+});
+
+test("saving GitHub credentials preserves registered repositories", async () => {
+  const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+  const credentials = {
+    appId: "123",
+    installationId: "456",
+    privateKeyFile: "/tmp/informant.pem",
+  };
+
+  try {
+    await addRepository(repository, path);
+    await saveGitHubCredentials(credentials, path);
+    expect(await getGitHubCredentials(path)).toEqual(credentials);
+    expect((await listRepositories(path)).map((value) => value.fullName)).toEqual(["acme/widgets"]);
   } finally {
     await Bun.file(path).delete();
   }

@@ -11,7 +11,8 @@ informant setup
 
 The setup command uses GitHub's App Manifest flow to create the correctly scoped App, capture its
 generated private key over a temporary localhost callback, open the installation page, detect the
-installation, and register every selected repository. It stores the key at
+installation, and save its credentials. App installation access and this worker's registered
+repository list are separate. It stores the key at
 `~/.config/informant/app-<APP_ID>.pem` with mode `600` and records the IDs in
 `~/.config/informant/config.json`. No environment variables are required.
 

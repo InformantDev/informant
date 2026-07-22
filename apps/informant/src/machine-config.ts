@@ -87,18 +87,3 @@ export async function saveGitHubCredentials(
   const config = await readMachineConfig(path);
   await writeMachineConfig({ ...config, github: credentials }, path);
 }
-
-export async function configureMachine(
-  credentials: GitHubCredentials,
-  repositories: Repository[],
-  path = machineConfigPath(),
-): Promise<void> {
-  await writeMachineConfig(
-    {
-      version: 1,
-      github: credentials,
-      repositories: repositories.map((repository) => repository.fullName).sort(),
-    },
-    path,
-  );
-}
