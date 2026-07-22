@@ -9,3 +9,7 @@ dist
 .staffreview/
 .informant/worktrees/
 .informant/logs/
+.staffreview/diffs/
+.staffreview/attachments/
+.staffreview/active.json
+.staffreview/section-cache.json
