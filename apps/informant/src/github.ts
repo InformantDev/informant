@@ -2,12 +2,26 @@ import { createSign } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { getGitHubCredentials } from "./machine-config.ts";
-import type { CheckRun, Repository } from "./types.ts";
+import type {
+  CheckRun,
+  PullRequest,
+  PullRequestComment,
+  Repository,
+  TriggerEvent,
+} from "./types.ts";
 
 const API = "https://api.github.com";
 export const CLAIM_NAME = "Informant CI";
+export const COMMENT_CLAIM_NAME = "Informant CI / comment";
 export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
+
+export interface ClaimResult {
+  check?: CheckRun;
+  requestedJobs: string[];
+  manualRequest: boolean;
+  retry?: boolean;
+}
 
 function outputTail(value: string | undefined, maximumBytes = 60_000): string | undefined {
   if (!value) return value;
@@ -155,6 +169,104 @@ export class GitHubClient {
     return ref.object.sha;
   }
 
+  async branches(repository: Repository): Promise<Array<{ name: string; sha: string }>> {
+    const values: Array<{ name: string; commit: { sha: string } }> = [];
+    for (let page = 1; ; page++) {
+      const pageValues = await this.api<typeof values>(
+        `/repos/${repository.fullName}/branches?per_page=100&page=${page}`,
+      );
+      values.push(...pageValues);
+      if (pageValues.length < 100) break;
+    }
+    return values.map((value) => ({ name: value.name, sha: value.commit.sha }));
+  }
+
+  private parsePullRequest(
+    value: {
+      number: number;
+      state: "open" | "closed";
+      draft: boolean;
+      base: { ref: string };
+      head: { sha: string; repo: { full_name: string } | null };
+    },
+    repository: Repository,
+  ): PullRequest {
+    return {
+      number: value.number,
+      state: value.state,
+      draft: value.draft,
+      baseBranch: value.base.ref,
+      headSha: value.head.sha,
+      sameRepository:
+        value.head.repo?.full_name.toLowerCase() === repository.fullName.toLowerCase(),
+    };
+  }
+
+  async pullRequests(repository: Repository): Promise<PullRequest[]> {
+    type Raw = {
+      number: number;
+      state: "open" | "closed";
+      draft: boolean;
+      base: { ref: string };
+      head: { sha: string; repo: { full_name: string } | null };
+    };
+    const values: Raw[] = [];
+    for (let page = 1; ; page++) {
+      const pageValues = await this.api<Raw[]>(
+        `/repos/${repository.fullName}/pulls?state=open&per_page=100&page=${page}`,
+      );
+      values.push(...pageValues);
+      if (pageValues.length < 100) break;
+    }
+    return values.map((value) => this.parsePullRequest(value, repository));
+  }
+
+  async pullRequest(repository: Repository, number: number): Promise<PullRequest> {
+    const value = await this.api<{
+      number: number;
+      state: "open" | "closed";
+      draft: boolean;
+      base: { ref: string };
+      head: { sha: string; repo: { full_name: string } | null };
+    }>(`/repos/${repository.fullName}/pulls/${number}`);
+    return this.parsePullRequest(value, repository);
+  }
+
+  async pullRequestComments(repository: Repository, since?: string): Promise<PullRequestComment[]> {
+    type Raw = { id: number; issue_url: string; created_at: string; updated_at: string };
+    const values: Raw[] = [];
+    for (let page = 1; ; page++) {
+      const query = since ? `&since=${encodeURIComponent(since)}` : "";
+      const pageValues = await this.api<Raw[]>(
+        `/repos/${repository.fullName}/issues/comments?sort=created&direction=asc&per_page=100&page=${page}${query}`,
+      );
+      values.push(...pageValues);
+      if (pageValues.length < 100) break;
+    }
+    return values.map((value) => ({
+      id: value.id,
+      pullRequestNumber: Number(value.issue_url.split("/").at(-1)),
+      createdAt: value.created_at,
+      updatedAt: value.updated_at,
+    }));
+  }
+
+  async latestPullRequestComments(
+    repository: Repository,
+    limit = 100,
+  ): Promise<PullRequestComment[]> {
+    type Raw = { id: number; issue_url: string; created_at: string; updated_at: string };
+    const values = await this.api<Raw[]>(
+      `/repos/${repository.fullName}/issues/comments?sort=updated&direction=desc&per_page=${limit}&page=1`,
+    );
+    return values.map((value) => ({
+      id: value.id,
+      pullRequestNumber: Number(value.issue_url.split("/").at(-1)),
+      createdAt: value.created_at,
+      updatedAt: value.updated_at,
+    }));
+  }
+
   async defaultBranch(repository: Repository): Promise<string> {
     const result = await this.api<{ default_branch: string }>(`/repos/${repository.fullName}`);
     return result.default_branch;
@@ -168,19 +280,19 @@ export class GitHubClient {
     return Buffer.from(result.content.replaceAll("\n", ""), "base64").toString("utf8");
   }
 
-  async checks(repository: Repository, sha: string): Promise<CheckRun[]> {
+  async checks(repository: Repository, sha: string, name = CLAIM_NAME): Promise<CheckRun[]> {
     await this.authenticate();
     const appId = this.appId;
     const appFilter = appId ? `&app_id=${encodeURIComponent(appId)}` : "";
     const checks: CheckRun[] = [];
     for (let page = 1; ; page++) {
       const result = await this.api<{ check_runs: CheckRun[] }>(
-        `/repos/${repository.fullName}/commits/${sha}/check-runs?check_name=${encodeURIComponent(CLAIM_NAME)}&filter=all&per_page=100&page=${page}${appFilter}`,
+        `/repos/${repository.fullName}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=all&per_page=100&page=${page}${appFilter}`,
       );
       checks.push(...result.check_runs);
       if (result.check_runs.length < 100) break;
     }
-    return checks.filter((check) => check.name === CLAIM_NAME);
+    return checks.filter((check) => check.name === name);
   }
 
   async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
@@ -200,13 +312,30 @@ export class GitHubClient {
     );
   }
 
-  async checkSuiteStatus(repository: Repository, sha: string): Promise<string | undefined> {
+  async checkSuiteStatus(
+    repository: Repository,
+    sha: string,
+    name = CLAIM_NAME,
+  ): Promise<string | undefined> {
     await this.authenticate();
     const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
     const result = await this.api<{ check_suites: Array<{ status?: string | null }> }>(
-      `/repos/${repository.fullName}/commits/${sha}/check-suites?check_name=${encodeURIComponent(CLAIM_NAME)}&per_page=1${appFilter}`,
+      `/repos/${repository.fullName}/commits/${sha}/check-suites?check_name=${encodeURIComponent(name)}&per_page=1${appFilter}`,
     );
     return result.check_suites[0]?.status ?? undefined;
+  }
+
+  async hasPendingManualRequest(repository: Repository, sha: string): Promise<boolean> {
+    const checks = await this.checks(repository, sha, CLAIM_NAME);
+    if (
+      checks.some((check) => check.status === "queued" && !check.external_id?.includes(":event:"))
+    ) {
+      return true;
+    }
+    return (
+      checks.some((check) => check.status === "completed") &&
+      (await this.checkSuiteStatus(repository, sha, CLAIM_NAME)) === "queued"
+    );
   }
 
   async installationRepositories(): Promise<Repository[]> {
@@ -252,6 +381,7 @@ export class GitHubClient {
     externalId: string,
     status: "queued" | "in_progress" = "in_progress",
     requestedJobs: string[] = [],
+    name = CLAIM_NAME,
   ): Promise<CheckRun> {
     const requestId =
       status === "queued"
@@ -260,7 +390,7 @@ export class GitHubClient {
     return this.api(`/repos/${repository.fullName}/check-runs`, {
       method: "POST",
       body: JSON.stringify({
-        name: CLAIM_NAME,
+        name,
         head_sha: sha,
         status,
         external_id: requestId,
@@ -315,15 +445,50 @@ export class GitHubClient {
     repository: Repository,
     sha: string,
     machineId: string,
-  ): Promise<{ check: CheckRun; requestedJobs: string[] } | undefined> {
-    const existing = await this.checks(repository, sha);
+    event: { type: TriggerEvent | "manual"; id: string } = { type: "commit", id: sha },
+  ): Promise<ClaimResult | undefined> {
+    const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
+    const initialChecks = await this.checks(repository, sha, initialName);
+    const requestedChecks =
+      event.type === "comment"
+        ? []
+        : initialChecks.filter(
+            (check) => check.status === "queued" && !check.external_id?.includes(":event:"),
+          );
+    const suiteRerun =
+      event.type !== "comment" &&
+      requestedChecks.length === 0 &&
+      initialChecks.some((check) => check.status === "completed") &&
+      (await this.checkSuiteStatus(repository, sha, initialName)) === "queued";
+    const claimEvent =
+      requestedChecks.length > 0 || suiteRerun ? { type: "manual" as const, id: sha } : event;
+    const name = claimEvent.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
+    const scope = `${claimEvent.type}:${claimEvent.id}`;
+    const acceptsLegacyCommit =
+      claimEvent.type === "commit" &&
+      (claimEvent.id === sha || claimEvent.id.startsWith("branch:"));
+    const existing = initialChecks.filter(
+      (check) =>
+        check.external_id?.endsWith(`:event:${scope}`) ||
+        requestedChecks.some((request) => request.id === check.id) ||
+        (acceptsLegacyCommit && !check.external_id?.includes(":event:")),
+    );
+    const historicalCompleted = new Set(
+      existing.filter((check) => check.status === "completed").map((check) => check.id),
+    );
     const active = existing.filter((check) => check.status === "in_progress");
     const stale = active.filter(
       (check) =>
         !check.started_at || Date.now() - new Date(check.started_at).getTime() > STALE_CLAIM_MS,
     );
+    const allStale = initialChecks
+      .filter((check) => check.status === "in_progress")
+      .filter(
+        (check) =>
+          !check.started_at || Date.now() - new Date(check.started_at).getTime() > STALE_CLAIM_MS,
+      );
     await Promise.all(
-      stale.map(async (check) => {
+      allStale.map(async (check) => {
         const jobs = (await this.jobChecks(repository, sha, check.id)).filter(
           (job) => job.status !== "completed",
         );
@@ -345,21 +510,45 @@ export class GitHubClient {
         });
       }),
     );
-    if (active.length > stale.length) return undefined;
-    let requested = existing.some((check) => check.status === "queued");
-    const completed = existing.some((check) => check.status === "completed");
-    if (!requested && completed && stale.length === 0) {
-      requested = (await this.checkSuiteStatus(repository, sha)) === "queued";
-    }
-    if (!requested && stale.length === 0 && completed) {
+    if (active.length > stale.length)
+      return { requestedJobs: [], manualRequest: claimEvent.type === "manual", retry: true };
+    const requested = suiteRerun || existing.some((check) => check.status === "queued");
+    if (
+      !requested &&
+      stale.length === 0 &&
+      existing.some((check) => check.status === "completed")
+    ) {
       return undefined;
     }
 
-    const candidate = await this.createCheck(repository, sha, machineId);
-    const contenders = (await this.checks(repository, sha))
+    const candidate = await this.createCheck(
+      repository,
+      sha,
+      `${machineId}:event:${scope}`,
+      "in_progress",
+      [],
+      name,
+    );
+    const election = await this.checks(repository, sha, name);
+    const ignoredCompletions = new Set([
+      ...stale.map((check) => check.id),
+      ...(requested ? historicalCompleted : []),
+    ]);
+    const completed = election.some(
+      (check) =>
+        check.status === "completed" &&
+        check.external_id?.endsWith(`:event:${scope}`) &&
+        !ignoredCompletions.has(check.id),
+    );
+    const contenders = election
+      .filter(
+        (check) =>
+          check.external_id?.endsWith(`:event:${scope}`) ||
+          (acceptsLegacyCommit && !check.external_id?.includes(":event:")),
+      )
       .filter((check) => check.status === "in_progress")
       .sort((a, b) => a.id - b.id);
-    if (contenders[0]?.id === candidate.id) {
+    if (!completed && contenders[0]?.id === candidate.id) {
       const queued = existing.filter((check) => check.status === "queued");
       const jobRequests = queued.map((check) => {
         const encoded = check.external_id?.split(":jobs:")[1];
@@ -384,7 +573,11 @@ export class GitHubClient {
           }),
         ),
       );
-      return { check: candidate, requestedJobs };
+      return {
+        check: candidate,
+        requestedJobs,
+        manualRequest: claimEvent.type === "manual",
+      };
     }
 
     await this.updateCheck(repository, candidate.id, {
@@ -393,6 +586,8 @@ export class GitHubClient {
       title: "Claim lost",
       summary: "Another Informant machine claimed this commit first.",
     });
-    return undefined;
+    return completed
+      ? undefined
+      : { requestedJobs: [], manualRequest: claimEvent.type === "manual", retry: true };
   }
 }

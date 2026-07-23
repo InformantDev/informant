@@ -1,12 +1,12 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import type { InformantConfig, JobConfig, Repository } from "./types.ts";
+import type { InformantConfig, JobConfig, Repository, TriggerRule } from "./types.ts";
 
 export const CONFIG_FILE = ".informant.toml";
 
 const defaultConfig = `version = 1
 poll_interval_seconds = 20
-branches = ["main"]
+triggers = [{ event = "commit", branch = { names = ["main"] } }]
 
 [vm]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
@@ -40,6 +40,82 @@ export function selectJobs(config: InformantConfig, requested: string[]): Inform
   return { ...config, jobs: config.jobs.filter((job) => selected.has(job.name)) };
 }
 
+export function selectTriggeredJobs(
+  config: InformantConfig,
+  matches: (rule: TriggerRule) => boolean,
+) {
+  const roots = config.jobs
+    .filter((job) => (job.triggers ?? config.triggers ?? []).some(matches))
+    .map((job) => job.name);
+  return roots.length ? selectJobs(config, roots) : { ...config, jobs: [] };
+}
+
+function parseTriggers(value: unknown, label: string): TriggerRule[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      throw new Error(`${label}[${index}] must be a table`);
+    const raw = item as Record<string, unknown>;
+    if (raw.event !== "commit" && raw.event !== "comment")
+      throw new Error(`${label}[${index}].event must be commit or comment`);
+    const allowed = new Set(["event", "branch", "pull_request"]);
+    if (Object.keys(raw).some((key) => !allowed.has(key)))
+      throw new Error(`${label}[${index}] contains an unknown field`);
+    if (raw.branch !== undefined && raw.pull_request !== undefined)
+      throw new Error(`${label}[${index}] cannot use both branch and pull_request`);
+    if (raw.event === "comment" && raw.branch !== undefined)
+      throw new Error(`${label}[${index}] comment cannot use branch`);
+    let branch: TriggerRule["branch"];
+    if (raw.branch !== undefined) {
+      const table = raw.branch as Record<string, unknown>;
+      if (
+        !table ||
+        typeof table !== "object" ||
+        Array.isArray(table) ||
+        Object.keys(table).some((key) => key !== "names")
+      )
+        throw new Error(`${label}[${index}].branch must contain only names`);
+      if (
+        !Array.isArray(table.names) ||
+        table.names.length === 0 ||
+        table.names.some((name) => typeof name !== "string" || !name.trim())
+      )
+        throw new Error(`${label}[${index}].branch.names must contain non-empty strings`);
+      branch = { names: table.names as string[] };
+    }
+    let pullRequest: TriggerRule["pullRequest"];
+    if (raw.pull_request !== undefined) {
+      const table = raw.pull_request as Record<string, unknown>;
+      if (
+        !table ||
+        typeof table !== "object" ||
+        Array.isArray(table) ||
+        Object.keys(table).some((key) => !["state", "draft", "base_branches"].includes(key))
+      )
+        throw new Error(`${label}[${index}].pull_request is invalid`);
+      if (table.state !== undefined && !["open", "closed", "all"].includes(String(table.state)))
+        throw new Error(`${label}[${index}].pull_request.state must be open, closed, or all`);
+      if (table.draft !== undefined && typeof table.draft !== "boolean")
+        throw new Error(`${label}[${index}].pull_request.draft must be boolean`);
+      if (
+        table.base_branches !== undefined &&
+        (!Array.isArray(table.base_branches) ||
+          table.base_branches.length === 0 ||
+          table.base_branches.some((name) => typeof name !== "string" || !name.trim()))
+      )
+        throw new Error(
+          `${label}[${index}].pull_request.base_branches must contain non-empty strings`,
+        );
+      pullRequest = {
+        state: table.state as "open" | "closed" | "all" | undefined,
+        draft: table.draft as boolean | undefined,
+        baseBranches: table.base_branches as string[] | undefined,
+      };
+    }
+    return { event: raw.event, branch, pullRequest } as TriggerRule;
+  });
+}
+
 export function parseRepository(value: string): Repository {
   const normalized = value
     .trim()
@@ -71,6 +147,15 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   }
   const vm = (raw.vm ?? {}) as Record<string, unknown>;
   const rawJobs = raw.jobs;
+  if (raw.branches !== undefined && raw.triggers !== undefined)
+    throw new Error("branches and triggers cannot both be set");
+  const topTriggers =
+    raw.triggers !== undefined
+      ? parseTriggers(raw.triggers, "triggers")
+      : parseTriggers(
+          [{ event: "commit", branch: { names: raw.branches ?? ["main"] } }],
+          "triggers",
+        );
   if (!Array.isArray(rawJobs) || rawJobs.length === 0) {
     throw new Error(`${label} must contain at least one [[jobs]] entry`);
   }
@@ -154,6 +239,10 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
       environment: Object.fromEntries(
         Object.entries(environment).map(([key, item]) => [key, String(item)]),
       ),
+      triggers:
+        job.triggers === undefined
+          ? topTriggers
+          : parseTriggers(job.triggers, `jobs[${index}].triggers`),
       cache: cache === undefined ? undefined : caches,
     };
   });
@@ -195,13 +284,6 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   if (!Number.isFinite(pollIntervalSeconds) || pollIntervalSeconds <= 0) {
     throw new Error("poll_interval_seconds must be a positive number");
   }
-  const branches = Array.isArray(raw.branches) ? raw.branches : ["main"];
-  if (
-    branches.length === 0 ||
-    branches.some((branch) => typeof branch !== "string" || branch.trim().length === 0)
-  ) {
-    throw new Error("branches must contain at least one non-empty string");
-  }
   const user = vm.user ?? "admin";
   const password = vm.password ?? "admin";
   if (typeof user !== "string" || !/^[A-Za-z_][A-Za-z0-9._-]*$/.test(user)) {
@@ -217,7 +299,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   return {
     version: raw.version,
     pollIntervalSeconds: Math.max(5, pollIntervalSeconds),
-    branches,
+    triggers: topTriggers,
     vm: {
       image: vm.image,
       user,

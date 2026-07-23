@@ -37,10 +37,14 @@ saved by `informant setup`:
 
 ## Manual App creation
 
-[Open GitHub with Informant's permissions preselected →](https://github.com/settings/apps/new?name=Informant%20Local%20CI&description=Runs%20private%20CI%20on%20your%20local%20machines&url=https%3A%2F%2Fgithub.com%2Finformant-ci%2Finformant&public=false&checks=write&contents=read&webhook_active=false)
+[Open GitHub with Informant's permissions preselected →](https://github.com/settings/apps/new?name=Informant%20Local%20CI&description=Runs%20private%20CI%20on%20your%20local%20machines&url=https%3A%2F%2Fgithub.com%2Finformant-ci%2Finformant&public=false&checks=write&contents=read&pull_requests=read&webhook_active=false)
 
-The registration URL requests only **Checks: read/write** and **Contents: read**, and disables
+The registration URL requests **Checks: read/write**, **Contents: read**, and **Pull requests: read**, and disables
 webhooks. Informant polls GitHub, so it does not need a webhook URL or a publicly reachable server.
+
+PR conversation comments are discovered by polling. Historical comments are seeded rather than
+replayed on first enable; a durable per-machine cursor and pending event snapshot prevent restart
+replay and retargeting. Check claims deduplicate the same event when multiple machines observe it.
 
 After creating the App:
 

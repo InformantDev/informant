@@ -31,7 +31,7 @@ test("claim elects the oldest active check using the full check history", async 
     "machine",
   );
 
-  expect(claim?.check.id).toBe(10);
+  expect(claim?.check?.id).toBe(10);
   expect(claim?.requestedJobs).toEqual([]);
   expect(urls.filter((url) => url.includes("check-runs"))).toHaveLength(3);
   expect(urls.some((url) => url.includes("filter=all") && url.includes("per_page=100"))).toBe(true);
@@ -155,9 +155,17 @@ test("claim replaces a stale claim after its accepted request was completed", as
     },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "completed" }] });
+    }
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
-      const check = { id: nextId++, name: body.name, status: body.status };
+      const check = {
+        id: nextId++,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
       checks.push(check);
       return Response.json(check);
     }
@@ -176,7 +184,7 @@ test("claim replaces a stale claim after its accepted request was completed", as
     "replacement",
   );
 
-  expect(claim?.check.id).toBe(100);
+  expect(claim?.check?.id).toBe(100);
   expect(checks.find((check) => check.id === 3)).toMatchObject({
     status: "completed",
     conclusion: "cancelled",
@@ -229,7 +237,12 @@ test("claim treats a queued check suite as a GitHub UI re-run request", async ()
     const url = String(input);
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
-      const check = { id: 2, name: body.name, status: body.status };
+      const check = {
+        id: 2,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
       checks.push(check);
       return Response.json(check);
     }
@@ -245,7 +258,7 @@ test("claim treats a queued check suite as a GitHub UI re-run request", async ()
     "machine",
   );
 
-  expect(claim?.check.id).toBe(2);
+  expect(claim?.check?.id).toBe(2);
   expect(claim?.requestedJobs).toEqual([]);
 });
 
@@ -298,4 +311,212 @@ test("pre-minted installation tokens retain their App ID check filter", async ()
     if (previousAccount === undefined) delete Bun.env.INFORMANT_GITHUB_ACCOUNT;
     else Bun.env.INFORMANT_GITHUB_ACCOUNT = previousAccount;
   }
+});
+
+test("event scopes match exactly and legacy checks do not suppress PR commits", async () => {
+  let nextId = 100;
+  const checks: Array<Record<string, unknown>> = [
+    {
+      id: 1,
+      name: "Informant CI / comment",
+      status: "completed",
+      external_id: "worker:event:comment:pr:1:comment:10",
+    },
+    { id: 2, name: "Informant CI", status: "completed", external_id: "legacy-worker" },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "completed" }] });
+    }
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = {
+        id: nextId++,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") return Response.json({});
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+  const github = new GitHubClient({ token: "installation-token", fetch });
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+
+  const comment = await github.claim(repository, "abc123", "worker", {
+    type: "comment",
+    id: "pr:1:comment:1",
+  });
+  const pullRequest = await github.claim(repository, "abc123", "worker", {
+    type: "commit",
+    id: "pr:1:abc123",
+  });
+
+  expect(comment?.check?.id).toBe(100);
+  expect(pullRequest?.check?.id).toBe(101);
+});
+
+test("queued work elects in a canonical manual scope", async () => {
+  let createdExternalId = "";
+  const checks: Array<Record<string, unknown>> = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:jobs:${Buffer.from("[]").toString("base64url")}`,
+    },
+  ];
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      createdExternalId = body.external_id;
+      const check = { id: 2, name: body.name, status: body.status, external_id: body.external_id };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") return Response.json({});
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123" },
+  );
+
+  expect(createdExternalId.endsWith(":event:manual:abc123")).toBe(true);
+  expect(claim?.manualRequest).toBe(true);
+});
+
+test("an active event claim is retryable rather than terminal", async () => {
+  const fetch = (async (_input: string | URL | Request) =>
+    Response.json({
+      check_runs: [
+        {
+          id: 1,
+          name: "Informant CI / comment",
+          status: "in_progress",
+          started_at: new Date().toISOString(),
+          external_id: "worker:event:comment:pr:1:comment:2",
+        },
+      ],
+    })) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "worker",
+    { type: "comment", id: "pr:1:comment:2" },
+  );
+
+  expect(claim?.retry).toBe(true);
+});
+
+test("a repeated queued manual request can replace historical manual completion", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "completed",
+      external_id: "old-worker:event:manual:abc123",
+    },
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:jobs:${Buffer.from("[]").toString("base64url")}`,
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = {
+        id: 3,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    { type: "commit", id: "branch:main:abc123" },
+  );
+
+  expect(claim?.check?.id).toBe(3);
+  expect(claim?.manualRequest).toBe(true);
+  expect(checks.find((check) => check.id === 2)).toMatchObject({
+    status: "completed",
+    conclusion: "neutral",
+  });
+});
+
+test("an event-scoped stale claim and its children are replaced", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "in_progress",
+      started_at: "2000-01-01T00:00:00.000Z",
+      external_id: "old-worker:event:commit:branch:main:abc123",
+    },
+    {
+      id: 2,
+      name: "Informant / test",
+      status: "in_progress",
+      external_id: "informant-job:1:dGVzdA",
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = {
+        id: 3,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "replacement",
+    { type: "commit", id: "branch:main:abc123" },
+  );
+
+  expect(claim?.check?.id).toBe(3);
+  expect(checks.find((check) => check.id === 1)).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+  });
+  expect(checks.find((check) => check.id === 2)).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+  });
 });

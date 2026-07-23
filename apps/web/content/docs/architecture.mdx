@@ -4,7 +4,7 @@ description: How GitHub Checks act as a decentralized work queue.
 ---
 
 ```text
-GitHub branch ──poll──▶ Mac A ─┐
+GitHub branch/PR/comment ──poll──▶ Mac A ─┐
                       Mac B ─┼──▶ oldest Check Run wins ──▶ Tart VM
                       Mac C ─┘                                  │
                            ▲                                    ▼
@@ -27,6 +27,9 @@ GitHub UI. Jobs skipped because a dependency failed receive a `skipped` conclusi
 Because the Checks API does not offer compare-and-swap, this election is best-effort rather than a
 strict distributed lock. Checks are fetched with `filter=all` and scoped to the configured GitHub App;
 claims left behind by dead workers become retryable after 24 hours.
+
+Claims are scoped to event identity, so a commit and each newly-created PR conversation comment on
+the same SHA elect independently. Comment runs use the distinct `Informant CI / comment` check name.
 
 Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
 already has an older completed result.

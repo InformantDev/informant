@@ -1,10 +1,13 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { selectJobs } from "./config.ts";
+import { selectJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, runInTart } from "./tart.ts";
+import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, CheckRun, InformantConfig, JobConfig, Repository } from "./types.ts";
+
+type RunEvent = (EventContext | { type: "manual" }) & { id: string };
 
 export interface CoordinatorDependencies {
   createBuild: typeof createBuild;
@@ -42,13 +45,33 @@ export async function runCommit(
   branch: string,
   config: InformantConfig,
   dependencies: CoordinatorDependencies = defaultDependencies,
-): Promise<BuildRecord | undefined> {
+  event?: RunEvent,
+): Promise<BuildRecord | false | undefined> {
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
-  const claim = await github.claim(repository, sha, machine);
-  if (!claim) return undefined;
+  const claim = await github.claim(
+    repository,
+    sha,
+    machine,
+    event ? { type: event.type, id: event.id } : undefined,
+  );
+  if (claim?.retry) return false;
+  if (!claim?.check) return undefined;
   const { check } = claim;
-  config = selectJobs(config, claim.requestedJobs);
+  config = claim.manualRequest
+    ? selectJobs(config, claim.requestedJobs)
+    : event && event.type !== "manual"
+      ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event))
+      : config;
+  if (config.jobs.length === 0) {
+    await github.updateCheck(repository, check.id, {
+      status: "completed",
+      conclusion: "neutral",
+      title: "No jobs matched",
+      summary: `No jobs are configured for this ${event?.type ?? "manual"} event.`,
+    });
+    return undefined;
+  }
 
   type CheckUpdate = Parameters<GitHubClient["updateCheck"]>[2];
   interface JobCheckState {
@@ -69,6 +92,11 @@ export async function runCommit(
     status: "running",
     logPath: join(dataDirectory(), "builds", id, "build.log"),
     checkUrl: check.html_url,
+    event: claim.manualRequest
+      ? { type: "manual", id: check.id.toString() }
+      : event
+        ? { type: event.type, id: event.id }
+        : { type: "manual", id: check.id.toString() },
   };
   const cancelledValues = (name: string): CheckUpdate => ({
     status: "completed",
