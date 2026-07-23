@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { cachePathIdentity, preparedImageName, scheduleJobs } from "./tart.ts";
+import {
+  cachePathIdentity,
+  isRetryableSshAuthenticationFailure,
+  preparedImageName,
+  scheduleJobs,
+} from "./tart.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
@@ -42,6 +47,33 @@ test("cache destinations have distinct storage identities", () => {
     cachePathIdentity("admin", "~/.npm"),
   );
   expect(cachePathIdentity("admin", "~/.npm")).not.toBe(cachePathIdentity("builder", "~/.npm"));
+});
+
+test("retries SSH only when authentication failed before the command started", () => {
+  expect(
+    isRetryableSshAuthenticationFailure({
+      exitCode: 255,
+      stdout: "",
+      stderr: "admin@host: Permission denied (publickey,password).",
+      timedOut: false,
+    }),
+  ).toBe(true);
+  expect(
+    isRetryableSshAuthenticationFailure({
+      exitCode: 255,
+      stdout: "command output",
+      stderr: "Permission denied",
+      timedOut: false,
+    }),
+  ).toBe(false);
+  expect(
+    isRetryableSshAuthenticationFailure({
+      exitCode: 1,
+      stdout: "",
+      stderr: "Permission denied",
+      timedOut: false,
+    }),
+  ).toBe(false);
 });
 
 describe("job scheduler", () => {

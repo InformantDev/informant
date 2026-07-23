@@ -70,6 +70,8 @@ async function waitForSsh(
         "PreferredAuthentications=password",
         "-o",
         "PubkeyAuthentication=no",
+        "-o",
+        "NumberOfPasswordPrompts=1",
         `${user}@${ip}`,
         "true",
       ],
@@ -170,25 +172,46 @@ async function withImageLock<T>(image: string, callback: () => Promise<T>): Prom
   }
 }
 
-async function sshCommand(ip: string, config: InformantConfig, remote: string, timeoutMs: number) {
-  return command(
-    [
-      "sshpass",
-      "-e",
-      "ssh",
-      "-o",
-      "StrictHostKeyChecking=no",
-      "-o",
-      "UserKnownHostsFile=/dev/null",
-      "-o",
-      "PreferredAuthentications=password",
-      "-o",
-      "PubkeyAuthentication=no",
-      `${config.vm.user}@${ip}`,
-      remote,
-    ],
-    { env: { SSHPASS: config.vm.password }, timeoutMs },
+export function isRetryableSshAuthenticationFailure(result: {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}): boolean {
+  return (
+    result.exitCode === 255 &&
+    !result.timedOut &&
+    result.stdout.length === 0 &&
+    result.stderr.includes("Permission denied")
   );
+}
+
+async function sshCommand(ip: string, config: InformantConfig, remote: string, timeoutMs: number) {
+  const argv = [
+    "sshpass",
+    "-e",
+    "ssh",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "PreferredAuthentications=password",
+    "-o",
+    "PubkeyAuthentication=no",
+    "-o",
+    "NumberOfPasswordPrompts=1",
+    `${config.vm.user}@${ip}`,
+    remote,
+  ];
+  for (let attempt = 0; ; attempt++) {
+    const result = await command(argv, {
+      env: { SSHPASS: config.vm.password },
+      timeoutMs,
+    });
+    if (!isRetryableSshAuthenticationFailure(result) || attempt >= 9) return result;
+    await Bun.sleep(2_000);
+  }
 }
 
 export function preparedImageName(config: InformantConfig): string | undefined {
