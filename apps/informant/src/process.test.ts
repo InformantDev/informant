@@ -13,3 +13,11 @@ test("command retains only a bounded diagnostic tail", async () => {
   expect(result.stdout.endsWith("stdout-tail")).toBe(true);
   expect(result.stderr.endsWith("stderr-tail")).toBe(true);
 });
+
+test("command timeout stops waiting for output inherited by a child process", async () => {
+  const started = Date.now();
+  const result = await command(["sh", "-c", "sleep 10 & exit 0"], { timeoutMs: 20 });
+
+  expect(result.timedOut).toBe(true);
+  expect(Date.now() - started).toBeLessThan(3_000);
+});

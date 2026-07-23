@@ -7,15 +7,24 @@ export interface CommandResult {
 
 const MAX_CAPTURE_CHARS = 1024 * 1024;
 
-async function captureTail(stream: ReadableStream<Uint8Array>): Promise<string> {
+async function captureTail(
+  stream: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): Promise<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let tail = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    tail += decoder.decode(value, { stream: true });
-    if (tail.length > MAX_CAPTURE_CHARS) tail = tail.slice(-MAX_CAPTURE_CHARS);
+  const abort = () => void reader.cancel();
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      tail += decoder.decode(value, { stream: true });
+      if (tail.length > MAX_CAPTURE_CHARS) tail = tail.slice(-MAX_CAPTURE_CHARS);
+    }
+  } finally {
+    signal.removeEventListener("abort", abort);
   }
   tail += decoder.decode();
   return tail.length > MAX_CAPTURE_CHARS ? tail.slice(-MAX_CAPTURE_CHARS) : tail;
@@ -44,16 +53,20 @@ export async function command(
   const process = spawned;
   let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const captureController = new AbortController();
   const timer = options.timeoutMs
     ? setTimeout(() => {
         timedOut = true;
         process.kill("SIGTERM");
-        killTimer = setTimeout(() => process.kill("SIGKILL"), 2_000);
+        killTimer = setTimeout(() => {
+          process.kill("SIGKILL");
+          captureController.abort();
+        }, 2_000);
       }, options.timeoutMs)
     : undefined;
   const [stdout, stderr, exitCode] = await Promise.all([
-    captureTail(process.stdout),
-    captureTail(process.stderr),
+    captureTail(process.stdout, captureController.signal),
+    captureTail(process.stderr, captureController.signal),
     process.exited,
   ]);
   if (timer) clearTimeout(timer);
