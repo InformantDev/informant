@@ -50,12 +50,14 @@ In the repository that needs CI:
 
 ```bash
 informant init
-informant repo add # detects owner/repository from the current Git remote
 git add .informant.toml
 git commit -m "Configure Informant CI"
 git push
 informant hook install # supported pre-push hook; waits until the push is visible
 ```
+
+`informant init` detects `owner/repository` from the `origin` Git remote and registers it with this
+machine automatically.
 
 Start the worker now and automatically whenever you log in:
 
