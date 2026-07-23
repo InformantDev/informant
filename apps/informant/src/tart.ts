@@ -364,14 +364,14 @@ async function runJob(
   workspace: string,
   config: InformantConfig,
   job: InformantConfig["jobs"][number],
-  record: BuildRecord,
+  log: (text: string) => Promise<void>,
 ): Promise<boolean> {
   let vmCreated = false;
   let tart: ReturnType<typeof Bun.spawn> | undefined;
 
   try {
     const ready = await provisionVm(async () => {
-      await appendLog(record, `\n━━ ${job.name} ━━\n$ tart clone ${image} ${vm}\n`);
+      await log(`\n━━ ${job.name} ━━\n$ tart clone ${image} ${vm}\n`);
       const clone = () => requireCommand(["tart", "clone", image, vm]);
       if (image.startsWith("informant-prepared-")) await withImageLock(image, clone);
       else await clone();
@@ -391,13 +391,13 @@ async function runJob(
         config,
         job.timeoutMinutes,
         async () => {
-          await appendLog(record, `[${job.name}] waiting for an available Tart VM slot\n`);
+          await log(`[${job.name}] waiting for an available Tart VM slot\n`);
         },
       );
       tart = started.process;
       return { ip: started.ip, cacheRestore: caches.restore, cacheSave: caches.save };
     });
-    await appendLog(record, `[${job.name}] $ ${job.command}\n`);
+    await log(`[${job.name}] $ ${job.command}\n`);
     const env = Object.entries(job.environment)
       .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
       .join(" ");
@@ -408,20 +408,37 @@ async function runJob(
     const result = await sshCommand(ready.ip, config, jobCommand, job.timeoutMinutes * 60_000);
     let output = `${result.stdout}${result.stderr}\n[${job.name}: exit ${result.exitCode}]\n`;
     if (result.timedOut) output += `[${job.name}: timed out after ${job.timeoutMinutes}m]\n`;
-    await appendLog(record, output);
+    await log(output);
     return result.exitCode === 0 && !result.timedOut;
   } finally {
     if (tart) await stopVm(vm, tart);
     if (vmCreated) {
       const deleted = await command(["tart", "delete", vm], { timeoutMs: 30_000 });
       if (deleted.exitCode !== 0) {
-        await appendLog(
-          record,
-          `[${job.name}] could not delete Tart VM ${vm}: ${deleted.stderr}\n`,
-        );
+        await log(`[${job.name}] could not delete Tart VM ${vm}: ${deleted.stderr}\n`);
       }
     }
   }
+}
+
+export type JobOutcome = "success" | "failure" | "skipped";
+
+export interface JobExecutionObserver {
+  started?: (job: InformantConfig["jobs"][number]) => Promise<void> | void;
+  completed?: (
+    job: InformantConfig["jobs"][number],
+    result: { outcome: JobOutcome; log: string },
+  ) => Promise<void> | void;
+}
+
+const JOB_LOG_BYTES = 55_000;
+
+export function utf8Tail(value: string, maximumBytes = JOB_LOG_BYTES): string {
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.length <= maximumBytes) return value;
+  let start = bytes.length - maximumBytes;
+  while (start < bytes.length && ((bytes[start] ?? 0) & 0xc0) === 0x80) start++;
+  return new TextDecoder().decode(bytes.subarray(start));
 }
 
 export async function scheduleJobs(
@@ -465,10 +482,24 @@ export async function runInTart(
   sha: string,
   config: InformantConfig,
   record: BuildRecord,
+  observer: JobExecutionObserver = {},
 ): Promise<boolean> {
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
   const workspaces = config.jobs.map((_, index) => join(root, `job-${index}`));
+  const jobLogs = new Map<string, string>();
+  const logJob = async (job: InformantConfig["jobs"][number], text: string) => {
+    jobLogs.set(job.name, utf8Tail(`${jobLogs.get(job.name) ?? ""}${text}`));
+    await appendLog(record, text);
+  };
+  const notify = async (callback: (() => Promise<void> | void) | undefined) => {
+    if (!callback) return;
+    try {
+      await callback();
+    } catch {
+      // Check reporting is observational and must not change dependency execution.
+    }
+  };
 
   try {
     await mkdir(root, { recursive: true });
@@ -495,24 +526,44 @@ export async function runInTart(
     return await scheduleJobs(
       config.jobs,
       async (job, index) => {
+        await notify(() => observer.started?.(job));
         const workspace = workspaces[index];
         if (!workspace) throw new Error(`workspace missing for job ${job.name}`);
-        return runJob(
+        const success = await runJob(
           `informant-${record.id}-${index}`,
           image,
           repository,
           workspace,
           config,
           job,
-          record,
+          (text) => logJob(job, text),
         );
+        await notify(() =>
+          observer.completed?.(job, {
+            outcome: success ? "success" : "failure",
+            log: jobLogs.get(job.name) ?? "",
+          }),
+        );
+        return success;
       },
       async (job) => {
-        await appendLog(record, `\n━━ ${job.name} ━━\n[skipped: dependency failed]\n`);
+        await logJob(job, `\n━━ ${job.name} ━━\n[skipped: dependency failed]\n`);
+        await notify(() =>
+          observer.completed?.(job, {
+            outcome: "skipped",
+            log: jobLogs.get(job.name) ?? "",
+          }),
+        );
       },
       async (job, error) => {
         const message = error instanceof Error ? error.message : String(error);
-        await appendLog(record, `\n[${job.name}: ${message}]\n`);
+        await logJob(job, `\n[${job.name}: ${message}]\n`);
+        await notify(() =>
+          observer.completed?.(job, {
+            outcome: "failure",
+            log: jobLogs.get(job.name) ?? "",
+          }),
+        );
       },
     );
   } finally {

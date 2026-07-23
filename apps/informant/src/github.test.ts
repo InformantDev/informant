@@ -79,6 +79,28 @@ test("queued checks encode selected jobs in the request", async () => {
   expect(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"))).toEqual(["test", "lint"]);
 });
 
+test("job checks are separate queued runs correlated to the aggregate claim", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return Response.json({ id: 2, name: "Informant / test", status: "queued" });
+  }) as typeof globalThis.fetch;
+
+  await new GitHubClient({ token: "installation-token", fetch }).createJobCheck(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    42,
+    "test",
+  );
+
+  expect(requestBody).toMatchObject({
+    name: "Informant / test",
+    head_sha: "abc123",
+    status: "queued",
+    external_id: "informant-job:42:dGVzdA",
+  });
+});
+
 test("claim unions targeted requests unless an all-jobs request takes precedence", async () => {
   const requestSets = [["test"], ["lint", "test"]];
   const run = async (includeAllJobs: boolean) => {
@@ -125,6 +147,12 @@ test("claim replaces a stale claim after its accepted request was completed", as
       status: "in_progress",
       started_at: "2000-01-01T00:00:00.000Z",
     },
+    {
+      id: 3,
+      name: "Informant / test",
+      status: "in_progress",
+      external_id: "informant-job:2:dGVzdA",
+    },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "POST") {
@@ -149,6 +177,48 @@ test("claim replaces a stale claim after its accepted request was completed", as
   );
 
   expect(claim?.check.id).toBe(100);
+  expect(checks.find((check) => check.id === 3)).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+  });
+});
+
+test("stale recovery leaves the aggregate active when a child cannot be cancelled", async () => {
+  let created = false;
+  let aggregateCancelled = false;
+  const checks = [
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "in_progress",
+      started_at: "2000-01-01T00:00:00.000Z",
+    },
+    {
+      id: 3,
+      name: "Informant / test",
+      status: "in_progress",
+      external_id: "informant-job:2:dGVzdA",
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") created = true;
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      if (id === 2) aggregateCancelled = true;
+      if (id === 3) return new Response("unavailable", { status: 503 });
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  await expect(
+    new GitHubClient({ token: "installation-token", fetch }).claim(
+      { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+      "abc123",
+      "replacement",
+    ),
+  ).rejects.toThrow("GitHub 503");
+  expect(aggregateCancelled).toBe(false);
+  expect(created).toBe(false);
 });
 
 test("claim treats a queued check suite as a GitHub UI re-run request", async () => {

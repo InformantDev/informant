@@ -6,7 +6,17 @@ import type { CheckRun, Repository } from "./types.ts";
 
 const API = "https://api.github.com";
 export const CLAIM_NAME = "Informant CI";
+export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
+
+function outputTail(value: string | undefined, maximumBytes = 60_000): string | undefined {
+  if (!value) return value;
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.length <= maximumBytes) return value;
+  let start = bytes.length - maximumBytes;
+  while (start < bytes.length && ((bytes[start] ?? 0) & 0xc0) === 0x80) start++;
+  return new TextDecoder().decode(bytes.subarray(start));
+}
 
 interface GitHubOptions {
   token?: string;
@@ -173,6 +183,23 @@ export class GitHubClient {
     return checks.filter((check) => check.name === CLAIM_NAME);
   }
 
+  async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
+    await this.authenticate();
+    const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
+    const checks: CheckRun[] = [];
+    for (let page = 1; ; page++) {
+      const result = await this.api<{ check_runs: CheckRun[] }>(
+        `/repos/${repository.fullName}/commits/${sha}/check-runs?filter=all&per_page=100&page=${page}${appFilter}`,
+      );
+      checks.push(...result.check_runs);
+      if (result.check_runs.length < 100) break;
+    }
+    const prefix = `informant-job:${claimId}:`;
+    return checks.filter(
+      (check) => check.name.startsWith(JOB_CHECK_PREFIX) && check.external_id?.startsWith(prefix),
+    );
+  }
+
   async checkSuiteStatus(repository: Repository, sha: string): Promise<string | undefined> {
     await this.authenticate();
     const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
@@ -243,12 +270,30 @@ export class GitHubClient {
     });
   }
 
+  async createJobCheck(
+    repository: Repository,
+    sha: string,
+    claimId: number,
+    jobName: string,
+  ): Promise<CheckRun> {
+    return this.api(`/repos/${repository.fullName}/check-runs`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: `${JOB_CHECK_PREFIX}${jobName}`,
+        head_sha: sha,
+        status: "queued",
+        external_id: `informant-job:${claimId}:${Buffer.from(jobName).toString("base64url")}`,
+        output: { title: jobName, summary: "Waiting for dependencies and an available worker." },
+      }),
+    });
+  }
+
   async updateCheck(
     repository: Repository,
     id: number,
     values: {
       status?: "in_progress" | "completed";
-      conclusion?: "success" | "failure" | "cancelled" | "neutral";
+      conclusion?: "success" | "failure" | "cancelled" | "neutral" | "skipped";
       title: string;
       summary: string;
       text?: string;
@@ -259,8 +304,9 @@ export class GitHubClient {
       body: JSON.stringify({
         status: values.status,
         conclusion: values.conclusion,
+        started_at: values.status === "in_progress" ? new Date().toISOString() : undefined,
         completed_at: values.status === "completed" ? new Date().toISOString() : undefined,
-        output: { title: values.title, summary: values.summary, text: values.text?.slice(-60_000) },
+        output: { title: values.title, summary: values.summary, text: outputTail(values.text) },
       }),
     });
   }
@@ -277,14 +323,27 @@ export class GitHubClient {
         !check.started_at || Date.now() - new Date(check.started_at).getTime() > STALE_CLAIM_MS,
     );
     await Promise.all(
-      stale.map((check) =>
-        this.updateCheck(repository, check.id, {
+      stale.map(async (check) => {
+        const jobs = (await this.jobChecks(repository, sha, check.id)).filter(
+          (job) => job.status !== "completed",
+        );
+        await Promise.all(
+          jobs.map((job) =>
+            this.updateCheck(repository, job.id, {
+              status: "completed",
+              conclusion: "cancelled",
+              title: "Stale worker job",
+              summary: "The worker claim expired before this job completed.",
+            }),
+          ),
+        );
+        return this.updateCheck(repository, check.id, {
           status: "completed",
           conclusion: "cancelled",
           title: "Stale worker claim",
           summary: "The worker did not complete this claim within 24 hours; it may be retried.",
-        }),
-      ),
+        });
+      }),
     );
     if (active.length > stale.length) return undefined;
     let requested = existing.some((check) => check.status === "queued");

@@ -4,6 +4,7 @@ import {
   isRetryableSshAuthenticationFailure,
   preparedImageName,
   scheduleJobs,
+  utf8Tail,
 } from "./tart.ts";
 import type { InformantConfig } from "./types.ts";
 
@@ -74,6 +75,13 @@ test("retries SSH only when authentication failed before the command started", (
       timedOut: false,
     }),
   ).toBe(false);
+});
+
+test("job log tails stay within their UTF-8 byte limit", () => {
+  const tail = utf8Tail(`prefix${"😀".repeat(20)}`, 17);
+  expect(new TextEncoder().encode(tail).length).toBeLessThanOrEqual(17);
+  expect(tail).not.toContain("�");
+  expect(tail).toBe("😀".repeat(4));
 });
 
 describe("job scheduler", () => {
