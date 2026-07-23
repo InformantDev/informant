@@ -1,6 +1,9 @@
 version = 1
 poll_interval_seconds = 20
-branches = ["main"]
+triggers = [
+  { event = "commit", branch = { names = ["main"] } },
+  { event = "commit", pull_request = { state = "open", draft = false } },
+]
 
 [vm]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
