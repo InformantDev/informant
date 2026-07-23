@@ -79,6 +79,28 @@ test("queued checks encode selected jobs in the request", async () => {
   expect(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"))).toEqual(["test", "lint"]);
 });
 
+test("job checks are separate queued runs correlated to the aggregate claim", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return Response.json({ id: 2, name: "Informant / test", status: "queued" });
+  }) as typeof globalThis.fetch;
+
+  await new GitHubClient({ token: "installation-token", fetch }).createJobCheck(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    42,
+    "test",
+  );
+
+  expect(requestBody).toMatchObject({
+    name: "Informant / test",
+    head_sha: "abc123",
+    status: "queued",
+    external_id: "informant-job:42:dGVzdA",
+  });
+});
+
 test("claim unions targeted requests unless an all-jobs request takes precedence", async () => {
   const requestSets = [["test"], ["lint", "test"]];
   const run = async (includeAllJobs: boolean) => {
@@ -125,11 +147,25 @@ test("claim replaces a stale claim after its accepted request was completed", as
       status: "in_progress",
       started_at: "2000-01-01T00:00:00.000Z",
     },
+    {
+      id: 3,
+      name: "Informant / test",
+      status: "in_progress",
+      external_id: "informant-job:2:dGVzdA",
+    },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "completed" }] });
+    }
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
-      const check = { id: nextId++, name: body.name, status: body.status };
+      const check = {
+        id: nextId++,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
       checks.push(check);
       return Response.json(check);
     }
@@ -149,6 +185,132 @@ test("claim replaces a stale claim after its accepted request was completed", as
   );
 
   expect(claim?.check?.id).toBe(100);
+  expect(checks.find((check) => check.id === 3)).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+  });
+});
+
+test("stale recovery leaves the aggregate active when a child cannot be cancelled", async () => {
+  let created = false;
+  let aggregateCancelled = false;
+  const checks = [
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "in_progress",
+      started_at: "2000-01-01T00:00:00.000Z",
+    },
+    {
+      id: 3,
+      name: "Informant / test",
+      status: "in_progress",
+      external_id: "informant-job:2:dGVzdA",
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") created = true;
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      if (id === 2) aggregateCancelled = true;
+      if (id === 3) return new Response("unavailable", { status: 503 });
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  await expect(
+    new GitHubClient({ token: "installation-token", fetch }).claim(
+      { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+      "abc123",
+      "replacement",
+    ),
+  ).rejects.toThrow("GitHub 503");
+  expect(aggregateCancelled).toBe(false);
+  expect(created).toBe(false);
+});
+
+test("claim treats a queued check suite as a GitHub UI re-run request", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    { id: 1, name: "Informant CI", status: "completed", conclusion: "failure" },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = {
+        id: 2,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (url.includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "queued" }] });
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "machine",
+  );
+
+  expect(claim?.check?.id).toBe(2);
+  expect(claim?.requestedJobs).toEqual([]);
+});
+
+test("claim does not repeat a completed check suite", async () => {
+  let created = false;
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") created = true;
+    if (String(input).includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "completed" }] });
+    }
+    return Response.json({
+      check_runs: [{ id: 1, name: "Informant CI", status: "completed", conclusion: "success" }],
+    });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "machine",
+  );
+
+  expect(claim).toBeUndefined();
+  expect(created).toBe(false);
+});
+
+test("pre-minted installation tokens retain their App ID check filter", async () => {
+  const previousToken = Bun.env.INFORMANT_GITHUB_TOKEN;
+  const previousAppId = Bun.env.INFORMANT_GITHUB_APP_ID;
+  const previousAccount = Bun.env.INFORMANT_GITHUB_ACCOUNT;
+  Bun.env.INFORMANT_GITHUB_TOKEN = "installation-token";
+  Bun.env.INFORMANT_GITHUB_APP_ID = "123";
+  Bun.env.INFORMANT_GITHUB_ACCOUNT = "acme";
+  let requestUrl = "";
+  const fetch = (async (input: string | URL | Request) => {
+    requestUrl = String(input);
+    return Response.json({ check_runs: [] });
+  }) as typeof globalThis.fetch;
+
+  try {
+    await new GitHubClient({
+      repository: { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+      fetch,
+    }).checks({ owner: "acme", repo: "widgets", fullName: "acme/widgets" }, "abc123");
+    expect(new URL(requestUrl).searchParams.get("app_id")).toBe("123");
+  } finally {
+    if (previousToken === undefined) delete Bun.env.INFORMANT_GITHUB_TOKEN;
+    else Bun.env.INFORMANT_GITHUB_TOKEN = previousToken;
+    if (previousAppId === undefined) delete Bun.env.INFORMANT_GITHUB_APP_ID;
+    else Bun.env.INFORMANT_GITHUB_APP_ID = previousAppId;
+    if (previousAccount === undefined) delete Bun.env.INFORMANT_GITHUB_ACCOUNT;
+    else Bun.env.INFORMANT_GITHUB_ACCOUNT = previousAccount;
+  }
 });
 
 test("event scopes match exactly and legacy checks do not suppress PR commits", async () => {
@@ -162,7 +324,10 @@ test("event scopes match exactly and legacy checks do not suppress PR commits", 
     },
     { id: 2, name: "Informant CI", status: "completed", external_id: "legacy-worker" },
   ];
-  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "completed" }] });
+    }
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       const check = {
@@ -248,4 +413,110 @@ test("an active event claim is retryable rather than terminal", async () => {
   );
 
   expect(claim?.retry).toBe(true);
+});
+
+test("a repeated queued manual request can replace historical manual completion", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "completed",
+      external_id: "old-worker:event:manual:abc123",
+    },
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:jobs:${Buffer.from("[]").toString("base64url")}`,
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = {
+        id: 3,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    { type: "commit", id: "branch:main:abc123" },
+  );
+
+  expect(claim?.check?.id).toBe(3);
+  expect(claim?.manualRequest).toBe(true);
+  expect(checks.find((check) => check.id === 2)).toMatchObject({
+    status: "completed",
+    conclusion: "neutral",
+  });
+});
+
+test("an event-scoped stale claim and its children are replaced", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "in_progress",
+      started_at: "2000-01-01T00:00:00.000Z",
+      external_id: "old-worker:event:commit:branch:main:abc123",
+    },
+    {
+      id: 2,
+      name: "Informant / test",
+      status: "in_progress",
+      external_id: "informant-job:1:dGVzdA",
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = {
+        id: 3,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "replacement",
+    { type: "commit", id: "branch:main:abc123" },
+  );
+
+  expect(claim?.check?.id).toBe(3);
+  expect(checks.find((check) => check.id === 1)).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+  });
+  expect(checks.find((check) => check.id === 2)).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+  });
 });

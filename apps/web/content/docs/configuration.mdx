@@ -19,12 +19,14 @@ user = "admin"
 password = "admin"
 cpu = 4
 memory_mb = 8192
+prepare = "curl -fsSL https://bun.sh/install | bash && sudo mkdir -p /usr/local/bin && sudo ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun"
 
 [[jobs]]
 name = "test"
 command = "bun install --frozen-lockfile && bun test"
 timeout_minutes = 30
 environment = { CI = "true" }
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
 
 [[jobs]]
 name = "lint"
@@ -63,3 +65,26 @@ Jobs inherit top-level triggers. A job's own `triggers` replaces them; `triggers
 or dependency-only. Matching rules are ORed, and dependencies of matching root jobs are always added.
 Legacy `branches` still becomes commit branch rules (default `main`), but cannot be combined with
 top-level `triggers`. Manual `informant run` ignores trigger eligibility.
+
+## Prepared VM images
+
+`vm.prepare` runs once when a worker first sees that image and preparation command. Informant keeps the
+stopped result as a local Tart image and clones jobs from it, so tools such as Bun do not need to be
+installed in every job. Changing `vm.image`, `vm.user`, or `vm.prepare` creates a new prepared image.
+
+Preparation is automatic. Use `informant image prepare` to warm the image ahead of a build,
+`informant image list` to inspect prepared images, and `informant image prune` to remove them. Every
+worker prepares its own local copy, which keeps multi-machine setup automatic.
+
+## Persistent job caches
+
+`jobs.cache` is an array of cache groups. Each group associates one or more guest `paths` with its
+`key_files`, so paths that use the same lockfile can share one declaration. Informant restores every
+path from persistent host storage before the job and saves it afterward. Caches are isolated by
+repository and job. Changing a key file such as `bun.lock` starts new caches for the paths in that
+group. Missing key files are handled consistently and do not fail the job. Use `informant cache path`
+to locate the cache root and `informant cache prune` to remove all saved caches.
+
+Prepared images and caches serve different purposes: put runtimes and system packages in
+`vm.prepare`; use `jobs.cache` for downloaded dependencies and compiler caches. Checkouts and all
+uncached VM changes remain disposable.

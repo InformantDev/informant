@@ -15,8 +15,9 @@ export interface ServerOptions {
 }
 
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
-  const github = new GitHubClient();
+  const github = new GitHubClient({ repository });
   let intervalSeconds = 20;
+  let lastPollError: string | undefined;
   const message = options.onMessage ?? console.log;
   do {
     try {
@@ -31,6 +32,15 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         github.branches(repository),
         github.pullRequests(repository),
       ]);
+      const manualRequests = new Map<string, Promise<boolean>>();
+      const hasPendingManualRequest = (sha: string) => {
+        let pending = manualRequests.get(sha);
+        if (!pending) {
+          pending = github.hasPendingManualRequest(repository, sha);
+          manualRequests.set(sha, pending);
+        }
+        return pending;
+      };
       for (const target of [
         ...branches.map((branch) => ({
           sha: branch.sha,
@@ -58,12 +68,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             await github.fileContent(repository, target.sha, CONFIG_FILE),
             `${repository.fullName}/${CONFIG_FILE}@${target.sha.slice(0, 7)}`,
           );
-          if (
-            !config.jobs.some((job) =>
-              (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
-            )
-          )
-            continue;
+          const matches = config.jobs.some((job) =>
+            (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
+          );
+          if (!matches && !(await hasPendingManualRequest(target.sha))) continue;
           const build = await runCommit(
             github,
             repository,
@@ -158,8 +166,17 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           );
         }
       }
+      lastPollError = undefined;
     } catch (error) {
-      message(`poll failed: ${error instanceof Error ? error.message : String(error)}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      const pollError =
+        detail.startsWith("GitHub 404:") && detail.includes("rest/repos/contents")
+          ? `waiting for ${CONFIG_FILE}`
+          : detail.startsWith("GitHub 409:") && detail.includes("rest/git/refs")
+            ? "waiting for the repository's first commit"
+            : `poll failed: ${detail}`;
+      if (pollError !== lastPollError) message(pollError);
+      lastPollError = pollError;
     }
     if (options.once) return;
     await Bun.sleep(intervalSeconds * 1_000);
@@ -170,6 +187,20 @@ export async function serveRepositories(
   repositories: Repository[],
   options: ServerOptions = {},
 ): Promise<void> {
+  const owners = new Set(repositories.map((repository) => repository.owner.toLowerCase()));
+  const hasEnvironmentCredentials = Boolean(
+    Bun.env.INFORMANT_GITHUB_TOKEN ||
+      Bun.env.GITHUB_TOKEN ||
+      Bun.env.INFORMANT_GITHUB_APP_ID ||
+      Bun.env.INFORMANT_GITHUB_INSTALLATION_ID ||
+      Bun.env.INFORMANT_GITHUB_PRIVATE_KEY ||
+      Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE,
+  );
+  if (owners.size > 1 && hasEnvironmentCredentials && !Bun.env.INFORMANT_GITHUB_ACCOUNT) {
+    throw new Error(
+      "INFORMANT_GITHUB_ACCOUNT is required when environment credentials serve multiple repository owners",
+    );
+  }
   await Promise.all(
     repositories.map((repository) =>
       serve(repository, {

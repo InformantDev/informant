@@ -5,6 +5,10 @@ export interface JobConfig {
   environment: Record<string, string>;
   needs: string[];
   triggers?: TriggerRule[];
+  cache?: Array<{
+    paths: string[];
+    keyFiles: string[];
+  }>;
 }
 
 export type TriggerEvent = "commit" | "comment";
@@ -47,6 +51,7 @@ export interface InformantConfig {
     password: string;
     cpu?: number;
     memoryMb?: number;
+    prepare?: string;
   };
   jobs: JobConfig[];
 }

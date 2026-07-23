@@ -8,7 +8,7 @@ GitHub branch/PR/comment ──poll──▶ Mac A ─┐
                       Mac B ─┼──▶ oldest Check Run wins ──▶ Tart VM
                       Mac C ─┘                                  │
                            ▲                                    ▼
-                           └──────── GitHub Checks ◀──── conclusion + log tail
+                           └──────── GitHub Checks ◀──── job conclusions + separate logs
 ```
 
 ## Claim safety
@@ -19,6 +19,11 @@ Only that claimant starts a VM; the others complete themselves as cancelled. Thi
 execution after the race is visible to GitHub while keeping GitHub as the only shared coordination
 system.
 
+The elected `Informant CI` check remains the build-level claim and summary. Informant creates a
+separate `Informant / <job>` check for every selected job. Each job check moves from queued to running
+to its own conclusion and contains only that job's log, so parallel output is never interleaved in the
+GitHub UI. Jobs skipped because a dependency failed receive a `skipped` conclusion.
+
 Because the Checks API does not offer compare-and-swap, this election is best-effort rather than a
 strict distributed lock. Checks are fetched with `filter=all` and scoped to the configured GitHub App;
 claims left behind by dead workers become retryable after 24 hours.
@@ -28,3 +33,7 @@ the same SHA elect independently. Comment runs use the distinct `Informant CI / 
 
 Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
 already has an older completed result.
+
+GitHub UI re-runs use the same path. Clicking **Re-run** resets Informant's Check Suite to queued.
+Workers observe that state through the Checks API, elect one claimant, and create a fresh Check Run.
+Informant does not need a public webhook endpoint to receive the re-run request.

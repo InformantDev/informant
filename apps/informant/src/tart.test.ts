@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { scheduleJobs } from "./tart.ts";
+import {
+  cachePathIdentity,
+  isRetryableSshAuthenticationFailure,
+  preparedImageName,
+  scheduleJobs,
+  utf8Tail,
+} from "./tart.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
@@ -8,6 +14,74 @@ const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number
   command: name,
   environment: {},
   timeoutMinutes: 1,
+});
+
+const config = (prepare?: string): InformantConfig => ({
+  version: 1,
+  pollIntervalSeconds: 20,
+  branches: ["main"],
+  vm: { image: "base", user: "admin", password: "admin", prepare },
+  jobs: [job("test")],
+});
+
+test("prepared image identity changes with its source or preparation", () => {
+  expect(preparedImageName(config())).toBeUndefined();
+  const first = preparedImageName(config("install bun"));
+  expect(first).toStartWith("informant-prepared-");
+  expect(preparedImageName(config("install node"))).not.toBe(first);
+  expect(
+    preparedImageName({
+      ...config("install bun"),
+      vm: { ...config().vm, image: "other", prepare: "install bun" },
+    }),
+  ).not.toBe(first);
+  expect(
+    preparedImageName({
+      ...config("install bun"),
+      vm: { ...config().vm, user: "builder", prepare: "install bun" },
+    }),
+  ).not.toBe(first);
+});
+
+test("cache destinations have distinct storage identities", () => {
+  expect(cachePathIdentity("admin", "~/.bun/install/cache")).not.toBe(
+    cachePathIdentity("admin", "~/.npm"),
+  );
+  expect(cachePathIdentity("admin", "~/.npm")).not.toBe(cachePathIdentity("builder", "~/.npm"));
+});
+
+test("retries SSH only when authentication failed before the command started", () => {
+  expect(
+    isRetryableSshAuthenticationFailure({
+      exitCode: 255,
+      stdout: "",
+      stderr: "admin@host: Permission denied (publickey,password).",
+      timedOut: false,
+    }),
+  ).toBe(true);
+  expect(
+    isRetryableSshAuthenticationFailure({
+      exitCode: 255,
+      stdout: "command output",
+      stderr: "Permission denied",
+      timedOut: false,
+    }),
+  ).toBe(false);
+  expect(
+    isRetryableSshAuthenticationFailure({
+      exitCode: 1,
+      stdout: "",
+      stderr: "Permission denied",
+      timedOut: false,
+    }),
+  ).toBe(false);
+});
+
+test("job log tails stay within their UTF-8 byte limit", () => {
+  const tail = utf8Tail(`prefix${"😀".repeat(20)}`, 17);
+  expect(new TextEncoder().encode(tail).length).toBeLessThanOrEqual(17);
+  expect(tail).not.toContain("�");
+  expect(tail).toBe("😀".repeat(4));
 });
 
 describe("job scheduler", () => {

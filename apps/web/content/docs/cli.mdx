@@ -14,6 +14,11 @@ informant serve --once                 Poll every registered repository once
 informant run --ref HEAD               Manually run every job for a commit
 informant run --job test               Run one job and the jobs it needs
 informant run --job test --job lint    Run multiple selected jobs
+informant image prepare                Prepare this repository's cached Tart image
+informant image list                   List Informant-prepared Tart images
+informant image prune                  Delete Informant-prepared Tart images
+informant cache path                   Print the persistent job cache directory
+informant cache prune                  Delete all persistent job caches
 informant startup enable               Start the worker now and automatically at login
 informant startup disable              Stop and remove the automatic startup worker
 informant hook install                 Install the push-accelerating pre-push hook
@@ -42,3 +47,7 @@ changing any `INFORMANT_*` environment-variable overrides so the service capture
 
 `informant run` accepts repeatable `--job` flags as well as comma-separated job names. Only selected
 jobs and their transitive `needs` dependencies run. Omit `--job` to run the complete job graph.
+
+Completed builds can also be re-run from GitHub. Open the commit or pull request checks, select the
+Informant check, and click **Re-run**. GitHub marks the Check Suite as queued, and the next Informant
+poll lets one eligible machine claim the new attempt. No webhook endpoint is required.
