@@ -1,24 +1,38 @@
 #!/usr/bin/env bun
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { cancel, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import Table from "cli-table3";
 import packageJson from "../package.json" with { type: "json" };
-import { CONFIG_FILE, configTemplate, parseConfig, parseRepository, selectJobs } from "./config.ts";
+import {
+  CONFIG_FILE,
+  configTemplate,
+  parseConfig,
+  parseRepository,
+  readConfig,
+  selectJobs,
+} from "./config.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubClient } from "./github.ts";
 import { installPostPushHook, uninstallPostPushHook } from "./hook.ts";
-import { addRepository, listRepositories, removeRepository } from "./machine-config.ts";
+import {
+  addRepository,
+  listGitHubCredentials,
+  listRepositories,
+  removeRepository,
+} from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup } from "./startup.ts";
-import { getBuild, listBuilds } from "./store.ts";
+import { dataDirectory, getBuild, listBuilds } from "./store.ts";
+import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Macs
 
 Usage:
-  informant setup                        Create the GitHub App and configure this machine
+  informant setup                        Add a private GitHub App for an account
   informant init                         Create .informant.toml and register origin
   informant repo add [owner/repo]         Register a repository on this machine
   informant repo list                     List registered repositories
@@ -26,6 +40,11 @@ Usage:
   informant serve [--once]                Poll all registered repositories
   informant run [--ref <ref>] [--job <name>]
                                         Manually request all or selected jobs
+  informant image prepare                Prepare this repository's cached VM image
+  informant image list                   List Informant-prepared VM images
+  informant image prune                  Delete Informant-prepared VM images
+  informant cache path                   Print the persistent job cache directory
+  informant cache prune                  Delete all persistent job caches
   informant startup enable               Start the worker now and at login
   informant startup disable              Stop and remove the startup worker
   informant hook install                 Accelerate pushes with a pre-push hook
@@ -127,7 +146,7 @@ async function manualRun(
   const repository = await repositoryFromGit();
   const sha = await requireCommand(["git", "rev-parse", ref]);
   const branch = await command(["git", "branch", "--show-current"]);
-  const github = new GitHubClient();
+  const github = new GitHubClient({ repository });
   if (waitForGitHub) await github.waitForCommit(repository, sha);
   const config = parseConfig(
     await requireCommand(["git", "show", `${sha}:${CONFIG_FILE}`]),
@@ -166,6 +185,39 @@ async function showBuilds(): Promise<void> {
     ]);
   }
   console.log(builds.length ? table.toString() : "No local builds yet.");
+}
+
+async function manageImages(action?: string): Promise<void> {
+  if (action === "prepare") {
+    const image = await ensurePreparedImage(await readConfig());
+    outro(`Prepared ${image}`);
+    return;
+  }
+  if (action === "list" || !action) {
+    const images = await listPreparedImages();
+    console.log(images.length > 0 ? images.join("\n") : "No prepared Informant images.");
+    return;
+  }
+  if (action === "prune") {
+    const count = await prunePreparedImages();
+    outro(`Deleted ${count} prepared ${count === 1 ? "image" : "images"}`);
+    return;
+  }
+  throw new Error("image action must be one of: prepare, list, prune");
+}
+
+async function manageCaches(action?: string): Promise<void> {
+  const path = join(dataDirectory(), "caches");
+  if (action === "path" || !action) {
+    console.log(path);
+    return;
+  }
+  if (action === "prune") {
+    await rm(path, { recursive: true, force: true });
+    outro("Deleted persistent job caches");
+    return;
+  }
+  throw new Error("cache action must be one of: path, prune");
 }
 
 async function repositoryArgument(value?: string): Promise<ReturnType<typeof parseRepository>> {
@@ -224,8 +276,14 @@ async function doctor(): Promise<void> {
     failed = true;
   } else console.log("✓ macOS on Apple Silicon");
   try {
-    await new GitHubClient().authenticate();
-    console.log("✓ GitHub App credentials");
+    const apps = await listGitHubCredentials();
+    if (apps.length === 0) throw new Error("run informant setup");
+    for (const credentials of apps) {
+      await new GitHubClient({ credentials }).authenticate();
+      console.log(
+        `✓ GitHub App credentials${credentials.account ? ` · ${credentials.account}` : ""}`,
+      );
+    }
   } catch (error) {
     console.log(`✗ GitHub App credentials — ${error instanceof Error ? error.message : error}`);
     failed = true;
@@ -248,6 +306,8 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "setup") return setup();
   if (subcommand === "doctor") return doctor();
   if (subcommand === "repo") return manageRepositories(action, id);
+  if (subcommand === "image") return manageImages(action);
+  if (subcommand === "cache") return manageCaches(action);
   if (subcommand === "serve") {
     if (action) throw new Error("serve does not accept a repository; use informant repo add first");
     const repositories = await listRepositories();

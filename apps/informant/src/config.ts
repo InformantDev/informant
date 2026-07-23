@@ -12,11 +12,13 @@ branches = ["main"]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
 user = "admin"
 password = "admin"
+prepare = "curl -fsSL https://bun.sh/install | bash && sudo mkdir -p /usr/local/bin && sudo ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun"
 
 [[jobs]]
 name = "test"
 command = "bun install --frozen-lockfile && bun test"
 timeout_minutes = 30
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
 `;
 
 export function configTemplate(): string {
@@ -100,6 +102,46 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
       throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
     }
+    const cache = job.cache;
+    if (cache !== undefined && (!Array.isArray(cache) || cache.length === 0)) {
+      throw new Error(`jobs[${index}].cache must be a non-empty array of tables`);
+    }
+    const caches = (cache ?? []).map((value, cacheIndex) => {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error(`jobs[${index}].cache[${cacheIndex}] must be a table`);
+      }
+      const entry = value as Record<string, unknown>;
+      const paths = entry.paths;
+      if (
+        !Array.isArray(paths) ||
+        paths.length === 0 ||
+        paths.some(
+          (path) =>
+            typeof path !== "string" ||
+            !path.startsWith("~/") ||
+            path.length <= 2 ||
+            path.split("/").includes(".."),
+        )
+      ) {
+        throw new Error(
+          `jobs[${index}].cache[${cacheIndex}].paths must contain paths starting with ~/ without ..`,
+        );
+      }
+      const keyFiles = entry.key_files ?? [];
+      if (
+        !Array.isArray(keyFiles) ||
+        keyFiles.some(
+          (keyFile) =>
+            typeof keyFile !== "string" ||
+            keyFile.length === 0 ||
+            keyFile.startsWith("/") ||
+            keyFile.split("/").includes(".."),
+        )
+      ) {
+        throw new Error(`jobs[${index}].cache[${cacheIndex}].key_files must be relative paths`);
+      }
+      return { paths, keyFiles };
+    });
     return {
       name: job.name,
       command: job.command,
@@ -112,6 +154,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
       environment: Object.fromEntries(
         Object.entries(environment).map(([key, item]) => [key, String(item)]),
       ),
+      cache: cache === undefined ? undefined : caches,
     };
   });
   const jobNames = new Set(jobs.map((job) => job.name));
@@ -161,11 +204,15 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   }
   const user = vm.user ?? "admin";
   const password = vm.password ?? "admin";
-  if (typeof user !== "string" || user.trim().length === 0) {
-    throw new Error("vm.user must be a non-empty string");
+  if (typeof user !== "string" || !/^[A-Za-z_][A-Za-z0-9._-]*$/.test(user)) {
+    throw new Error("vm.user must be a valid account name");
   }
   if (typeof password !== "string") {
     throw new Error("vm.password must be a string (an empty password is allowed)");
+  }
+  const prepare = vm.prepare;
+  if (prepare !== undefined && (typeof prepare !== "string" || prepare.trim().length === 0)) {
+    throw new Error("vm.prepare must be a non-empty string");
   }
   return {
     version: raw.version,
@@ -177,6 +224,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
       password,
       cpu,
       memoryMb,
+      prepare,
     },
     jobs,
   };

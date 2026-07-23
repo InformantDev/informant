@@ -1,13 +1,19 @@
 import { createSign } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
-import { GitHubClient } from "./github.ts";
-import { configureMachine, machineConfigPath } from "./machine-config.ts";
+import {
+  listGitHubCredentials,
+  listRepositories,
+  machineConfigPath,
+  saveGitHubCredentials,
+} from "./machine-config.ts";
 import { command } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 
 const API = "https://api.github.com";
+const APP_URL = "https://github.com/InformantDev/informant";
 
 interface ManifestApp {
   id: number;
@@ -15,14 +21,19 @@ interface ManifestApp {
   pem: string;
 }
 
-function appJwt(appId: number, privateKey: string): string {
+function appJwt(appId: number | string, privateKey: string): string {
   const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
   const now = Math.floor(Date.now() / 1_000);
   const unsigned = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iat: now - 60, exp: now + 540, iss: String(appId) })}`;
   return `${unsigned}.${createSign("RSA-SHA256").update(unsigned).sign(privateKey, "base64url")}`;
 }
 
-async function installations(app: ManifestApp): Promise<Array<{ id: number }>> {
+interface Installation {
+  id: number;
+  account: { login: string };
+}
+
+async function installations(app: ManifestApp): Promise<Installation[]> {
   const response = await fetch(`${API}/app/installations`, {
     headers: {
       Accept: "application/vnd.github+json",
@@ -32,7 +43,57 @@ async function installations(app: ManifestApp): Promise<Array<{ id: number }>> {
   });
   if (!response.ok)
     throw new Error(`could not check GitHub App installation: ${await response.text()}`);
-  return response.json() as Promise<Array<{ id: number }>>;
+  return response.json() as Promise<Installation[]>;
+}
+
+async function installation(
+  appId: string,
+  installationId: string,
+  privateKey: string,
+): Promise<Installation> {
+  const response = await fetch(`${API}/app/installations/${installationId}`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${appJwt(appId, privateKey)}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!response.ok)
+    throw new Error(`could not validate GitHub App installation: ${await response.text()}`);
+  return response.json() as Promise<Installation>;
+}
+
+async function migrateLegacyApp(): Promise<void> {
+  const legacy = (await listGitHubCredentials()).find((credentials) => !credentials.account);
+  if (!legacy) return;
+  const privateKey = await readFile(legacy.privateKeyFile, "utf8");
+  const current = await installation(legacy.appId, legacy.installationId, privateKey);
+  await saveGitHubCredentials({ ...legacy, account: current.account.login });
+}
+
+async function storeInstallation(
+  appId: string,
+  current: Installation,
+  privateKey: string,
+): Promise<void> {
+  await migrateLegacyApp();
+  const keyPath = join(
+    dirname(machineConfigPath()),
+    `app-${appId}-${crypto.randomUUID().slice(0, 8)}.pem`,
+  );
+  await mkdir(dirname(keyPath), { recursive: true });
+  await writeFile(keyPath, privateKey, { mode: 0o600, flag: "wx" });
+  try {
+    await saveGitHubCredentials({
+      account: current.account.login,
+      appId,
+      installationId: String(current.id),
+      privateKeyFile: keyPath,
+    });
+  } catch (error) {
+    await rm(keyPath, { force: true });
+    throw error;
+  }
 }
 
 async function openBrowser(url: string): Promise<void> {
@@ -82,12 +143,12 @@ async function createApp(owner?: string): Promise<ManifestApp> {
       const callback = `http://127.0.0.1:${server.port}/callback`;
       const manifest = JSON.stringify({
         name: `Informant ${crypto.randomUUID().slice(0, 8)}`,
-        url: "https://github.com/informant-ci/informant",
+        url: APP_URL,
         redirect_url: callback,
         public: false,
         default_permissions: { checks: "write", contents: "read" },
         default_events: [],
-        hook_attributes: { url: callback, active: false },
+        hook_attributes: { url: APP_URL, active: false },
       })
         .replaceAll("&", "&amp;")
         .replaceAll('"', "&quot;");
@@ -114,8 +175,56 @@ async function createApp(owner?: string): Promise<ManifestApp> {
   }
 }
 
+async function connectExistingApp(): Promise<string | undefined> {
+  const appId = await text({
+    message: "GitHub App ID",
+    validate: (value) => (value?.trim() ? undefined : "Required"),
+  });
+  if (isCancel(appId)) return undefined;
+  const installationId = await text({
+    message: "GitHub App installation ID",
+    validate: (value) => (value?.trim() ? undefined : "Required"),
+  });
+  if (isCancel(installationId)) return undefined;
+  const privateKeyPath = await text({
+    message: "Path to this machine's GitHub App private key",
+    validate: (value) => (value?.trim() ? undefined : "Required"),
+  });
+  if (isCancel(privateKeyPath)) return undefined;
+
+  const path = resolve(privateKeyPath.trim().replace(/^~(?=\/)/, homedir()));
+  const privateKey = await readFile(path, "utf8");
+  const current = await installation(appId.trim(), installationId.trim(), privateKey);
+  await storeInstallation(appId.trim(), current, privateKey);
+  return current.account.login;
+}
+
+async function finishSetup(account: string): Promise<void> {
+  const repositories = await listRepositories();
+  const start = await confirm({ message: "Start the worker now?", initialValue: true });
+  outro(`GitHub App configured for ${account}.`);
+  if (!isCancel(start) && start) {
+    await serveRepositories(repositories, { onMessage: console.log });
+  }
+}
+
 export async function setup(): Promise<void> {
   intro("Informant setup");
+  const setupType = await select({
+    message: "How should this machine be configured?",
+    options: [
+      { value: "create", label: "Create a private App for another account" },
+      { value: "connect", label: "Connect an existing App used by another machine" },
+    ],
+  });
+  if (isCancel(setupType)) return;
+  if (setupType === "connect") {
+    const account = await connectExistingApp();
+    if (!account) return;
+    await finishSetup(account);
+    return;
+  }
+
   const ownerType = await select({
     message: "Who should own the GitHub App?",
     options: [
@@ -141,7 +250,7 @@ export async function setup(): Promise<void> {
 
   await openBrowser(`https://github.com/apps/${app.slug}/installations/new`);
   progress.start("Waiting for you to install the App on repositories");
-  let installation: { id: number } | undefined;
+  let installation: Installation | undefined;
   for (let attempt = 0; attempt < 300; attempt++) {
     installation = (await installations(app))[0];
     if (installation) break;
@@ -149,38 +258,7 @@ export async function setup(): Promise<void> {
   }
   if (!installation) throw new Error("GitHub App was not installed within 5 minutes");
 
-  const github = new GitHubClient({
-    credentials: {
-      appId: String(app.id),
-      installationId: String(installation.id),
-      privateKey: app.pem,
-    },
-  });
-  const repositories = await github.installationRepositories();
-
-  const keyPath = join(dirname(machineConfigPath()), `app-${app.id}.pem`);
-  await mkdir(dirname(keyPath), { recursive: true });
-  await writeFile(keyPath, app.pem, { mode: 0o600, flag: "wx" });
-  try {
-    await configureMachine(
-      {
-        appId: String(app.id),
-        installationId: String(installation.id),
-        privateKeyFile: keyPath,
-      },
-      repositories,
-    );
-  } catch (error) {
-    await rm(keyPath, { force: true });
-    throw error;
-  }
-  progress.stop(
-    `Configured ${repositories.length} ${repositories.length === 1 ? "repository" : "repositories"}`,
-  );
-
-  const start = await confirm({ message: "Start the worker now?", initialValue: true });
-  outro("Setup complete.");
-  if (!isCancel(start) && start) {
-    await serveRepositories(repositories, { onMessage: console.log });
-  }
+  await storeInstallation(String(app.id), installation, app.pem);
+  progress.stop(`GitHub App configured for ${installation.account.login}`);
+  await finishSetup(installation.account.login);
 }

@@ -4,6 +4,10 @@ export interface JobConfig {
   timeoutMinutes: number;
   environment: Record<string, string>;
   needs: string[];
+  cache?: Array<{
+    paths: string[];
+    keyFiles: string[];
+  }>;
 }
 
 export interface InformantConfig {
@@ -16,6 +20,7 @@ export interface InformantConfig {
     password: string;
     cpu?: number;
     memoryMb?: number;
+    prepare?: string;
   };
   jobs: JobConfig[];
 }

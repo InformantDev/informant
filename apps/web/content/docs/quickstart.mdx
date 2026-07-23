@@ -34,13 +34,17 @@ Informant will:
 2. Open GitHub with **Checks: read/write**, **Contents: read**, and webhooks disabled.
 3. Receive and protect the generated private key automatically.
 4. Open GitHub's installation screen so you can choose repositories.
-5. Detect the installation and register its repositories on this machine.
+5. Detect the installation and save its credentials without changing this machine's registered
+   repositories.
 6. Offer to start the worker.
 
 The browser steps are limited to approving creation and choosing repository access—GitHub requires
 those decisions from the App owner. Informant stores everything else under `~/.config/informant`;
 there are no environment variables to copy. See [GitHub App credentials](/docs/github-app) for
 headless and environment-variable overrides.
+
+Repeat `informant setup` for every additional organization this machine should serve. Each organization
+gets its own private GitHub App and installation credentials.
 
 In the repository that needs CI:
 

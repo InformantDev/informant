@@ -4,7 +4,11 @@ import { configTemplate, parseConfig, parseRepository, selectJobs } from "./conf
 describe("configuration", () => {
   test("parses the generated template", () => {
     const config = parseConfig(configTemplate());
-    expect(config.vm.user).toBe("admin");
+    expect(config.vm).toMatchObject({
+      user: "admin",
+      prepare:
+        "curl -fsSL https://bun.sh/install | bash && sudo mkdir -p /usr/local/bin && sudo ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun",
+    });
     expect(config.jobs).toEqual([
       {
         name: "test",
@@ -12,6 +16,7 @@ describe("configuration", () => {
         timeoutMinutes: 30,
         environment: {},
         needs: [],
+        cache: [{ paths: ["~/.bun/install/cache"], keyFiles: ["bun.lock"] }],
       },
     ]);
   });
@@ -83,19 +88,28 @@ describe("configuration", () => {
         ),
       ).vm,
     ).toMatchObject({ user: "builder", password: "" });
-    expect(() => parseConfig(configTemplate().replace('user = "admin"', 'user = "   "'))).toThrow(
-      "vm.user must be a non-empty string",
-    );
+    expect(() =>
+      parseConfig(configTemplate().replace('user = "admin"', 'user = "-oProxyCommand=bad"')),
+    ).toThrow("vm.user must be a valid account name");
     expect(() => parseConfig(configTemplate().replace('user = "admin"', "user = [1]"))).toThrow(
-      "vm.user must be a non-empty string",
+      "vm.user must be a valid account name",
     );
     expect(() =>
       parseConfig(configTemplate().replace('password = "admin"', "password = { value = 1 }")),
     ).toThrow("vm.password must be a string");
   });
 
+  test("requires a non-empty VM preparation command", () => {
+    expect(() => parseConfig(configTemplate().replace(/prepare = .+/, 'prepare = ""'))).toThrow(
+      "vm.prepare must be a non-empty string",
+    );
+  });
+
   test("requires job environment to contain scalar values", () => {
-    const withEnvironment = `${configTemplate()}\n[jobs.environment]\nTEXT = "value"\nCOUNT = 2\nENABLED = true\n`;
+    const withEnvironment = configTemplate().replace(
+      "timeout_minutes = 30",
+      'timeout_minutes = 30\nenvironment = { TEXT = "value", COUNT = 2, ENABLED = true }',
+    );
     expect(parseConfig(withEnvironment).jobs[0]?.environment).toEqual({
       TEXT: "value",
       COUNT: "2",
@@ -107,17 +121,80 @@ describe("configuration", () => {
       ),
     ).toThrow("environment must be a table of scalar values");
     expect(() =>
-      parseConfig(`${configTemplate()}\n[jobs.environment.NESTED]\nVALUE = "bad"\n`),
+      parseConfig(
+        configTemplate().replace(
+          "timeout_minutes = 30",
+          'timeout_minutes = 30\nenvironment = { NESTED = { VALUE = "bad" } }',
+        ),
+      ),
     ).toThrow("environment must be a table of scalar values");
   });
 
   test("requires job environment keys to be shell variable names", () => {
     expect(() =>
-      parseConfig(`${configTemplate()}\n[jobs.environment]\n"BAD KEY" = "value"\n`),
+      parseConfig(
+        configTemplate().replace(
+          "timeout_minutes = 30",
+          'timeout_minutes = 30\nenvironment = { "BAD KEY" = "value" }',
+        ),
+      ),
     ).toThrow('environment key "BAD KEY" is not a shell variable');
     expect(() =>
-      parseConfig(`${configTemplate()}\n[jobs.environment]\n"$(touch /tmp/bad)" = "value"\n`),
+      parseConfig(
+        configTemplate().replace(
+          "timeout_minutes = 30",
+          'timeout_minutes = 30\nenvironment = { "$(touch /tmp/bad)" = "value" }',
+        ),
+      ),
     ).toThrow("is not a shell variable");
+  });
+
+  test("parses and validates persistent job caches", () => {
+    expect(parseConfig(configTemplate()).jobs[0]?.cache).toEqual([
+      { paths: ["~/.bun/install/cache"], keyFiles: ["bun.lock"] },
+    ]);
+    expect(
+      parseConfig(
+        configTemplate().replace(
+          'cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]',
+          'cache = [{ paths = ["~/.bun/install/cache", "~/.cache/example"], key_files = ["bun.lock"] }, { paths = ["~/.cache/toolchain"], key_files = ["toolchain.toml"] }]',
+        ),
+      ).jobs[0]?.cache,
+    ).toEqual([
+      {
+        paths: ["~/.bun/install/cache", "~/.cache/example"],
+        keyFiles: ["bun.lock"],
+      },
+      { paths: ["~/.cache/toolchain"], keyFiles: ["toolchain.toml"] },
+    ]);
+    expect(() => parseConfig(configTemplate().replace('"~/.bun/install/cache"', '"/tmp"'))).toThrow(
+      "paths must contain paths starting with ~/",
+    );
+    expect(() =>
+      parseConfig(
+        configTemplate().replace('key_files = ["bun.lock"]', 'key_files = ["../secret"]'),
+      ),
+    ).toThrow("key_files must be relative paths");
+    expect(() =>
+      parseConfig(
+        configTemplate().replace(
+          '{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }',
+          '"invalid"',
+        ),
+      ),
+    ).toThrow("must be a table");
+    expect(() => parseConfig(configTemplate().replace('["bun.lock"]', '"bun.lock"'))).toThrow(
+      "key_files must be relative paths",
+    );
+    expect(() => parseConfig(configTemplate().replace(/cache = .+/, "cache = []"))).toThrow(
+      "cache must be a non-empty array",
+    );
+    expect(() =>
+      parseConfig(configTemplate().replace('paths = ["~/.bun/install/cache"]', "paths = []")),
+    ).toThrow("paths must contain paths starting with ~/");
+    expect(() => parseConfig(configTemplate().replace(/cache = .+/, "cache = {}"))).toThrow(
+      "cache must be a non-empty array",
+    );
   });
 
   test("requires at least one non-empty branch", () => {

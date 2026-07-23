@@ -34,15 +34,57 @@ test("readLogTail reads a bounded Unicode-safe tail", async () => {
 });
 
 function harness(options: { claim?: boolean; success?: boolean; error?: Error } = {}) {
-  const updates: Array<Record<string, unknown>> = [];
+  const updates: Array<{ id: number; values: Record<string, unknown> }> = [];
+  const jobChecks: string[] = [];
+  const remoteChecks: Array<{
+    id: number;
+    name: string;
+    status: "queued" | "in_progress" | "completed";
+  }> = [];
   const saved: BuildRecord[] = [];
+  const aggregateCheck: {
+    id: number;
+    name: string;
+    status: "in_progress" | "completed";
+    conclusion?: string;
+    html_url: string;
+  } = {
+    id: 42,
+    name: "Informant CI",
+    status: "in_progress",
+    html_url: "https://example.test/check",
+  };
+  let nextCheckId = 100;
   const github = {
     claim: async () =>
-      options.claim === false
-        ? undefined
-        : { check: { id: 42, html_url: "https://example.test/check" }, requestedJobs: [] },
-    updateCheck: async (_repository: Repository, _id: number, values: Record<string, unknown>) => {
-      updates.push(values);
+      options.claim === false ? undefined : { check: aggregateCheck, requestedJobs: [] },
+    createJobCheck: async (
+      _repository: Repository,
+      _sha: string,
+      _claimId: number,
+      name: string,
+    ) => {
+      jobChecks.push(name);
+      const jobCheck = {
+        id: nextCheckId++,
+        name: `Informant / ${name}`,
+        status: "queued" as const,
+      };
+      remoteChecks.push(jobCheck);
+      return jobCheck;
+    },
+    jobChecks: async () => remoteChecks,
+    checks: async () => [aggregateCheck],
+    updateCheck: async (_repository: Repository, id: number, values: Record<string, unknown>) => {
+      updates.push({ id, values });
+      const jobCheck = remoteChecks.find((item) => item.id === id);
+      if (jobCheck && values.status) {
+        jobCheck.status = values.status as "queued" | "in_progress" | "completed";
+      }
+      if (id === aggregateCheck.id && values.status === "completed") {
+        aggregateCheck.status = "completed";
+        aggregateCheck.conclusion = String(values.conclusion);
+      }
       return {};
     },
   } as unknown as GitHubClient;
@@ -51,13 +93,21 @@ function harness(options: { claim?: boolean; success?: boolean; error?: Error } 
     saveBuild: async (record) => {
       saved.push({ ...record });
     },
-    runInTart: async () => {
+    runInTart: async (_repository, _sha, selectedConfig, _record, observer) => {
       if (options.error) throw options.error;
-      return options.success ?? true;
+      const success = options.success ?? true;
+      for (const job of selectedConfig.jobs) {
+        await observer?.started?.(job);
+        await observer?.completed?.(job, {
+          outcome: success ? "success" : "failure",
+          log: `${job.name} output`,
+        });
+      }
+      return success;
     },
     readLogTail: async () => "build output",
   };
-  return { github, dependencies, updates, saved };
+  return { github, dependencies, updates, jobChecks, saved };
 }
 
 describe("runCommit", () => {
@@ -67,6 +117,7 @@ describe("runCommit", () => {
       await runCommit(context.github, repository, "sha", "main", config, context.dependencies),
     ).toBeUndefined();
     expect(context.updates).toEqual([]);
+    expect(context.jobChecks).toEqual([]);
     expect(context.saved).toEqual([]);
   });
 
@@ -84,7 +135,20 @@ describe("runCommit", () => {
       context.dependencies,
     );
     expect(record?.status).toBe(status);
-    expect(context.updates[0]).toMatchObject({ status: "completed", conclusion });
+    expect(context.jobChecks).toEqual(["test"]);
+    expect(context.updates.find((update) => update.id === 100)?.values).toMatchObject({
+      status: "in_progress",
+    });
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ status: "completed", conclusion, text: "```text\ntest output\n```" });
+    const aggregate = context.updates.find((update) => update.id === 42)?.values;
+    expect(aggregate).toMatchObject({
+      status: "completed",
+      conclusion,
+    });
+    expect(aggregate?.text).toBeUndefined();
     expect(context.saved.at(-1)?.status).toBe(status);
   });
 
@@ -93,7 +157,7 @@ describe("runCommit", () => {
     await expect(
       runCommit(context.github, repository, "sha", "main", config, context.dependencies),
     ).rejects.toThrow("tart broke");
-    expect(context.updates[0]).toMatchObject({
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
       status: "completed",
       conclusion: "failure",
       summary: "tart broke",
@@ -103,12 +167,108 @@ describe("runCommit", () => {
 
   test("persists failure when the terminal check update throws", async () => {
     const context = harness();
-    context.github.updateCheck = async () => {
+    const attemptedIds: number[] = [];
+    context.github.updateCheck = async (_target, id) => {
+      attemptedIds.push(id);
       throw new Error("update failed");
     };
     await expect(
       runCommit(context.github, repository, "sha", "main", config, context.dependencies),
-    ).rejects.toThrow("update failed");
+    ).rejects.toThrow("update failed; additionally, GitHub reporting failed: update failed");
+    expect(attemptedIds).not.toContain(42);
     expect(context.saved.at(-1)?.status).toBe("failure");
+  });
+
+  test("retries a failed terminal job update without changing the execution result", async () => {
+    const context = harness();
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    let terminalAttempts = 0;
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 100 && values.status === "completed" && terminalAttempts++ < 2) {
+        throw new Error("temporary GitHub error");
+      }
+      return updateCheck(target, id, values);
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+    );
+
+    expect(terminalAttempts).toBe(3);
+    expect(record?.status).toBe("success");
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "success", text: "```text\ntest output\n```" });
+  });
+
+  test("preserves success when the aggregate completion response is lost", async () => {
+    const context = harness();
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    let loseResponse = true;
+    context.github.updateCheck = async (target, id, values) => {
+      const result = await updateCheck(target, id, values);
+      if (id === 42 && values.status === "completed" && loseResponse) {
+        loseResponse = false;
+        throw new Error("response lost");
+      }
+      return result;
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+    );
+
+    expect(record?.status).toBe("success");
+    expect(context.saved.at(-1)?.status).toBe("success");
+    expect(context.updates.filter((update) => update.id === 42)).toHaveLength(1);
+    expect(context.updates.find((update) => update.id === 42)?.values.conclusion).toBe("success");
+  });
+
+  test("cancels created job checks when later check creation fails", async () => {
+    const context = harness();
+    const createJobCheck = context.github.createJobCheck.bind(context.github);
+    context.github.createJobCheck = async (target, sha, claimId, name) => {
+      const created = await createJobCheck(target, sha, claimId, name);
+      if (name === "lint") throw new Error("could not create lint check");
+      return created;
+    };
+    let executed = false;
+    context.dependencies.runInTart = async () => {
+      executed = true;
+      return true;
+    };
+    const multipleJobs = {
+      ...config,
+      jobs: [
+        ...config.jobs,
+        { name: "lint", command: "lint", timeoutMinutes: 1, environment: {}, needs: [] },
+      ],
+    };
+
+    await expect(
+      runCommit(context.github, repository, "sha", "main", multipleJobs, context.dependencies),
+    ).rejects.toThrow("could not create lint check");
+    expect(executed).toBe(false);
+    expect(
+      context.updates.find(
+        (update) => update.id === 100 && update.values.conclusion === "cancelled",
+      ),
+    ).toBeDefined();
+    expect(
+      context.updates.find(
+        (update) => update.id === 101 && update.values.conclusion === "cancelled",
+      ),
+    ).toBeDefined();
   });
 });

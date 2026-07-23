@@ -6,12 +6,28 @@ import type { CheckRun, Repository } from "./types.ts";
 
 const API = "https://api.github.com";
 export const CLAIM_NAME = "Informant CI";
+export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
+
+function outputTail(value: string | undefined, maximumBytes = 60_000): string | undefined {
+  if (!value) return value;
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.length <= maximumBytes) return value;
+  let start = bytes.length - maximumBytes;
+  while (start < bytes.length && ((bytes[start] ?? 0) & 0xc0) === 0x80) start++;
+  return new TextDecoder().decode(bytes.subarray(start));
+}
 
 interface GitHubOptions {
   token?: string;
   fetch?: typeof globalThis.fetch;
-  credentials?: { appId: string; installationId: string; privateKey: string };
+  repository?: Repository;
+  credentials?: {
+    appId: string;
+    installationId: string;
+    privateKey?: string;
+    privateKeyFile?: string;
+  };
 }
 
 export class GitHubClient {
@@ -20,34 +36,58 @@ export class GitHubClient {
   private tokenExpiresAt = 0;
   private appId?: string;
   private readonly credentials?: GitHubOptions["credentials"];
+  private readonly repository?: Repository;
 
   constructor(options: GitHubOptions = {}) {
     this.token = options.token;
     if (options.token) this.tokenExpiresAt = Number.POSITIVE_INFINITY;
     this.request = options.fetch ?? globalThis.fetch;
     this.credentials = options.credentials;
+    this.repository = options.repository;
   }
 
   async authenticate(): Promise<void> {
     if (this.token && Date.now() < this.tokenExpiresAt - 60_000) return;
-    const stored = this.credentials ? undefined : await getGitHubCredentials();
-    const environmentToken = this.credentials
-      ? undefined
-      : (Bun.env.INFORMANT_GITHUB_TOKEN ?? Bun.env.GITHUB_TOKEN);
-    this.appId = this.credentials?.appId ?? Bun.env.INFORMANT_GITHUB_APP_ID ?? stored?.appId;
+    const environmentAccount = Bun.env.INFORMANT_GITHUB_ACCOUNT;
+    const environmentMatches =
+      !this.repository ||
+      !environmentAccount ||
+      environmentAccount.toLowerCase() === this.repository.owner.toLowerCase();
+    const environmentToken =
+      !this.credentials && environmentMatches
+        ? (Bun.env.INFORMANT_GITHUB_TOKEN ?? Bun.env.GITHUB_TOKEN)
+        : undefined;
+    this.appId =
+      this.credentials?.appId ?? (environmentMatches ? Bun.env.INFORMANT_GITHUB_APP_ID : undefined);
     if (environmentToken) {
       this.token = environmentToken;
       this.tokenExpiresAt = Number.POSITIVE_INFINITY;
       return;
     }
 
+    const hasEnvironmentCredentials = Boolean(
+      environmentMatches &&
+        Bun.env.INFORMANT_GITHUB_APP_ID &&
+        Bun.env.INFORMANT_GITHUB_INSTALLATION_ID &&
+        (Bun.env.INFORMANT_GITHUB_PRIVATE_KEY || Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE),
+    );
+    const stored =
+      this.credentials || hasEnvironmentCredentials
+        ? undefined
+        : await getGitHubCredentials(this.repository);
+    this.appId ??= stored?.appId;
+
     const appId = this.appId;
     const installationId =
       this.credentials?.installationId ??
-      Bun.env.INFORMANT_GITHUB_INSTALLATION_ID ??
+      (environmentMatches ? Bun.env.INFORMANT_GITHUB_INSTALLATION_ID : undefined) ??
       stored?.installationId;
     const privateKey =
-      this.credentials?.privateKey ?? (await this.privateKey(stored?.privateKeyFile));
+      this.credentials?.privateKey ??
+      (await this.privateKey(
+        this.credentials?.privateKeyFile ?? stored?.privateKeyFile,
+        environmentMatches,
+      ));
     if (!appId || !installationId || !privateKey) {
       throw new Error(
         "GitHub App credentials are required; run informant setup or set the INFORMANT_GITHUB_* environment variables",
@@ -71,11 +111,15 @@ export class GitHubClient {
     this.tokenExpiresAt = new Date(result.expires_at).getTime();
   }
 
-  private async privateKey(storedPath?: string): Promise<string | undefined> {
-    if (Bun.env.INFORMANT_GITHUB_PRIVATE_KEY) {
+  private async privateKey(
+    storedPath?: string,
+    useEnvironment = true,
+  ): Promise<string | undefined> {
+    if (useEnvironment && Bun.env.INFORMANT_GITHUB_PRIVATE_KEY) {
       return Bun.env.INFORMANT_GITHUB_PRIVATE_KEY.replaceAll("\\n", "\n");
     }
-    const path = Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE ?? storedPath;
+    const path =
+      (useEnvironment ? Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE : undefined) ?? storedPath;
     return path ? readFile(path, "utf8") : undefined;
   }
 
@@ -139,6 +183,32 @@ export class GitHubClient {
     return checks.filter((check) => check.name === CLAIM_NAME);
   }
 
+  async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
+    await this.authenticate();
+    const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
+    const checks: CheckRun[] = [];
+    for (let page = 1; ; page++) {
+      const result = await this.api<{ check_runs: CheckRun[] }>(
+        `/repos/${repository.fullName}/commits/${sha}/check-runs?filter=all&per_page=100&page=${page}${appFilter}`,
+      );
+      checks.push(...result.check_runs);
+      if (result.check_runs.length < 100) break;
+    }
+    const prefix = `informant-job:${claimId}:`;
+    return checks.filter(
+      (check) => check.name.startsWith(JOB_CHECK_PREFIX) && check.external_id?.startsWith(prefix),
+    );
+  }
+
+  async checkSuiteStatus(repository: Repository, sha: string): Promise<string | undefined> {
+    await this.authenticate();
+    const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
+    const result = await this.api<{ check_suites: Array<{ status?: string | null }> }>(
+      `/repos/${repository.fullName}/commits/${sha}/check-suites?check_name=${encodeURIComponent(CLAIM_NAME)}&per_page=1${appFilter}`,
+    );
+    return result.check_suites[0]?.status ?? undefined;
+  }
+
   async installationRepositories(): Promise<Repository[]> {
     const repositories: Array<{ full_name: string }> = [];
     for (let page = 1; ; page++) {
@@ -200,12 +270,30 @@ export class GitHubClient {
     });
   }
 
+  async createJobCheck(
+    repository: Repository,
+    sha: string,
+    claimId: number,
+    jobName: string,
+  ): Promise<CheckRun> {
+    return this.api(`/repos/${repository.fullName}/check-runs`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: `${JOB_CHECK_PREFIX}${jobName}`,
+        head_sha: sha,
+        status: "queued",
+        external_id: `informant-job:${claimId}:${Buffer.from(jobName).toString("base64url")}`,
+        output: { title: jobName, summary: "Waiting for dependencies and an available worker." },
+      }),
+    });
+  }
+
   async updateCheck(
     repository: Repository,
     id: number,
     values: {
       status?: "in_progress" | "completed";
-      conclusion?: "success" | "failure" | "cancelled" | "neutral";
+      conclusion?: "success" | "failure" | "cancelled" | "neutral" | "skipped";
       title: string;
       summary: string;
       text?: string;
@@ -216,8 +304,9 @@ export class GitHubClient {
       body: JSON.stringify({
         status: values.status,
         conclusion: values.conclusion,
+        started_at: values.status === "in_progress" ? new Date().toISOString() : undefined,
         completed_at: values.status === "completed" ? new Date().toISOString() : undefined,
-        output: { title: values.title, summary: values.summary, text: values.text?.slice(-60_000) },
+        output: { title: values.title, summary: values.summary, text: outputTail(values.text) },
       }),
     });
   }
@@ -234,22 +323,35 @@ export class GitHubClient {
         !check.started_at || Date.now() - new Date(check.started_at).getTime() > STALE_CLAIM_MS,
     );
     await Promise.all(
-      stale.map((check) =>
-        this.updateCheck(repository, check.id, {
+      stale.map(async (check) => {
+        const jobs = (await this.jobChecks(repository, sha, check.id)).filter(
+          (job) => job.status !== "completed",
+        );
+        await Promise.all(
+          jobs.map((job) =>
+            this.updateCheck(repository, job.id, {
+              status: "completed",
+              conclusion: "cancelled",
+              title: "Stale worker job",
+              summary: "The worker claim expired before this job completed.",
+            }),
+          ),
+        );
+        return this.updateCheck(repository, check.id, {
           status: "completed",
           conclusion: "cancelled",
           title: "Stale worker claim",
           summary: "The worker did not complete this claim within 24 hours; it may be retried.",
-        }),
-      ),
+        });
+      }),
     );
     if (active.length > stale.length) return undefined;
-    const requested = existing.some((check) => check.status === "queued");
-    if (
-      !requested &&
-      stale.length === 0 &&
-      existing.some((check) => check.status === "completed")
-    ) {
+    let requested = existing.some((check) => check.status === "queued");
+    const completed = existing.some((check) => check.status === "completed");
+    if (!requested && completed && stale.length === 0) {
+      requested = (await this.checkSuiteStatus(repository, sha)) === "queued";
+    }
+    if (!requested && stale.length === 0 && completed) {
       return undefined;
     }
 
