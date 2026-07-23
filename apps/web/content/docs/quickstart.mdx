@@ -43,6 +43,9 @@ those decisions from the App owner. Informant stores everything else under `~/.c
 there are no environment variables to copy. See [GitHub App credentials](/docs/github-app) for
 headless and environment-variable overrides.
 
+Repeat `informant setup` for every additional organization this machine should serve. Each organization
+gets its own private GitHub App and installation credentials.
+
 In the repository that needs CI:
 
 ```bash

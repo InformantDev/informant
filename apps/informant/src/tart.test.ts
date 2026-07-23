@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { scheduleJobs } from "./tart.ts";
+import { cachePathIdentity, preparedImageName, scheduleJobs } from "./tart.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
@@ -8,6 +8,40 @@ const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number
   command: name,
   environment: {},
   timeoutMinutes: 1,
+});
+
+const config = (prepare?: string): InformantConfig => ({
+  version: 1,
+  pollIntervalSeconds: 20,
+  branches: ["main"],
+  vm: { image: "base", user: "admin", password: "admin", prepare },
+  jobs: [job("test")],
+});
+
+test("prepared image identity changes with its source or preparation", () => {
+  expect(preparedImageName(config())).toBeUndefined();
+  const first = preparedImageName(config("install bun"));
+  expect(first).toStartWith("informant-prepared-");
+  expect(preparedImageName(config("install node"))).not.toBe(first);
+  expect(
+    preparedImageName({
+      ...config("install bun"),
+      vm: { ...config().vm, image: "other", prepare: "install bun" },
+    }),
+  ).not.toBe(first);
+  expect(
+    preparedImageName({
+      ...config("install bun"),
+      vm: { ...config().vm, user: "builder", prepare: "install bun" },
+    }),
+  ).not.toBe(first);
+});
+
+test("cache destinations have distinct storage identities", () => {
+  expect(cachePathIdentity("admin", "~/.bun/install/cache")).not.toBe(
+    cachePathIdentity("admin", "~/.npm"),
+  );
+  expect(cachePathIdentity("admin", "~/.npm")).not.toBe(cachePathIdentity("builder", "~/.npm"));
 });
 
 describe("job scheduler", () => {

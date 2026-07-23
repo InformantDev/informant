@@ -10,7 +10,7 @@ export interface ServerOptions {
 }
 
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
-  const github = new GitHubClient();
+  const github = new GitHubClient({ repository });
   let intervalSeconds = 20;
   let lastPollError: string | undefined;
   const message = options.onMessage ?? console.log;
@@ -58,6 +58,20 @@ export async function serveRepositories(
   repositories: Repository[],
   options: ServerOptions = {},
 ): Promise<void> {
+  const owners = new Set(repositories.map((repository) => repository.owner.toLowerCase()));
+  const hasEnvironmentCredentials = Boolean(
+    Bun.env.INFORMANT_GITHUB_TOKEN ||
+      Bun.env.GITHUB_TOKEN ||
+      Bun.env.INFORMANT_GITHUB_APP_ID ||
+      Bun.env.INFORMANT_GITHUB_INSTALLATION_ID ||
+      Bun.env.INFORMANT_GITHUB_PRIVATE_KEY ||
+      Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE,
+  );
+  if (owners.size > 1 && hasEnvironmentCredentials && !Bun.env.INFORMANT_GITHUB_ACCOUNT) {
+    throw new Error(
+      "INFORMANT_GITHUB_ACCOUNT is required when environment credentials serve multiple repository owners",
+    );
+  }
   await Promise.all(
     repositories.map((repository) =>
       serve(repository, {

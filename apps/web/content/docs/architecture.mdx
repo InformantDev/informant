@@ -25,3 +25,7 @@ claims left behind by dead workers become retryable after 24 hours.
 
 Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
 already has an older completed result.
+
+GitHub UI re-runs use the same path. Clicking **Re-run** resets Informant's Check Suite to queued.
+Workers observe that state through the Checks API, elect one claimant, and create a fresh Check Run.
+Informant does not need a public webhook endpoint to receive the re-run request.

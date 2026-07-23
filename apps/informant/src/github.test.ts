@@ -150,3 +150,82 @@ test("claim replaces a stale claim after its accepted request was completed", as
 
   expect(claim?.check.id).toBe(100);
 });
+
+test("claim treats a queued check suite as a GitHub UI re-run request", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    { id: 1, name: "Informant CI", status: "completed", conclusion: "failure" },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = { id: 2, name: body.name, status: body.status };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (url.includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "queued" }] });
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "machine",
+  );
+
+  expect(claim?.check.id).toBe(2);
+  expect(claim?.requestedJobs).toEqual([]);
+});
+
+test("claim does not repeat a completed check suite", async () => {
+  let created = false;
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") created = true;
+    if (String(input).includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "completed" }] });
+    }
+    return Response.json({
+      check_runs: [{ id: 1, name: "Informant CI", status: "completed", conclusion: "success" }],
+    });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "machine",
+  );
+
+  expect(claim).toBeUndefined();
+  expect(created).toBe(false);
+});
+
+test("pre-minted installation tokens retain their App ID check filter", async () => {
+  const previousToken = Bun.env.INFORMANT_GITHUB_TOKEN;
+  const previousAppId = Bun.env.INFORMANT_GITHUB_APP_ID;
+  const previousAccount = Bun.env.INFORMANT_GITHUB_ACCOUNT;
+  Bun.env.INFORMANT_GITHUB_TOKEN = "installation-token";
+  Bun.env.INFORMANT_GITHUB_APP_ID = "123";
+  Bun.env.INFORMANT_GITHUB_ACCOUNT = "acme";
+  let requestUrl = "";
+  const fetch = (async (input: string | URL | Request) => {
+    requestUrl = String(input);
+    return Response.json({ check_runs: [] });
+  }) as typeof globalThis.fetch;
+
+  try {
+    await new GitHubClient({
+      repository: { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+      fetch,
+    }).checks({ owner: "acme", repo: "widgets", fullName: "acme/widgets" }, "abc123");
+    expect(new URL(requestUrl).searchParams.get("app_id")).toBe("123");
+  } finally {
+    if (previousToken === undefined) delete Bun.env.INFORMANT_GITHUB_TOKEN;
+    else Bun.env.INFORMANT_GITHUB_TOKEN = previousToken;
+    if (previousAppId === undefined) delete Bun.env.INFORMANT_GITHUB_APP_ID;
+    else Bun.env.INFORMANT_GITHUB_APP_ID = previousAppId;
+    if (previousAccount === undefined) delete Bun.env.INFORMANT_GITHUB_ACCOUNT;
+    else Bun.env.INFORMANT_GITHUB_ACCOUNT = previousAccount;
+  }
+});

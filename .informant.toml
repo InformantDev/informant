@@ -8,28 +8,33 @@ user = "admin"
 password = "admin"
 cpu = 4
 memory_mb = 8192
+prepare = "curl -fsSL https://bun.sh/install | bash && sudo mkdir -p /usr/local/bin && sudo ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun"
 
 [[jobs]]
 name = "test"
 command = "bun install --frozen-lockfile && bun test"
 timeout_minutes = 15
 environment = { CI = "true" }
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
 
 [[jobs]]
 name = "lint"
 command = "bun install --frozen-lockfile && bun run check"
 timeout_minutes = 15
 environment = { CI = "true" }
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
 
 [[jobs]]
 name = "typecheck"
 command = "bun install --frozen-lockfile && bun run typecheck"
 timeout_minutes = 20
 environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
 
 [[jobs]]
 name = "build"
 command = "bun install --frozen-lockfile && bun run build"
 timeout_minutes = 30
 environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
 needs = ["test", "lint", "typecheck"]

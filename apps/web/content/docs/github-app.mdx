@@ -16,6 +16,10 @@ repository list are separate. It stores the key at
 `~/.config/informant/app-<APP_ID>.pem` with mode `600` and records the IDs in
 `~/.config/informant/config.json`. No environment variables are required.
 
+Run `informant setup` once for each personal account or organization whose repositories this machine
+will handle. Informant creates a private App for that account and keeps all previously configured Apps.
+At runtime, each registered repository uses the installation whose account matches the repository owner.
+
 The only browser actions are approving App creation and selecting repositories. GitHub intentionally
 requires the owner to make those authorization decisions.
 
@@ -26,6 +30,7 @@ saved by `informant setup`:
 
 | Variable | Meaning | Where to find it |
 | --- | --- | --- |
+| `INFORMANT_GITHUB_ACCOUNT` | Limits environment credentials to one repository owner. Required when environment credentials are present and the worker serves multiple owners. | The GitHub personal account or organization name. |
 | `INFORMANT_GITHUB_APP_ID` | Identifies the GitHub App. | The App's **General** settings page. This is the numeric **App ID**, not the Client ID. |
 | `INFORMANT_GITHUB_INSTALLATION_ID` | Identifies the installation that grants repository access. | The number at the end of the installation settings URL after installing the App. |
 | `INFORMANT_GITHUB_PRIVATE_KEY_FILE` | Absolute path to a PEM private key for the App. | Downloaded after selecting **Generate a private key** on the App's settings page. |
@@ -63,6 +68,7 @@ mv "$HOME/Downloads/YOUR-KEY.private-key.pem" "$HOME/.config/informant/app.pem"
 chmod 600 "$HOME/.config/informant/app.pem"
 
 cat > "$HOME/.config/informant/env" <<'EOF'
+export INFORMANT_GITHUB_ACCOUNT="YOUR-ORGANIZATION"
 export INFORMANT_GITHUB_APP_ID="123456"
 export INFORMANT_GITHUB_INSTALLATION_ID="7890123"
 export INFORMANT_GITHUB_PRIVATE_KEY_FILE="$HOME/.config/informant/app.pem"
@@ -114,16 +120,14 @@ and run Tart.
 
 ## Add another worker machine
 
-The simplest option is to run `informant setup` on each machine and create a machine-owned App. To
-share one App across workers, the App ID and installation ID remain the same. For easier revocation,
-generate a separate private key from that GitHub App for each machine instead of copying one PEM
-everywhere. On each manually configured machine:
+All workers for one repository owner must use the same App ID and installation ID so they see the
+same Check claims. Do not create another App for that account on the second machine.
 
-1. Store its private key under `~/.config/informant/app.pem` with mode `600`.
-2. Create and source `~/.config/informant/env`.
-3. Run `informant doctor`.
-4. Register repositories with `informant repo add owner/repository`.
-5. Start `informant serve`.
+1. Open the existing App's settings and generate a separate private key for the new machine.
+2. Run `informant setup` on the new machine.
+3. Choose **Connect an existing App used by another machine**.
+4. Enter the existing App ID, installation ID, and downloaded PEM path.
+5. Register repositories and start `informant serve`.
 
 Deleting one machine's key from the GitHub App settings then revokes that machine without rotating
 every worker.
@@ -135,6 +139,7 @@ key and installation ID:
 
 ```bash
 export INFORMANT_GITHUB_APP_ID="123456"
+export INFORMANT_GITHUB_ACCOUNT="YOUR-ORGANIZATION"
 export INFORMANT_GITHUB_TOKEN="ghs_..."
 ```
 
