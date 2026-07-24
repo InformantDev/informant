@@ -3,7 +3,7 @@ import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
 import { triggerMatches } from "./triggers.ts";
-import type { Repository } from "./types.ts";
+import type { InformantConfig, Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
@@ -27,10 +27,30 @@ export interface ServerOptions {
   once?: boolean;
   signal?: AbortSignal;
   onMessage?: (message: string) => void;
+  dependencies?: ServerDependencies;
+}
+
+export interface ServerDependencies {
+  github?: GitHubClient;
+  repositoryConfig?: (
+    github: GitHubClient,
+    repository: Repository,
+    sha: string,
+  ) => Promise<InformantConfig>;
+  runCommit?: typeof runCommit;
+  readPollState?: typeof readPollState;
+  savePollState?: typeof savePollState;
+  sleep?: (milliseconds: number) => Promise<void>;
 }
 
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
-  const github = new GitHubClient({ repository });
+  const dependencies = options.dependencies ?? {};
+  const github = dependencies.github ?? new GitHubClient({ repository });
+  const loadRepositoryConfig = dependencies.repositoryConfig ?? repositoryConfig;
+  const executeCommit = dependencies.runCommit ?? runCommit;
+  const loadPollState = dependencies.readPollState ?? readPollState;
+  const persistPollState = dependencies.savePollState ?? savePollState;
+  const sleep = dependencies.sleep ?? Bun.sleep;
   let intervalSeconds = 30;
   let lastPollError: string | undefined;
   let rateLimitUntil = 0;
@@ -42,7 +62,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const configAt = (sha: string) => {
     const cached = configs.get(sha);
     if (cached) return cached;
-    const pending = repositoryConfig(github, repository, sha);
+    const pending = loadRepositoryConfig(github, repository, sha);
     configs.set(sha, pending);
     void pending.catch(() => {
       if (configs.get(sha) === pending) configs.delete(sha);
@@ -56,18 +76,24 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     return error instanceof Error ? error.message : String(error);
   };
+  const abortAutomaticRuns = () => {
+    for (const { controller } of automaticLanes.values()) {
+      controller.abort("Server shutdown requested.");
+    }
+    automaticLanes.clear();
+  };
   const drainRuns = async () => {
     await Promise.allSettled(inFlightRuns.values());
     if (completedComments.size > 0) {
       const completed = new Set(completedComments);
-      const state = await readPollState(repository.fullName);
+      const state = await loadPollState(repository.fullName);
       state.pending = state.pending.filter((item) => !completed.has(item.id));
-      await savePollState(repository.fullName, state);
+      await persistPollState(repository.fullName, state);
       for (const id of completed) completedComments.delete(id);
     }
   };
   do {
-    if (rateLimitUntil > Date.now()) await Bun.sleep(rateLimitUntil - Date.now());
+    if (rateLimitUntil > Date.now()) await sleep(rateLimitUntil - Date.now());
     try {
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
@@ -105,6 +131,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           })),
       ]) {
         if (options.signal?.aborted) {
+          abortAutomaticRuns();
           await drainRuns();
           return;
         }
@@ -127,7 +154,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           if (!matches && !(await hasPendingManualRequest(target.sha))) continue;
           const controller = new AbortController();
           automaticLanes.set(target.lane, { sha: target.sha, controller });
-          const run = runCommit(
+          const run = executeCommit(
             github,
             repository,
             target.sha,
@@ -159,12 +186,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         }
       }
 
-      const state = await readPollState(repository.fullName);
+      const state = await loadPollState(repository.fullName);
       if (completedComments.size > 0) {
         const completed = new Set(completedComments);
         state.pending = state.pending.filter((item) => !completed.has(item.id));
         for (const id of completed) completedComments.delete(id);
-        await savePollState(repository.fullName, state);
+        await persistPollState(repository.fullName, state);
       }
       if (!state.cursor) {
         const latest = await github.latestPullRequestComments(repository);
@@ -173,7 +200,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           new Date(0).toISOString(),
         );
         state.seenCommentIds = latest.map((comment) => comment.id);
-        await savePollState(repository.fullName, state);
+        await persistPollState(repository.fullName, state);
       } else {
         const previousCursor = state.cursor;
         const overlap = new Date(
@@ -204,7 +231,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             });
         }
         state.seenCommentIds = state.seenCommentIds.slice(-SEEN_COMMENT_LIMIT);
-        await savePollState(repository.fullName, state);
+        await persistPollState(repository.fullName, state);
       }
       for (const pending of [...state.pending]) {
         const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
@@ -221,10 +248,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           );
           if (!matches) {
             state.pending = state.pending.filter((item) => item.id !== pending.id);
-            await savePollState(repository.fullName, state);
+            await persistPollState(repository.fullName, state);
             continue;
           }
-          const run = runCommit(
+          const run = executeCommit(
             github,
             repository,
             pending.sha,
@@ -263,8 +290,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       await drainRuns();
       return;
     }
-    await Bun.sleep(intervalSeconds * 1_000);
+    await sleep(intervalSeconds * 1_000);
   } while (!options.signal?.aborted);
+  abortAutomaticRuns();
   await drainRuns();
 }
 

@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { command, requireCommand } from "./process.ts";
 import { appendLog, dataDirectory } from "./store.ts";
@@ -599,6 +599,26 @@ export function utf8Tail(value: string, maximumBytes = JOB_LOG_BYTES): string {
   return new TextDecoder().decode(bytes.subarray(start));
 }
 
+export function appendUtf8Tail(
+  tail: Uint8Array,
+  value: string,
+  maximumBytes = JOB_LOG_BYTES,
+): Uint8Array {
+  const addition = new TextEncoder().encode(value);
+  if (addition.length >= maximumBytes) {
+    let start = addition.length - maximumBytes;
+    while (start < addition.length && ((addition[start] ?? 0) & 0xc0) === 0x80) start++;
+    return addition.slice(start);
+  }
+  const keep = Math.min(tail.length, maximumBytes - addition.length);
+  let start = tail.length - keep;
+  while (start < tail.length && ((tail[start] ?? 0) & 0xc0) === 0x80) start++;
+  const result = new Uint8Array(tail.length - start + addition.length);
+  result.set(tail.subarray(start));
+  result.set(addition, tail.length - start);
+  return result;
+}
+
 export async function scheduleJobs(
   jobs: InformantConfig["jobs"],
   executeJob: (job: InformantConfig["jobs"][number], index: number) => Promise<boolean>,
@@ -646,11 +666,33 @@ export async function runInTart(
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
   const workspaces = config.jobs.map((_, index) => join(root, `job-${index}`));
-  const jobLogs = new Map<string, string>();
+  const jobLogs = new Map<string, Uint8Array>();
+  const decoder = new TextDecoder();
+  let logHandle: Awaited<ReturnType<typeof open>> | undefined;
+  let writes = Promise.resolve();
+  const writeLog = (text: string) => {
+    writes = writes.then(async () => {
+      if (logHandle) await logHandle.appendFile(text);
+      else await appendLog(record, text);
+    });
+    return writes;
+  };
+  const progressTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const flushProgress = async (job: InformantConfig["jobs"][number]) => {
+    const timer = progressTimers.get(job.name);
+    if (timer) clearTimeout(timer);
+    progressTimers.delete(job.name);
+    await notify(() => observer.progress?.(job, decoder.decode(jobLogs.get(job.name))));
+  };
   const logJob = async (job: InformantConfig["jobs"][number], text: string) => {
-    jobLogs.set(job.name, utf8Tail(`${jobLogs.get(job.name) ?? ""}${text}`));
-    await appendLog(record, text);
-    await notify(() => observer.progress?.(job, jobLogs.get(job.name) ?? ""));
+    jobLogs.set(job.name, appendUtf8Tail(jobLogs.get(job.name) ?? new Uint8Array(), text));
+    void writeLog(text);
+    if (!progressTimers.has(job.name)) {
+      progressTimers.set(
+        job.name,
+        setTimeout(() => void flushProgress(job), 100),
+      );
+    }
   };
   const notify = async (callback: (() => Promise<void> | void) | undefined) => {
     if (!callback) return;
@@ -661,14 +703,19 @@ export async function runInTart(
     }
   };
 
+  let runFailed = false;
+  let runError: unknown;
+  let cleanupError: unknown;
+  let result: boolean | undefined;
   try {
     signal?.throwIfAborted();
     await mkdir(root, { recursive: true });
-    await appendLog(record, `$ cloning ${repository.fullName} at ${sha}\n`);
+    logHandle = await open(record.logPath, "a");
+    await writeLog(`$ cloning ${repository.fullName} at ${sha}\n`);
     const image = await ensurePreparedImage(
       config,
       async (message) => {
-        await appendLog(record, `$ ${message}\n`);
+        await writeLog(`$ ${message}\n`);
       },
       repository.fullName,
       signal,
@@ -691,7 +738,7 @@ export async function runInTart(
         );
       }
     }
-    return await scheduleJobs(
+    result = await scheduleJobs(
       config.jobs,
       async (job, index) => {
         const workspace = workspaces[index];
@@ -708,20 +755,24 @@ export async function runInTart(
           signal,
         );
         const outcome = signal?.aborted ? "cancelled" : success ? "success" : "failure";
+        await writes;
+        await flushProgress(job);
         await notify(() =>
           observer.completed?.(job, {
             outcome,
-            log: jobLogs.get(job.name) ?? "",
+            log: decoder.decode(jobLogs.get(job.name)),
           }),
         );
         return success;
       },
       async (job) => {
         await logJob(job, `\n━━ ${job.name} ━━\n[skipped: dependency failed]\n`);
+        await writes;
+        await flushProgress(job);
         await notify(() =>
           observer.completed?.(job, {
             outcome: signal?.aborted ? "cancelled" : "skipped",
-            log: jobLogs.get(job.name) ?? "",
+            log: decoder.decode(jobLogs.get(job.name)),
           }),
         );
       },
@@ -731,15 +782,39 @@ export async function runInTart(
           job,
           signal?.aborted ? `\n[${job.name}: cancelled]\n` : `\n[${job.name}: ${message}]\n`,
         );
+        await writes;
+        await flushProgress(job);
         await notify(() =>
           observer.completed?.(job, {
             outcome: signal?.aborted ? "cancelled" : "failure",
-            log: jobLogs.get(job.name) ?? "",
+            log: decoder.decode(jobLogs.get(job.name)),
           }),
         );
       },
     );
+  } catch (error) {
+    runFailed = true;
+    runError = error;
   } finally {
-    await rm(root, { recursive: true, force: true });
+    for (const timer of progressTimers.values()) clearTimeout(timer);
+    try {
+      await writes;
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      await logHandle?.close();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    try {
+      await rm(root, { recursive: true, force: true });
+    } catch (error) {
+      cleanupError ??= error;
+    }
   }
+  if (runFailed) throw runError;
+  if (cleanupError !== undefined) throw cleanupError;
+  if (result === undefined) throw new Error("job scheduler did not return a result");
+  return result;
 }

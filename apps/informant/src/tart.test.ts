@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  appendUtf8Tail,
   cachePathIdentity,
   ensurePreparedImage,
   isRetryableSshAuthenticationFailure,
@@ -181,6 +182,16 @@ test("job log tails stay within their UTF-8 byte limit", () => {
   expect(new TextEncoder().encode(tail).length).toBeLessThanOrEqual(17);
   expect(tail).not.toContain("�");
   expect(tail).toBe("😀".repeat(4));
+});
+
+test("job log tails can be maintained incrementally", () => {
+  let tail: Uint8Array<ArrayBufferLike> = new Uint8Array();
+  tail = appendUtf8Tail(tail, "prefix", 17);
+  tail = appendUtf8Tail(tail, "😀".repeat(20), 17);
+  const value = new TextDecoder().decode(tail);
+  expect(tail.length).toBeLessThanOrEqual(17);
+  expect(value).not.toContain("�");
+  expect(value).toBe("😀".repeat(4));
 });
 
 describe("job scheduler", () => {

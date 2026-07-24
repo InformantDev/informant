@@ -404,6 +404,78 @@ describe("runCommit", () => {
     ).toBe("```text\nfinal\n```");
   });
 
+  test("rate-limits sequential progress updates and publishes the latest tail", async () => {
+    const context = harness();
+    const realNow = Date.now;
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    let now = 10_000;
+    let nextTimer = 1;
+    const timers = new Map<number, { at: number; callback: () => void }>();
+    const advance = async (milliseconds: number) => {
+      now += milliseconds;
+      for (;;) {
+        const due = [...timers.entries()]
+          .filter(([, timer]) => timer.at <= now)
+          .sort((left, right) => left[1].at - right[1].at)[0];
+        if (!due) break;
+        timers.delete(due[0]);
+        due[1].callback();
+        await Promise.resolve();
+      }
+    };
+    Date.now = () => now;
+    globalThis.setTimeout = ((callback: () => void, delay = 0) => {
+      const id = nextTimer++;
+      timers.set(id, { at: now + delay, callback });
+      return id;
+    }) as unknown as typeof setTimeout;
+    globalThis.clearTimeout = ((id: number) => {
+      timers.delete(id);
+    }) as typeof clearTimeout;
+    try {
+      context.dependencies.runInTart = async (
+        _repository,
+        _sha,
+        selectedConfig,
+        _record,
+        observer,
+      ) => {
+        const [job] = selectedConfig.jobs;
+        if (!job) throw new Error("expected a job");
+        await observer?.started?.(job);
+        observer?.progress?.(job, "first");
+        await advance(0);
+        await Promise.resolve();
+        observer?.progress?.(job, "second");
+        observer?.progress?.(job, "latest");
+        await advance(9_999);
+        expect(
+          context.updates.filter(
+            (update) =>
+              update.id === 100 && update.values.status === undefined && update.values.text,
+          ),
+        ).toHaveLength(1);
+        await advance(1);
+        await Promise.resolve();
+        await Promise.resolve();
+        return true;
+      };
+
+      await runCommit(context.github, repository, "sha", "main", config, context.dependencies);
+
+      const progress = context.updates.filter(
+        (update) => update.id === 100 && update.values.status === undefined && update.values.text,
+      );
+      expect(progress).toHaveLength(2);
+      expect(progress[1]?.values.text).toBe("```text\nlatest\n```");
+    } finally {
+      Date.now = realNow;
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+  });
+
   test("cancels an automatic build when its signal is aborted", async () => {
     const context = harness();
     const controller = new AbortController();
