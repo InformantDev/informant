@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  appendUtf8Tail,
   cachePathIdentity,
   ensurePreparedImage,
   isRetryableSshAuthenticationFailure,
@@ -10,7 +11,7 @@ import {
   prunePreparedImages,
   scheduleJobs,
   utf8Tail,
-} from "./tart.ts";
+} from "./tart/index.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
@@ -97,6 +98,108 @@ fi
   }
 });
 
+test("a failed superseded image deletion still advances the repository reference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-image-delete-failure-"));
+  const bin = join(root, "bin");
+  const tart = join(bin, "tart");
+  const failed = join(root, "failed");
+  const deleted = join(root, "deleted");
+  const firstConfig = config("install bun");
+  const secondConfig = config("install node");
+  const first = preparedImageName(firstConfig);
+  const second = preparedImageName(secondConfig);
+  if (!first || !second) throw new Error("expected prepared image names");
+  await mkdir(bin);
+  await Bun.write(
+    tart,
+    `#!/bin/sh
+if [ "$1" = "list" ]; then
+  printf '%s\\n' '${JSON.stringify([
+    { Name: first, Source: "local" },
+    { Name: second, Source: "local" },
+  ])}'
+elif [ "$1" = "delete" ]; then
+  if [ ! -e '${failed}' ]; then
+    touch '${failed}'
+    exit 1
+  fi
+  printf '%s\\n' "$2" >> '${deleted}'
+fi
+`,
+  );
+  await chmod(tart, 0o755);
+  const originalPath = Bun.env.PATH;
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.PATH = `${bin}:${originalPath}`;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  try {
+    await ensurePreparedImage(firstConfig, () => {}, "owner/repository");
+    const messages: string[] = [];
+    await ensurePreparedImage(
+      secondConfig,
+      (message) => {
+        messages.push(message);
+      },
+      "owner/repository",
+    );
+
+    expect(messages).toEqual([`Could not delete superseded Tart image ${first}; will retry later`]);
+    expect(await prunePreparedImages()).toBe(1);
+    expect((await Bun.file(deleted).text()).trim()).toBe(first);
+  } finally {
+    if (originalPath === undefined) delete Bun.env.PATH;
+    else Bun.env.PATH = originalPath;
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling image preparation deletes its staging VM", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-cancel-image-"));
+  const bin = join(root, "bin");
+  const tart = join(bin, "tart");
+  const started = join(root, "started");
+  const deleted = join(root, "deleted");
+  await mkdir(bin);
+  await Bun.write(
+    tart,
+    `#!/bin/sh
+if [ "$1" = "list" ]; then
+  printf '[]\\n'
+elif [ "$1" = "clone" ]; then
+  touch '${started}'
+  sleep 30
+elif [ "$1" = "delete" ]; then
+  printf '%s\\n' "$2" >> '${deleted}'
+fi
+`,
+  );
+  await chmod(tart, 0o755);
+  const originalPath = Bun.env.PATH;
+  Bun.env.PATH = `${bin}:${originalPath}`;
+  const controller = new AbortController();
+  try {
+    const preparation = ensurePreparedImage(
+      config("install bun"),
+      () => {},
+      undefined,
+      controller.signal,
+    );
+    while (!(await Bun.file(started).exists())) await Bun.sleep(10);
+    controller.abort(new Error("superseded"));
+
+    await expect(preparation).rejects.toThrow("superseded");
+    expect((await Bun.file(deleted).text()).trim()).toMatch(
+      /^informant-prepared-[0-9a-f]{16}-staging-/,
+    );
+  } finally {
+    if (originalPath === undefined) delete Bun.env.PATH;
+    else Bun.env.PATH = originalPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cache destinations have distinct storage identities", () => {
   expect(cachePathIdentity("admin", "~/.bun/install/cache")).not.toBe(
     cachePathIdentity("admin", "~/.npm"),
@@ -136,6 +239,16 @@ test("job log tails stay within their UTF-8 byte limit", () => {
   expect(new TextEncoder().encode(tail).length).toBeLessThanOrEqual(17);
   expect(tail).not.toContain("�");
   expect(tail).toBe("😀".repeat(4));
+});
+
+test("job log tails can be maintained incrementally", () => {
+  let tail: Uint8Array<ArrayBufferLike> = new Uint8Array();
+  tail = appendUtf8Tail(tail, "prefix", 17);
+  tail = appendUtf8Tail(tail, "😀".repeat(20), 17);
+  const value = new TextDecoder().decode(tail);
+  expect(tail.length).toBeLessThanOrEqual(17);
+  expect(value).not.toContain("�");
+  expect(value).toBe("😀".repeat(4));
 });
 
 describe("job scheduler", () => {

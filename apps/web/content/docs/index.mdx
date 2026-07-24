@@ -20,5 +20,9 @@ pushes to start immediately rather than at the next poll.
 3. Interested workers create claims. The oldest active check wins; every loser cancels itself.
 4. The winner clones the exact commit and runs each job in a fresh Tart VM. Independent jobs run
    concurrently, while `needs` dependencies impose ordering.
-5. GitHub receives the terminal conclusion and a log tail. Local build logs retain the final 1 MiB
-   of stdout and stderr from each command.
+5. Each running job publishes its latest log tail to GitHub about every 10 seconds, followed by its
+   terminal conclusion. Local build logs retain the complete stdout and stderr from each job.
+
+When a branch or pull request receives another commit, its worker cancels the superseded automatic
+build, removes its disposable VMs, and starts the new commit. Manual and GitHub UI re-runs continue
+independently so a new push cannot discard work that a user explicitly requested.

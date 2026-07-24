@@ -3,7 +3,7 @@ import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
 import { triggerMatches } from "./triggers.ts";
-import type { Repository } from "./types.ts";
+import type { InformantConfig, Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
@@ -27,20 +27,42 @@ export interface ServerOptions {
   once?: boolean;
   signal?: AbortSignal;
   onMessage?: (message: string) => void;
+  dependencies?: ServerDependencies;
+}
+
+export interface ServerDependencies {
+  github?: GitHubClient;
+  repositoryConfig?: (
+    github: GitHubClient,
+    repository: Repository,
+    sha: string,
+  ) => Promise<InformantConfig>;
+  runCommit?: typeof runCommit;
+  readPollState?: typeof readPollState;
+  savePollState?: typeof savePollState;
+  sleep?: (milliseconds: number) => Promise<void>;
 }
 
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
-  const github = new GitHubClient({ repository });
+  const dependencies = options.dependencies ?? {};
+  const github = dependencies.github ?? new GitHubClient({ repository });
+  const loadRepositoryConfig = dependencies.repositoryConfig ?? repositoryConfig;
+  const executeCommit = dependencies.runCommit ?? runCommit;
+  const loadPollState = dependencies.readPollState ?? readPollState;
+  const persistPollState = dependencies.savePollState ?? savePollState;
+  const sleep = dependencies.sleep ?? Bun.sleep;
   let intervalSeconds = 30;
   let lastPollError: string | undefined;
   let rateLimitUntil = 0;
   const configs = new Map<string, ReturnType<typeof repositoryConfig>>();
   const inFlightRuns = new Map<string, Promise<void>>();
+  const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
+  const completedComments = new Set<number>();
   const message = options.onMessage ?? console.log;
   const configAt = (sha: string) => {
     const cached = configs.get(sha);
     if (cached) return cached;
-    const pending = repositoryConfig(github, repository, sha);
+    const pending = loadRepositoryConfig(github, repository, sha);
     configs.set(sha, pending);
     void pending.catch(() => {
       if (configs.get(sha) === pending) configs.delete(sha);
@@ -54,11 +76,45 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     return error instanceof Error ? error.message : String(error);
   };
+  const abortAutomaticRuns = () => {
+    for (const { controller } of automaticLanes.values()) {
+      controller.abort("Server shutdown requested.");
+    }
+    automaticLanes.clear();
+  };
+  const waitForDelay = async (milliseconds: number) => {
+    if (options.signal?.aborted) return false;
+    if (!options.signal) {
+      await sleep(milliseconds);
+      return true;
+    }
+    let stopWaiting: (() => void) | undefined;
+    const aborted = new Promise<false>((resolve) => {
+      stopWaiting = () => resolve(false);
+      options.signal?.addEventListener("abort", stopWaiting, { once: true });
+    });
+    try {
+      return await Promise.race([sleep(milliseconds).then(() => true as const), aborted]);
+    } finally {
+      if (stopWaiting) options.signal.removeEventListener("abort", stopWaiting);
+    }
+  };
   const drainRuns = async () => {
     await Promise.allSettled(inFlightRuns.values());
+    if (completedComments.size > 0) {
+      const completed = new Set(completedComments);
+      const state = await loadPollState(repository.fullName);
+      state.pending = state.pending.filter((item) => !completed.has(item.id));
+      await persistPollState(repository.fullName, state);
+      for (const id of completed) completedComments.delete(id);
+    }
   };
   do {
-    if (rateLimitUntil > Date.now()) await Bun.sleep(rateLimitUntil - Date.now());
+    if (rateLimitUntil > Date.now() && !(await waitForDelay(rateLimitUntil - Date.now()))) {
+      abortAutomaticRuns();
+      await drainRuns();
+      return;
+    }
     try {
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
@@ -68,6 +124,17 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         github.branches(repository),
         github.pullRequests(repository),
       ]);
+      const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
+      const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
+      for (const [lane, active] of automaticLanes) {
+        if (lane.startsWith("branch:") && !openBranchLanes.has(lane)) {
+          active.controller.abort(`Branch ${lane.slice(7)} no longer exists.`);
+          automaticLanes.delete(lane);
+        } else if (lane.startsWith("pr:") && !openPullRequestLanes.has(lane)) {
+          active.controller.abort(`Pull request #${lane.slice(3)} is no longer open.`);
+          automaticLanes.delete(lane);
+        }
+      }
       const manualRequests = new Map<string, Promise<boolean>>();
       const hasPendingManualRequest = (sha: string) => {
         let pending = manualRequests.get(sha);
@@ -83,6 +150,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           branch: branch.name,
           pullRequest: undefined,
           eventId: `branch:${branch.name}:${branch.sha}`,
+          lane: `branch:${branch.name}`,
         })),
         ...prs
           .filter((pr) => pr.sameRepository)
@@ -91,11 +159,18 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             branch: `pull/${pullRequest.number}`,
             pullRequest,
             eventId: `pr:${pullRequest.number}:${pullRequest.headSha}`,
+            lane: `pr:${pullRequest.number}`,
           })),
       ]) {
         if (options.signal?.aborted) {
+          abortAutomaticRuns();
           await drainRuns();
           return;
+        }
+        const previous = automaticLanes.get(target.lane);
+        if (previous && previous.sha !== target.sha) {
+          previous.controller.abort(`Superseded by ${target.branch}@${target.sha.slice(0, 7)}.`);
+          automaticLanes.delete(target.lane);
         }
         if (inFlightRuns.has(target.eventId)) continue;
         const context = {
@@ -109,10 +184,21 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
           );
           if (!matches && !(await hasPendingManualRequest(target.sha))) continue;
-          const run = runCommit(github, repository, target.sha, target.branch, config, undefined, {
-            ...context,
-            id: target.eventId,
-          })
+          const controller = new AbortController();
+          automaticLanes.set(target.lane, { sha: target.sha, controller });
+          const run = executeCommit(
+            github,
+            repository,
+            target.sha,
+            target.branch,
+            config,
+            undefined,
+            {
+              ...context,
+              id: target.eventId,
+            },
+            controller.signal,
+          )
             .then((build) => {
               if (build)
                 message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
@@ -122,6 +208,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(target.eventId);
+              if (automaticLanes.get(target.lane)?.controller === controller) {
+                automaticLanes.delete(target.lane);
+              }
             });
           inFlightRuns.set(target.eventId, run);
         } catch (error) {
@@ -129,7 +218,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         }
       }
 
-      const state = await readPollState(repository.fullName);
+      const state = await loadPollState(repository.fullName);
+      if (completedComments.size > 0) {
+        const completed = new Set(completedComments);
+        state.pending = state.pending.filter((item) => !completed.has(item.id));
+        await persistPollState(repository.fullName, state);
+        for (const id of completed) completedComments.delete(id);
+      }
       if (!state.cursor) {
         const latest = await github.latestPullRequestComments(repository);
         state.cursor = latest.reduce(
@@ -137,7 +232,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           new Date(0).toISOString(),
         );
         state.seenCommentIds = latest.map((comment) => comment.id);
-        await savePollState(repository.fullName, state);
+        await persistPollState(repository.fullName, state);
       } else {
         const previousCursor = state.cursor;
         const overlap = new Date(
@@ -168,34 +263,45 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             });
         }
         state.seenCommentIds = state.seenCommentIds.slice(-SEEN_COMMENT_LIMIT);
-        await savePollState(repository.fullName, state);
+        await persistPollState(repository.fullName, state);
       }
       for (const pending of [...state.pending]) {
+        const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
+        if (inFlightRuns.has(eventId)) continue;
         try {
           const config = await configAt(pending.sha);
           const context = {
             type: "comment" as const,
             pullRequest: pending.pullRequest,
-            id: `pr:${pending.pullRequest.number}:comment:${pending.id}`,
+            id: eventId,
           };
-          if (
-            config.jobs.some((job) =>
-              (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
-            )
-          ) {
-            const result = await runCommit(
-              github,
-              repository,
-              pending.sha,
-              `pull/${pending.pullRequest.number}`,
-              config,
-              undefined,
-              context,
-            );
-            if (result === false) continue;
+          const matches = config.jobs.some((job) =>
+            (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
+          );
+          if (!matches) {
+            state.pending = state.pending.filter((item) => item.id !== pending.id);
+            await persistPollState(repository.fullName, state);
+            continue;
           }
-          state.pending = state.pending.filter((item) => item.id !== pending.id);
-          await savePollState(repository.fullName, state);
+          const run = executeCommit(
+            github,
+            repository,
+            pending.sha,
+            `pull/${pending.pullRequest.number}`,
+            config,
+            undefined,
+            context,
+          )
+            .then((result) => {
+              if (result !== false) completedComments.add(pending.id);
+            })
+            .catch((error) => {
+              message(`comment ${pending.id} failed: ${errorDetail(error)}`);
+            })
+            .finally(() => {
+              inFlightRuns.delete(eventId);
+            });
+          inFlightRuns.set(eventId, run);
         } catch (error) {
           message(`comment ${pending.id} failed: ${errorDetail(error)}`);
         }
@@ -216,8 +322,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       await drainRuns();
       return;
     }
-    await Bun.sleep(intervalSeconds * 1_000);
+    if (!(await waitForDelay(intervalSeconds * 1_000))) {
+      abortAutomaticRuns();
+      await drainRuns();
+      return;
+    }
   } while (!options.signal?.aborted);
+  abortAutomaticRuns();
   await drainRuns();
 }
 
