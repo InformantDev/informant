@@ -10,13 +10,32 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-async function provisionVm<T>(provision: () => Promise<T>): Promise<T> {
-  const result = vmProvisioning.then(provision, provision);
+async function provisionVm<T>(provision: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  let started = false;
+  const run = () => {
+    started = true;
+    signal?.throwIfAborted();
+    return provision();
+  };
+  const result = vmProvisioning.then(run, run);
   vmProvisioning = result.then(
     () => undefined,
     () => undefined,
   );
-  return result;
+  if (!signal) return result;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      if (started) return;
+      try {
+        signal.throwIfAborted();
+      } catch (error) {
+        reject(error);
+      }
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    result.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
 }
 
 async function exitedVmError(
@@ -34,11 +53,13 @@ async function waitForIp(
   vm: string,
   process: ReturnType<typeof Bun.spawn>,
   stderr: Promise<string>,
+  signal?: AbortSignal,
 ): Promise<string> {
   for (let attempt = 0; attempt < 60; attempt++) {
+    signal?.throwIfAborted();
     const exitError = await exitedVmError(process, stderr);
     if (exitError) throw exitError;
-    const result = await command(["tart", "ip", vm]);
+    const result = await command(["tart", "ip", vm], { signal });
     if (result.exitCode === 0 && result.stdout.trim()) return result.stdout.trim();
     await Bun.sleep(1_000);
   }
@@ -51,8 +72,10 @@ async function waitForSsh(
   password: string,
   process: ReturnType<typeof Bun.spawn>,
   stderr: Promise<string>,
+  signal?: AbortSignal,
 ): Promise<void> {
   for (let attempt = 0; attempt < 60; attempt++) {
+    signal?.throwIfAborted();
     const exitError = await exitedVmError(process, stderr);
     if (exitError) throw exitError;
     const result = await command(
@@ -75,7 +98,7 @@ async function waitForSsh(
         `${user}@${ip}`,
         "true",
       ],
-      { env: { SSHPASS: password } },
+      { env: { SSHPASS: password }, signal },
     );
     if (result.exitCode === 0) return;
     await Bun.sleep(1_000);
@@ -87,8 +110,10 @@ function digest(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
-async function tartImages(): Promise<Array<{ Name: string; Source: string; Accessed?: string }>> {
-  const output = await requireCommand(["tart", "list", "--format", "json"]);
+async function tartImages(
+  signal?: AbortSignal,
+): Promise<Array<{ Name: string; Source: string; Accessed?: string }>> {
+  const output = await requireCommand(["tart", "list", "--format", "json"], undefined, { signal });
   return JSON.parse(output) as Array<{ Name: string; Source: string; Accessed?: string }>;
 }
 
@@ -98,10 +123,12 @@ async function startVm(
   config: InformantConfig,
   timeoutMinutes: number,
   onCapacity: () => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<{ process: ReturnType<typeof Bun.spawn>; ip: string }> {
   const capacityDeadline = Date.now() + timeoutMinutes * 60_000;
   let waitingForCapacity = false;
   while (true) {
+    signal?.throwIfAborted();
     const process = Bun.spawn(["tart", "run", "--no-graphics", ...args, vm], {
       stdout: "ignore",
       stderr: "pipe",
@@ -111,8 +138,8 @@ async function startVm(
         ? new Response(process.stderr).text()
         : Promise.resolve("");
     try {
-      const ip = await waitForIp(vm, process, stderr);
-      await waitForSsh(ip, config.vm.user, config.vm.password, process, stderr);
+      const ip = await waitForIp(vm, process, stderr, signal);
+      await waitForSsh(ip, config.vm.user, config.vm.password, process, stderr, signal);
       return { process, ip };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -141,9 +168,10 @@ async function stopVm(vm: string, process: ReturnType<typeof Bun.spawn>): Promis
   await Promise.race([process.exited, Bun.sleep(5_000)]);
 }
 
-async function waitForCleanShutdown(vm: string): Promise<void> {
+async function waitForCleanShutdown(vm: string, signal?: AbortSignal): Promise<void> {
   for (let attempt = 0; attempt < 60; attempt++) {
-    const result = await command(["tart", "get", vm, "--format", "json"]);
+    signal?.throwIfAborted();
+    const result = await command(["tart", "get", vm, "--format", "json"], { signal });
     if (
       result.exitCode === 0 &&
       (JSON.parse(result.stdout) as { Running?: boolean }).Running === false
@@ -155,12 +183,17 @@ async function waitForCleanShutdown(vm: string): Promise<void> {
   throw new Error("prepared VM did not shut down cleanly within 60 seconds");
 }
 
-async function withImageLock<T>(image: string, callback: () => Promise<T>): Promise<T> {
+async function withImageLock<T>(
+  image: string,
+  callback: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
   const directory = join(dataDirectory(), "locks");
   const path = join(directory, `${image}.lock`);
   await mkdir(directory, { recursive: true });
   for (let attempt = 0; ; attempt++) {
-    const lock = await command(["shlock", "-f", path, "-p", String(process.pid)]);
+    signal?.throwIfAborted();
+    const lock = await command(["shlock", "-f", path, "-p", String(process.pid)], { signal });
     if (lock.exitCode === 0) break;
     if (attempt >= 600) throw new Error(`timed out waiting for prepared image lock: ${image}`);
     await Bun.sleep(1_000);
@@ -186,7 +219,13 @@ export function isRetryableSshAuthenticationFailure(result: {
   );
 }
 
-async function sshCommand(ip: string, config: InformantConfig, remote: string, timeoutMs: number) {
+async function sshCommand(
+  ip: string,
+  config: InformantConfig,
+  remote: string,
+  timeoutMs: number,
+  options: { signal?: AbortSignal; onOutput?: (text: string) => Promise<void> | void } = {},
+) {
   const argv = [
     "sshpass",
     "-e",
@@ -208,6 +247,8 @@ async function sshCommand(ip: string, config: InformantConfig, remote: string, t
     const result = await command(argv, {
       env: { SSHPASS: config.vm.password },
       timeoutMs,
+      signal: options.signal,
+      onOutput: options.onOutput,
     });
     if (!isRetryableSshAuthenticationFailure(result) || attempt >= 9) return result;
     await Bun.sleep(2_000);
@@ -224,6 +265,7 @@ async function activatePreparedImageLocked(
   repository: string | undefined,
   prepared: string | undefined,
   onMessage: (message: string) => Promise<void> | void,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (!repository) return;
   const directory = join(dataDirectory(), "prepared-image-references");
@@ -232,18 +274,22 @@ async function activatePreparedImageLocked(
   if (previous === prepared) return;
 
   if (previous) {
-    const cleanup = await withImageLock(previous, async () => {
-      const references = await readdir(directory).catch(() => []);
-      const values = await Promise.all(
-        references
-          .filter((entry) => join(directory, entry) !== path)
-          .map((entry) => readFile(join(directory, entry), "utf8").catch(() => "")),
-      );
-      if (values.some((value) => value.trim() === previous)) return "retained";
-      if (!(await listPreparedImages()).includes(previous)) return "missing";
-      const result = await command(["tart", "delete", previous], { timeoutMs: 30_000 });
-      return result.exitCode === 0 ? "deleted" : "failed";
-    });
+    const cleanup = await withImageLock(
+      previous,
+      async () => {
+        const references = await readdir(directory).catch(() => []);
+        const values = await Promise.all(
+          references
+            .filter((entry) => join(directory, entry) !== path)
+            .map((entry) => readFile(join(directory, entry), "utf8").catch(() => "")),
+        );
+        if (values.some((value) => value.trim() === previous)) return "retained";
+        if (!(await listPreparedImages(signal)).includes(previous)) return "missing";
+        const result = await command(["tart", "delete", previous], { timeoutMs: 30_000 });
+        return result.exitCode === 0 ? "deleted" : "failed";
+      },
+      signal,
+    );
     if (cleanup === "failed") {
       await onMessage(`Could not delete superseded Tart image ${previous}; will retry later`);
       return;
@@ -256,17 +302,22 @@ async function activatePreparedImageLocked(
   else await rm(path, { force: true });
 }
 
-async function withPreparedImageReferencesLock<T>(callback: () => Promise<T>): Promise<T> {
-  return withImageLock("prepared-image-references", callback);
+async function withPreparedImageReferencesLock<T>(
+  callback: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  return withImageLock("prepared-image-references", callback, signal);
 }
 
 async function activatePreparedImage(
   repository: string | undefined,
   prepared: string | undefined,
   onMessage: (message: string) => Promise<void> | void,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await withPreparedImageReferencesLock(() =>
-    activatePreparedImageLocked(repository, prepared, onMessage),
+  await withPreparedImageReferencesLock(
+    () => activatePreparedImageLocked(repository, prepared, onMessage, signal),
+    signal,
   );
 }
 
@@ -283,72 +334,93 @@ export async function ensurePreparedImage(
   config: InformantConfig,
   onMessage: (message: string) => Promise<void> | void = console.log,
   repository?: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   const prepared = preparedImageName(config);
   if (!prepared) {
-    await activatePreparedImage(repository, undefined, onMessage);
+    await activatePreparedImage(repository, undefined, onMessage, signal);
     return config.vm.image;
   }
-  if ((await tartImages()).some((image) => image.Source === "local" && image.Name === prepared)) {
-    await activatePreparedImage(repository, prepared, onMessage);
+  if (
+    (await tartImages(signal)).some((image) => image.Source === "local" && image.Name === prepared)
+  ) {
+    await activatePreparedImage(repository, prepared, onMessage, signal);
     return prepared;
   }
 
   const image = await provisionVm(async () => {
-    if ((await tartImages()).some((image) => image.Source === "local" && image.Name === prepared)) {
+    if (
+      (await tartImages(signal)).some(
+        (image) => image.Source === "local" && image.Name === prepared,
+      )
+    ) {
       return prepared;
     }
     await onMessage(`Preparing Tart image ${prepared}`);
     const staging = `${prepared}-staging-${crypto.randomUUID().slice(0, 8)}`;
-    await requireCommand(["tart", "clone", config.vm.image, staging]);
     let process: ReturnType<typeof Bun.spawn> | undefined;
     try {
-      const ready = await startVm(staging, [], config, 30, async () => {
-        await onMessage("Waiting for an available Tart VM slot to prepare the image");
-      });
+      await requireCommand(["tart", "clone", config.vm.image, staging], undefined, { signal });
+      const ready = await startVm(
+        staging,
+        [],
+        config,
+        30,
+        async () => {
+          await onMessage("Waiting for an available Tart VM slot to prepare the image");
+        },
+        signal,
+      );
       process = ready.process;
       const result = await sshCommand(
         ready.ip,
         config,
         `/bin/bash -lc ${shellQuote(config.vm.prepare ?? "")}`,
         30 * 60_000,
+        { signal },
       );
       if (result.exitCode !== 0 || result.timedOut) {
         throw new Error(`image preparation failed: ${result.stdout}${result.stderr}`.trim());
       }
-      await sshCommand(ready.ip, config, "sudo shutdown -h now", 60_000);
-      await waitForCleanShutdown(staging);
+      await sshCommand(ready.ip, config, "sudo shutdown -h now", 60_000, { signal });
+      await waitForCleanShutdown(staging, signal);
       await stopVm(staging, process);
-      return withPreparedImageReferencesLock(() =>
-        withImageLock(prepared, async () => {
-          if (
-            (await tartImages()).some(
-              (image) => image.Source === "local" && image.Name === prepared,
-            )
-          ) {
-            await requireCommand(["tart", "delete", staging]);
-          } else {
-            await requireCommand(
-              ["tart", "rename", staging, prepared],
-              "could not publish prepared image",
-            );
-          }
-          await activatePreparedImageLocked(repository, prepared, onMessage);
-          return prepared;
-        }),
+      return withPreparedImageReferencesLock(
+        () =>
+          withImageLock(
+            prepared,
+            async () => {
+              if (
+                (await tartImages(signal)).some(
+                  (image) => image.Source === "local" && image.Name === prepared,
+                )
+              ) {
+                await requireCommand(["tart", "delete", staging]);
+              } else {
+                await requireCommand(
+                  ["tart", "rename", staging, prepared],
+                  "could not publish prepared image",
+                );
+              }
+              await activatePreparedImageLocked(repository, prepared, onMessage, signal);
+              return prepared;
+            },
+            signal,
+          ),
+        signal,
       );
     } catch (error) {
       if (process) await stopVm(staging, process);
       await command(["tart", "delete", staging], { timeoutMs: 30_000 });
       throw error;
     }
-  });
-  await activatePreparedImage(repository, image, onMessage);
+  }, signal);
+  await activatePreparedImage(repository, image, onMessage, signal);
   return image;
 }
 
-export async function listPreparedImages(): Promise<string[]> {
-  return (await tartImages())
+export async function listPreparedImages(signal?: AbortSignal): Promise<string[]> {
+  return (await tartImages(signal))
     .filter(
       (image) => image.Source === "local" && /^informant-prepared-[0-9a-f]{16}$/.test(image.Name),
     )
@@ -441,22 +513,25 @@ async function runJob(
   config: InformantConfig,
   job: InformantConfig["jobs"][number],
   log: (text: string) => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   let vmCreated = false;
   let tart: ReturnType<typeof Bun.spawn> | undefined;
 
   try {
+    signal?.throwIfAborted();
     const ready = await provisionVm(async () => {
+      signal?.throwIfAborted();
       await log(`\n━━ ${job.name} ━━\n$ tart clone ${image} ${vm}\n`);
-      const clone = () => requireCommand(["tart", "clone", image, vm]);
-      if (image.startsWith("informant-prepared-")) await withImageLock(image, clone);
-      else await clone();
       vmCreated = true;
+      const clone = () => requireCommand(["tart", "clone", image, vm], undefined, { signal });
+      if (image.startsWith("informant-prepared-")) await withImageLock(image, clone, signal);
+      else await clone();
       if (config.vm.cpu || config.vm.memoryMb) {
         const args = ["tart", "set", vm];
         if (config.vm.cpu) args.push("--cpu", String(config.vm.cpu));
         if (config.vm.memoryMb) args.push("--memory", String(config.vm.memoryMb));
-        await requireCommand(args);
+        await requireCommand(args, undefined, { signal });
       }
 
       const sharedWorkspace = await realpath(workspace);
@@ -469,10 +544,11 @@ async function runJob(
         async () => {
           await log(`[${job.name}] waiting for an available Tart VM slot\n`);
         },
+        signal,
       );
       tart = started.process;
       return { ip: started.ip, cacheRestore: caches.restore, cacheSave: caches.save };
-    });
+    }, signal);
     await log(`[${job.name}] $ ${job.command}\n`);
     const env = Object.entries(job.environment)
       .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
@@ -481,8 +557,11 @@ async function runJob(
     const jobCommand = ready.cacheRestore
       ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; ${ready.cacheSave}; informant_cache_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; exit $informant_cache_status`
       : execute;
-    const result = await sshCommand(ready.ip, config, jobCommand, job.timeoutMinutes * 60_000);
-    let output = `${result.stdout}${result.stderr}\n[${job.name}: exit ${result.exitCode}]\n`;
+    const result = await sshCommand(ready.ip, config, jobCommand, job.timeoutMinutes * 60_000, {
+      signal,
+      onOutput: log,
+    });
+    let output = `\n[${job.name}: exit ${result.exitCode}]\n`;
     if (result.timedOut) output += `[${job.name}: timed out after ${job.timeoutMinutes}m]\n`;
     await log(output);
     return result.exitCode === 0 && !result.timedOut;
@@ -497,10 +576,11 @@ async function runJob(
   }
 }
 
-export type JobOutcome = "success" | "failure" | "skipped";
+export type JobOutcome = "success" | "failure" | "skipped" | "cancelled";
 
 export interface JobExecutionObserver {
   started?: (job: InformantConfig["jobs"][number]) => Promise<void> | void;
+  progress?: (job: InformantConfig["jobs"][number], log: string) => Promise<void> | void;
   completed?: (
     job: InformantConfig["jobs"][number],
     result: { outcome: JobOutcome; log: string },
@@ -559,6 +639,7 @@ export async function runInTart(
   config: InformantConfig,
   record: BuildRecord,
   observer: JobExecutionObserver = {},
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
@@ -567,6 +648,7 @@ export async function runInTart(
   const logJob = async (job: InformantConfig["jobs"][number], text: string) => {
     jobLogs.set(job.name, utf8Tail(`${jobLogs.get(job.name) ?? ""}${text}`));
     await appendLog(record, text);
+    await notify(() => observer.progress?.(job, jobLogs.get(job.name) ?? ""));
   };
   const notify = async (callback: (() => Promise<void> | void) | undefined) => {
     if (!callback) return;
@@ -578,6 +660,7 @@ export async function runInTart(
   };
 
   try {
+    signal?.throwIfAborted();
     await mkdir(root, { recursive: true });
     await appendLog(record, `$ cloning ${repository.fullName} at ${sha}\n`);
     const image = await ensurePreparedImage(
@@ -586,15 +669,18 @@ export async function runInTart(
         await appendLog(record, `$ ${message}\n`);
       },
       repository.fullName,
+      signal,
     );
     await requireCommand(
       ["gh", "repo", "clone", repository.fullName, repositoryPath, "--", "--no-checkout"],
       `could not clone ${repository.fullName}`,
+      { signal },
     );
     for (const [index, workspace] of workspaces.entries()) {
       const checkout = await command(["git", "worktree", "add", "--detach", workspace, sha], {
         cwd: repositoryPath,
         timeoutMs: 60_000,
+        signal,
       });
       if (checkout.exitCode !== 0) {
         const job = config.jobs[index];
@@ -617,10 +703,12 @@ export async function runInTart(
           config,
           job,
           (text) => logJob(job, text),
+          signal,
         );
+        const outcome = signal?.aborted ? "cancelled" : success ? "success" : "failure";
         await notify(() =>
           observer.completed?.(job, {
-            outcome: success ? "success" : "failure",
+            outcome,
             log: jobLogs.get(job.name) ?? "",
           }),
         );
@@ -630,17 +718,20 @@ export async function runInTart(
         await logJob(job, `\n━━ ${job.name} ━━\n[skipped: dependency failed]\n`);
         await notify(() =>
           observer.completed?.(job, {
-            outcome: "skipped",
+            outcome: signal?.aborted ? "cancelled" : "skipped",
             log: jobLogs.get(job.name) ?? "",
           }),
         );
       },
       async (job, error) => {
         const message = error instanceof Error ? error.message : String(error);
-        await logJob(job, `\n[${job.name}: ${message}]\n`);
+        await logJob(
+          job,
+          signal?.aborted ? `\n[${job.name}: cancelled]\n` : `\n[${job.name}: ${message}]\n`,
+        );
         await notify(() =>
           observer.completed?.(job, {
-            outcome: "failure",
+            outcome: signal?.aborted ? "cancelled" : "failure",
             log: jobLogs.get(job.name) ?? "",
           }),
         );

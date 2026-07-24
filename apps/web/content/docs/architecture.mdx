@@ -22,7 +22,9 @@ system.
 The elected `Informant CI` check remains the build-level claim and summary. Informant creates a
 separate `Informant / <job>` check for every selected job. Each job check moves from queued to running
 to its own conclusion and contains only that job's log, so parallel output is never interleaved in the
-GitHub UI. Jobs skipped because a dependency failed receive a `skipped` conclusion.
+GitHub UI. While a job runs, Informant updates its check with a rolling log tail about every 10 seconds.
+Updates are coalesced to avoid an API request per output chunk, and the complete retained log remains
+available from the CLI. Jobs skipped because a dependency failed receive a `skipped` conclusion.
 
 Because the Checks API does not offer compare-and-swap, this election is best-effort rather than a
 strict distributed lock. Checks are fetched with `filter=all` and scoped to the configured GitHub App;
@@ -33,6 +35,12 @@ the same SHA elect independently. Comment runs use the distinct `Informant CI / 
 
 Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
 already has an older completed result.
+
+Automatic builds are grouped into branch and pull-request lanes. When polling observes a new SHA in a
+lane, the worker that owns the previous SHA aborts its commands, cleans up its Tart VMs, and concludes
+its checks as cancelled. Every machine polls the same registered repository heads, so this cancellation
+does not depend on the machine that claims the replacement build. Manual and comment-triggered runs are
+not part of an automatic lane and are never superseded by a push.
 
 GitHub UI re-runs use the same path. Clicking **Re-run** resets Informant's Check Suite to queued.
 Workers observe that state through the Checks API, elect one claimant, and create a fresh Check Run.

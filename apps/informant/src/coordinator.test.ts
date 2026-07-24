@@ -42,6 +42,7 @@ function harness(
     id: number;
     name: string;
     status: "queued" | "in_progress" | "completed";
+    conclusion?: string;
   }> = [];
   const saved: BuildRecord[] = [];
   const aggregateCheck: {
@@ -88,6 +89,7 @@ function harness(
       const jobCheck = remoteChecks.find((item) => item.id === id);
       if (jobCheck && values.status) {
         jobCheck.status = values.status as "queued" | "in_progress" | "completed";
+        if (values.conclusion) jobCheck.conclusion = String(values.conclusion);
       }
       if (id === aggregateCheck.id && values.status === "completed") {
         aggregateCheck.status = "completed";
@@ -305,5 +307,201 @@ describe("runCommit", () => {
         (update) => update.id === 101 && update.values.conclusion === "cancelled",
       ),
     ).toBeDefined();
+  });
+
+  test("publishes job output while the job is running", async () => {
+    const context = harness();
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const [job] = selectedConfig.jobs;
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      await observer?.progress?.(job, "live output");
+      await Bun.sleep(5);
+      await observer?.completed?.(job, { outcome: "success", log: "final output" });
+      return true;
+    };
+
+    await runCommit(context.github, repository, "sha", "main", config, context.dependencies);
+
+    const progress = context.updates.find(
+      (update) => update.id === 100 && update.values.status === undefined && update.values.text,
+    );
+    expect(progress?.values).toMatchObject({
+      title: "test is running",
+      text: "```text\nlive output\n```",
+    });
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values.text,
+    ).toBe("```text\nfinal output\n```");
+  });
+
+  test("coalesces progress while a GitHub update is in flight", async () => {
+    const context = harness();
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    let release!: () => void;
+    let started!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const progressStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 100 && values.status === undefined && values.text) {
+        started();
+        await blocked;
+      }
+      return updateCheck(target, id, values);
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const [job] = selectedConfig.jobs;
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      await observer?.progress?.(job, "first");
+      await progressStarted;
+      await observer?.progress?.(job, "second");
+      await observer?.progress?.(job, "third");
+      release();
+      await Bun.sleep(5);
+      await observer?.completed?.(job, { outcome: "success", log: "final" });
+      return true;
+    };
+
+    await runCommit(context.github, repository, "sha", "main", config, context.dependencies);
+
+    const progress = context.updates.filter(
+      (update) => update.id === 100 && update.values.status === undefined && update.values.text,
+    );
+    expect(progress).toHaveLength(1);
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values.text,
+    ).toBe("```text\nfinal\n```");
+  });
+
+  test("cancels an automatic build when its signal is aborted", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    const automaticConfig = { ...config, triggers: [{ event: "commit" as const }] };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+      signal,
+    ) => {
+      const [job] = selectedConfig.jobs;
+      if (!job || !signal) throw new Error("expected an abortable job");
+      await observer?.started?.(job);
+      controller.abort("Superseded by main@new-sha.");
+      await observer?.completed?.(job, { outcome: "cancelled", log: "cancelled output" });
+      return false;
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "old-sha",
+      "main",
+      automaticConfig,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:old-sha" },
+      controller.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(context.saved.at(-1)?.status).toBe("cancelled");
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "cancelled", summary: "Superseded by main@new-sha." });
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      summary: "Superseded by main@new-sha.",
+    });
+  });
+
+  test("replaces a raced successful job conclusion when cancelling", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    const automaticConfig = { ...config, triggers: [{ event: "commit" as const }] };
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    let cancellationAttempts = 0;
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 100 && values.conclusion === "cancelled" && cancellationAttempts++ === 0) {
+        throw new Error("temporary update failure");
+      }
+      return updateCheck(target, id, values);
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const [job] = selectedConfig.jobs;
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      await observer?.completed?.(job, { outcome: "success", log: "finished" });
+      controller.abort("Superseded by main@new-sha.");
+      return true;
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "old-sha",
+      "main",
+      automaticConfig,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:old-sha" },
+      controller.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(cancellationAttempts).toBe(2);
+    expect(
+      context.updates.find(
+        (update) => update.id === 100 && update.values.conclusion === "cancelled",
+      ),
+    ).toBeDefined();
+  });
+
+  test("does not cancel a manually requested build", async () => {
+    const context = harness({ manualRequest: true });
+    const controller = new AbortController();
+    controller.abort("superseded");
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+      controller.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("success");
+    expect(record.event?.type).toBe("manual");
   });
 });

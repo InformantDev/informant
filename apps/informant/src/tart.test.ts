@@ -97,6 +97,51 @@ fi
   }
 });
 
+test("cancelling image preparation deletes its staging VM", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-cancel-image-"));
+  const bin = join(root, "bin");
+  const tart = join(bin, "tart");
+  const started = join(root, "started");
+  const deleted = join(root, "deleted");
+  await mkdir(bin);
+  await Bun.write(
+    tart,
+    `#!/bin/sh
+if [ "$1" = "list" ]; then
+  printf '[]\\n'
+elif [ "$1" = "clone" ]; then
+  touch '${started}'
+  sleep 30
+elif [ "$1" = "delete" ]; then
+  printf '%s\\n' "$2" >> '${deleted}'
+fi
+`,
+  );
+  await chmod(tart, 0o755);
+  const originalPath = Bun.env.PATH;
+  Bun.env.PATH = `${bin}:${originalPath}`;
+  const controller = new AbortController();
+  try {
+    const preparation = ensurePreparedImage(
+      config("install bun"),
+      () => {},
+      undefined,
+      controller.signal,
+    );
+    while (!(await Bun.file(started).exists())) await Bun.sleep(10);
+    controller.abort(new Error("superseded"));
+
+    await expect(preparation).rejects.toThrow("superseded");
+    expect((await Bun.file(deleted).text()).trim()).toMatch(
+      /^informant-prepared-[0-9a-f]{16}-staging-/,
+    );
+  } finally {
+    if (originalPath === undefined) delete Bun.env.PATH;
+    else Bun.env.PATH = originalPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cache destinations have distinct storage identities", () => {
   expect(cachePathIdentity("admin", "~/.bun/install/cache")).not.toBe(
     cachePathIdentity("admin", "~/.npm"),

@@ -18,6 +18,7 @@ export interface CoordinatorDependencies {
 
 const CHECK_LOG_CHARACTERS = 55_000;
 const CHECK_LOG_BYTES = CHECK_LOG_CHARACTERS * 4;
+const CHECK_LOG_UPDATE_INTERVAL_MS = 10_000;
 
 export async function readLogTail(path: string): Promise<string> {
   const file = Bun.file(path);
@@ -46,6 +47,7 @@ export async function runCommit(
   config: InformantConfig,
   dependencies: CoordinatorDependencies = defaultDependencies,
   event?: RunEvent,
+  signal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
@@ -58,6 +60,7 @@ export async function runCommit(
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;
   const { check } = claim;
+  const executionSignal = claim.manualRequest ? undefined : signal;
   config = claim.manualRequest
     ? selectJobs(config, claim.requestedJobs)
     : event && event.type !== "manual"
@@ -79,6 +82,10 @@ export async function runCommit(
     job: JobConfig;
     desired?: CheckUpdate;
     terminal: boolean;
+    progressLog?: string;
+    progressTimer?: ReturnType<typeof setTimeout>;
+    progressInFlight?: Promise<void>;
+    lastProgressAt: number;
   }
   const jobChecks = new Map<string, JobCheckState>();
 
@@ -102,7 +109,9 @@ export async function runCommit(
     status: "completed",
     conclusion: "cancelled",
     title: `${name} cancelled`,
-    summary: "The build stopped before this job completed.",
+    summary: executionSignal?.aborted
+      ? String(executionSignal.reason || "Superseded by a newer commit.")
+      : "The build stopped before this job completed.",
   });
   const completedValues = (job: JobConfig, outcome: JobOutcome, log: string): CheckUpdate => ({
     status: "completed",
@@ -112,13 +121,23 @@ export async function runCommit(
         ? `${job.name} passed`
         : outcome === "failure"
           ? `${job.name} failed`
-          : `${job.name} skipped`,
+          : outcome === "cancelled"
+            ? `${job.name} cancelled`
+            : `${job.name} skipped`,
     summary:
-      outcome === "skipped" ? "Skipped because a dependency failed." : `Ran on ${record.machine}.`,
+      outcome === "skipped"
+        ? "Skipped because a dependency failed."
+        : outcome === "cancelled"
+          ? String(executionSignal?.reason || "The build was cancelled.")
+          : `Ran on ${record.machine}.`,
     text: log ? `\`\`\`text\n${log}\n\`\`\`` : undefined,
   });
   const updateJob = async (state: JobCheckState, values: CheckUpdate, terminal = false) => {
-    if (terminal) state.desired = values;
+    if (terminal) {
+      state.desired = values;
+      if (state.progressTimer) clearTimeout(state.progressTimer);
+      await state.progressInFlight;
+    }
     try {
       await github.updateCheck(repository, state.check.id, values);
       if (terminal) state.terminal = true;
@@ -126,9 +145,36 @@ export async function runCommit(
       // Reconciled after execution; reporting must not alter dependency results.
     }
   };
+  const publishProgress = (state: JobCheckState) => {
+    if (state.desired || state.progressInFlight || !state.progressLog) return;
+    state.lastProgressAt = Date.now();
+    const log = state.progressLog;
+    const pending = updateJob(state, {
+      title: `${state.job.name} is running`,
+      summary: `Running on ${record.machine}. Logs update about every 10 seconds.`,
+      text: `\`\`\`text\n${log}\n\`\`\``,
+    }).finally(() => {
+      if (state.progressInFlight !== pending) return;
+      state.progressInFlight = undefined;
+      if (!state.desired && state.progressLog !== log)
+        queueProgress(state, state.progressLog ?? "");
+    });
+    state.progressInFlight = pending;
+  };
+  const queueProgress = (state: JobCheckState, log: string) => {
+    state.progressLog = log;
+    if (state.desired || state.progressTimer) return;
+    const delay = Math.max(0, CHECK_LOG_UPDATE_INTERVAL_MS - (Date.now() - state.lastProgressAt));
+    state.progressTimer = setTimeout(() => {
+      state.progressTimer = undefined;
+      publishProgress(state);
+    }, delay);
+  };
   const reconcileJobChecks = async () => {
     for (const state of jobChecks.values()) {
       state.desired ??= cancelledValues(state.job.name);
+      if (state.progressTimer) clearTimeout(state.progressTimer);
+      await state.progressInFlight;
       if (!state.terminal) {
         try {
           await github.updateCheck(repository, state.check.id, state.desired);
@@ -143,7 +189,10 @@ export async function runCommit(
     const localById = new Map([...jobChecks.values()].map((state) => [state.check.id, state]));
     for (const remote of remoteChecks) {
       const state = localById.get(remote.id);
-      if (remote.status === "completed") {
+      if (
+        remote.status === "completed" &&
+        (!state || remote.conclusion === state.desired?.conclusion)
+      ) {
         if (state) state.terminal = true;
         continue;
       }
@@ -188,29 +237,80 @@ export async function runCommit(
     try {
       for (const job of config.jobs) {
         const jobCheck = await github.createJobCheck(repository, sha, check.id, job.name);
-        jobChecks.set(job.name, { check: jobCheck, job, terminal: false });
+        jobChecks.set(job.name, {
+          check: jobCheck,
+          job,
+          terminal: false,
+          lastProgressAt: 0,
+        });
       }
 
-      success = await dependencies.runInTart(repository, sha, config, record, {
-        started: async (job) => {
-          const state = jobChecks.get(job.name);
-          if (!state) return;
-          await updateJob(state, {
-            status: "in_progress",
-            title: `${job.name} is running`,
-            summary: `Running on ${record.machine}.`,
-          });
+      success = await dependencies.runInTart(
+        repository,
+        sha,
+        config,
+        record,
+        {
+          started: async (job) => {
+            const state = jobChecks.get(job.name);
+            if (!state) return;
+            await updateJob(state, {
+              status: "in_progress",
+              title: `${job.name} is running`,
+              summary: `Running on ${record.machine}.`,
+            });
+          },
+          progress: (job, log) => {
+            const state = jobChecks.get(job.name);
+            if (state) queueProgress(state, log);
+          },
+          completed: async (job, result) => {
+            const state = jobChecks.get(job.name);
+            if (!state) return;
+            await updateJob(state, completedValues(job, result.outcome, result.log), true);
+          },
         },
-        completed: async (job, result) => {
-          const state = jobChecks.get(job.name);
-          if (!state) return;
-          await updateJob(state, completedValues(job, result.outcome, result.log), true);
-        },
-      });
+        executionSignal,
+      );
     } catch (error) {
       executionError = error;
     }
 
+    if (executionSignal?.aborted) {
+      record.status = "cancelled";
+      record.completedAt = new Date().toISOString();
+      executionFinished = true;
+      await dependencies.saveBuild(record);
+      for (const state of jobChecks.values()) {
+        state.desired = cancelledValues(state.job.name);
+        state.terminal = false;
+      }
+      let childError: unknown;
+      try {
+        await reconcileJobChecks().catch(() => reconcileJobChecks());
+        childrenReconciled = true;
+      } catch (error) {
+        childError = error;
+      }
+      let aggregateError: unknown;
+      try {
+        await completeAggregate({
+          status: "completed",
+          conclusion: "cancelled",
+          title: "Superseded by a newer commit",
+          summary: String(executionSignal.reason || "This build was cancelled."),
+        });
+      } catch (error) {
+        aggregateError = error;
+      }
+      if (childError || aggregateError) {
+        throw new AggregateError(
+          [childError, aggregateError].filter((error) => error instanceof Error),
+          "The build was cancelled, but one or more GitHub checks could not be updated.",
+        );
+      }
+      return record;
+    }
     await reconcileJobChecks().catch(() => reconcileJobChecks());
     childrenReconciled = true;
     if (executionError) throw executionError;
