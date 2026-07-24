@@ -1,8 +1,8 @@
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { dataDirectory } from "./store.ts";
-import { digest, shellQuote } from "./tart-vm.ts";
-import type { InformantConfig, Repository } from "./types.ts";
+import { dataDirectory } from "../store.ts";
+import type { InformantConfig, Repository } from "../types.ts";
+import { digest, shellQuote } from "./vm.ts";
 
 export function cachePathIdentity(user: string, path: string): string {
   return digest(`${user}\0${path}`).slice(0, 16);

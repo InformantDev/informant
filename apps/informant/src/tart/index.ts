@@ -1,20 +1,20 @@
 import { mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { command, requireCommand } from "./process.ts";
-import { appendLog } from "./store.ts";
-import { cacheMounts } from "./tart-cache.ts";
-import { ensurePreparedImage } from "./tart-images.ts";
-import { provisionVm, shellQuote, sshCommand, startVm, stopVm, withImageLock } from "./tart-vm.ts";
-import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
+import { command, requireCommand } from "../process.ts";
+import { appendLog } from "../store.ts";
+import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
+import { cacheMounts } from "./cache.ts";
+import { ensurePreparedImage } from "./images.ts";
+import { provisionVm, shellQuote, sshCommand, startVm, stopVm, withImageLock } from "./vm.ts";
 
-export { cachePathIdentity } from "./tart-cache.ts";
+export { cachePathIdentity } from "./cache.ts";
 export {
   ensurePreparedImage,
   listPreparedImages,
   preparedImageName,
   prunePreparedImages,
-} from "./tart-images.ts";
-export { isRetryableSshAuthenticationFailure } from "./tart-vm.ts";
+} from "./images.ts";
+export { isRetryableSshAuthenticationFailure } from "./vm.ts";
 
 async function runJob(
   vm: string,

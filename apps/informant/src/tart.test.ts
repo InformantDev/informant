@@ -11,7 +11,7 @@ import {
   prunePreparedImages,
   scheduleJobs,
   utf8Tail,
-} from "./tart.ts";
+} from "./tart/index.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({

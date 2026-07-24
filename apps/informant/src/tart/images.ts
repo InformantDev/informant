@@ -1,7 +1,8 @@
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { command, requireCommand } from "./process.ts";
-import { dataDirectory } from "./store.ts";
+import { command, requireCommand } from "../process.ts";
+import { dataDirectory } from "../store.ts";
+import type { InformantConfig } from "../types.ts";
 import {
   digest,
   provisionVm,
@@ -12,8 +13,7 @@ import {
   tartImages,
   waitForCleanShutdown,
   withImageLock,
-} from "./tart-vm.ts";
-import type { InformantConfig } from "./types.ts";
+} from "./vm.ts";
 
 export function preparedImageName(config: InformantConfig): string | undefined {
   return config.vm.prepare

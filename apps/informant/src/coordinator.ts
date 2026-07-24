@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { selectJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, dataDirectory, saveBuild } from "./store.ts";
-import { type JobOutcome, runInTart } from "./tart.ts";
+import { type JobOutcome, runInTart } from "./tart/index.ts";
 import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, CheckRun, InformantConfig, JobConfig, Repository } from "./types.ts";
 

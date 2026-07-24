@@ -29,7 +29,7 @@ import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup } from "./startup.ts";
 import { dataDirectory, getBuild, listBuilds } from "./store.ts";
-import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart.ts";
+import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Macs
 

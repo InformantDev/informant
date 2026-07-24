@@ -1,8 +1,8 @@
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { command, requireCommand } from "./process.ts";
-import { dataDirectory } from "./store.ts";
-import type { InformantConfig } from "./types.ts";
+import { command, requireCommand } from "../process.ts";
+import { dataDirectory } from "../store.ts";
+import type { InformantConfig } from "../types.ts";
 
 let vmProvisioning = Promise.resolve();
 
