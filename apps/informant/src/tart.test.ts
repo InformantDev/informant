@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   cachePathIdentity,
+  ensurePreparedImage,
   isRetryableSshAuthenticationFailure,
   preparedImageName,
+  prunePreparedImages,
   scheduleJobs,
   utf8Tail,
 } from "./tart.ts";
@@ -41,6 +46,55 @@ test("prepared image identity changes with its source or preparation", () => {
       vm: { ...config().vm, user: "builder", prepare: "install bun" },
     }),
   ).not.toBe(first);
+});
+
+test("superseded prepared images are deleted after their last repository switches", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-images-"));
+  const bin = join(root, "bin");
+  const tart = join(bin, "tart");
+  const deleted = join(root, "deleted");
+  const firstConfig = config("install bun");
+  const secondConfig = config("install node");
+  const first = preparedImageName(firstConfig);
+  const second = preparedImageName(secondConfig);
+  if (!first || !second) throw new Error("expected prepared image names");
+  await mkdir(bin);
+  await Bun.write(
+    tart,
+    `#!/bin/sh
+if [ "$1" = "list" ]; then
+  printf '%s\\n' '${JSON.stringify([
+    { Name: first, Source: "local" },
+    { Name: second, Source: "local" },
+  ])}'
+elif [ "$1" = "delete" ]; then
+  printf '%s\\n' "$2" >> '${deleted}'
+fi
+`,
+  );
+  await chmod(tart, 0o755);
+  const originalPath = Bun.env.PATH;
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.PATH = `${bin}:${originalPath}`;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  try {
+    await ensurePreparedImage(firstConfig, () => {}, "owner/one");
+    await ensurePreparedImage(firstConfig, () => {}, "owner/two");
+    await ensurePreparedImage(secondConfig, () => {}, "owner/one");
+    expect(await Bun.file(deleted).exists()).toBe(false);
+
+    await ensurePreparedImage(secondConfig, () => {}, "owner/two");
+    expect((await Bun.file(deleted).text()).trim()).toBe(first);
+
+    expect(await prunePreparedImages()).toBe(1);
+    expect((await Bun.file(deleted).text()).trim().split("\n")).toEqual([first, first]);
+  } finally {
+    if (originalPath === undefined) delete Bun.env.PATH;
+    else Bun.env.PATH = originalPath;
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("cache destinations have distinct storage identities", () => {

@@ -3,11 +3,15 @@ title: TOML configuration
 description: GitHub Actions-like jobs without YAML.
 ---
 
-Informant reads `.informant.toml` from the commit it is about to run.
+Informant reads shared defaults from `.informant/config.toml` and loads every `.toml` file in
+`.informant/jobs/` from the commit it is about to run. One job per file keeps larger pipelines easy to
+navigate and review.
+
+`.informant/config.toml`:
 
 ```toml
 version = 1
-poll_interval_seconds = 20
+timeout_minutes = 30
 triggers = [
   { event = "commit", branch = { names = ["main", "release"] } },
   { event = "comment", pull_request = { state = "open", draft = false, base_branches = ["main"] } }
@@ -19,30 +23,57 @@ user = "admin"
 password = "admin"
 cpu = 4
 memory_mb = 8192
-prepare = "curl -fsSL https://bun.sh/install | bash && sudo mkdir -p /usr/local/bin && sudo ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun"
+prepare = """
+set -euo pipefail
+curl -fsSL https://bun.sh/install | bash
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
+"""
+```
 
-[[jobs]]
+Informant polls every 30 seconds by default. Set `poll_interval_seconds` only when a repository needs
+a different cadence; values below five seconds are clamped to five.
+
+`.informant/jobs/test.toml`:
+
+```toml
 name = "test"
-command = "bun install --frozen-lockfile && bun test"
-timeout_minutes = 30
+command = """
+set -euo pipefail
+bun install --frozen-lockfile
+bun test
+"""
 environment = { CI = "true" }
 cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
+```
 
-[[jobs]]
+`.informant/jobs/lint.toml`:
+
+```toml
 name = "lint"
-command = "bun run check"
+command = """
+bun run check
+"""
 timeout_minutes = 10
 triggers = [
   { event = "commit", pull_request = { state = "open", draft = false } },
   { event = "comment", pull_request = { state = "open" } }
 ]
+```
 
-[[jobs]]
+`.informant/jobs/build.toml`:
+
+```toml
 name = "build"
-command = "bun run build"
+command = """
+bun run build
+"""
 timeout_minutes = 20
 needs = ["test", "lint"]
 ```
+
+Top-level `timeout_minutes` is inherited by every job. Set `timeout_minutes` on an individual job only
+when it needs a different limit.
 
 Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh Tart VM and isolated
 checkout mounted at `/Volumes/My Shared Files/workspace`. Use `needs` to make a job wait for one or
@@ -73,8 +104,9 @@ stopped result as a local Tart image and clones jobs from it, so tools such as B
 installed in every job. Changing `vm.image`, `vm.user`, or `vm.prepare` creates a new prepared image.
 
 Preparation is automatic. Use `informant image prepare` to warm the image ahead of a build,
-`informant image list` to inspect prepared images, and `informant image prune` to remove them. Every
-worker prepares its own local copy, which keeps multi-machine setup automatic.
+`informant image list` to inspect prepared images, and `informant image prune` to remove images that
+no repository still references. Every worker prepares its own local copy, which keeps multi-machine
+setup automatic.
 
 ## Persistent job caches
 

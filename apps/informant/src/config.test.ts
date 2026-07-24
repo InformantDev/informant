@@ -1,13 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { configTemplate, parseConfig, parseRepository, selectJobs } from "./config.ts";
+import {
+  directoryConfigTemplate,
+  jobTemplate,
+  parseConfig,
+  parseConfigFiles,
+  parseRepository,
+  selectJobs,
+} from "./config.ts";
+
+const configTemplate = () => `${directoryConfigTemplate()}
+[[jobs]]
+name = "test"
+command = "bun install --frozen-lockfile && bun test"
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
+`;
 
 describe("configuration", () => {
   test("parses the generated template", () => {
     const config = parseConfig(configTemplate());
+    expect(directoryConfigTemplate()).not.toContain("poll_interval_seconds");
+    expect(config.pollIntervalSeconds).toBe(30);
     expect(config.vm).toMatchObject({
       user: "admin",
       prepare:
-        "curl -fsSL https://bun.sh/install | bash && sudo mkdir -p /usr/local/bin && sudo ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun",
+        'set -euo pipefail\ncurl -fsSL https://bun.sh/install | bash\nsudo mkdir -p /usr/local/bin\nsudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun',
     });
     expect(config.jobs).toEqual([
       {
@@ -20,6 +36,20 @@ describe("configuration", () => {
         cache: [{ paths: ["~/.bun/install/cache"], keyFiles: ["bun.lock"] }],
       },
     ]);
+  });
+
+  test("combines directory defaults with independently parsed job files", () => {
+    const config = parseConfigFiles(directoryConfigTemplate(), [
+      { path: ".informant/jobs/test.toml", source: jobTemplate() },
+      {
+        path: ".informant/jobs/build.toml",
+        source: 'name = "build"\ncommand = "bun run build"\nneeds = ["test"]',
+      },
+    ]);
+    expect(config.jobs.map((job) => job.name)).toEqual(["test", "build"]);
+    expect(config.jobs[0]?.command).toBe("bun install --frozen-lockfile && bun test");
+    expect(config.jobs[1]?.needs).toEqual(["test"]);
+    expect(config.jobs.every((job) => job.timeoutMinutes === 30)).toBe(true);
   });
 
   test("parses GitHub repository forms", () => {
@@ -101,15 +131,33 @@ describe("configuration", () => {
   });
 
   test("requires a non-empty VM preparation command", () => {
-    expect(() => parseConfig(configTemplate().replace(/prepare = .+/, 'prepare = ""'))).toThrow(
-      "vm.prepare must be a non-empty string",
-    );
+    expect(() =>
+      parseConfig(configTemplate().replace(/prepare = """[\s\S]*?"""/, 'prepare = ""')),
+    ).toThrow("vm.prepare must be a non-empty string");
+  });
+
+  test("jobs inherit and can override the top-level timeout", () => {
+    expect(
+      parseConfig(configTemplate().replace("timeout_minutes = 30", "timeout_minutes = 12")).jobs[0]
+        ?.timeoutMinutes,
+    ).toBe(12);
+    expect(
+      parseConfig(
+        configTemplate().replace(
+          'command = "bun install --frozen-lockfile && bun test"',
+          'command = "bun install --frozen-lockfile && bun test"\ntimeout_minutes = 5',
+        ),
+      ).jobs[0]?.timeoutMinutes,
+    ).toBe(5);
+    expect(() =>
+      parseConfig(configTemplate().replace("timeout_minutes = 30", "timeout_minutes = 0")),
+    ).toThrow("timeout_minutes must be a positive number");
   });
 
   test("requires job environment to contain scalar values", () => {
     const withEnvironment = configTemplate().replace(
-      "timeout_minutes = 30",
-      'timeout_minutes = 30\nenvironment = { TEXT = "value", COUNT = 2, ENABLED = true }',
+      'command = "bun install --frozen-lockfile && bun test"',
+      'command = "bun install --frozen-lockfile && bun test"\nenvironment = { TEXT = "value", COUNT = 2, ENABLED = true }',
     );
     expect(parseConfig(withEnvironment).jobs[0]?.environment).toEqual({
       TEXT: "value",
@@ -124,8 +172,8 @@ describe("configuration", () => {
     expect(() =>
       parseConfig(
         configTemplate().replace(
-          "timeout_minutes = 30",
-          'timeout_minutes = 30\nenvironment = { NESTED = { VALUE = "bad" } }',
+          'command = "bun install --frozen-lockfile && bun test"',
+          'command = "bun install --frozen-lockfile && bun test"\nenvironment = { NESTED = { VALUE = "bad" } }',
         ),
       ),
     ).toThrow("environment must be a table of scalar values");
@@ -135,16 +183,16 @@ describe("configuration", () => {
     expect(() =>
       parseConfig(
         configTemplate().replace(
-          "timeout_minutes = 30",
-          'timeout_minutes = 30\nenvironment = { "BAD KEY" = "value" }',
+          'command = "bun install --frozen-lockfile && bun test"',
+          'command = "bun install --frozen-lockfile && bun test"\nenvironment = { "BAD KEY" = "value" }',
         ),
       ),
     ).toThrow('environment key "BAD KEY" is not a shell variable');
     expect(() =>
       parseConfig(
         configTemplate().replace(
-          "timeout_minutes = 30",
-          'timeout_minutes = 30\nenvironment = { "$(touch /tmp/bad)" = "value" }',
+          'command = "bun install --frozen-lockfile && bun test"',
+          'command = "bun install --frozen-lockfile && bun test"\nenvironment = { "$(touch /tmp/bad)" = "value" }',
         ),
       ),
     ).toThrow("is not a shell variable");

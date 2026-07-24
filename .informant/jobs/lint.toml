@@ -1,0 +1,9 @@
+name = "lint"
+command = """
+set -euo pipefail
+bun install --frozen-lockfile
+bun run check
+"""
+timeout_minutes = 15
+environment = { CI = "true" }
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]

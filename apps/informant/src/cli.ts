@@ -1,14 +1,16 @@
 #!/usr/bin/env bun
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { cancel, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import Table from "cli-table3";
 import packageJson from "../package.json" with { type: "json" };
 import {
   CONFIG_FILE,
-  configTemplate,
-  parseConfig,
+  directoryConfigTemplate,
+  JOBS_DIRECTORY,
+  jobTemplate,
+  parseConfigFiles,
   parseRepository,
   readConfig,
   selectJobs,
@@ -33,7 +35,7 @@ const HELP = `Informant ${packageJson.version} — background CI on your Macs
 
 Usage:
   informant setup                        Add a private GitHub App for an account
-  informant init                         Create .informant.toml and register origin
+  informant init                         Create .informant/ and register origin
   informant repo add [owner/repo]         Register a repository on this machine
   informant repo list                     List registered repositories
   informant repo remove [owner/repo]      Stop handling a repository
@@ -42,7 +44,7 @@ Usage:
                                         Manually request all or selected jobs
   informant image prepare                Prepare this repository's cached VM image
   informant image list                   List Informant-prepared VM images
-  informant image prune                  Delete Informant-prepared VM images
+  informant image prune                  Delete unused prepared VM images
   informant cache path                   Print the persistent job cache directory
   informant cache prune                  Delete all persistent job caches
   informant startup enable               Start the worker now and at login
@@ -109,7 +111,7 @@ async function repositoryFromGit(): Promise<ReturnType<typeof parseRepository>> 
 
 async function init(): Promise<void> {
   const path = resolve(CONFIG_FILE);
-  if (existsSync(path)) throw new Error(`${CONFIG_FILE} already exists`);
+  if (existsSync(path)) throw new Error("Informant configuration already exists");
   const repository = await repositoryFromGit();
   intro("Informant setup");
   let jobs = "bun install --frozen-lockfile && bun test";
@@ -125,9 +127,11 @@ async function init(): Promise<void> {
     }
     jobs = commandValue;
   }
+  await mkdir(resolve(JOBS_DIRECTORY), { recursive: true });
+  await Bun.write(path, directoryConfigTemplate());
   await Bun.write(
-    path,
-    configTemplate().replace("bun install --frozen-lockfile && bun test", jobs),
+    resolve(JOBS_DIRECTORY, "test.toml"),
+    jobTemplate().replace("bun install --frozen-lockfile && bun test", jobs),
   );
   const added = await addRepository(repository);
   outro(
@@ -135,6 +139,29 @@ async function init(): Promise<void> {
       ? `Created ${path} and registered ${repository.fullName}`
       : `Created ${path}; ${repository.fullName} was already registered`,
   );
+}
+
+async function configAtGitRef(sha: string) {
+  const current = await command(["git", "show", `${sha}:${CONFIG_FILE}`]);
+  if (current.exitCode === 0) {
+    const entries = (
+      await requireCommand(["git", "ls-tree", "-r", "--name-only", sha, "--", JOBS_DIRECTORY])
+    )
+      .split("\n")
+      .filter((entry) => entry.endsWith(".toml"))
+      .sort();
+    return parseConfigFiles(
+      current.stdout,
+      await Promise.all(
+        entries.map(async (path) => ({
+          path,
+          source: await requireCommand(["git", "show", `${sha}:${path}`]),
+        })),
+      ),
+      `${CONFIG_FILE}@${sha.slice(0, 7)}`,
+    );
+  }
+  throw new Error(`could not find ${CONFIG_FILE} at ${sha.slice(0, 7)}`);
 }
 
 async function manualRun(
@@ -148,10 +175,7 @@ async function manualRun(
   const branch = await command(["git", "branch", "--show-current"]);
   const github = new GitHubClient({ repository });
   if (waitForGitHub) await github.waitForCommit(repository, sha);
-  const config = parseConfig(
-    await requireCommand(["git", "show", `${sha}:${CONFIG_FILE}`]),
-    `${CONFIG_FILE}@${sha.slice(0, 7)}`,
-  );
+  const config = await configAtGitRef(sha);
   selectJobs(config, jobs);
   await github.createCheck(repository, sha, `manual:${crypto.randomUUID()}`, "queued", jobs);
   const progress = spinner();
@@ -191,7 +215,8 @@ async function showBuilds(): Promise<void> {
 
 async function manageImages(action?: string): Promise<void> {
   if (action === "prepare") {
-    const image = await ensurePreparedImage(await readConfig());
+    const repository = await repositoryFromGit();
+    const image = await ensurePreparedImage(await readConfig(), console.log, repository.fullName);
     outro(`Prepared ${image}`);
     return;
   }
@@ -202,7 +227,7 @@ async function manageImages(action?: string): Promise<void> {
   }
   if (action === "prune") {
     const count = await prunePreparedImages();
-    outro(`Deleted ${count} prepared ${count === 1 ? "image" : "images"}`);
+    outro(`Deleted ${count} unused prepared ${count === 1 ? "image" : "images"}`);
     return;
   }
   throw new Error("image action must be one of: prepare, list, prune");

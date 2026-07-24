@@ -1,4 +1,4 @@
-import { mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { command, requireCommand } from "./process.ts";
 import { appendLog, dataDirectory } from "./store.ts";
@@ -220,17 +220,81 @@ export function preparedImageName(config: InformantConfig): string | undefined {
     : undefined;
 }
 
+async function activatePreparedImageLocked(
+  repository: string | undefined,
+  prepared: string | undefined,
+  onMessage: (message: string) => Promise<void> | void,
+): Promise<void> {
+  if (!repository) return;
+  const directory = join(dataDirectory(), "prepared-image-references");
+  const path = join(directory, digest(repository));
+  const previous = (await readFile(path, "utf8").catch(() => "")).trim() || undefined;
+  if (previous === prepared) return;
+
+  if (previous) {
+    const cleanup = await withImageLock(previous, async () => {
+      const references = await readdir(directory).catch(() => []);
+      const values = await Promise.all(
+        references
+          .filter((entry) => join(directory, entry) !== path)
+          .map((entry) => readFile(join(directory, entry), "utf8").catch(() => "")),
+      );
+      if (values.some((value) => value.trim() === previous)) return "retained";
+      if (!(await listPreparedImages()).includes(previous)) return "missing";
+      const result = await command(["tart", "delete", previous], { timeoutMs: 30_000 });
+      return result.exitCode === 0 ? "deleted" : "failed";
+    });
+    if (cleanup === "failed") {
+      await onMessage(`Could not delete superseded Tart image ${previous}; will retry later`);
+      return;
+    }
+    if (cleanup === "deleted") await onMessage(`Deleted superseded Tart image ${previous}`);
+  }
+
+  await mkdir(directory, { recursive: true });
+  if (prepared) await Bun.write(path, `${prepared}\n`);
+  else await rm(path, { force: true });
+}
+
+async function withPreparedImageReferencesLock<T>(callback: () => Promise<T>): Promise<T> {
+  return withImageLock("prepared-image-references", callback);
+}
+
+async function activatePreparedImage(
+  repository: string | undefined,
+  prepared: string | undefined,
+  onMessage: (message: string) => Promise<void> | void,
+): Promise<void> {
+  await withPreparedImageReferencesLock(() =>
+    activatePreparedImageLocked(repository, prepared, onMessage),
+  );
+}
+
+async function preparedImageReferences(): Promise<Set<string>> {
+  const directory = join(dataDirectory(), "prepared-image-references");
+  const references = await readdir(directory).catch(() => []);
+  const values = await Promise.all(
+    references.map((entry) => readFile(join(directory, entry), "utf8").catch(() => "")),
+  );
+  return new Set(values.map((value) => value.trim()).filter(Boolean));
+}
+
 export async function ensurePreparedImage(
   config: InformantConfig,
   onMessage: (message: string) => Promise<void> | void = console.log,
+  repository?: string,
 ): Promise<string> {
   const prepared = preparedImageName(config);
-  if (!prepared) return config.vm.image;
+  if (!prepared) {
+    await activatePreparedImage(repository, undefined, onMessage);
+    return config.vm.image;
+  }
   if ((await tartImages()).some((image) => image.Source === "local" && image.Name === prepared)) {
+    await activatePreparedImage(repository, prepared, onMessage);
     return prepared;
   }
 
-  return provisionVm(async () => {
+  const image = await provisionVm(async () => {
     if ((await tartImages()).some((image) => image.Source === "local" && image.Name === prepared)) {
       return prepared;
     }
@@ -255,39 +319,51 @@ export async function ensurePreparedImage(
       await sshCommand(ready.ip, config, "sudo shutdown -h now", 60_000);
       await waitForCleanShutdown(staging);
       await stopVm(staging, process);
-      return withImageLock(prepared, async () => {
-        if (
-          (await tartImages()).some((image) => image.Source === "local" && image.Name === prepared)
-        ) {
-          await requireCommand(["tart", "delete", staging]);
+      return withPreparedImageReferencesLock(() =>
+        withImageLock(prepared, async () => {
+          if (
+            (await tartImages()).some(
+              (image) => image.Source === "local" && image.Name === prepared,
+            )
+          ) {
+            await requireCommand(["tart", "delete", staging]);
+          } else {
+            await requireCommand(
+              ["tart", "rename", staging, prepared],
+              "could not publish prepared image",
+            );
+          }
+          await activatePreparedImageLocked(repository, prepared, onMessage);
           return prepared;
-        }
-        await requireCommand(
-          ["tart", "rename", staging, prepared],
-          "could not publish prepared image",
-        );
-        return prepared;
-      });
+        }),
+      );
     } catch (error) {
       if (process) await stopVm(staging, process);
       await command(["tart", "delete", staging], { timeoutMs: 30_000 });
       throw error;
     }
   });
+  await activatePreparedImage(repository, image, onMessage);
+  return image;
 }
 
 export async function listPreparedImages(): Promise<string[]> {
   return (await tartImages())
-    .filter((image) => image.Source === "local" && image.Name.startsWith("informant-prepared-"))
+    .filter(
+      (image) => image.Source === "local" && /^informant-prepared-[0-9a-f]{16}$/.test(image.Name),
+    )
     .map((image) => image.Name);
 }
 
 export async function prunePreparedImages(): Promise<number> {
-  const images = await listPreparedImages();
-  for (const image of images) {
-    await withImageLock(image, async () => requireCommand(["tart", "delete", image]));
-  }
-  return images.length;
+  return withPreparedImageReferencesLock(async () => {
+    const referenced = await preparedImageReferences();
+    const images = (await listPreparedImages()).filter((image) => !referenced.has(image));
+    for (const image of images) {
+      await withImageLock(image, async () => requireCommand(["tart", "delete", image]));
+    }
+    return images.length;
+  });
 }
 
 export function cachePathIdentity(user: string, path: string): string {
@@ -504,9 +580,13 @@ export async function runInTart(
   try {
     await mkdir(root, { recursive: true });
     await appendLog(record, `$ cloning ${repository.fullName} at ${sha}\n`);
-    const image = await ensurePreparedImage(config, async (message) => {
-      await appendLog(record, `$ ${message}\n`);
-    });
+    const image = await ensurePreparedImage(
+      config,
+      async (message) => {
+        await appendLog(record, `$ ${message}\n`);
+      },
+      repository.fullName,
+    );
     await requireCommand(
       ["gh", "repo", "clone", repository.fullName, repositoryPath, "--", "--no-checkout"],
       `could not clone ${repository.fullName}`,

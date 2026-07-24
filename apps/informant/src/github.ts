@@ -15,12 +15,44 @@ export const CLAIM_NAME = "Informant CI";
 export const COMMENT_CLAIM_NAME = "Informant CI / comment";
 export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
+const rateLimitGates = new Map<string, number>();
 
 export interface ClaimResult {
   check?: CheckRun;
   requestedJobs: string[];
   manualRequest: boolean;
   retry?: boolean;
+}
+
+export class GitHubApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly responseBody: string,
+    readonly retryAt?: number,
+  ) {
+    super(`GitHub ${status}: ${responseBody}`);
+    this.name = "GitHubApiError";
+  }
+}
+
+function rateLimitRetryAt(response: Response, body: string): number | undefined {
+  const rateLimited =
+    response.status === 429 ||
+    response.headers.get("x-ratelimit-remaining") === "0" ||
+    /rate limit/i.test(body);
+  if (!rateLimited) return undefined;
+
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Date.now() + seconds * 1_000;
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return date;
+  }
+
+  const reset = Number(response.headers.get("x-ratelimit-reset"));
+  if (Number.isFinite(reset) && reset > 0) return reset * 1_000;
+  return Date.now() + 60_000;
 }
 
 function outputTail(value: string | undefined, maximumBytes = 60_000): string | undefined {
@@ -51,6 +83,7 @@ export class GitHubClient {
   private appId?: string;
   private readonly credentials?: GitHubOptions["credentials"];
   private readonly repository?: Repository;
+  private readonly rateLimitKey: string;
 
   constructor(options: GitHubOptions = {}) {
     this.token = options.token;
@@ -58,6 +91,7 @@ export class GitHubClient {
     this.request = options.fetch ?? globalThis.fetch;
     this.credentials = options.credentials;
     this.repository = options.repository;
+    this.rateLimitKey = options.repository?.owner.toLowerCase() ?? "default";
   }
 
   async authenticate(): Promise<void> {
@@ -146,20 +180,28 @@ export class GitHubClient {
 
   private async api<T>(path: string, init: RequestInit = {}): Promise<T> {
     await this.authenticate();
-    const response = await this.request(`${API}${path}`, {
-      ...init,
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${this.token}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/json",
-        ...init.headers,
-      },
-    });
-    if (!response.ok) {
-      throw new Error(`GitHub ${response.status}: ${await response.text()}`);
+    for (let attempt = 0; ; attempt++) {
+      const blockedUntil = rateLimitGates.get(this.rateLimitKey) ?? 0;
+      if (blockedUntil > Date.now()) await Bun.sleep(blockedUntil - Date.now());
+
+      const response = await this.request(`${API}${path}`, {
+        ...init,
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${this.token}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+          "Content-Type": "application/json",
+          ...init.headers,
+        },
+      });
+      if (response.ok) return (await response.json()) as T;
+
+      const body = await response.text();
+      const retryAt = rateLimitRetryAt(response, body);
+      const error = new GitHubApiError(response.status, body, retryAt);
+      if (!retryAt || attempt > 0) throw error;
+      rateLimitGates.set(this.rateLimitKey, retryAt);
     }
-    return (await response.json()) as T;
   }
 
   async branchHead(repository: Repository, branch: string): Promise<string> {
@@ -278,6 +320,16 @@ export class GitHubClient {
     );
     if (result.encoding !== "base64") throw new Error(`unsupported GitHub content encoding`);
     return Buffer.from(result.content.replaceAll("\n", ""), "base64").toString("utf8");
+  }
+
+  async directoryFiles(repository: Repository, sha: string, path: string): Promise<string[]> {
+    const result = await this.api<Array<{ name: string; path: string; type: string }>>(
+      `/repos/${repository.fullName}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(sha)}`,
+    );
+    return result
+      .filter((entry) => entry.type === "file" && entry.name.endsWith(".toml"))
+      .map((entry) => entry.path)
+      .sort();
   }
 
   async checks(repository: Repository, sha: string, name = CLAIM_NAME): Promise<CheckRun[]> {

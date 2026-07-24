@@ -14,7 +14,8 @@ pushes to start immediately rather than at the next poll.
 
 ## Operating model
 
-1. A worker reads `.informant.toml` from the repository's default branch.
+1. A worker reads `.informant/config.toml` and `.informant/jobs/*.toml` from the repository's default
+   branch.
 2. It resolves each configured branch head and looks for an existing `Informant CI` check.
 3. Interested workers create claims. The oldest active check wins; every loser cancels itself.
 4. The winner clones the exact commit and runs each job in a fresh Tart VM. Independent jobs run

@@ -1,0 +1,9 @@
+name = "typecheck"
+command = """
+set -euo pipefail
+bun install --frozen-lockfile
+bun run typecheck
+"""
+timeout_minutes = 20
+environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
+cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]

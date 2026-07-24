@@ -1,12 +1,27 @@
-import { CONFIG_FILE, parseConfig } from "./config.ts";
+import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles } from "./config.ts";
 import { runCommit } from "./coordinator.ts";
-import { GitHubClient } from "./github.ts";
+import { GitHubApiError, GitHubClient } from "./github.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
 import { triggerMatches } from "./triggers.ts";
 import type { Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
+
+async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
+  const source = await github.fileContent(repository, sha, CONFIG_FILE);
+  const paths = await github.directoryFiles(repository, sha, JOBS_DIRECTORY);
+  return parseConfigFiles(
+    source,
+    await Promise.all(
+      paths.map(async (path) => ({
+        path,
+        source: await github.fileContent(repository, sha, path),
+      })),
+    ),
+    `${repository.fullName}/${CONFIG_FILE}@${sha.slice(0, 7)}`,
+  );
+}
 
 export interface ServerOptions {
   once?: boolean;
@@ -16,17 +31,38 @@ export interface ServerOptions {
 
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
   const github = new GitHubClient({ repository });
-  let intervalSeconds = 20;
+  let intervalSeconds = 30;
   let lastPollError: string | undefined;
+  let rateLimitUntil = 0;
+  const configs = new Map<string, ReturnType<typeof repositoryConfig>>();
+  const inFlightRuns = new Map<string, Promise<void>>();
   const message = options.onMessage ?? console.log;
+  const configAt = (sha: string) => {
+    const cached = configs.get(sha);
+    if (cached) return cached;
+    const pending = repositoryConfig(github, repository, sha);
+    configs.set(sha, pending);
+    void pending.catch(() => {
+      if (configs.get(sha) === pending) configs.delete(sha);
+    });
+    return pending;
+  };
+  const errorDetail = (error: unknown) => {
+    if (error instanceof GitHubApiError && error.retryAt) {
+      rateLimitUntil = Math.max(rateLimitUntil, error.retryAt);
+      return `GitHub API rate limit reached; retrying after ${new Date(error.retryAt).toLocaleTimeString()}`;
+    }
+    return error instanceof Error ? error.message : String(error);
+  };
+  const drainRuns = async () => {
+    await Promise.allSettled(inFlightRuns.values());
+  };
   do {
+    if (rateLimitUntil > Date.now()) await Bun.sleep(rateLimitUntil - Date.now());
     try {
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
-      const bootstrap = parseConfig(
-        await github.fileContent(repository, defaultSha, CONFIG_FILE),
-        `${repository.fullName}/${CONFIG_FILE}`,
-      );
+      const bootstrap = await configAt(defaultSha);
       intervalSeconds = bootstrap.pollIntervalSeconds;
       const [branches, prs] = await Promise.all([
         github.branches(repository),
@@ -57,36 +93,39 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             eventId: `pr:${pullRequest.number}:${pullRequest.headSha}`,
           })),
       ]) {
-        if (options.signal?.aborted) return;
+        if (options.signal?.aborted) {
+          await drainRuns();
+          return;
+        }
+        if (inFlightRuns.has(target.eventId)) continue;
         const context = {
           type: "commit" as const,
           branch: target.pullRequest ? undefined : target.branch,
           pullRequest: target.pullRequest,
         };
         try {
-          const config = parseConfig(
-            await github.fileContent(repository, target.sha, CONFIG_FILE),
-            `${repository.fullName}/${CONFIG_FILE}@${target.sha.slice(0, 7)}`,
-          );
+          const config = await configAt(target.sha);
           const matches = config.jobs.some((job) =>
             (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
           );
           if (!matches && !(await hasPendingManualRequest(target.sha))) continue;
-          const build = await runCommit(
-            github,
-            repository,
-            target.sha,
-            target.branch,
-            config,
-            undefined,
-            { ...context, id: target.eventId },
-          );
-          if (build)
-            message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
+          const run = runCommit(github, repository, target.sha, target.branch, config, undefined, {
+            ...context,
+            id: target.eventId,
+          })
+            .then((build) => {
+              if (build)
+                message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
+            })
+            .catch((error) => {
+              message(`${target.branch}@${target.sha.slice(0, 7)} failed: ${errorDetail(error)}`);
+            })
+            .finally(() => {
+              inFlightRuns.delete(target.eventId);
+            });
+          inFlightRuns.set(target.eventId, run);
         } catch (error) {
-          message(
-            `${target.branch}@${target.sha.slice(0, 7)} failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          message(`${target.branch}@${target.sha.slice(0, 7)} failed: ${errorDetail(error)}`);
         }
       }
 
@@ -133,10 +172,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       }
       for (const pending of [...state.pending]) {
         try {
-          const config = parseConfig(
-            await github.fileContent(repository, pending.sha, CONFIG_FILE),
-            `${repository.fullName}/${CONFIG_FILE}@${pending.sha.slice(0, 7)}`,
-          );
+          const config = await configAt(pending.sha);
           const context = {
             type: "comment" as const,
             pullRequest: pending.pullRequest,
@@ -161,14 +197,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           state.pending = state.pending.filter((item) => item.id !== pending.id);
           await savePollState(repository.fullName, state);
         } catch (error) {
-          message(
-            `comment ${pending.id} failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          message(`comment ${pending.id} failed: ${errorDetail(error)}`);
         }
       }
       lastPollError = undefined;
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = errorDetail(error);
       const pollError =
         detail.startsWith("GitHub 404:") && detail.includes("rest/repos/contents")
           ? `waiting for ${CONFIG_FILE}`
@@ -178,9 +212,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       if (pollError !== lastPollError) message(pollError);
       lastPollError = pollError;
     }
-    if (options.once) return;
+    if (options.once) {
+      await drainRuns();
+      return;
+    }
     await Bun.sleep(intervalSeconds * 1_000);
   } while (!options.signal?.aborted);
+  await drainRuns();
 }
 
 export async function serveRepositories(

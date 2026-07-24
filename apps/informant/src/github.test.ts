@@ -1,5 +1,69 @@
 import { expect, test } from "bun:test";
-import { GitHubClient } from "./github.ts";
+import { GitHubApiError, GitHubClient } from "./github.ts";
+
+test("rate limit errors preserve GitHub's reset time", async () => {
+  const reset = Math.floor(Date.now() / 1_000);
+  const fetch = (async () =>
+    new Response('{"message":"API rate limit exceeded"}', {
+      status: 403,
+      headers: {
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": String(reset),
+      },
+    })) as unknown as typeof globalThis.fetch;
+
+  const error = await new GitHubClient({ token: "installation-token", fetch })
+    .defaultBranch({ owner: "acme", repo: "widgets", fullName: "acme/widgets" })
+    .catch((value) => value);
+
+  expect(error).toBeInstanceOf(GitHubApiError);
+  expect(error.status).toBe(403);
+  expect(error.retryAt).toBe(reset * 1_000);
+});
+
+test("rate limited requests wait and retry once", async () => {
+  let requests = 0;
+  const fetch = (async () => {
+    requests++;
+    if (requests === 1) {
+      return new Response('{"message":"API rate limit exceeded"}', {
+        status: 403,
+        headers: { "retry-after": "0" },
+      });
+    }
+    return Response.json({ default_branch: "main" });
+  }) as unknown as typeof globalThis.fetch;
+
+  const branch = await new GitHubClient({ token: "installation-token", fetch }).defaultBranch({
+    owner: "retry-test",
+    repo: "widgets",
+    fullName: "retry-test/widgets",
+  });
+
+  expect(branch).toBe("main");
+  expect(requests).toBe(2);
+});
+
+test("directory files returns sorted TOML files only", async () => {
+  let requested = "";
+  const fetch = (async (input: string | URL | Request) => {
+    requested = String(input);
+    return Response.json([
+      { name: "test.toml", path: ".informant/jobs/test.toml", type: "file" },
+      { name: "notes.md", path: ".informant/jobs/notes.md", type: "file" },
+      { name: "build.toml", path: ".informant/jobs/build.toml", type: "file" },
+      { name: "nested.toml", path: ".informant/jobs/nested.toml", type: "dir" },
+    ]);
+  }) as typeof globalThis.fetch;
+  const files = await new GitHubClient({ token: "installation-token", fetch }).directoryFiles(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    ".informant/jobs",
+  );
+
+  expect(files).toEqual([".informant/jobs/build.toml", ".informant/jobs/test.toml"]);
+  expect(requested).toContain("/contents/.informant%2Fjobs?ref=abc123");
+});
 
 test("claim elects the oldest active check using the full check history", async () => {
   const urls: string[] = [];

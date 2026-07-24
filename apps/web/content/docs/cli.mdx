@@ -5,7 +5,7 @@ description: Operate workers, trigger runs, and inspect build history.
 
 ```text
 informant setup                        Create the GitHub App and configure this machine
-informant init                         Create .informant.toml and register the origin repository
+informant init                         Create .informant/ and register the origin repository
 informant repo add [owner/repo]        Register a repository; defaults to the current Git remote
 informant repo list                    List repositories handled by this machine
 informant repo remove [owner/repo]     Stop handling a repository
@@ -16,7 +16,7 @@ informant run --job test               Run one job and the jobs it needs
 informant run --job test --job lint    Run multiple selected jobs
 informant image prepare                Prepare this repository's cached Tart image
 informant image list                   List Informant-prepared Tart images
-informant image prune                  Delete Informant-prepared Tart images
+informant image prune                  Delete unused prepared Tart images
 informant cache path                   Print the persistent job cache directory
 informant cache prune                  Delete all persistent job caches
 informant startup enable               Start the worker now and automatically at login

@@ -1,28 +1,41 @@
 import { existsSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { InformantConfig, JobConfig, Repository, TriggerRule } from "./types.ts";
 
-export const CONFIG_FILE = ".informant.toml";
+export const CONFIG_DIRECTORY = ".informant";
+export const CONFIG_FILE = `${CONFIG_DIRECTORY}/config.toml`;
+export const JOBS_DIRECTORY = `${CONFIG_DIRECTORY}/jobs`;
 
-const defaultConfig = `version = 1
-poll_interval_seconds = 20
+const defaultDirectoryConfig = `version = 1
+timeout_minutes = 30
 triggers = [{ event = "commit", branch = { names = ["main"] } }]
 
 [vm]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
 user = "admin"
 password = "admin"
-prepare = "curl -fsSL https://bun.sh/install | bash && sudo mkdir -p /usr/local/bin && sudo ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun"
+prepare = """
+set -euo pipefail
+curl -fsSL https://bun.sh/install | bash
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
+"""
+`;
 
-[[jobs]]
-name = "test"
-command = "bun install --frozen-lockfile && bun test"
-timeout_minutes = 30
+const defaultJob = `name = "test"
+command = """
+bun install --frozen-lockfile && bun test
+"""
 cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
 `;
 
-export function configTemplate(): string {
-  return defaultConfig;
+export function directoryConfigTemplate(): string {
+  return defaultDirectoryConfig;
+}
+
+export function jobTemplate(): string {
+  return defaultJob;
 }
 
 export function selectJobs(config: InformantConfig, requested: string[]): InformantConfig {
@@ -131,13 +144,22 @@ export function parseRepository(value: string): Repository {
 export function findConfig(start = process.cwd()): string {
   let directory = resolve(start);
   while (true) {
-    const candidate = resolve(directory, CONFIG_FILE);
-    if (existsSync(candidate)) return candidate;
+    const config = resolve(directory, CONFIG_FILE);
+    if (existsSync(config)) return config;
     const parent = resolve(directory, "..");
     if (parent === directory) break;
     directory = parent;
   }
   throw new Error(`could not find ${CONFIG_FILE}; run informant init in the repository`);
+}
+
+export function parseConfigFiles(
+  source: string,
+  jobs: Array<{ path: string; source: string }>,
+  label = CONFIG_FILE,
+): InformantConfig {
+  const combined = [source, ...jobs.map((job) => `\n[[jobs]]\n${job.source}`)].join("\n");
+  return parseConfig(combined, label);
 }
 
 export function parseConfig(source: string, label = CONFIG_FILE): InformantConfig {
@@ -158,6 +180,10 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         );
   if (!Array.isArray(rawJobs) || rawJobs.length === 0) {
     throw new Error(`${label} must contain at least one [[jobs]] entry`);
+  }
+  const defaultTimeoutMinutes = Number(raw.timeout_minutes ?? 30);
+  if (!Number.isFinite(defaultTimeoutMinutes) || defaultTimeoutMinutes <= 0) {
+    throw new Error("timeout_minutes must be a positive number");
   }
   const jobs: JobConfig[] = rawJobs.map((value, index) => {
     const job = value as Record<string, unknown>;
@@ -183,7 +209,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         );
       }
     }
-    const timeoutMinutes = Number(job.timeout_minutes ?? 30);
+    const timeoutMinutes = Number(job.timeout_minutes ?? defaultTimeoutMinutes);
     if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
       throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
     }
@@ -229,7 +255,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     });
     return {
       name: job.name,
-      command: job.command,
+      command: job.command.trim(),
       timeoutMinutes,
       needs: Array.isArray(job.needs)
         ? job.needs.map(String)
@@ -280,7 +306,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   ) {
     throw new Error("vm.memory_mb must be a positive integer");
   }
-  const pollIntervalSeconds = Number(raw.poll_interval_seconds ?? 20);
+  const pollIntervalSeconds = Number(raw.poll_interval_seconds ?? 30);
   if (!Number.isFinite(pollIntervalSeconds) || pollIntervalSeconds <= 0) {
     throw new Error("poll_interval_seconds must be a positive number");
   }
@@ -292,10 +318,14 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   if (typeof password !== "string") {
     throw new Error("vm.password must be a string (an empty password is allowed)");
   }
-  const prepare = vm.prepare;
-  if (prepare !== undefined && (typeof prepare !== "string" || prepare.trim().length === 0)) {
+  const rawPrepare = vm.prepare;
+  if (
+    rawPrepare !== undefined &&
+    (typeof rawPrepare !== "string" || rawPrepare.trim().length === 0)
+  ) {
     throw new Error("vm.prepare must be a non-empty string");
   }
+  const prepare = typeof rawPrepare === "string" ? rawPrepare.trim() : undefined;
   return {
     version: raw.version,
     pollIntervalSeconds: Math.max(5, pollIntervalSeconds),
@@ -313,5 +343,18 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
 }
 
 export async function readConfig(path = findConfig()): Promise<InformantConfig> {
-  return parseConfig(await Bun.file(path).text(), path);
+  const jobsDirectory = resolve(path, "..", "jobs");
+  const entries = (await readdir(jobsDirectory).catch(() => []))
+    .filter((entry) => entry.endsWith(".toml"))
+    .sort();
+  return parseConfigFiles(
+    await Bun.file(path).text(),
+    await Promise.all(
+      entries.map(async (entry) => ({
+        path: resolve(jobsDirectory, entry),
+        source: await Bun.file(resolve(jobsDirectory, entry)).text(),
+      })),
+    ),
+    path,
+  );
 }
