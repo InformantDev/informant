@@ -45,6 +45,7 @@ function harness(
     conclusion?: string;
   }> = [];
   const saved: BuildRecord[] = [];
+  let jobCheckListings = 0;
   const aggregateCheck: {
     id: number;
     name: string;
@@ -82,7 +83,10 @@ function harness(
       remoteChecks.push(jobCheck);
       return jobCheck;
     },
-    jobChecks: async () => remoteChecks,
+    jobChecks: async () => {
+      jobCheckListings++;
+      return remoteChecks;
+    },
     checks: async () => [aggregateCheck],
     updateCheck: async (_repository: Repository, id: number, values: Record<string, unknown>) => {
       updates.push({ id, values });
@@ -117,7 +121,14 @@ function harness(
     },
     readLogTail: async () => "build output",
   };
-  return { github, dependencies, updates, jobChecks, saved };
+  return {
+    github,
+    dependencies,
+    updates,
+    jobChecks,
+    saved,
+    jobCheckListings: () => jobCheckListings,
+  };
 }
 
 describe("runCommit", () => {
@@ -161,6 +172,7 @@ describe("runCommit", () => {
     });
     expect(aggregate?.text).toBeUndefined();
     expect(context.saved.at(-1)?.status).toBe(status);
+    expect(context.jobCheckListings()).toBe(0);
   });
 
   test("reports, persists, and rethrows execution failures", async () => {

@@ -513,6 +513,7 @@ async function runJob(
   config: InformantConfig,
   job: InformantConfig["jobs"][number],
   log: (text: string) => Promise<void>,
+  started: () => Promise<void>,
   signal?: AbortSignal,
 ): Promise<boolean> {
   let vmCreated = false;
@@ -549,6 +550,7 @@ async function runJob(
       tart = started.process;
       return { ip: started.ip, cacheRestore: caches.restore, cacheSave: caches.save };
     }, signal);
+    await started();
     await log(`[${job.name}] $ ${job.command}\n`);
     const env = Object.entries(job.environment)
       .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
@@ -692,7 +694,6 @@ export async function runInTart(
     return await scheduleJobs(
       config.jobs,
       async (job, index) => {
-        await notify(() => observer.started?.(job));
         const workspace = workspaces[index];
         if (!workspace) throw new Error(`workspace missing for job ${job.name}`);
         const success = await runJob(
@@ -703,6 +704,7 @@ export async function runInTart(
           config,
           job,
           (text) => logJob(job, text),
+          () => notify(() => observer.started?.(job)),
           signal,
         );
         const outcome = signal?.aborted ? "cancelled" : success ? "success" : "failure";

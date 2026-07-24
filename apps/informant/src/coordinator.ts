@@ -185,6 +185,13 @@ export async function runCommit(
       }
     }
 
+    if (
+      jobChecks.size === config.jobs.length &&
+      [...jobChecks.values()].every((state) => state.terminal)
+    ) {
+      return;
+    }
+
     const remoteChecks = await github.jobChecks(repository, sha, check.id);
     const localById = new Map([...jobChecks.values()].map((state) => [state.check.id, state]));
     for (const remote of remoteChecks) {
