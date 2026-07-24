@@ -18,7 +18,7 @@ assignments, and short findings between agents — never whole file contents.
 ## Step 1 — Determine the diff and agent count
 
 The `staff` CLI is optional: never stop to ask for it. Resolve the slug from a
-user argument, then `staff active --json` if available, otherwise `main..WT`.
+user argument, then `staff active --json` if available, otherwise `HEAD..WT`.
 With the CLI, target that slug; without it, continue and let workers use Git:
 
 ```bash

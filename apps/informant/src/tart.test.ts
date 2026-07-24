@@ -98,6 +98,63 @@ fi
   }
 });
 
+test("a failed superseded image deletion still advances the repository reference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-image-delete-failure-"));
+  const bin = join(root, "bin");
+  const tart = join(bin, "tart");
+  const failed = join(root, "failed");
+  const deleted = join(root, "deleted");
+  const firstConfig = config("install bun");
+  const secondConfig = config("install node");
+  const first = preparedImageName(firstConfig);
+  const second = preparedImageName(secondConfig);
+  if (!first || !second) throw new Error("expected prepared image names");
+  await mkdir(bin);
+  await Bun.write(
+    tart,
+    `#!/bin/sh
+if [ "$1" = "list" ]; then
+  printf '%s\\n' '${JSON.stringify([
+    { Name: first, Source: "local" },
+    { Name: second, Source: "local" },
+  ])}'
+elif [ "$1" = "delete" ]; then
+  if [ ! -e '${failed}' ]; then
+    touch '${failed}'
+    exit 1
+  fi
+  printf '%s\\n' "$2" >> '${deleted}'
+fi
+`,
+  );
+  await chmod(tart, 0o755);
+  const originalPath = Bun.env.PATH;
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.PATH = `${bin}:${originalPath}`;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  try {
+    await ensurePreparedImage(firstConfig, () => {}, "owner/repository");
+    const messages: string[] = [];
+    await ensurePreparedImage(
+      secondConfig,
+      (message) => {
+        messages.push(message);
+      },
+      "owner/repository",
+    );
+
+    expect(messages).toEqual([`Could not delete superseded Tart image ${first}; will retry later`]);
+    expect(await prunePreparedImages()).toBe(1);
+    expect((await Bun.file(deleted).text()).trim()).toBe(first);
+  } finally {
+    if (originalPath === undefined) delete Bun.env.PATH;
+    else Bun.env.PATH = originalPath;
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cancelling image preparation deletes its staging VM", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-cancel-image-"));
   const bin = join(root, "bin");

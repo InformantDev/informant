@@ -32,13 +32,14 @@ function deferred<T>() {
 function github(options: {
   branchHead?: () => Promise<string>;
   branches?: () => Promise<Array<{ name: string; sha: string }>>;
+  pullRequests?: () => Promise<PullRequest[]>;
   manual?: (sha: string) => Promise<boolean>;
 }) {
   return {
     defaultBranch: async () => "main",
     branchHead: options.branchHead ?? (async () => "default-sha"),
     branches: options.branches ?? (async () => []),
-    pullRequests: async () => [],
+    pullRequests: options.pullRequests ?? (async () => []),
     hasPendingManualRequest: async (_repository: Repository, sha: string) =>
       options.manual?.(sha) ?? false,
     latestPullRequestComments: async () => [],
@@ -107,6 +108,68 @@ describe("serve polling orchestration", () => {
     expect(signals[1]?.reason).toBe("Server shutdown requested.");
   });
 
+  test("cancels an automatic build when its pull request is no longer open", async () => {
+    const outer = new AbortController();
+    const run = deferred<BuildRecord | false | undefined>();
+    let poll = 0;
+    let receivedSignal: AbortSignal | undefined;
+    const client = github({
+      pullRequests: async () => (poll++ === 0 ? [pullRequest] : []),
+    });
+
+    await serve(repository, {
+      signal: outer.signal,
+      dependencies: dependencies(
+        client,
+        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [] },
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
+          receivedSignal = signal;
+          return run.promise;
+        },
+        async () => {
+          if (poll !== 2) return;
+          expect(receivedSignal?.aborted).toBe(true);
+          expect(receivedSignal?.reason).toBe("Pull request #7 is no longer open.");
+          run.resolve(undefined);
+          outer.abort();
+        },
+      ),
+    });
+
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
+  test("cancels an automatic build when its branch is deleted", async () => {
+    const outer = new AbortController();
+    const run = deferred<BuildRecord | false | undefined>();
+    let poll = 0;
+    let receivedSignal: AbortSignal | undefined;
+    const client = github({
+      branches: async () => (poll++ === 0 ? [{ name: "topic", sha: "sha" }] : []),
+    });
+
+    await serve(repository, {
+      signal: outer.signal,
+      dependencies: dependencies(
+        client,
+        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [] },
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
+          receivedSignal = signal;
+          return run.promise;
+        },
+        async () => {
+          if (poll !== 2) return;
+          expect(receivedSignal?.aborted).toBe(true);
+          expect(receivedSignal?.reason).toBe("Branch topic no longer exists.");
+          run.resolve(undefined);
+          outer.abort();
+        },
+      ),
+    });
+
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
   test("aborts automatic runs before draining during shutdown", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;
@@ -129,6 +192,38 @@ describe("serve polling orchestration", () => {
 
     expect(receivedSignal?.aborted).toBe(true);
     expect(receivedSignal?.reason).toBe("Server shutdown requested.");
+  });
+
+  test("interrupts the polling interval to abort automatic runs on shutdown", async () => {
+    const outer = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    let releaseSleep!: () => void;
+    const sleepStarted = new Promise<void>((resolve) => {
+      releaseSleep = resolve;
+    });
+    const runSettled = deferred<BuildRecord | false | undefined>();
+    const server = serve(repository, {
+      signal: outer.signal,
+      dependencies: dependencies(
+        github({ branches: async () => [{ name: "main", sha: "sha" }] }),
+        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [] },
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
+          receivedSignal = signal;
+          signal?.addEventListener("abort", () => runSettled.resolve(undefined), { once: true });
+          return runSettled.promise;
+        },
+        async () => sleepStarted,
+      ),
+    });
+
+    await Promise.resolve();
+    while (!receivedSignal) await Promise.resolve();
+    outer.abort();
+    await server;
+    releaseSleep();
+
+    expect(receivedSignal.aborted).toBe(true);
+    expect(receivedSignal.reason).toBe("Server shutdown requested.");
   });
 
   test("does not pass an automatic-lane signal to comment runs", async () => {

@@ -82,6 +82,23 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     automaticLanes.clear();
   };
+  const waitForDelay = async (milliseconds: number) => {
+    if (options.signal?.aborted) return false;
+    if (!options.signal) {
+      await sleep(milliseconds);
+      return true;
+    }
+    let stopWaiting: (() => void) | undefined;
+    const aborted = new Promise<false>((resolve) => {
+      stopWaiting = () => resolve(false);
+      options.signal?.addEventListener("abort", stopWaiting, { once: true });
+    });
+    try {
+      return await Promise.race([sleep(milliseconds).then(() => true as const), aborted]);
+    } finally {
+      if (stopWaiting) options.signal.removeEventListener("abort", stopWaiting);
+    }
+  };
   const drainRuns = async () => {
     await Promise.allSettled(inFlightRuns.values());
     if (completedComments.size > 0) {
@@ -93,7 +110,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
   };
   do {
-    if (rateLimitUntil > Date.now()) await sleep(rateLimitUntil - Date.now());
+    if (rateLimitUntil > Date.now() && !(await waitForDelay(rateLimitUntil - Date.now()))) {
+      abortAutomaticRuns();
+      await drainRuns();
+      return;
+    }
     try {
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
@@ -103,6 +124,17 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         github.branches(repository),
         github.pullRequests(repository),
       ]);
+      const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
+      const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
+      for (const [lane, active] of automaticLanes) {
+        if (lane.startsWith("branch:") && !openBranchLanes.has(lane)) {
+          active.controller.abort(`Branch ${lane.slice(7)} no longer exists.`);
+          automaticLanes.delete(lane);
+        } else if (lane.startsWith("pr:") && !openPullRequestLanes.has(lane)) {
+          active.controller.abort(`Pull request #${lane.slice(3)} is no longer open.`);
+          automaticLanes.delete(lane);
+        }
+      }
       const manualRequests = new Map<string, Promise<boolean>>();
       const hasPendingManualRequest = (sha: string) => {
         let pending = manualRequests.get(sha);
@@ -190,8 +222,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       if (completedComments.size > 0) {
         const completed = new Set(completedComments);
         state.pending = state.pending.filter((item) => !completed.has(item.id));
-        for (const id of completed) completedComments.delete(id);
         await persistPollState(repository.fullName, state);
+        for (const id of completed) completedComments.delete(id);
       }
       if (!state.cursor) {
         const latest = await github.latestPullRequestComments(repository);
@@ -290,7 +322,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       await drainRuns();
       return;
     }
-    await sleep(intervalSeconds * 1_000);
+    if (!(await waitForDelay(intervalSeconds * 1_000))) {
+      abortAutomaticRuns();
+      await drainRuns();
+      return;
+    }
   } while (!options.signal?.aborted);
   abortAutomaticRuns();
   await drainRuns();

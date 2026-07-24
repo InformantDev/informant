@@ -40,6 +40,28 @@ test("command streams output before the process exits", async () => {
   expect(await result).toMatchObject({ exitCode: 0, stdout: "firstsecond" });
 });
 
+test("command applies backpressure while an output callback is blocked", async () => {
+  let callbacks = 0;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const result = command(
+    ["bun", "-e", 'for (let i = 0; i < 10_000; i++) process.stdout.write("output\\n")'],
+    {
+      onOutput: async () => {
+        callbacks += 1;
+        await blocked;
+      },
+    },
+  );
+
+  await Bun.sleep(50);
+  expect(callbacks).toBe(1);
+  release();
+  expect((await result).exitCode).toBe(0);
+});
+
 test("command terminates when its signal is aborted", async () => {
   const controller = new AbortController();
   const started = Date.now();
