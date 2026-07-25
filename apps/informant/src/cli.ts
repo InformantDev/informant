@@ -247,10 +247,17 @@ async function manageCaches(action?: string): Promise<void> {
   }
   if (action === "prune") {
     const entries = await readdir(path, { withFileTypes: true }).catch(() => []);
+    const linuxPath = join(path, "linux");
+    const linuxEntries = await readdir(linuxPath, { withFileTypes: true }).catch(() => []);
     await Promise.all(
-      entries
-        .filter((entry) => entry.name !== "shared")
-        .map((entry) => rm(join(path, entry.name), { recursive: true, force: true })),
+      [
+        ...entries
+          .filter((entry) => entry.name !== "shared" && entry.name !== "linux")
+          .map((entry) => join(path, entry.name)),
+        ...linuxEntries
+          .filter((entry) => entry.name !== "shared")
+          .map((entry) => join(linuxPath, entry.name)),
+      ].map((entry) => rm(entry, { recursive: true, force: true })),
     );
     outro("Deleted keyed job caches; preserved shared caches");
     return;

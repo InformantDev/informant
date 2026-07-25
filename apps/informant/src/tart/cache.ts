@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, realpath, rm, stat, utimes } from "node:fs/pr
 import { isAbsolute, join, relative, sep } from "node:path";
 import { dataDirectory } from "../store.ts";
 import type { InformantConfig, Repository } from "../types.ts";
+import { guestHome, guestSharedRoot } from "./layout.ts";
 import { digest, shellQuote } from "./vm.ts";
 
 export function cachePathIdentity(user: string, path: string): string {
@@ -33,13 +34,14 @@ export async function cacheMounts(
   workspace: string,
   job: InformantConfig["jobs"][number],
   user: string,
+  guestOs: InformantConfig["vm"]["guestOs"],
   trusted = false,
 ) {
   if (!job.cache) return { args: [] as string[], restore: "", save: "" };
   const workspaceRoot = await realpath(workspace);
+  const persistentRoot = join(dataDirectory(), "caches", ...(guestOs === "linux" ? ["linux"] : []));
   const root = join(
-    dataDirectory(),
-    "caches",
+    persistentRoot,
     digest(repository.fullName).slice(0, 16),
     digest(job.name).slice(0, 16),
   );
@@ -76,13 +78,13 @@ export async function cacheMounts(
     for (const path of cache.paths) {
       if (cache.shared) {
         const host = trusted
-          ? join(dataDirectory(), "caches", "shared", cachePathIdentity(user, path))
+          ? join(persistentRoot, "shared", cachePathIdentity(user, path))
           : join(workspace, "..", "shared-caches", cachePathIdentity(user, path));
         await mkdir(host, { recursive: true });
         args.push(`--dir=cache-${mountIndex}:${await realpath(host)}`);
-        const guest = `/Users/${user}/${path.slice(2)}`;
+        const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
         const parent = guest.slice(0, guest.lastIndexOf("/"));
-        const shared = `/Volumes/My Shared Files/cache-${mountIndex}`;
+        const shared = `${guestSharedRoot(guestOs)}/cache-${mountIndex}`;
         restore.push(
           `mkdir -p ${shellQuote(parent)} && rm -rf ${shellQuote(guest)} && ln -s ${shellQuote(shared)} ${shellQuote(guest)}`,
         );
@@ -98,8 +100,8 @@ export async function cacheMounts(
       await utimes(host, now, now);
       await pruneCacheVersions(parent, cacheKey);
       args.push(`--dir=cache-${mountIndex}:${await realpath(host)}`);
-      const guest = `/Users/${user}/${path.slice(2)}`;
-      const shared = `/Volumes/My Shared Files/cache-${mountIndex}`;
+      const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
+      const shared = `${guestSharedRoot(guestOs)}/cache-${mountIndex}`;
       const temporary = `${shared}/cache-${crypto.randomUUID().slice(0, 8)}.tar.gz.tmp`;
       restore.push(
         `mkdir -p ${shellQuote(guest)} && if [ -f ${shellQuote(`${shared}/cache.tar.gz`)} ]; then tar -xzpf ${shellQuote(`${shared}/cache.tar.gz`)} -C ${shellQuote(guest)}; fi`,

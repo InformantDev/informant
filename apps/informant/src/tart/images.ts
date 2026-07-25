@@ -17,7 +17,7 @@ import {
 
 export function preparedImageName(config: InformantConfig): string | undefined {
   return config.vm.prepare
-    ? `informant-prepared-${digest(`${config.vm.image}\0${config.vm.user}\0${config.vm.prepare}`).slice(0, 16)}`
+    ? `informant-prepared-${digest(`${config.vm.image}\0${config.vm.guestOs}\0${config.vm.user}\0${config.vm.prepare}`).slice(0, 16)}`
     : undefined;
 }
 

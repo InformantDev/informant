@@ -18,6 +18,7 @@ import {
   streamingSecretRedactor,
   utf8Tail,
 } from "./tart/index.ts";
+import { linuxSharedMountCommand } from "./tart/layout.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
@@ -76,6 +77,17 @@ test("prepares and cleans up a restricted secret mount", async () => {
     expect(await readFile(environment, "utf8")).toBe("export TOKEN='top secret'\n");
     expect(mount.args).toEqual([`--dir=secrets:${await realpath(mount.directory)}`]);
     expect(mount.source).toContain("/Volumes/My Shared Files/secrets/environment");
+    expect(mount.source).toContain("|| exit; rm -f");
+    expect(mount.source).toEndWith("|| exit;");
+
+    const linuxMount = await secretMount(
+      workspace,
+      { ...job("review"), secrets: ["TOKEN"] },
+      { TOKEN: "top secret" },
+      "linux",
+    );
+    expect(linuxMount.source).toContain("/mnt/shared/secrets/environment");
+    if (linuxMount.directory) await rm(linuxMount.directory, { recursive: true, force: true });
 
     await rm(mount.directory, { recursive: true, force: true });
     expect(await Bun.file(environment).exists()).toBe(false);
@@ -94,6 +106,7 @@ test("removes plaintext secrets when mount preparation fails", async () => {
         workspace,
         { ...job("review"), secrets: ["TOKEN"] },
         { TOKEN: "top secret" },
+        "macos",
         { realpath: async () => Promise.reject(new Error("realpath failed")) },
       ),
     ).rejects.toThrow("realpath failed");
@@ -107,7 +120,7 @@ const config = (prepare?: string): InformantConfig => ({
   version: 1,
   pollIntervalSeconds: 20,
   branches: ["main"],
-  vm: { image: "base", user: "admin", password: "admin", prepare },
+  vm: { image: "base", guestOs: "macos", user: "admin", password: "admin", prepare },
   jobs: [job("test")],
 });
 
@@ -126,6 +139,12 @@ test("prepared image identity changes with its source or preparation", () => {
     preparedImageName({
       ...config("install bun"),
       vm: { ...config().vm, user: "builder", prepare: "install bun" },
+    }),
+  ).not.toBe(first);
+  expect(
+    preparedImageName({
+      ...config("install bun"),
+      vm: { ...config().vm, guestOs: "linux", prepare: "install bun" },
     }),
   ).not.toBe(first);
 });
@@ -304,6 +323,7 @@ test("shared caches use one direct host mount across repositories and jobs", asy
       workspace,
       sharedJob,
       "admin",
+      "macos",
       true,
     );
     const second = await cacheMounts(
@@ -311,6 +331,7 @@ test("shared caches use one direct host mount across repositories and jobs", asy
       workspace,
       { ...sharedJob, name: "lint" },
       "admin",
+      "macos",
       true,
     );
     expect(first.args).toEqual(second.args);
@@ -321,6 +342,7 @@ test("shared caches use one direct host mount across repositories and jobs", asy
       workspace,
       sharedJob,
       "admin",
+      "macos",
     );
     expect(untrusted.args).not.toEqual(first.args);
     expect(untrusted.args[0]).toContain(root);
@@ -345,8 +367,15 @@ test("keyed caches cross builds only for trusted commits", async () => {
   };
   const repository = { owner: "one", repo: "repo", fullName: "one/repo" };
   try {
-    const trusted = await cacheMounts(repository, trustedWorkspace, keyedJob, "admin", true);
-    const untrusted = await cacheMounts(repository, untrustedWorkspace, keyedJob, "admin");
+    const trusted = await cacheMounts(
+      repository,
+      trustedWorkspace,
+      keyedJob,
+      "admin",
+      "macos",
+      true,
+    );
+    const untrusted = await cacheMounts(repository, untrustedWorkspace, keyedJob, "admin", "macos");
 
     expect(trusted.args[0]).toContain(join(root, "data", "caches"));
     expect(untrusted.args[0]).toContain(join(root, "keyed-caches"));
@@ -357,6 +386,39 @@ test("keyed caches cross builds only for trusted commits", async () => {
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Linux caches use Linux guest paths and separate persistent host storage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-linux-cache-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  const cachedJob = {
+    ...job("test"),
+    cache: [{ paths: ["~/.npm"], keyFiles: [], shared: false }],
+  };
+  const repository = { owner: "one", repo: "repo", fullName: "one/repo" };
+  try {
+    const macos = await cacheMounts(repository, workspace, cachedJob, "admin", "macos", true);
+    const linux = await cacheMounts(repository, workspace, cachedJob, "admin", "linux", true);
+    expect(macos.args[0]).not.toContain(join("caches", "linux"));
+    expect(linux.args[0]).toContain(join("caches", "linux"));
+    expect(macos.restore).toContain("/Users/admin/.npm");
+    expect(macos.restore).toContain("/Volumes/My Shared Files/cache-0");
+    expect(linux.restore).toContain("/home/admin/.npm");
+    expect(linux.restore).toContain("/mnt/shared/cache-0");
+  } finally {
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Linux shared mount setup is non-interactive and verifies the workspace", () => {
+  expect(linuxSharedMountCommand()).toBe(
+    "sudo -n mkdir -p /mnt/shared && (mountpoint -q /mnt/shared || sudo -n mount -t virtiofs com.apple.virtio-fs.automount /mnt/shared) && test -d /mnt/shared/workspace",
+  );
 });
 
 test("retries SSH only when authentication failed before the command started", () => {

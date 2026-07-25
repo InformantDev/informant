@@ -17,7 +17,7 @@ const config: InformantConfig = {
   version: 1,
   pollIntervalSeconds: 0,
   triggers: [{ event: "commit" }, { event: "comment" }],
-  vm: { image: "image", user: "user", password: "password" },
+  vm: { image: "image", guestOs: "macos", user: "user", password: "password" },
   jobs: [
     { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
   ],
@@ -97,7 +97,7 @@ describe("serve polling orchestration", () => {
 
     expect(applySecretPolicy(untrusted, trusted, "trusted-sha")).toMatchObject({
       trustedSha: "trusted-sha",
-      vm: { image: "trusted-image" },
+      vm: { image: "trusted-image", guestOs: "macos" },
       jobs: [
         { name: "setup", command: "trusted setup", secrets: [] },
         {

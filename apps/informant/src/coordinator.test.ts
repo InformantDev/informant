@@ -11,7 +11,7 @@ const config: InformantConfig = {
   version: 1,
   pollIntervalSeconds: 10,
   branches: ["main"],
-  vm: { image: "image", user: "user", password: "password" },
+  vm: { image: "image", guestOs: "macos", user: "user", password: "password" },
   jobs: [
     { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
   ],
