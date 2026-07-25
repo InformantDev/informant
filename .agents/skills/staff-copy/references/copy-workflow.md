@@ -107,6 +107,43 @@ query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
 
 Keep only `reviewThreads.nodes[]` where `isResolved == false`.
 
+For every retained thread whose `comments.pageInfo.hasNextPage` is true, fetch
+the remaining comment pages using that thread's node `id` and the comments
+connection's own cursor:
+
+```bash
+gh api graphql --paginate \
+  -f threadId="<review-thread-node-id>" \
+  -f query='
+query($threadId: ID!, $endCursor: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          databaseId
+          url
+          body
+          createdAt
+          diffHunk
+          path
+          line
+          originalLine
+          startLine
+          originalStartLine
+          side
+          startSide
+          author { login }
+        }
+      }
+    }
+  }
+}'
+```
+
+Merge these pages into the thread's initial `comments.nodes`, deduplicating by
+`databaseId`, before copying any comments.
+
 ## Step 3 — Create the local PR diff
 
 Fetch the PR commits without checking anything out, then create/load the local

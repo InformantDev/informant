@@ -34,11 +34,14 @@ include it.
 staff comment add \
   --file path/to/file.ts \
   --line 42 \
-  --side new \                       # "new" (default) or "old"
-  --author "Opus 4.8" \              # your model name
-  --priority P1 \                    # AI-reviewer severity (see below)
+  --side new \
+  --author "Opus 4.8" \
+  --priority P1 \
   --body "Off-by-one: the loop misses the last element."
 ```
+
+Here `--side` is `new` (the default) or `old`, `--author` is your model name,
+and `--priority` is the AI-reviewer severity described below.
 
 **Priority** (`--priority P1|P2|P3`) — an *agent-only* severity so a human can
 triage your findings; **P1 is the most serious/urgent**, P3 the least. Set it on
