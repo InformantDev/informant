@@ -1,12 +1,35 @@
 name = "staff-review"
 command = """
 set -euo pipefail
-trusted="$(mktemp -d)"
-env -u AMP_API_KEY -u GITHUB_TOKEN git show "$INFORMANT_TRUSTED_SHA:scripts/staff-review.ts" > "$trusted/staff-review.ts"
-env -u AMP_API_KEY -u GITHUB_TOKEN git show "$INFORMANT_TRUSTED_SHA:package.json" > "$trusted/package.json"
-env -u AMP_API_KEY -u GITHUB_TOKEN git show "$INFORMANT_TRUSTED_SHA:bun.lock" > "$trusted/bun.lock"
-(cd "$trusted" && env -u AMP_API_KEY -u GITHUB_TOKEN bun install --frozen-lockfile --ignore-scripts)
-INFORMANT_REVIEW_ROOT="$PWD" bun --cwd "$trusted" --no-env-file staff-review.ts
+review_root="$PWD"
+review_home="$(mktemp -d)"
+printf '{}\n' > "$review_home/settings.json"
+pr_number="${INFORMANT_BRANCH#pull/}"
+if [ "$pr_number" = "$INFORMANT_BRANCH" ]; then
+  echo "staff review can only run for a pull request" >&2
+  exit 1
+fi
+prompt="$(cat <<EOF
+Perform a staff/principal-level review of pull request #$pr_number in $INFORMANT_REPOSITORY at commit $INFORMANT_SHA.
+
+The untrusted checkout is at $review_root. Review its diff and surrounding code using git -C $review_root and read-only
+inspection tools. Focus only on concrete, actionable defects in changed code: correctness, concurrency, security,
+data integrity, interfaces, missing tests, maintainability, and material performance problems. Ignore style preferences
+and speculation. Do not modify the checkout.
+
+Before posting, use gh api to confirm the pull request head is still $INFORMANT_SHA. Post each confirmed finding
+directly to GitHub as an inline pull-request review comment anchored to an added or changed right-side line. Use the
+authenticated gh CLI and GitHub pull-request reviews API. Keep comments concise, include severity P1/P2/P3, and post
+nothing when there are no findings. Never print credentials or include them in commands, arguments, comments, or output.
+EOF
+)"
+cd "$review_home"
+export HOME="$review_home"
+export XDG_CONFIG_HOME="$review_home/.config"
+export GH_TOKEN="$GITHUB_TOKEN"
+unset GITHUB_TOKEN
+amp --settings-file "$review_home/settings.json" --mcp-config '{}' --no-ide --no-notifications \
+  --visibility private --mode high --execute "$prompt"
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]

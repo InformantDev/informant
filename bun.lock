@@ -5,7 +5,6 @@
     "": {
       "name": "informant-monorepo",
       "devDependencies": {
-        "@ampcode/sdk": "0.1.0-20260724142523-g5b0a5e3",
         "@biomejs/biome": "^2.4.16",
         "@types/bun": "latest",
         "typescript": "^5",
@@ -51,20 +50,6 @@
   },
   "packages": {
     "@alloc/quick-lru": ["@alloc/quick-lru@5.2.0", "", {}, "sha512-UrcABB+4bUrFABwbluTIBErXwvbsU/V7TZWfmbgJfbkwiBuziS9gxdODUyuiecfdGQ85jglMW6juS3+z5TsKLw=="],
-
-    "@ampcode/cli": ["@ampcode/cli@0.0.1784917055-ge644b2", "", { "optionalDependencies": { "@ampcode/cli-darwin-arm64": "0.0.1784917055-ge644b2", "@ampcode/cli-darwin-x64": "0.0.1784917055-ge644b2", "@ampcode/cli-linux-arm64": "0.0.1784917055-ge644b2", "@ampcode/cli-linux-x64": "0.0.1784917055-ge644b2", "@ampcode/cli-win32-x64": "0.0.1784917055-ge644b2" }, "bin": { "amp": "bin/amp.exe" } }, "sha512-bDEihLG3v/BjKHOGtBjOq6QjHWOieEFLzENYql13yv973Y3O33+gPyS1RoZw3KQAI1A7EMu0OYC2BDF741Wm+Q=="],
-
-    "@ampcode/cli-darwin-arm64": ["@ampcode/cli-darwin-arm64@0.0.1784917055-ge644b2", "", { "os": "darwin", "cpu": "arm64" }, "sha512-1zQXxCJaYx4+7fzVdaK5TZEnkClf9vtMfr+revMLK1Ny+piogqGy6CouYXDfRNkfsUeva+EB6wrw6Qf/tT2zcA=="],
-
-    "@ampcode/cli-darwin-x64": ["@ampcode/cli-darwin-x64@0.0.1784917055-ge644b2", "", { "os": "darwin", "cpu": "x64" }, "sha512-9Ui+X8mX5MRAG0FCu7uM8RIBDdJ6ljaRDBxyWEdXeJfEegc8GnMwAG01xpAxMEOGSr54DK8p/tJ2fHNGLHMV8w=="],
-
-    "@ampcode/cli-linux-arm64": ["@ampcode/cli-linux-arm64@0.0.1784917055-ge644b2", "", { "os": "linux", "cpu": "arm64" }, "sha512-KDK8vkGo5hgd3mxWAEyUn/z6k582HO20xtbz6aE4bKxqmxV80YSrC2Ex3F/o9GzP6RQuI1fHJlFrgyDWYJv/Iw=="],
-
-    "@ampcode/cli-linux-x64": ["@ampcode/cli-linux-x64@0.0.1784917055-ge644b2", "", { "os": "linux", "cpu": "x64" }, "sha512-ivSP6dHZKN6bCemMWYOp3hVIu6R5obrG6UNX+D3g60+MrdDsXol5O2Vy6k4bxdI7RsZkeu7x9grvzVykGyatOA=="],
-
-    "@ampcode/cli-win32-x64": ["@ampcode/cli-win32-x64@0.0.1784917055-ge644b2", "", { "os": "win32", "cpu": "x64" }, "sha512-PvGsMUszjovVfmXLEEPJ/HeiC+PCQwQ6UgK3N5IG/4Nh9pKNLTFgMkcQu4cDGNz+o9EJOOqMXVmlR0Y6YpvxyQ=="],
-
-    "@ampcode/sdk": ["@ampcode/sdk@0.1.0-20260724142523-g5b0a5e3", "", { "dependencies": { "@ampcode/cli": "latest", "zod": "^3.23.8" }, "bin": { "amp-sdk": "bin/amp-sdk.js" } }, "sha512-U9LP3kEEuMcPQ67xaDhoM0fg/T07VXXpfKb7PNCksvoc05eEppylzXZZ+0UCB0Wkt1S1qV8ma8VrQG3Z2zof3Q=="],
 
     "@biomejs/biome": ["@biomejs/biome@2.5.4", "", { "optionalDependencies": { "@biomejs/cli-darwin-arm64": "2.5.4", "@biomejs/cli-darwin-x64": "2.5.4", "@biomejs/cli-linux-arm64": "2.5.4", "@biomejs/cli-linux-arm64-musl": "2.5.4", "@biomejs/cli-linux-x64": "2.5.4", "@biomejs/cli-linux-x64-musl": "2.5.4", "@biomejs/cli-win32-arm64": "2.5.4", "@biomejs/cli-win32-x64": "2.5.4" }, "bin": { "biome": "bin/biome" } }, "sha512-xy5FNE5kQJKyK5MR1gJy6ztXYx4WBAbYGlK04lMEgmyPRWKybY9NFwiG9yo0XdzOU8Xvhj41u034J1ywfoWfMw=="],
 
@@ -850,7 +835,7 @@
 
     "yuku-ast": ["yuku-ast@0.6.11", "", { "dependencies": { "@yuku-toolchain/types": "0.6.8" } }, "sha512-ZfXkFYVsDewS45+kv3WiA/qNB73CRfxFDEQwfnRMUAR4AD5zRI7PRqxmI2U3Jz/oG41GneTVW6mxDOQal0lgeA=="],
 
-    "zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
+    "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 
     "zwitch": ["zwitch@2.0.4", "", {}, "sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A=="],
 
@@ -865,10 +850,6 @@
     "@tailwindcss/oxide-wasm32-wasi/@tybys/wasm-util": ["@tybys/wasm-util@0.10.3", "", { "dependencies": { "tslib": "^2.4.0" }, "bundled": true }, "sha512-F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg=="],
 
     "@tailwindcss/oxide-wasm32-wasi/tslib": ["tslib@2.8.1", "", { "bundled": true }, "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="],
-
-    "fumadocs-core/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
-
-    "fumadocs-mdx/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 
     "fumadocs-ui/lucide-react": ["lucide-react@1.25.0", "", { "peerDependencies": { "react": "^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0" } }, "sha512-/mdJTRbiwcLOQ1NZZK1amZF9rIZyvO18D6r9TngE6TG1NmqHgFuT4eE7Xrkm9UsXMbBJD1NlfwHVltCDWHrOTw=="],
 

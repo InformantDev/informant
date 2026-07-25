@@ -16,7 +16,6 @@
     "typecheck": "bun run --filter '*' typecheck"
   },
   "devDependencies": {
-    "@ampcode/sdk": "0.1.0-20260724142523-g5b0a5e3",
     "@biomejs/biome": "^2.4.16",
     "@types/bun": "latest",
     "typescript": "^5"
