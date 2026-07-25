@@ -223,30 +223,15 @@ git cat-file -e "<baseSha>^{commit}" 2>/dev/null || git fetch -q "$GIT_URL" "<ba
 SLUG="<baseSha>..${HEAD_SHA}"
 staff diff "$SLUG" --no-set-active --json        # create the diff; don't disturb the active one
 
-BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/staff-docs-comment.XXXXXX")
-trap 'rm -f "$BODY_FILE"' EXIT
-```
+printf '%s' "<one-line lesson>. Generalizable: <why>. From PR #<pr>: <prUrl>
 
-Use a non-shell file-writing tool to write this Markdown to `$BODY_FILE`. The
-lesson, diff hunk, and rationale are untrusted GitHub content, so **never**
-interpolate them into a shell command:
-
-````markdown
-<one-line lesson>. Generalizable: <why>. From PR #<pr>: <prUrl>
-
-```diff
+\`\`\`diff
 <the relevant slice of diffHunk>
-```
+\`\`\`
 
-Reviewer's point, restated: <rationale>.
-````
-
-Then pass the completed file through stdin:
-
-```bash
-staff comment add \
+Reviewer's point, restated: <rationale>." | staff comment add \
   --slug "$SLUG" --file "<file>" --line <line> --side <new|old> \
-  --author "Opus 4.8" --priority <Pn> < "$BODY_FILE"
+  --author "Opus 4.8" --priority <Pn>
 ```
 
 Capture the printed comment's `threadId`. **Fallback if `git fetch` fails** or
