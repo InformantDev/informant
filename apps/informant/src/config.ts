@@ -178,9 +178,9 @@ function parseEnvironment(value: unknown, label: string): Record<string, string>
   return Object.fromEntries(Object.entries(environment).map(([key, item]) => [key, String(item)]));
 }
 
-function parseCaches(value: unknown, label: string): JobConfig["cache"] {
+function parseCaches(value: unknown, label: string, allowEmpty = false): JobConfig["cache"] {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length === 0) {
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) {
     throw new Error(`${label} must be a non-empty array of tables`);
   }
   return value.map((item, cacheIndex) => {
@@ -286,7 +286,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
       throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
     }
     const cache =
-      job.cache === undefined ? defaultCache : parseCaches(job.cache, `jobs[${index}].cache`);
+      job.cache === undefined ? defaultCache : parseCaches(job.cache, `jobs[${index}].cache`, true);
     return {
       name: job.name,
       command: job.command.trim(),

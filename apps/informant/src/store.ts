@@ -11,6 +11,48 @@ function buildDirectory(id: string): string {
   return join(dataDirectory(), "builds", id);
 }
 
+const WORKSPACE_OWNER = ".owner.json";
+
+function processStartIdentity(pid: number): string | undefined {
+  const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  if (result.exitCode !== 0) return undefined;
+  const identity = result.stdout.toString().trim();
+  return identity || undefined;
+}
+
+export async function claimBuildWorkspace(workspace: string): Promise<void> {
+  await mkdir(workspace, { recursive: true });
+  const startedAt = processStartIdentity(process.pid);
+  if (!startedAt) throw new Error("Could not determine worker process start identity");
+  await Bun.write(
+    join(workspace, WORKSPACE_OWNER),
+    JSON.stringify({ pid: process.pid, startedAt }),
+  );
+}
+
+async function workspaceHasLiveOwner(workspace: string): Promise<boolean> {
+  try {
+    const owner = (await Bun.file(join(workspace, WORKSPACE_OWNER)).json()) as {
+      pid?: unknown;
+      startedAt?: unknown;
+    };
+    if (!Number.isInteger(owner.pid) || (owner.pid as number) <= 0) return false;
+    if (typeof owner.startedAt !== "string" || !owner.startedAt) return false;
+    try {
+      process.kill(owner.pid as number, 0);
+      return processStartIdentity(owner.pid as number) === owner.startedAt;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
+      return processStartIdentity(owner.pid as number) === owner.startedAt;
+    }
+  } catch {
+    return false;
+  }
+}
+
 export async function createBuild(record: BuildRecord): Promise<void> {
   await mkdir(buildDirectory(record.id), { recursive: true });
   await saveBuild(record);
@@ -66,6 +108,7 @@ export async function removeOrphanedBuildWorkspaces(
     try {
       const metadata = await stat(workspace);
       if (metadata.mtimeMs >= olderThan) continue;
+      if (await workspaceHasLiveOwner(workspace)) continue;
       await rm(workspace, { recursive: true });
       removed++;
     } catch (error) {

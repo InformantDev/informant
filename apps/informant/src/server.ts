@@ -48,16 +48,26 @@ export function applySecretPolicy(
   trusted: InformantConfig,
   trustedSha: string,
 ): InformantConfig {
-  const trustedJobs = trusted.jobs.filter((job) => job.secrets.length > 0);
-  if (trustedJobs.length === 0) {
+  const trustedSecretJobs = trusted.jobs.filter((job) => job.secrets.length > 0);
+  if (trustedSecretJobs.length === 0) {
     if (config.jobs.some((job) => job.secrets.length > 0)) {
       throw new Error("secret-bearing jobs must be authorized on the default branch");
     }
     return { ...config, trustedSha };
   }
-  const trustedByName = new Map(trustedJobs.map((job) => [job.name, job]));
+  const allTrustedByName = new Map(trusted.jobs.map((job) => [job.name, job]));
+  const trustedByName = new Map<string, (typeof trusted.jobs)[number]>();
+  const includeTrustedJob = (name: string) => {
+    if (trustedByName.has(name)) return;
+    const job = allTrustedByName.get(name);
+    if (!job) return;
+    trustedByName.set(name, job);
+    for (const dependency of job.needs) includeTrustedJob(dependency);
+  };
+  for (const job of trustedSecretJobs) includeTrustedJob(job.name);
+  const trustedSecretNames = new Set(trustedSecretJobs.map((job) => job.name));
   for (const job of config.jobs) {
-    if (job.secrets.length > 0 && !trustedByName.has(job.name)) {
+    if (job.secrets.length > 0 && !trustedSecretNames.has(job.name)) {
       throw new Error(`secret-bearing job ${job.name} is not authorized on the default branch`);
     }
   }
@@ -68,7 +78,7 @@ export function applySecretPolicy(
     included.add(job.name);
     return trustedJob;
   });
-  for (const job of trustedJobs) {
+  for (const job of trustedByName.values()) {
     if (!included.has(job.name)) jobs.push(job);
   }
   return { ...config, vm: trusted.vm, jobs, trustedSha };

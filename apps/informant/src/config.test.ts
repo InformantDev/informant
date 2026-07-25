@@ -171,6 +171,16 @@ describe("configuration", () => {
     expect(parsed?.cache).toEqual([{ paths: ["~/.cache/turbo"], keyFiles: [], shared: true }]);
   });
 
+  test("an explicit empty job cache opts out of inherited caches", () => {
+    const source = configTemplate()
+      .replace(
+        "timeout_minutes = 30",
+        'timeout_minutes = 30\ncache = [{ paths = ["~/.cache/turbo"], shared = true }]',
+      )
+      .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []");
+    expect(parseConfig(source).jobs[0]?.cache).toEqual([]);
+  });
+
   test("requires job environment to contain scalar values", () => {
     const withEnvironment = configTemplate().replace(
       'command = "bun install --frozen-lockfile && bun test"',
@@ -294,9 +304,11 @@ describe("configuration", () => {
         configTemplate().replace("shared = true", 'shared = true, key_files = ["bun.lock"]'),
       ),
     ).toThrow("cannot combine shared and key_files");
-    expect(() => parseConfig(configTemplate().replace(/cache = .+/, "cache = []"))).toThrow(
-      "cache must be a non-empty array",
-    );
+    expect(() =>
+      parseConfig(
+        configTemplate().replace("timeout_minutes = 30", "timeout_minutes = 30\ncache = []"),
+      ),
+    ).toThrow("cache must be a non-empty array");
     expect(() =>
       parseConfig(configTemplate().replace('paths = ["~/.bun/install/cache"]', "paths = []")),
     ).toThrow("paths must contain paths starting with ~/");

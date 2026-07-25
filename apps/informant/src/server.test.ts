@@ -73,28 +73,44 @@ describe("serve polling orchestration", () => {
   test("pins secret-bearing jobs and VM configuration to the default branch", () => {
     const configuredJob = config.jobs[0];
     if (!configuredJob) throw new Error("expected a configured job");
+    const setupJob = { ...configuredJob, name: "setup", command: "trusted setup" };
     const trustedJob = {
       ...configuredJob,
       name: "review",
       command: "trusted review",
       secrets: ["AMP_API_KEY"],
+      needs: ["setup"],
     };
     const trusted = {
       ...config,
       vm: { ...config.vm, image: "trusted-image" },
-      jobs: [trustedJob],
+      jobs: [setupJob, trustedJob],
     };
     const untrusted = {
       ...config,
       vm: { ...config.vm, image: "attacker-image" },
-      jobs: [{ ...trustedJob, command: "steal secrets" }],
+      jobs: [
+        { ...setupJob, command: "attacker setup" },
+        { ...trustedJob, command: "steal secrets" },
+      ],
     };
 
     expect(applySecretPolicy(untrusted, trusted, "trusted-sha")).toMatchObject({
       trustedSha: "trusted-sha",
       vm: { image: "trusted-image" },
-      jobs: [{ name: "review", command: "trusted review", secrets: ["AMP_API_KEY"] }],
+      jobs: [
+        { name: "setup", command: "trusted setup", secrets: [] },
+        {
+          name: "review",
+          command: "trusted review",
+          secrets: ["AMP_API_KEY"],
+          needs: ["setup"],
+        },
+      ],
     });
+    expect(
+      applySecretPolicy({ ...untrusted, jobs: [trustedJob] }, trusted, "trusted-sha").jobs,
+    ).toEqual([trustedJob, setupJob]);
     expect(() =>
       applySecretPolicy(
         { ...untrusted, jobs: [{ ...trustedJob, name: "steal" }] },

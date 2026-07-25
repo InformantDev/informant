@@ -1,7 +1,7 @@
 import { chmod, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { command, requireCommand } from "../process.ts";
-import { appendLog } from "../store.ts";
+import { appendLog, claimBuildWorkspace } from "../store.ts";
 import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
 import { cacheMounts } from "./cache.ts";
 import { ensurePreparedImage } from "./images.ts";
@@ -43,29 +43,38 @@ export async function resolveJobSecrets(
   );
 }
 
-async function secretMount(
+export async function secretMount(
   workspace: string,
   job: InformantConfig["jobs"][number],
   runtimeSecrets: RuntimeSecrets,
+  operations: {
+    write?: typeof Bun.write;
+    realpath?: typeof realpath;
+  } = {},
 ): Promise<{ args: string[]; source: string; values: string[]; directory?: string }> {
   const secrets = await resolveJobSecrets(job, runtimeSecrets);
   if (Object.keys(secrets).length === 0) return { args: [], source: "", values: [] };
   const directory = join(workspace, "..", `secrets-${crypto.randomUUID().slice(0, 8)}`);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, "environment");
-  await Bun.write(
-    path,
-    `${Object.entries(secrets)
-      .map(([name, value]) => `export ${name}=${shellQuote(value)}`)
-      .join("\n")}\n`,
-  );
-  await chmod(path, 0o600);
-  return {
-    args: [`--dir=secrets:${await realpath(directory)}`],
-    source: `. ${shellQuote("/Volumes/My Shared Files/secrets/environment")}; rm -f ${shellQuote("/Volumes/My Shared Files/secrets/environment")};`,
-    values: Object.values(secrets).filter((value) => value.length > 0),
-    directory,
-  };
+  try {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const path = join(directory, "environment");
+    await (operations.write ?? Bun.write)(
+      path,
+      `${Object.entries(secrets)
+        .map(([name, value]) => `export ${name}=${shellQuote(value)}`)
+        .join("\n")}\n`,
+    );
+    await chmod(path, 0o600);
+    return {
+      args: [`--dir=secrets:${await (operations.realpath ?? realpath)(directory)}`],
+      source: `. ${shellQuote("/Volumes/My Shared Files/secrets/environment")}; rm -f ${shellQuote("/Volumes/My Shared Files/secrets/environment")};`,
+      values: Object.values(secrets).filter((value) => value.length > 0),
+      directory,
+    };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export function streamingSecretRedactor(
@@ -224,6 +233,37 @@ export interface JobExecutionObserver {
 }
 
 const JOB_LOG_BYTES = 55_000;
+const BUILD_LOG_BYTES = 10 * 1024 * 1024;
+export const BUILD_LOG_TRUNCATION_MARKER = "\n[informant: build log truncated at 10 MiB]\n";
+
+export function boundedLogWriter(
+  output: (text: string) => Promise<void>,
+  maximumBytes = BUILD_LOG_BYTES,
+  marker = BUILD_LOG_TRUNCATION_MARKER,
+): (text: string) => Promise<void> {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const markerBytes = encoder.encode(marker);
+  if (markerBytes.length > maximumBytes) throw new Error("log truncation marker exceeds quota");
+  let writtenBytes = 0;
+  let truncated = false;
+  return async (text) => {
+    if (truncated) return;
+    const bytes = encoder.encode(text);
+    const contentLimit = maximumBytes - markerBytes.length;
+    if (writtenBytes + bytes.length <= contentLimit) {
+      writtenBytes += bytes.length;
+      await output(text);
+      return;
+    }
+    let length = Math.max(0, contentLimit - writtenBytes);
+    while (length > 0 && length < bytes.length && ((bytes[length] ?? 0) & 0xc0) === 0x80) length--;
+    if (length > 0) await output(decoder.decode(bytes.subarray(0, length)));
+    await output(marker);
+    writtenBytes += length + markerBytes.length;
+    truncated = true;
+  };
+}
 
 export function utf8Tail(value: string, maximumBytes = JOB_LOG_BYTES): string {
   const bytes = new TextEncoder().encode(value);
@@ -305,13 +345,13 @@ export async function runInTart(
   const decoder = new TextDecoder();
   let logHandle: Awaited<ReturnType<typeof open>> | undefined;
   let writes = Promise.resolve();
-  const writeLog = (text: string) => {
+  const writeLog = boundedLogWriter((text) => {
     writes = writes.then(async () => {
       if (logHandle) await logHandle.appendFile(text);
       else await appendLog(record, text);
     });
     return writes;
-  };
+  });
   const progressTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const flushProgress = async (job: InformantConfig["jobs"][number]) => {
     const timer = progressTimers.get(job.name);
@@ -344,7 +384,7 @@ export async function runInTart(
   let result: boolean | undefined;
   try {
     signal?.throwIfAborted();
-    await mkdir(root, { recursive: true });
+    await claimBuildWorkspace(root);
     logHandle = await open(record.logPath, "a");
     await writeLog(`$ cloning ${repository.fullName} at ${sha}\n`);
     const image = await ensurePreparedImage(

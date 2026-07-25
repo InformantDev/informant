@@ -89,7 +89,9 @@ export async function cacheMounts(
         mountIndex++;
         continue;
       }
-      const parent = join(root, cachePathIdentity(user, path));
+      const parent = trusted
+        ? join(root, cachePathIdentity(user, path))
+        : join(workspace, "..", "keyed-caches", cachePathIdentity(user, path));
       const host = join(parent, cacheKey);
       await mkdir(host, { recursive: true });
       const now = new Date();
