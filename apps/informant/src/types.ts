@@ -51,6 +51,7 @@ export interface InformantConfig {
   branches?: string[];
   vm: {
     image: string;
+    guestOs: "macos" | "linux";
     user: string;
     password: string;
     cpu?: number;

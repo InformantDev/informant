@@ -19,6 +19,7 @@ triggers = [
 
 [vm]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+os = "macos"
 user = "admin"
 password = "admin"
 cpu = 4
@@ -33,6 +34,22 @@ sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
 
 Informant polls every 30 seconds by default. Set `poll_interval_seconds` only when a repository needs
 a different cadence; values below five seconds are clamped to five.
+
+`vm.os` defaults to `"macos"`, preserving existing configurations. To use an official Tart Linux
+image, select Linux explicitly:
+
+```toml
+[vm]
+os = "linux"
+image = "ghcr.io/cirruslabs/ubuntu:latest"
+user = "admin"
+password = "admin"
+```
+
+Informant mounts the checkout and other Tart shared directories beneath `/mnt/shared` on Linux;
+Linux user caches are beneath `/home/<user>`. On macOS, these remain `/Volumes/My Shared Files` and
+`/Users/<user>` respectively. The Linux image must allow the configured user to mount Tart's
+VirtioFS share with passwordless `sudo`.
 
 `.informant/jobs/test.toml`:
 
@@ -78,7 +95,8 @@ when it needs a different limit.
 
 Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh Tart VM and isolated
 checkout mounted at `/Volumes/My Shared Files/workspace`. Use `needs` to make a job wait for one or
-more other jobs. In this example, `test` and `lint` start together; `build` starts only after both pass.
+more other jobs. Linux guests instead use `/mnt/shared/workspace`. In this example, `test` and `lint`
+start together; `build` starts only after both pass.
 If a dependency fails or times out, jobs that need it are skipped.
 
 ## Host secrets
@@ -138,7 +156,7 @@ top-level `triggers`. Manual `informant run` ignores trigger eligibility.
 
 `vm.prepare` runs once when a worker first sees that image and preparation command. Informant keeps the
 stopped result as a local Tart image and clones jobs from it, so tools such as Bun do not need to be
-installed in every job. Changing `vm.image`, `vm.user`, or `vm.prepare` creates a new prepared image.
+installed in every job. Changing `vm.image`, `vm.os`, `vm.user`, or `vm.prepare` creates a new prepared image.
 
 Preparation is automatic. Use `informant image prepare` to warm the image ahead of a build,
 `informant image list` to inspect prepared images, and `informant image prune` to remove images that

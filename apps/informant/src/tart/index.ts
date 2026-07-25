@@ -5,6 +5,7 @@ import { appendLog, claimBuildWorkspace } from "../store.ts";
 import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
 import { cacheMounts } from "./cache.ts";
 import { ensurePreparedImage } from "./images.ts";
+import { guestSharedRoot, linuxSharedMountCommand } from "./layout.ts";
 import { provisionVm, shellQuote, sshCommand, startVm, stopVm, withImageLock } from "./vm.ts";
 
 export { cachePathIdentity } from "./cache.ts";
@@ -47,6 +48,7 @@ export async function secretMount(
   workspace: string,
   job: InformantConfig["jobs"][number],
   runtimeSecrets: RuntimeSecrets,
+  guestOs: InformantConfig["vm"]["guestOs"] = "macos",
   operations: {
     write?: typeof Bun.write;
     realpath?: typeof realpath;
@@ -67,7 +69,7 @@ export async function secretMount(
     await chmod(path, 0o600);
     return {
       args: [`--dir=secrets:${await (operations.realpath ?? realpath)(directory)}`],
-      source: `. ${shellQuote("/Volumes/My Shared Files/secrets/environment")}; rm -f ${shellQuote("/Volumes/My Shared Files/secrets/environment")};`,
+      source: `. ${shellQuote(`${guestSharedRoot(guestOs)}/secrets/environment`)} || exit; rm -f ${shellQuote(`${guestSharedRoot(guestOs)}/secrets/environment`)} || exit;`,
       values: Object.values(secrets).filter((value) => value.length > 0),
       directory,
     };
@@ -157,9 +159,10 @@ async function runJob(
         workspace,
         job,
         config.vm.user,
+        config.vm.guestOs,
         config.trustedSha === sha,
       );
-      const secrets = await secretMount(workspace, job, runtimeSecrets);
+      const secrets = await secretMount(workspace, job, runtimeSecrets, config.vm.guestOs);
       secretDirectory = secrets.directory;
       const started = await startVm(
         vm,
@@ -172,6 +175,18 @@ async function runJob(
         signal,
       );
       tart = started.process;
+      if (config.vm.guestOs === "linux") {
+        const setup = await sshCommand(started.ip, config, linuxSharedMountCommand(), 60_000, {
+          signal,
+        });
+        if (setup.exitCode !== 0 || setup.timedOut) {
+          throw new Error(
+            setup.timedOut
+              ? "timed out mounting Tart Linux shared directories"
+              : `could not mount Tart Linux shared directories: ${setup.stderr.trim() || `exit ${setup.exitCode}`}`,
+          );
+        }
+      }
       return {
         ip: started.ip,
         cacheRestore: caches.restore,
@@ -192,7 +207,7 @@ async function runJob(
     const env = Object.entries(environment)
       .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
       .join(" ");
-    const execute = `cd ${shellQuote("/Volumes/My Shared Files/workspace")} && /bin/bash -lc ${shellQuote(`${env} ${ready.secretSource} ${job.command}`)}`;
+    const execute = `cd ${shellQuote(`${guestSharedRoot(config.vm.guestOs)}/workspace`)} && /bin/bash -lc ${shellQuote(`${env} ${ready.secretSource} ${job.command}`)}`;
     const jobCommand = ready.cacheRestore
       ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; ${ready.cacheSave}; informant_cache_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; exit $informant_cache_status`
       : execute;

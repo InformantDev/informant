@@ -21,6 +21,7 @@ describe("configuration", () => {
     expect(directoryConfigTemplate()).not.toContain("poll_interval_seconds");
     expect(config.pollIntervalSeconds).toBe(30);
     expect(config.vm).toMatchObject({
+      guestOs: "macos",
       user: "admin",
       prepare:
         'set -euo pipefail\ncurl -fsSL https://bun.sh/install | bash\nsudo mkdir -p /usr/local/bin\nsudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun',
@@ -109,6 +110,16 @@ describe("configuration", () => {
         ),
       ),
     ).toThrow("vm.image must be a non-empty string");
+  });
+
+  test("defaults the guest OS to macOS and accepts Linux", () => {
+    expect(parseConfig(configTemplate().replace('os = "macos"\n', "")).vm.guestOs).toBe("macos");
+    expect(parseConfig(configTemplate().replace('os = "macos"', 'os = "linux"')).vm.guestOs).toBe(
+      "linux",
+    );
+    expect(() => parseConfig(configTemplate().replace('os = "macos"', 'os = "windows"'))).toThrow(
+      'vm.os must be "macos" or "linux"',
+    );
   });
 
   test("validates VM credentials while allowing an explicitly empty password", () => {

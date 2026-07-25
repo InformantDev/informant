@@ -13,6 +13,7 @@ triggers = [{ event = "commit", branch = { names = ["main"] } }]
 
 [vm]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+os = "macos"
 user = "admin"
 password = "admin"
 prepare = """
@@ -328,6 +329,10 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   if (typeof vm.image !== "string" || vm.image.trim().length === 0) {
     throw new Error("vm.image must be a non-empty string");
   }
+  const guestOs = vm.os ?? "macos";
+  if (guestOs !== "macos" && guestOs !== "linux") {
+    throw new Error('vm.os must be "macos" or "linux"');
+  }
   const cpu = vm.cpu === undefined ? undefined : Number(vm.cpu);
   if (cpu !== undefined && (!Number.isFinite(cpu) || cpu <= 0 || !Number.isInteger(cpu))) {
     throw new Error("vm.cpu must be a positive integer");
@@ -365,6 +370,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     triggers: topTriggers,
     vm: {
       image: vm.image,
+      guestOs,
       user,
       password,
       cpu,

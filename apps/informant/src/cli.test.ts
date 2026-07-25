@@ -12,9 +12,12 @@ test("cache prune preserves shared caches and cache clear removes the cache root
   try {
     await mkdir(join(cacheRoot, "shared", "shared-entry"), { recursive: true });
     await mkdir(join(cacheRoot, "repository", "keyed-entry"), { recursive: true });
+    await mkdir(join(cacheRoot, "linux", "shared", "shared-entry"), { recursive: true });
+    await mkdir(join(cacheRoot, "linux", "repository", "keyed-entry"), { recursive: true });
 
     await main(["cache", "prune"]);
-    expect(await readdir(cacheRoot)).toEqual(["shared"]);
+    expect((await readdir(cacheRoot)).sort()).toEqual(["linux", "shared"]);
+    expect(await readdir(join(cacheRoot, "linux"))).toEqual(["shared"]);
 
     await main(["cache", "clear"]);
     expect(await Bun.file(cacheRoot).exists()).toBe(false);
