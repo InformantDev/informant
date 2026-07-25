@@ -37,10 +37,16 @@ saved by `informant setup`:
 
 ## Manual App creation
 
-[Open GitHub with Informant's permissions preselected →](https://github.com/settings/apps/new?name=Informant%20Local%20CI&description=Runs%20private%20CI%20on%20your%20local%20machines&url=https%3A%2F%2Fgithub.com%2Finformant-ci%2Finformant&public=false&checks=write&contents=read&pull_requests=read&webhook_active=false)
+[Open GitHub with Informant's permissions preselected →](https://github.com/settings/apps/new?name=Informant%20Local%20CI&description=Runs%20private%20CI%20on%20your%20local%20machines&url=https%3A%2F%2Fgithub.com%2FInformantDev%2Finformant&public=false&checks=write&contents=read&pull_requests=write&webhook_active=false)
 
-The registration URL requests **Checks: read/write**, **Contents: read**, and **Pull requests: read**, and disables
-webhooks. Informant polls GitHub, so it does not need a webhook URL or a publicly reachable server.
+The registration URL requests **Checks: read/write**, **Contents: read**, and **Pull requests:
+read/write**, and disables webhooks. Pull-request write access lets CI jobs use the short-lived App
+token to publish review comments. Informant polls GitHub, so it does not need a webhook URL or a
+publicly reachable server.
+
+Apps created before pull-request review jobs were introduced may still have read-only access. Open
+the App's **Permissions & events** settings, change **Pull requests** to **Read and write**, save, and
+approve the requested permission change on each installation.
 
 PR conversation comments are discovered by polling. Historical comments are seeded rather than
 replayed on first enable; a durable per-machine cursor and pending event snapshot prevent restart
@@ -163,7 +169,7 @@ Common failures:
 
 - **GitHub App authentication failed:** verify the App ID matches the App that generated the PEM.
 - **Not Found or Resource not accessible:** verify the installation includes the repository and has
-  **Checks: read/write** plus **Contents: read**.
+  **Checks: read/write**, **Contents: read**, and **Pull requests: read/write**.
 - **Private key file not found:** use an absolute path or `$HOME`; do not rely on the current directory.
 - **Works in Terminal but not as a service:** source the environment file in your terminal, then rerun
   `informant startup enable` so the launchd plist captures the current `INFORMANT_*` values.

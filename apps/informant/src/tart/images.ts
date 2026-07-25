@@ -196,3 +196,16 @@ export async function prunePreparedImages(): Promise<number> {
     return images.length;
   });
 }
+
+export async function pruneStoppedJobVms(): Promise<number> {
+  const vms = (await tartImages()).filter(
+    (image) =>
+      image.Source === "local" &&
+      !image.Running &&
+      /^informant-[0-9a-f]{8}-[0-9a-f]{3}-\d+$/.test(image.Name),
+  );
+  for (const vm of vms) {
+    await requireCommand(["tart", "delete", vm.Name], `could not delete stale Tart VM ${vm.Name}`);
+  }
+  return vms.length;
+}

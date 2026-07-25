@@ -1,5 +1,35 @@
 import { expect, test } from "bun:test";
+import { generateKeyPairSync } from "node:crypto";
 import { GitHubApiError, GitHubClient } from "./github.ts";
+
+test("job access tokens are freshly minted and downscoped to one repository", async () => {
+  const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({
+    type: "pkcs8",
+    format: "pem",
+  });
+  let requestBody: Record<string, unknown> | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return Response.json({ token: "job-token", expires_at: "2099-01-01T00:00:00Z" });
+  }) as typeof globalThis.fetch;
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+  const github = new GitHubClient({
+    token: "static-token-that-must-not-be-reused",
+    fetch,
+    repository,
+    credentials: {
+      appId: "123",
+      installationId: "456",
+      privateKey: String(privateKey),
+    },
+  });
+
+  expect(await github.createJobAccessToken(repository)).toBe("job-token");
+  expect(requestBody).toEqual({
+    repositories: ["widgets"],
+    permissions: { pull_requests: "write" },
+  });
+});
 
 test("rate limit errors preserve GitHub's reset time", async () => {
   const reset = Math.floor(Date.now() / 1_000);

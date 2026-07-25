@@ -3,11 +3,13 @@ export interface JobConfig {
   command: string;
   timeoutMinutes: number;
   environment: Record<string, string>;
+  secrets: string[];
   needs: string[];
   triggers?: TriggerRule[];
   cache?: Array<{
     paths: string[];
     keyFiles: string[];
+    shared: boolean;
   }>;
 }
 
@@ -42,6 +44,8 @@ export interface PullRequestComment {
 export interface InformantConfig {
   version: number;
   pollIntervalSeconds: number;
+  /** Default-branch commit that authorized secret-bearing jobs. */
+  trustedSha?: string;
   triggers?: TriggerRule[];
   /** Legacy input compatibility; normalized configs omit this field. */
   branches?: string[];

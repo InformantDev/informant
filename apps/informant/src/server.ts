@@ -43,6 +43,47 @@ export interface ServerDependencies {
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
+export function applySecretPolicy(
+  config: InformantConfig,
+  trusted: InformantConfig,
+  trustedSha: string,
+): InformantConfig {
+  const trustedSecretJobs = trusted.jobs.filter((job) => job.secrets.length > 0);
+  if (trustedSecretJobs.length === 0) {
+    if (config.jobs.some((job) => job.secrets.length > 0)) {
+      throw new Error("secret-bearing jobs must be authorized on the default branch");
+    }
+    return { ...config, trustedSha };
+  }
+  const allTrustedByName = new Map(trusted.jobs.map((job) => [job.name, job]));
+  const trustedByName = new Map<string, (typeof trusted.jobs)[number]>();
+  const includeTrustedJob = (name: string) => {
+    if (trustedByName.has(name)) return;
+    const job = allTrustedByName.get(name);
+    if (!job) return;
+    trustedByName.set(name, job);
+    for (const dependency of job.needs) includeTrustedJob(dependency);
+  };
+  for (const job of trustedSecretJobs) includeTrustedJob(job.name);
+  const trustedSecretNames = new Set(trustedSecretJobs.map((job) => job.name));
+  for (const job of config.jobs) {
+    if (job.secrets.length > 0 && !trustedSecretNames.has(job.name)) {
+      throw new Error(`secret-bearing job ${job.name} is not authorized on the default branch`);
+    }
+  }
+  const included = new Set<string>();
+  const jobs = config.jobs.map((job) => {
+    const trustedJob = trustedByName.get(job.name);
+    if (!trustedJob) return job;
+    included.add(job.name);
+    return trustedJob;
+  });
+  for (const job of trustedByName.values()) {
+    if (!included.has(job.name)) jobs.push(job);
+  }
+  return { ...config, vm: trusted.vm, jobs, trustedSha };
+}
+
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
   const dependencies = options.dependencies ?? {};
   const github = dependencies.github ?? new GitHubClient({ repository });
@@ -179,7 +220,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           pullRequest: target.pullRequest,
         };
         try {
-          const config = await configAt(target.sha);
+          const config = applySecretPolicy(await configAt(target.sha), bootstrap, defaultSha);
           const matches = config.jobs.some((job) =>
             (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
           );
@@ -269,7 +310,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
         if (inFlightRuns.has(eventId)) continue;
         try {
-          const config = await configAt(pending.sha);
+          const config = applySecretPolicy(await configAt(pending.sha), bootstrap, defaultSha);
           const context = {
             type: "comment" as const,
             pullRequest: pending.pullRequest,

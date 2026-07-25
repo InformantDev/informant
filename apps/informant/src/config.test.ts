@@ -12,7 +12,7 @@ const configTemplate = () => `${directoryConfigTemplate()}
 [[jobs]]
 name = "test"
 command = "bun install --frozen-lockfile && bun test"
-cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
+cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 `;
 
 describe("configuration", () => {
@@ -31,9 +31,10 @@ describe("configuration", () => {
         command: "bun install --frozen-lockfile && bun test",
         timeoutMinutes: 30,
         environment: {},
+        secrets: [],
         needs: [],
         triggers: [{ event: "commit", branch: { names: ["main"] }, pullRequest: undefined }],
-        cache: [{ paths: ["~/.bun/install/cache"], keyFiles: ["bun.lock"] }],
+        cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
       },
     ]);
   });
@@ -154,6 +155,32 @@ describe("configuration", () => {
     ).toThrow("timeout_minutes must be a positive number");
   });
 
+  test("jobs inherit top-level environment and caches while allowing overrides", () => {
+    const source = configTemplate()
+      .replace(
+        "timeout_minutes = 30",
+        'timeout_minutes = 30\nenvironment = { CI = true, SHARED = "default" }\ncache = [{ paths = ["~/.cache/turbo"], shared = true }]',
+      )
+      .replace(
+        'command = "bun install --frozen-lockfile && bun test"',
+        'command = "bun install --frozen-lockfile && bun test"\nenvironment = { SHARED = "job" }',
+      )
+      .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]\n', "");
+    const parsed = parseConfig(source).jobs[0];
+    expect(parsed?.environment).toEqual({ CI: "true", SHARED: "job" });
+    expect(parsed?.cache).toEqual([{ paths: ["~/.cache/turbo"], keyFiles: [], shared: true }]);
+  });
+
+  test("an explicit empty job cache opts out of inherited caches", () => {
+    const source = configTemplate()
+      .replace(
+        "timeout_minutes = 30",
+        'timeout_minutes = 30\ncache = [{ paths = ["~/.cache/turbo"], shared = true }]',
+      )
+      .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []");
+    expect(parseConfig(source).jobs[0]?.cache).toEqual([]);
+  });
+
   test("requires job environment to contain scalar values", () => {
     const withEnvironment = configTemplate().replace(
       'command = "bun install --frozen-lockfile && bun test"',
@@ -198,6 +225,25 @@ describe("configuration", () => {
     ).toThrow("is not a shell variable");
   });
 
+  test("parses and validates job secrets", () => {
+    const configured = configTemplate().replace(
+      'command = "bun install --frozen-lockfile && bun test"',
+      'command = "bun install --frozen-lockfile && bun test"\nsecrets = ["AMP_API_KEY", "GITHUB_TOKEN"]',
+    );
+    expect(parseConfig(configured).jobs[0]?.secrets).toEqual(["AMP_API_KEY", "GITHUB_TOKEN"]);
+    expect(() => parseConfig(configured.replace("GITHUB_TOKEN", "BAD KEY"))).toThrow(
+      "secrets must contain shell variable names",
+    );
+    expect(() => parseConfig(configured.replace('"GITHUB_TOKEN"', '"AMP_API_KEY"'))).toThrow(
+      "secrets must not contain duplicates",
+    );
+    expect(() =>
+      parseConfig(
+        configured.replace("secrets =", 'environment = { AMP_API_KEY = "bad" }\nsecrets ='),
+      ),
+    ).toThrow("also set in environment");
+  });
+
   test("requires at least one non-empty legacy branch", () => {
     const legacy = configTemplate().replace(
       'triggers = [{ event = "commit", branch = { names = ["main"] } }]',
@@ -216,12 +262,12 @@ describe("configuration", () => {
 
   test("parses and validates persistent job caches", () => {
     expect(parseConfig(configTemplate()).jobs[0]?.cache).toEqual([
-      { paths: ["~/.bun/install/cache"], keyFiles: ["bun.lock"] },
+      { paths: ["~/.bun/install/cache"], keyFiles: [], shared: true },
     ]);
     expect(
       parseConfig(
         configTemplate().replace(
-          'cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]',
+          'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
           'cache = [{ paths = ["~/.bun/install/cache", "~/.cache/example"], key_files = ["bun.lock"] }, { paths = ["~/.cache/toolchain"], key_files = ["toolchain.toml"] }]',
         ),
       ).jobs[0]?.cache,
@@ -229,31 +275,40 @@ describe("configuration", () => {
       {
         paths: ["~/.bun/install/cache", "~/.cache/example"],
         keyFiles: ["bun.lock"],
+        shared: false,
       },
-      { paths: ["~/.cache/toolchain"], keyFiles: ["toolchain.toml"] },
+      { paths: ["~/.cache/toolchain"], keyFiles: ["toolchain.toml"], shared: false },
     ]);
     expect(() => parseConfig(configTemplate().replace('"~/.bun/install/cache"', '"/tmp"'))).toThrow(
       "paths must contain paths starting with ~/",
     );
     expect(() =>
-      parseConfig(
-        configTemplate().replace('key_files = ["bun.lock"]', 'key_files = ["../secret"]'),
-      ),
+      parseConfig(configTemplate().replace("shared = true", 'key_files = ["../secret"]')),
     ).toThrow("key_files must be relative paths");
     expect(() =>
       parseConfig(
         configTemplate().replace(
-          '{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }',
+          '{ paths = ["~/.bun/install/cache"], shared = true }',
           '"invalid"',
         ),
       ),
     ).toThrow("must be a table");
-    expect(() => parseConfig(configTemplate().replace('["bun.lock"]', '"bun.lock"'))).toThrow(
-      "key_files must be relative paths",
+    expect(() =>
+      parseConfig(configTemplate().replace("shared = true", 'key_files = "bun.lock"')),
+    ).toThrow("key_files must be relative paths");
+    expect(() => parseConfig(configTemplate().replace("shared = true", 'shared = "yes"'))).toThrow(
+      "shared must be a boolean",
     );
-    expect(() => parseConfig(configTemplate().replace(/cache = .+/, "cache = []"))).toThrow(
-      "cache must be a non-empty array",
-    );
+    expect(() =>
+      parseConfig(
+        configTemplate().replace("shared = true", 'shared = true, key_files = ["bun.lock"]'),
+      ),
+    ).toThrow("cannot combine shared and key_files");
+    expect(() =>
+      parseConfig(
+        configTemplate().replace("timeout_minutes = 30", "timeout_minutes = 30\ncache = []"),
+      ),
+    ).toThrow("cache must be a non-empty array");
     expect(() =>
       parseConfig(configTemplate().replace('paths = ["~/.bun/install/cache"]', "paths = []")),
     ).toThrow("paths must contain paths starting with ~/");

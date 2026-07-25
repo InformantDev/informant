@@ -1,15 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { cacheMounts } from "./tart/cache.ts";
 import {
   appendUtf8Tail,
+  BUILD_LOG_TRUNCATION_MARKER,
+  boundedLogWriter,
   cachePathIdentity,
   ensurePreparedImage,
   isRetryableSshAuthenticationFailure,
   preparedImageName,
   prunePreparedImages,
+  resolveJobSecrets,
   scheduleJobs,
+  secretMount,
+  streamingSecretRedactor,
   utf8Tail,
 } from "./tart/index.ts";
 import type { InformantConfig } from "./types.ts";
@@ -19,7 +25,82 @@ const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number
   needs,
   command: name,
   environment: {},
+  secrets: [],
   timeoutMinutes: 1,
+});
+
+test("resolves only explicitly requested host secrets", async () => {
+  const configured = { ...job("review"), secrets: ["AMP_API_KEY", "GITHUB_TOKEN"] };
+  expect(
+    await resolveJobSecrets(
+      configured,
+      { GITHUB_TOKEN: "installation-token" },
+      {
+        INFORMANT_SECRET_AMP_API_KEY: "amp-token",
+        UNREQUESTED: "hidden",
+      },
+    ),
+  ).toEqual({ AMP_API_KEY: "amp-token", GITHUB_TOKEN: "installation-token" });
+  await expect(resolveJobSecrets(configured, {}, {})).rejects.toThrow(
+    "secret AMP_API_KEY is not configured",
+  );
+});
+
+test("redacts secrets split across streamed log chunks", async () => {
+  let output = "";
+  const redactor = streamingSecretRedactor(["top-secret"], async (text) => {
+    output += text;
+  });
+  await redactor.write("before top-");
+  await redactor.write("secret after");
+  await redactor.flush();
+  expect(output).toBe("before [REDACTED] after");
+});
+
+test("prepares and cleans up a restricted secret mount", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-secrets-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  try {
+    const mount = await secretMount(
+      workspace,
+      { ...job("review"), secrets: ["TOKEN"] },
+      {
+        TOKEN: "top secret",
+      },
+    );
+    if (!mount.directory) throw new Error("expected a secret directory");
+    const environment = join(mount.directory, "environment");
+    expect((await stat(mount.directory)).mode & 0o777).toBe(0o700);
+    expect((await stat(environment)).mode & 0o777).toBe(0o600);
+    expect(await readFile(environment, "utf8")).toBe("export TOKEN='top secret'\n");
+    expect(mount.args).toEqual([`--dir=secrets:${await realpath(mount.directory)}`]);
+    expect(mount.source).toContain("/Volumes/My Shared Files/secrets/environment");
+
+    await rm(mount.directory, { recursive: true, force: true });
+    expect(await Bun.file(environment).exists()).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("removes plaintext secrets when mount preparation fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-secrets-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  try {
+    await expect(
+      secretMount(
+        workspace,
+        { ...job("review"), secrets: ["TOKEN"] },
+        { TOKEN: "top secret" },
+        { realpath: async () => Promise.reject(new Error("realpath failed")) },
+      ),
+    ).rejects.toThrow("realpath failed");
+    expect((await Array.fromAsync(new Bun.Glob("secrets-*").scan(root))).length).toBe(0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 const config = (prepare?: string): InformantConfig => ({
@@ -207,6 +288,77 @@ test("cache destinations have distinct storage identities", () => {
   expect(cachePathIdentity("admin", "~/.npm")).not.toBe(cachePathIdentity("builder", "~/.npm"));
 });
 
+test("shared caches use one direct host mount across repositories and jobs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-shared-cache-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  const sharedJob = {
+    ...job("test"),
+    cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
+  };
+  try {
+    const first = await cacheMounts(
+      { owner: "one", repo: "repo", fullName: "one/repo" },
+      workspace,
+      sharedJob,
+      "admin",
+      true,
+    );
+    const second = await cacheMounts(
+      { owner: "two", repo: "other", fullName: "two/other" },
+      workspace,
+      { ...sharedJob, name: "lint" },
+      "admin",
+      true,
+    );
+    expect(first.args).toEqual(second.args);
+    expect(first.restore).toContain("ln -s");
+    expect(first.save).toBe(":");
+    const untrusted = await cacheMounts(
+      { owner: "one", repo: "repo", fullName: "one/repo" },
+      workspace,
+      sharedJob,
+      "admin",
+    );
+    expect(untrusted.args).not.toEqual(first.args);
+    expect(untrusted.args[0]).toContain(root);
+  } finally {
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("keyed caches cross builds only for trusted commits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-keyed-cache-"));
+  const trustedWorkspace = join(root, "trusted-workspace");
+  const untrustedWorkspace = join(root, "untrusted-workspace");
+  await mkdir(trustedWorkspace);
+  await mkdir(untrustedWorkspace);
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  const keyedJob = {
+    ...job("test"),
+    cache: [{ paths: ["~/.npm"], keyFiles: [], shared: false }],
+  };
+  const repository = { owner: "one", repo: "repo", fullName: "one/repo" };
+  try {
+    const trusted = await cacheMounts(repository, trustedWorkspace, keyedJob, "admin", true);
+    const untrusted = await cacheMounts(repository, untrustedWorkspace, keyedJob, "admin");
+
+    expect(trusted.args[0]).toContain(join(root, "data", "caches"));
+    expect(untrusted.args[0]).toContain(join(root, "keyed-caches"));
+    expect(untrusted.args[0]).not.toContain(join(root, "data", "caches"));
+    expect(untrusted.args).not.toEqual(trusted.args);
+  } finally {
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("retries SSH only when authentication failed before the command started", () => {
   expect(
     isRetryableSshAuthenticationFailure({
@@ -249,6 +401,22 @@ test("job log tails can be maintained incrementally", () => {
   expect(tail.length).toBeLessThanOrEqual(17);
   expect(value).not.toContain("�");
   expect(value).toBe("😀".repeat(4));
+});
+
+test("persistent build logs stop at their byte quota with a truncation marker", async () => {
+  let output = "";
+  const write = boundedLogWriter(async (text) => {
+    output += text;
+  }, 64);
+
+  await write("start 😀 ");
+  await write("x".repeat(100));
+  await write("ignored after truncation");
+
+  expect(new TextEncoder().encode(output).length).toBe(64);
+  expect(output).toEndWith(BUILD_LOG_TRUNCATION_MARKER);
+  expect(output).not.toContain("�");
+  expect(output).not.toContain("ignored");
 });
 
 describe("job scheduler", () => {

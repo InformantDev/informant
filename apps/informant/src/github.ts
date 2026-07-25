@@ -159,6 +159,57 @@ export class GitHubClient {
     this.tokenExpiresAt = new Date(result.expires_at).getTime();
   }
 
+  async createJobAccessToken(repository: Repository): Promise<string> {
+    const environmentAccount = Bun.env.INFORMANT_GITHUB_ACCOUNT;
+    const environmentMatches =
+      !environmentAccount || environmentAccount.toLowerCase() === repository.owner.toLowerCase();
+    const hasEnvironmentCredentials = Boolean(
+      environmentMatches &&
+        Bun.env.INFORMANT_GITHUB_APP_ID &&
+        Bun.env.INFORMANT_GITHUB_INSTALLATION_ID &&
+        (Bun.env.INFORMANT_GITHUB_PRIVATE_KEY || Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE),
+    );
+    const stored =
+      this.credentials || hasEnvironmentCredentials
+        ? undefined
+        : await getGitHubCredentials(repository);
+    const appId =
+      this.credentials?.appId ??
+      (environmentMatches ? Bun.env.INFORMANT_GITHUB_APP_ID : undefined) ??
+      stored?.appId;
+    const installationId =
+      this.credentials?.installationId ??
+      (environmentMatches ? Bun.env.INFORMANT_GITHUB_INSTALLATION_ID : undefined) ??
+      stored?.installationId;
+    const privateKey =
+      this.credentials?.privateKey ??
+      (await this.privateKey(
+        this.credentials?.privateKeyFile ?? stored?.privateKeyFile,
+        environmentMatches,
+      ));
+    if (!appId || !installationId || !privateKey) {
+      throw new Error("job tokens require refreshable GitHub App credentials, not a static token");
+    }
+    const response = await this.request(
+      `${API}/app/installations/${installationId}/access_tokens`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${this.appJwt(appId, privateKey)}`,
+          "Content-Type": "application/json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({
+          repositories: [repository.repo],
+          permissions: { pull_requests: "write" },
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(`GitHub App job token failed: ${await response.text()}`);
+    return ((await response.json()) as { token: string }).token;
+  }
+
   private async privateKey(
     storedPath?: string,
     useEnvironment = true,

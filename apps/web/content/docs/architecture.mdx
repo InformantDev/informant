@@ -23,8 +23,9 @@ The elected `Informant CI` check remains the build-level claim and summary. Info
 separate `Informant / <job>` check for every selected job. Each job check moves from queued to running
 to its own conclusion and contains only that job's log, so parallel output is never interleaved in the
 GitHub UI. While a job runs, Informant updates its check with a rolling log tail about every 10 seconds.
-Updates are coalesced to avoid an API request per output chunk, and the complete retained log remains
-available from the CLI. Jobs skipped because a dependency failed receive a `skipped` conclusion.
+Updates are coalesced to avoid an API request per output chunk. The CLI exposes the retained local log,
+which is capped at 10 MiB per build and includes a truncation marker when output exceeds that limit.
+Jobs skipped because a dependency failed receive a `skipped` conclusion.
 
 Because the Checks API does not offer compare-and-swap, this election is best-effort rather than a
 strict distributed lock. Checks are fetched with `filter=all` and scoped to the configured GitHub App;

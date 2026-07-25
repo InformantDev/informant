@@ -5,5 +5,5 @@ bun install --frozen-lockfile
 bun run build
 """
 environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
-cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
+cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 needs = ["test", "lint", "typecheck"]
