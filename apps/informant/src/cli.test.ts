@@ -1,8 +1,19 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "./cli.ts";
+
+test("--version prints the package version without help", async () => {
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await main(["--version"]);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith("0.1.0");
+  } finally {
+    log.mockRestore();
+  }
+});
 
 test("cache prune preserves shared caches and cache clear removes the cache root", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-cli-cache-"));

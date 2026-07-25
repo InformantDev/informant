@@ -344,12 +344,12 @@ async function doctor(): Promise<void> {
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const [subcommand, action, id] = positional;
-  if (!subcommand || flags.help || subcommand === "help") {
-    console.log(HELP);
-    return;
-  }
   if (flags.version || subcommand === "--version") {
     console.log(packageJson.version);
+    return;
+  }
+  if (!subcommand || flags.help || subcommand === "help") {
+    console.log(HELP);
     return;
   }
   if (subcommand === "init") return init();
