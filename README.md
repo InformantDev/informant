@@ -15,8 +15,8 @@ informant setup
 ```
 
 Informant requires macOS on Apple Silicon, [Tart](https://tart.run), GitHub CLI (`gh`), `sshpass`,
-and a GitHub App installation with **Checks: read/write** and **Contents: read** permissions. The
-interactive setup command creates and installs that App with the required permissions. See the
+and a GitHub App installation with **Checks: read/write**, **Contents: read**, and **Pull requests:
+read/write** permissions. The interactive setup command creates and installs that App with the required permissions. See the
 [documentation](apps/web/content/docs/index.mdx) for configuration and usage.
 
 ## Monorepo

@@ -27,7 +27,7 @@ const defaultJob = `name = "test"
 command = """
 bun install --frozen-lockfile && bun test
 """
-cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
+cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 `;
 
 export function directoryConfigTemplate(): string {
@@ -162,6 +162,72 @@ export function parseConfigFiles(
   return parseConfig(combined, label);
 }
 
+function parseEnvironment(value: unknown, label: string): Record<string, string> {
+  const environment = value ?? {};
+  if (typeof environment !== "object" || environment === null || Array.isArray(environment)) {
+    throw new Error(`${label} must be a table of scalar values`);
+  }
+  for (const [key, item] of Object.entries(environment)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(`${label} key ${JSON.stringify(key)} is not a shell variable`);
+    }
+    if (typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") {
+      throw new Error(`${label} must be a table of scalar values`);
+    }
+  }
+  return Object.fromEntries(Object.entries(environment).map(([key, item]) => [key, String(item)]));
+}
+
+function parseCaches(value: unknown, label: string): JobConfig["cache"] {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`${label} must be a non-empty array of tables`);
+  }
+  return value.map((item, cacheIndex) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error(`${label}[${cacheIndex}] must be a table`);
+    }
+    const entry = item as Record<string, unknown>;
+    const paths = entry.paths;
+    if (
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      paths.some(
+        (path) =>
+          typeof path !== "string" ||
+          !path.startsWith("~/") ||
+          path.length <= 2 ||
+          path.split("/").includes(".."),
+      )
+    ) {
+      throw new Error(
+        `${label}[${cacheIndex}].paths must contain paths starting with ~/ without ..`,
+      );
+    }
+    const keyFiles = entry.key_files ?? [];
+    if (
+      !Array.isArray(keyFiles) ||
+      keyFiles.some(
+        (keyFile) =>
+          typeof keyFile !== "string" ||
+          keyFile.length === 0 ||
+          keyFile.startsWith("/") ||
+          keyFile.split("/").includes(".."),
+      )
+    ) {
+      throw new Error(`${label}[${cacheIndex}].key_files must be relative paths`);
+    }
+    const shared = entry.shared ?? false;
+    if (typeof shared !== "boolean") {
+      throw new Error(`${label}[${cacheIndex}].shared must be a boolean`);
+    }
+    if (shared && keyFiles.length > 0) {
+      throw new Error(`${label}[${cacheIndex}] cannot combine shared and key_files`);
+    }
+    return { paths, keyFiles, shared };
+  });
+}
+
 export function parseConfig(source: string, label = CONFIG_FILE): InformantConfig {
   const raw = Bun.TOML.parse(source) as Record<string, unknown>;
   if (raw.version !== 1) {
@@ -185,6 +251,8 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   if (!Number.isFinite(defaultTimeoutMinutes) || defaultTimeoutMinutes <= 0) {
     throw new Error("timeout_minutes must be a positive number");
   }
+  const defaultEnvironment = parseEnvironment(raw.environment, "environment");
+  const defaultCache = parseCaches(raw.cache, "cache");
   const jobs: JobConfig[] = rawJobs.map((value, index) => {
     const job = value as Record<string, unknown>;
     if (typeof job.name !== "string" || typeof job.command !== "string") {
@@ -193,66 +261,32 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     if (job.name.trim().length === 0 || job.command.trim().length === 0) {
       throw new Error(`jobs[${index}] name and command fields must be non-empty`);
     }
-    const environment = job.environment ?? {};
-    if (typeof environment !== "object" || environment === null || Array.isArray(environment)) {
-      throw new Error(`jobs[${index}].environment must be a table of scalar values`);
+    const environment = {
+      ...defaultEnvironment,
+      ...parseEnvironment(job.environment, `jobs[${index}].environment`),
+    };
+    const secrets = job.secrets ?? [];
+    if (
+      !Array.isArray(secrets) ||
+      secrets.some((name) => typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
+    ) {
+      throw new Error(`jobs[${index}].secrets must contain shell variable names`);
     }
-    for (const value of Object.values(environment)) {
-      if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
-        throw new Error(`jobs[${index}].environment must be a table of scalar values`);
-      }
+    if (new Set(secrets).size !== secrets.length) {
+      throw new Error(`jobs[${index}].secrets must not contain duplicates`);
     }
-    for (const key of Object.keys(environment)) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
-        throw new Error(
-          `jobs[${index}].environment key ${JSON.stringify(key)} is not a shell variable`,
-        );
-      }
+    const conflictingSecret = secrets.find((name) => Object.hasOwn(environment, name));
+    if (conflictingSecret) {
+      throw new Error(
+        `jobs[${index}].secrets contains ${conflictingSecret}, which is also set in environment`,
+      );
     }
     const timeoutMinutes = Number(job.timeout_minutes ?? defaultTimeoutMinutes);
     if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
       throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
     }
-    const cache = job.cache;
-    if (cache !== undefined && (!Array.isArray(cache) || cache.length === 0)) {
-      throw new Error(`jobs[${index}].cache must be a non-empty array of tables`);
-    }
-    const caches = (cache ?? []).map((value, cacheIndex) => {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        throw new Error(`jobs[${index}].cache[${cacheIndex}] must be a table`);
-      }
-      const entry = value as Record<string, unknown>;
-      const paths = entry.paths;
-      if (
-        !Array.isArray(paths) ||
-        paths.length === 0 ||
-        paths.some(
-          (path) =>
-            typeof path !== "string" ||
-            !path.startsWith("~/") ||
-            path.length <= 2 ||
-            path.split("/").includes(".."),
-        )
-      ) {
-        throw new Error(
-          `jobs[${index}].cache[${cacheIndex}].paths must contain paths starting with ~/ without ..`,
-        );
-      }
-      const keyFiles = entry.key_files ?? [];
-      if (
-        !Array.isArray(keyFiles) ||
-        keyFiles.some(
-          (keyFile) =>
-            typeof keyFile !== "string" ||
-            keyFile.length === 0 ||
-            keyFile.startsWith("/") ||
-            keyFile.split("/").includes(".."),
-        )
-      ) {
-        throw new Error(`jobs[${index}].cache[${cacheIndex}].key_files must be relative paths`);
-      }
-      return { paths, keyFiles };
-    });
+    const cache =
+      job.cache === undefined ? defaultCache : parseCaches(job.cache, `jobs[${index}].cache`);
     return {
       name: job.name,
       command: job.command.trim(),
@@ -262,14 +296,13 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         : job.needs === undefined
           ? []
           : [String(job.needs)],
-      environment: Object.fromEntries(
-        Object.entries(environment).map(([key, item]) => [key, String(item)]),
-      ),
+      environment,
+      secrets,
       triggers:
         job.triggers === undefined
           ? topTriggers
           : parseTriggers(job.triggers, `jobs[${index}].triggers`),
-      cache: cache === undefined ? undefined : caches,
+      cache,
     };
   });
   const jobNames = new Set(jobs.map((job) => job.name));

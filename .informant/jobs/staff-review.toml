@@ -1,0 +1,14 @@
+name = "staff-review"
+command = """
+set -euo pipefail
+trusted="$(mktemp -d)"
+env -u AMP_API_KEY -u GITHUB_TOKEN git show "$INFORMANT_TRUSTED_SHA:scripts/staff-review.ts" > "$trusted/staff-review.ts"
+env -u AMP_API_KEY -u GITHUB_TOKEN git show "$INFORMANT_TRUSTED_SHA:package.json" > "$trusted/package.json"
+env -u AMP_API_KEY -u GITHUB_TOKEN git show "$INFORMANT_TRUSTED_SHA:bun.lock" > "$trusted/bun.lock"
+(cd "$trusted" && env -u AMP_API_KEY -u GITHUB_TOKEN bun install --frozen-lockfile --ignore-scripts)
+INFORMANT_REVIEW_ROOT="$PWD" bun --cwd "$trusted" --no-env-file staff-review.ts
+"""
+triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
+secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]
+environment = { CI = "true" }
+cache = [{ paths = ["~/.bun/install/cache"], shared = true }]

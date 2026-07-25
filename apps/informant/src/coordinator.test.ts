@@ -12,7 +12,9 @@ const config: InformantConfig = {
   pollIntervalSeconds: 10,
   branches: ["main"],
   vm: { image: "image", user: "user", password: "password" },
-  jobs: [{ name: "test", command: "test", timeoutMinutes: 1, environment: {}, needs: [] }],
+  jobs: [
+    { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
+  ],
 };
 
 const temporaryDirectories: string[] = [];
@@ -45,6 +47,7 @@ function harness(
     conclusion?: string;
   }> = [];
   const saved: BuildRecord[] = [];
+  let receivedRuntimeSecrets: Record<string, string> | undefined;
   let jobCheckListings = 0;
   const aggregateCheck: {
     id: number;
@@ -88,6 +91,7 @@ function harness(
       return remoteChecks;
     },
     checks: async () => [aggregateCheck],
+    createJobAccessToken: async () => "installation-token",
     updateCheck: async (_repository: Repository, id: number, values: Record<string, unknown>) => {
       updates.push({ id, values });
       const jobCheck = remoteChecks.find((item) => item.id === id);
@@ -107,7 +111,19 @@ function harness(
     saveBuild: async (record) => {
       saved.push({ ...record });
     },
-    runInTart: async (_repository, _sha, selectedConfig, _record, observer) => {
+    runInTart: async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+      _signal,
+      runtimeSecrets,
+    ) => {
+      receivedRuntimeSecrets = {};
+      for (const [name, value] of Object.entries(runtimeSecrets ?? {})) {
+        receivedRuntimeSecrets[name] = typeof value === "function" ? await value() : value;
+      }
       if (options.error) throw options.error;
       const success = options.success ?? true;
       for (const job of selectedConfig.jobs) {
@@ -127,6 +143,7 @@ function harness(
     updates,
     jobChecks,
     saved,
+    receivedRuntimeSecrets: () => receivedRuntimeSecrets,
     jobCheckListings: () => jobCheckListings,
   };
 }
@@ -173,6 +190,25 @@ describe("runCommit", () => {
     expect(aggregate?.text).toBeUndefined();
     expect(context.saved.at(-1)?.status).toBe(status);
     expect(context.jobCheckListings()).toBe(0);
+  });
+
+  test("supplies the GitHub App token only when a job requests it", async () => {
+    const context = harness();
+    const job = config.jobs[0];
+    if (!job) throw new Error("expected a configured job");
+    const reviewConfig = {
+      ...config,
+      jobs: [{ ...job, secrets: ["AMP_API_KEY", "GITHUB_TOKEN"] }],
+    };
+    await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "pull/1",
+      reviewConfig,
+      context.dependencies,
+    );
+    expect(context.receivedRuntimeSecrets()).toEqual({ GITHUB_TOKEN: "installation-token" });
   });
 
   test("reports, persists, and rethrows execution failures", async () => {
@@ -301,7 +337,14 @@ describe("runCommit", () => {
       ...config,
       jobs: [
         ...config.jobs,
-        { name: "lint", command: "lint", timeoutMinutes: 1, environment: {}, needs: [] },
+        {
+          name: "lint",
+          command: "lint",
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          needs: [],
+        },
       ],
     };
 

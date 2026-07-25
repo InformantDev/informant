@@ -44,7 +44,8 @@ bun install --frozen-lockfile
 bun test
 """
 environment = { CI = "true" }
-cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
+secrets = ["DEPLOY_TOKEN"]
+cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 ```
 
 `.informant/jobs/lint.toml`:
@@ -80,6 +81,42 @@ checkout mounted at `/Volumes/My Shared Files/workspace`. Use `needs` to make a 
 more other jobs. In this example, `test` and `lint` start together; `build` starts only after both pass.
 If a dependency fails or times out, jobs that need it are skipped.
 
+## Host secrets
+
+Jobs receive no host secrets by default. Declare the environment variable names a job needs with
+`secrets`; Informant fails the job before starting its VM when a requested value is unavailable:
+
+```toml
+secrets = ["AMP_API_KEY", "DEPLOY_TOKEN"]
+```
+
+Set each value on the worker with an `INFORMANT_SECRET_` prefix. Informant removes that prefix in the
+VM, so `INFORMANT_SECRET_AMP_API_KEY` becomes `AMP_API_KEY` for the job:
+
+```bash
+export INFORMANT_SECRET_AMP_API_KEY="sgamp_..."
+informant startup enable
+```
+
+`startup enable` captures `INFORMANT_*` values in the mode-`600` LaunchAgent definition; rerun it
+after changing a secret. The prefix is required for foreground workers too, preventing a repository
+from requesting unrelated variables in the host environment. Secret names must be shell variable
+names and cannot also appear in `environment`. Values are written to a mode-`600` temporary file,
+mounted only into that job's VM, sourced without appearing in the SSH command line, and deleted with
+the build workspace. Informant masks exact secret values in streamed and stored logs as defense in
+depth, but jobs must still not print, encode, or otherwise expose their secrets.
+
+`GITHUB_TOKEN` is special: when requested, Informant supplies its short-lived GitHub App installation
+token automatically. Informant mints it when the job starts, limits it to the current repository, and
+grants only pull-request write access. Static GitHub tokens cannot be forwarded this way.
+
+Secret-bearing jobs are trust-sensitive. For commits not yet on the default branch, Informant ignores
+that commit's version of every secret-bearing job and uses the job definition, VM configuration, and
+authorization from the current default-branch commit. A pull request therefore cannot add a secret,
+change the trusted command, select a hostile VM image, or remove a required secret-bearing job. The
+trusted command may inspect the proposed checkout, but it must not execute scripts or install packages
+from that checkout while secrets are present.
+
 ## Automatic triggers
 
 Events are `commit` and `comment`. A commit rule can filter either exact branch names or pull requests.
@@ -110,12 +147,31 @@ setup automatic.
 
 ## Persistent job caches
 
-`jobs.cache` is an array of cache groups. Each group associates one or more guest `paths` with its
-`key_files`, so paths that use the same lockfile can share one declaration. Informant restores every
-path from persistent host storage before the job and saves it afterward. Caches are isolated by
-repository and job. Changing a key file such as `bun.lock` starts new caches for the paths in that
-group. Missing key files are handled consistently and do not fail the job. Use `informant cache path`
-to locate the cache root and `informant cache prune` to remove all saved caches.
+`environment` and `cache` can be declared in `.informant/config.toml` as defaults inherited by every
+job. A job's environment values override matching defaults; a job-level `cache` replaces the default
+cache list. This keeps repository-wide package and build caches in one place:
+
+```toml
+environment = { TURBO_CACHE_DIR = "/Users/admin/.cache/turborepo", TURBO_CACHE_MAX_AGE = "14d", TURBO_CACHE_MAX_SIZE = "10GB" }
+cache = [
+  { paths = ["~/.bun/install/cache"], shared = true },
+  { paths = ["~/.cache/turborepo"], shared = true },
+]
+```
+
+`jobs.cache` is an array of cache groups. Set `shared = true` for a concurrency-safe,
+content-addressed package cache such as `~/.bun/install/cache`. Jobs in the same build mount one
+Informant-owned host directory directly. A default-branch build uses the persistent machine-wide
+cache; pull requests and other commits receive a build-scoped cache that is deleted afterward, so
+untrusted code cannot poison a later trusted build. Shared caches cannot use `key_files`. The host's
+personal cache is never exposed to CI code.
+
+Without `shared`, each group associates one or more guest `paths` with its `key_files`. Informant
+restores those paths from persistent host storage before the job and saves them afterward, isolated
+by repository, job, and key-file contents in compressed archives. Missing key files do not fail the job. Use
+`informant cache path` to locate the cache root. Informant retains the current and most recent keyed
+version, removing older versions after seven days. `informant cache prune` removes keyed caches while
+preserving shared caches; `informant cache clear` removes everything.
 
 Prepared images and caches serve different purposes: put runtimes and system packages in
 `vm.prepare`; use `jobs.cache` for downloaded dependencies and compiler caches. Checkouts and all

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { GitHubClient } from "./github.ts";
 import type { PollState } from "./poll-state.ts";
-import { type ServerDependencies, serve } from "./server.ts";
+import { applySecretPolicy, type ServerDependencies, serve } from "./server.ts";
 import type { BuildRecord, InformantConfig, PullRequest, Repository } from "./types.ts";
 
 const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
@@ -18,7 +18,9 @@ const config: InformantConfig = {
   pollIntervalSeconds: 0,
   triggers: [{ event: "commit" }, { event: "comment" }],
   vm: { image: "image", user: "user", password: "password" },
-  jobs: [{ name: "test", command: "test", timeoutMinutes: 1, environment: {}, needs: [] }],
+  jobs: [
+    { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
+  ],
 };
 
 function deferred<T>() {
@@ -68,6 +70,40 @@ function dependencies(
 }
 
 describe("serve polling orchestration", () => {
+  test("pins secret-bearing jobs and VM configuration to the default branch", () => {
+    const configuredJob = config.jobs[0];
+    if (!configuredJob) throw new Error("expected a configured job");
+    const trustedJob = {
+      ...configuredJob,
+      name: "review",
+      command: "trusted review",
+      secrets: ["AMP_API_KEY"],
+    };
+    const trusted = {
+      ...config,
+      vm: { ...config.vm, image: "trusted-image" },
+      jobs: [trustedJob],
+    };
+    const untrusted = {
+      ...config,
+      vm: { ...config.vm, image: "attacker-image" },
+      jobs: [{ ...trustedJob, command: "steal secrets" }],
+    };
+
+    expect(applySecretPolicy(untrusted, trusted, "trusted-sha")).toMatchObject({
+      trustedSha: "trusted-sha",
+      vm: { image: "trusted-image" },
+      jobs: [{ name: "review", command: "trusted review", secrets: ["AMP_API_KEY"] }],
+    });
+    expect(() =>
+      applySecretPolicy(
+        { ...untrusted, jobs: [{ ...trustedJob, name: "steal" }] },
+        trusted,
+        "trusted-sha",
+      ),
+    ).toThrow("not authorized on the default branch");
+  });
+
   test("supersedes only the previous automatic lane controller", async () => {
     const outer = new AbortController();
     const first = deferred<BuildRecord | false | undefined>();

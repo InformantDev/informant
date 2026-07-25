@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { cancel, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import Table from "cli-table3";
@@ -28,8 +28,13 @@ import { command, requireCommand } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup } from "./startup.ts";
-import { dataDirectory, getBuild, listBuilds } from "./store.ts";
-import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
+import { dataDirectory, getBuild, listBuilds, removeOrphanedBuildWorkspaces } from "./store.ts";
+import {
+  ensurePreparedImage,
+  listPreparedImages,
+  prunePreparedImages,
+  pruneStoppedJobVms,
+} from "./tart/index.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Macs
 
@@ -46,7 +51,8 @@ Usage:
   informant image list                   List Informant-prepared VM images
   informant image prune                  Delete unused prepared VM images
   informant cache path                   Print the persistent job cache directory
-  informant cache prune                  Delete all persistent job caches
+  informant cache prune                  Delete keyed caches while preserving shared caches
+  informant cache clear                  Delete all persistent job caches
   informant startup enable               Start the worker now and at login
   informant startup disable              Stop and remove the startup worker
   informant hook install                 Accelerate pushes with a pre-push hook
@@ -240,11 +246,21 @@ async function manageCaches(action?: string): Promise<void> {
     return;
   }
   if (action === "prune") {
-    await rm(path, { recursive: true, force: true });
-    outro("Deleted persistent job caches");
+    const entries = await readdir(path, { withFileTypes: true }).catch(() => []);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.name !== "shared")
+        .map((entry) => rm(join(path, entry.name), { recursive: true, force: true })),
+    );
+    outro("Deleted keyed job caches; preserved shared caches");
     return;
   }
-  throw new Error("cache action must be one of: path, prune");
+  if (action === "clear") {
+    await rm(path, { recursive: true, force: true });
+    outro("Deleted all persistent job caches");
+    return;
+  }
+  throw new Error("cache action must be one of: path, prune, clear");
 }
 
 async function repositoryArgument(value?: string): Promise<ReturnType<typeof parseRepository>> {
@@ -341,9 +357,19 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     if (repositories.length === 0) {
       throw new Error("no repositories registered; run informant repo add owner/repository");
     }
+    const removedWorkspaces = await removeOrphanedBuildWorkspaces();
+    const removedVms = await pruneStoppedJobVms();
     intro(
       `Informant worker · ${repositories.length} ${repositories.length === 1 ? "repository" : "repositories"}`,
     );
+    if (removedWorkspaces > 0) {
+      console.log(
+        `Cleaned ${removedWorkspaces} orphaned build ${removedWorkspaces === 1 ? "workspace" : "workspaces"}`,
+      );
+    }
+    if (removedVms > 0) {
+      console.log(`Deleted ${removedVms} stale Tart ${removedVms === 1 ? "VM" : "VMs"}`);
+    }
     return serveRepositories(repositories, {
       once: flags.once === true,
       onMessage: console.log,

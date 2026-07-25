@@ -146,7 +146,7 @@ async function createApp(owner?: string): Promise<ManifestApp> {
         url: APP_URL,
         redirect_url: callback,
         public: false,
-        default_permissions: { checks: "write", contents: "read", pull_requests: "read" },
+        default_permissions: { checks: "write", contents: "read", pull_requests: "write" },
         default_events: [],
         hook_attributes: { url: APP_URL, active: false },
       })

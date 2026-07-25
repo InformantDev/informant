@@ -1,4 +1,4 @@
-import { mkdir, open, realpath, rm } from "node:fs/promises";
+import { chmod, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { command, requireCommand } from "../process.ts";
 import { appendLog } from "../store.ts";
@@ -13,22 +13,118 @@ export {
   listPreparedImages,
   preparedImageName,
   prunePreparedImages,
+  pruneStoppedJobVms,
 } from "./images.ts";
 export { isRetryableSshAuthenticationFailure } from "./vm.ts";
+
+export type RuntimeSecrets = Record<string, string | (() => Promise<string>)>;
+
+export async function resolveJobSecrets(
+  job: InformantConfig["jobs"][number],
+  runtimeSecrets: RuntimeSecrets = {},
+  hostEnvironment: Record<string, string | undefined> = Bun.env,
+): Promise<Record<string, string>> {
+  return Object.fromEntries(
+    await Promise.all(
+      job.secrets.map(async (name) => {
+        const runtime = runtimeSecrets[name];
+        const value =
+          typeof runtime === "function"
+            ? await runtime()
+            : (runtime ?? hostEnvironment[`INFORMANT_SECRET_${name}`]);
+        if (value === undefined) {
+          throw new Error(
+            `secret ${name} is not configured on this worker; set INFORMANT_SECRET_${name}`,
+          );
+        }
+        return [name, value];
+      }),
+    ),
+  );
+}
+
+async function secretMount(
+  workspace: string,
+  job: InformantConfig["jobs"][number],
+  runtimeSecrets: RuntimeSecrets,
+): Promise<{ args: string[]; source: string; values: string[]; directory?: string }> {
+  const secrets = await resolveJobSecrets(job, runtimeSecrets);
+  if (Object.keys(secrets).length === 0) return { args: [], source: "", values: [] };
+  const directory = join(workspace, "..", `secrets-${crypto.randomUUID().slice(0, 8)}`);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, "environment");
+  await Bun.write(
+    path,
+    `${Object.entries(secrets)
+      .map(([name, value]) => `export ${name}=${shellQuote(value)}`)
+      .join("\n")}\n`,
+  );
+  await chmod(path, 0o600);
+  return {
+    args: [`--dir=secrets:${await realpath(directory)}`],
+    source: `. ${shellQuote("/Volumes/My Shared Files/secrets/environment")}; rm -f ${shellQuote("/Volumes/My Shared Files/secrets/environment")};`,
+    values: Object.values(secrets).filter((value) => value.length > 0),
+    directory,
+  };
+}
+
+export function streamingSecretRedactor(
+  secrets: string[],
+  output: (text: string) => Promise<void>,
+): { write: (text: string) => Promise<void>; flush: () => Promise<void> } {
+  const values = [...new Set(secrets)].sort((a, b) => b.length - a.length);
+  const retainedCharacters = Math.max(0, ...values.map((value) => value.length - 1));
+  let pending = "";
+  const drain = async (final: boolean) => {
+    const safeLength = final ? pending.length : Math.max(0, pending.length - retainedCharacters);
+    if (safeLength === 0) return;
+    let consumed = 0;
+    let redacted = "";
+    while (consumed < safeLength) {
+      let match: { index: number; value: string } | undefined;
+      for (const value of values) {
+        const index = pending.indexOf(value, consumed);
+        if (index >= 0 && (!match || index < match.index)) match = { index, value };
+      }
+      if (!match || match.index >= safeLength) {
+        redacted += pending.slice(consumed, safeLength);
+        consumed = safeLength;
+      } else {
+        redacted += `${pending.slice(consumed, match.index)}[REDACTED]`;
+        consumed = match.index + match.value.length;
+      }
+    }
+    pending = pending.slice(consumed);
+    if (redacted) await output(redacted);
+  };
+  return {
+    async write(text) {
+      pending += text;
+      await drain(false);
+    },
+    async flush() {
+      await drain(true);
+    },
+  };
+}
 
 async function runJob(
   vm: string,
   image: string,
   repository: Repository,
+  sha: string,
+  branch: string,
   workspace: string,
   config: InformantConfig,
   job: InformantConfig["jobs"][number],
   log: (text: string) => Promise<void>,
   started: () => Promise<void>,
+  runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
 ): Promise<boolean> {
   let vmCreated = false;
   let tart: ReturnType<typeof Bun.spawn> | undefined;
+  let secretDirectory: string | undefined;
 
   try {
     signal?.throwIfAborted();
@@ -47,10 +143,18 @@ async function runJob(
       }
 
       const sharedWorkspace = await realpath(workspace);
-      const caches = await cacheMounts(repository, workspace, job, config.vm.user);
+      const caches = await cacheMounts(
+        repository,
+        workspace,
+        job,
+        config.vm.user,
+        config.trustedSha === sha,
+      );
+      const secrets = await secretMount(workspace, job, runtimeSecrets);
+      secretDirectory = secrets.directory;
       const started = await startVm(
         vm,
-        [`--dir=workspace:${sharedWorkspace}`, ...caches.args],
+        [`--dir=workspace:${sharedWorkspace}`, ...caches.args, ...secrets.args],
         config,
         job.timeoutMinutes,
         async () => {
@@ -59,32 +163,51 @@ async function runJob(
         signal,
       );
       tart = started.process;
-      return { ip: started.ip, cacheRestore: caches.restore, cacheSave: caches.save };
+      return {
+        ip: started.ip,
+        cacheRestore: caches.restore,
+        cacheSave: caches.save,
+        secretSource: secrets.source,
+        secretValues: secrets.values,
+      };
     }, signal);
     await started();
     await log(`[${job.name}] $ ${job.command}\n`);
-    const env = Object.entries(job.environment)
+    const environment = {
+      ...job.environment,
+      INFORMANT_REPOSITORY: repository.fullName,
+      INFORMANT_SHA: sha,
+      INFORMANT_BRANCH: branch,
+      INFORMANT_TRUSTED_SHA: config.trustedSha ?? sha,
+    };
+    const env = Object.entries(environment)
       .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
       .join(" ");
-    const execute = `cd ${shellQuote("/Volumes/My Shared Files/workspace")} && /bin/bash -lc ${shellQuote(`${env} ${job.command}`)}`;
+    const execute = `cd ${shellQuote("/Volumes/My Shared Files/workspace")} && /bin/bash -lc ${shellQuote(`${env} ${ready.secretSource} ${job.command}`)}`;
     const jobCommand = ready.cacheRestore
       ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; ${ready.cacheSave}; informant_cache_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; exit $informant_cache_status`
       : execute;
+    const redactor = streamingSecretRedactor(ready.secretValues, log);
     const result = await sshCommand(ready.ip, config, jobCommand, job.timeoutMinutes * 60_000, {
       signal,
-      onOutput: log,
+      onOutput: redactor.write,
     });
+    await redactor.flush();
     let output = `\n[${job.name}: exit ${result.exitCode}]\n`;
     if (result.timedOut) output += `[${job.name}: timed out after ${job.timeoutMinutes}m]\n`;
     await log(output);
     return result.exitCode === 0 && !result.timedOut;
   } finally {
-    if (tart) await stopVm(vm, tart);
-    if (vmCreated) {
-      const deleted = await command(["tart", "delete", vm], { timeoutMs: 30_000 });
-      if (deleted.exitCode !== 0) {
-        await log(`[${job.name}] could not delete Tart VM ${vm}: ${deleted.stderr}\n`);
+    try {
+      if (tart) await stopVm(vm, tart);
+      if (vmCreated) {
+        const deleted = await command(["tart", "delete", vm], { timeoutMs: 30_000 });
+        if (deleted.exitCode !== 0) {
+          await log(`[${job.name}] could not delete Tart VM ${vm}: ${deleted.stderr}\n`);
+        }
       }
+    } finally {
+      if (secretDirectory) await rm(secretDirectory, { recursive: true, force: true });
     }
   }
 }
@@ -173,6 +296,7 @@ export async function runInTart(
   record: BuildRecord,
   observer: JobExecutionObserver = {},
   signal?: AbortSignal,
+  runtimeSecrets: RuntimeSecrets = {},
 ): Promise<boolean> {
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
@@ -237,13 +361,25 @@ export async function runInTart(
       { signal },
     );
     for (const [index, workspace] of workspaces.entries()) {
-      const checkout = await command(["git", "worktree", "add", "--detach", workspace, sha], {
-        cwd: repositoryPath,
-        timeoutMs: 60_000,
-        signal,
-      });
+      const job = config.jobs[index];
+      const checkout = job?.secrets.length
+        ? await command(
+            ["git", "clone", "--no-local", "--no-checkout", repositoryPath, workspace],
+            { timeoutMs: 60_000, signal },
+          ).then(async (clone) => {
+            if (clone.exitCode !== 0) return clone;
+            return command(["git", "checkout", "--detach", sha], {
+              cwd: workspace,
+              timeoutMs: 60_000,
+              signal,
+            });
+          })
+        : await command(["git", "worktree", "add", "--detach", workspace, sha], {
+            cwd: repositoryPath,
+            timeoutMs: 60_000,
+            signal,
+          });
       if (checkout.exitCode !== 0) {
-        const job = config.jobs[index];
         throw new Error(
           `could not check out ${sha}${job ? ` for ${job.name}` : ""}: ${checkout.stderr}`,
         );
@@ -258,11 +394,14 @@ export async function runInTart(
           `informant-${record.id}-${index}`,
           image,
           repository,
+          sha,
+          record.branch,
           workspace,
           config,
           job,
           (text) => logJob(job, text),
           () => notify(() => observer.started?.(job)),
+          runtimeSecrets,
           signal,
         );
         const outcome = signal?.aborted ? "cancelled" : success ? "success" : "failure";

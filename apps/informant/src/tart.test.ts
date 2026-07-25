@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { cacheMounts } from "./tart/cache.ts";
 import {
   appendUtf8Tail,
   cachePathIdentity,
@@ -9,7 +10,9 @@ import {
   isRetryableSshAuthenticationFailure,
   preparedImageName,
   prunePreparedImages,
+  resolveJobSecrets,
   scheduleJobs,
+  streamingSecretRedactor,
   utf8Tail,
 } from "./tart/index.ts";
 import type { InformantConfig } from "./types.ts";
@@ -19,7 +22,36 @@ const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number
   needs,
   command: name,
   environment: {},
+  secrets: [],
   timeoutMinutes: 1,
+});
+
+test("resolves only explicitly requested host secrets", async () => {
+  const configured = { ...job("review"), secrets: ["AMP_API_KEY", "GITHUB_TOKEN"] };
+  expect(
+    await resolveJobSecrets(
+      configured,
+      { GITHUB_TOKEN: "installation-token" },
+      {
+        INFORMANT_SECRET_AMP_API_KEY: "amp-token",
+        UNREQUESTED: "hidden",
+      },
+    ),
+  ).toEqual({ AMP_API_KEY: "amp-token", GITHUB_TOKEN: "installation-token" });
+  await expect(resolveJobSecrets(configured, {}, {})).rejects.toThrow(
+    "secret AMP_API_KEY is not configured",
+  );
+});
+
+test("redacts secrets split across streamed log chunks", async () => {
+  let output = "";
+  const redactor = streamingSecretRedactor(["top-secret"], async (text) => {
+    output += text;
+  });
+  await redactor.write("before top-");
+  await redactor.write("secret after");
+  await redactor.flush();
+  expect(output).toBe("before [REDACTED] after");
 });
 
 const config = (prepare?: string): InformantConfig => ({
@@ -205,6 +237,49 @@ test("cache destinations have distinct storage identities", () => {
     cachePathIdentity("admin", "~/.npm"),
   );
   expect(cachePathIdentity("admin", "~/.npm")).not.toBe(cachePathIdentity("builder", "~/.npm"));
+});
+
+test("shared caches use one direct host mount across repositories and jobs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-shared-cache-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  const sharedJob = {
+    ...job("test"),
+    cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
+  };
+  try {
+    const first = await cacheMounts(
+      { owner: "one", repo: "repo", fullName: "one/repo" },
+      workspace,
+      sharedJob,
+      "admin",
+      true,
+    );
+    const second = await cacheMounts(
+      { owner: "two", repo: "other", fullName: "two/other" },
+      workspace,
+      { ...sharedJob, name: "lint" },
+      "admin",
+      true,
+    );
+    expect(first.args).toEqual(second.args);
+    expect(first.restore).toContain("ln -s");
+    expect(first.save).toBe(":");
+    const untrusted = await cacheMounts(
+      { owner: "one", repo: "repo", fullName: "one/repo" },
+      workspace,
+      sharedJob,
+      "admin",
+    );
+    expect(untrusted.args).not.toEqual(first.args);
+    expect(untrusted.args[0]).toContain(root);
+  } finally {
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("retries SSH only when authentication failed before the command started", () => {

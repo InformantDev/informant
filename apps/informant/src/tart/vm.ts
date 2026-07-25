@@ -115,9 +115,14 @@ export function digest(value: string): string {
 
 export async function tartImages(
   signal?: AbortSignal,
-): Promise<Array<{ Name: string; Source: string; Accessed?: string }>> {
+): Promise<Array<{ Name: string; Source: string; Accessed?: string; Running?: boolean }>> {
   const output = await requireCommand(["tart", "list", "--format", "json"], undefined, { signal });
-  return JSON.parse(output) as Array<{ Name: string; Source: string; Accessed?: string }>;
+  return JSON.parse(output) as Array<{
+    Name: string;
+    Source: string;
+    Accessed?: string;
+    Running?: boolean;
+  }>;
 }
 
 export async function startVm(

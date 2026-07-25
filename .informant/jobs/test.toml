@@ -6,4 +6,4 @@ bun test
 """
 timeout_minutes = 15
 environment = { CI = "true" }
-cache = [{ paths = ["~/.bun/install/cache"], key_files = ["bun.lock"] }]
+cache = [{ paths = ["~/.bun/install/cache"], shared = true }]

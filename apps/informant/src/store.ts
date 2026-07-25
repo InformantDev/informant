@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readdir, stat } from "node:fs/promises";
+import { appendFile, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BuildRecord } from "./types.ts";
@@ -52,4 +52,25 @@ export async function listBuilds(limit = 100): Promise<BuildRecord[]> {
 
 export async function listAllBuilds(): Promise<BuildRecord[]> {
   return listBuilds(Number.POSITIVE_INFINITY);
+}
+
+export async function removeOrphanedBuildWorkspaces(
+  olderThan = Date.now() - 24 * 60 * 60 * 1_000,
+): Promise<number> {
+  const root = join(dataDirectory(), "builds");
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const workspace = join(root, entry.name, "workspace");
+    try {
+      const metadata = await stat(workspace);
+      if (metadata.mtimeMs >= olderThan) continue;
+      await rm(workspace, { recursive: true });
+      removed++;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return removed;
 }
