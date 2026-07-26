@@ -274,6 +274,18 @@ export class GitHubClient {
     return values.map((value) => ({ name: value.name, sha: value.commit.sha }));
   }
 
+  async tags(repository: Repository): Promise<Array<{ name: string; sha: string }>> {
+    const values: Array<{ name: string; commit: { sha: string } }> = [];
+    for (let page = 1; ; page++) {
+      const pageValues = await this.api<typeof values>(
+        `/repos/${repository.fullName}/tags?per_page=100&page=${page}`,
+      );
+      values.push(...pageValues);
+      if (pageValues.length < 100) break;
+    }
+    return values.map((value) => ({ name: value.name, sha: value.commit.sha }));
+  }
+
   private parsePullRequest(
     value: {
       number: number;

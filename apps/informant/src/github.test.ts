@@ -155,6 +155,30 @@ test("checks paginates through the complete check history", async () => {
   expect(pages).toEqual([1, 2]);
 });
 
+test("tags paginate and map dereferenced commit SHAs", async () => {
+  const pages: number[] = [];
+  const fetch = (async (input: string | URL | Request) => {
+    const page = Number(new URL(String(input)).searchParams.get("page"));
+    pages.push(page);
+    const count = page === 1 ? 100 : 1;
+    return Response.json(
+      Array.from({ length: count }, (_, index) => ({
+        name: `v${(page - 1) * 100 + index}`,
+        commit: { sha: `commit-${page}-${index}` },
+      })),
+    );
+  }) as typeof globalThis.fetch;
+
+  const tags = await new GitHubClient({ token: "installation-token", fetch }).tags({
+    owner: "acme",
+    repo: "widgets",
+    fullName: "acme/widgets",
+  });
+  expect(tags).toHaveLength(101);
+  expect(tags[100]).toEqual({ name: "v100", sha: "commit-2-0" });
+  expect(pages).toEqual([1, 2]);
+});
+
 test("queued checks encode selected jobs in the request", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {

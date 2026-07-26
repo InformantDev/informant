@@ -22,6 +22,7 @@ export interface PullRequestFilter {
 export interface TriggerRule {
   event: TriggerEvent;
   branch?: { names: string[] };
+  tag?: { patterns: string[] };
   pullRequest?: PullRequestFilter;
 }
 

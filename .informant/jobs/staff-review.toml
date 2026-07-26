@@ -29,7 +29,7 @@ export XDG_CONFIG_HOME="$review_home/.config"
 export GH_TOKEN="$GITHUB_TOKEN"
 unset GITHUB_TOKEN
 amp --settings-file "$review_home/settings.json" --mcp-config '{}' --no-ide --no-notifications \
-  --visibility private --mode high --execute "$prompt"
+  --visibility private --mode medium --execute "$prompt"
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]

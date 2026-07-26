@@ -176,6 +176,9 @@ async function manualRun(
   waitForGitHub = false,
   jobs: string[] = [],
 ): Promise<void> {
+  if (branchOverride?.startsWith("refs/tags/")) {
+    throw new Error("tag pushes are handled by the Informant service");
+  }
   const repository = await repositoryFromGit();
   const sha = await requireCommand(["git", "rev-parse", ref]);
   const branch = await command(["git", "branch", "--show-current"]);
