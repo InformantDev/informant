@@ -249,6 +249,10 @@ export async function runInContainer(
       true,
     );
     const environment = {
+      TERM: "xterm-256color",
+      COLORTERM: "truecolor",
+      FORCE_COLOR: "3",
+      CLICOLOR_FORCE: "1",
       ...job.environment,
       INFORMANT_REPOSITORY: repository.fullName,
       INFORMANT_SHA: sha,

@@ -252,6 +252,10 @@ test("passes secrets through the client environment and always removes the conta
     "--memory",
     "1024M",
   ]);
+  expect(args).toContain("TERM=xterm-256color");
+  expect(args).toContain("COLORTERM=truecolor");
+  expect(args).toContain("FORCE_COLOR=3");
+  expect(args).toContain("CLICOLOR_FORCE=1");
   expect(invocations[0]?.environment?.TOKEN).toBe("line one\nline two");
   expect(invocations[1]?.args.slice(0, 3)).toEqual(["container", "delete", "--force"]);
   expect(output.join("")).toStartWith("\n[test] $ bun test\n");
