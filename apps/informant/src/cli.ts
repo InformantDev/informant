@@ -274,18 +274,41 @@ interface BrowserOption {
   disabled?: boolean;
 }
 
+const terminalColor = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  cyan: "\x1b[36m",
+};
+
+function coloredStatus(status: string): string {
+  const color =
+    status === "success"
+      ? terminalColor.green
+      : status === "failure" || status === "cancelled"
+        ? terminalColor.red
+        : status === "running"
+          ? terminalColor.cyan
+          : terminalColor.yellow;
+  return `${color}${status}${terminalColor.reset}`;
+}
+
 function buildBrowserOptions(builds: Build[]): BrowserOption[] {
   if (builds.length === 0) return [{ value: "none", label: "No builds available", disabled: true }];
   return builds.flatMap((build) => [
     {
       value: build.id,
-      label: `${build.repo} · ${build.branch}@${build.sha.slice(0, 7)}`,
-      hint: `${build.status} · ${build.id}`,
+      label: `${terminalColor.bold}${build.repo}${terminalColor.reset} · ${terminalColor.blue}${build.branch}@${build.sha.slice(0, 7)}${terminalColor.reset}`,
+      hint: `${coloredStatus(build.status)} · ${terminalColor.dim}${build.id}${terminalColor.reset}`,
     },
     ...jobsForBuild(build).map((job) => ({
       value: `${build.id}\0${job.name}`,
-      label: `  ↳ ${job.name}`,
-      hint: job.status,
+      label: `  ${terminalColor.dim}↳${terminalColor.reset} ${job.name}`,
+      hint: coloredStatus(job.status),
     })),
   ]);
 }
@@ -308,10 +331,15 @@ async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol
       const visible = this.options.slice(start, start + rows);
       const lines = visible.map((option, index) => {
         const selected = start + index === this.cursor;
-        const marker = option.disabled ? "─" : selected ? "◆" : "◇";
+        const marker = option.disabled
+          ? `${terminalColor.dim}─${terminalColor.reset}`
+          : selected
+            ? `${terminalColor.cyan}◆${terminalColor.reset}`
+            : `${terminalColor.dim}◇${terminalColor.reset}`;
         return `│  ${marker} ${option.label}${option.hint ? `  (${option.hint})` : ""}`;
       });
-      return `◆  ${includeHistory ? "Recent builds" : "Running builds"}\n${lines.join("\n")}\n└  ↑/↓ navigate · Enter open logs · Esc back`;
+      const title = includeHistory ? "Recent builds" : "Running builds";
+      return `${terminalColor.cyan}◆${terminalColor.reset}  ${terminalColor.bold}${title}${terminalColor.reset}\n${lines.join("\n")}\n└  ${terminalColor.dim}↑/↓ navigate · Enter open logs · Esc back${terminalColor.reset}`;
     },
   });
   let open = true;
@@ -378,7 +406,7 @@ async function browseLog(buildId: string, job?: string): Promise<"back" | "exit"
       }
       if (!build) return "back";
       const contents = await logTail(path);
-      const availableRows = Math.max(1, (output.rows ?? 24) - 4);
+      const availableRows = Math.max(1, (output.rows ?? 24) - 5);
       const visible = contents.trimEnd().split("\n").slice(-availableRows).join("\n");
       const title = job
         ? `${job} · ${build.repo} · ${build.branch}@${build.sha.slice(0, 7)}`
@@ -386,7 +414,12 @@ async function browseLog(buildId: string, job?: string): Promise<"back" | "exit"
       const jobStatus = job
         ? jobsForBuild(build).find((item) => item.name === job)?.status
         : undefined;
-      const frame = `◆ ${title}\n  ${jobStatus ?? build.status} · ${build.id}\n\n${visible}\n\nEsc/Backspace: back`;
+      const footerWidth = Math.max(1, output.columns ?? 80);
+      const footer = "  Esc  Back to list    Ctrl-C  Exit"
+        .slice(0, footerWidth)
+        .padEnd(footerWidth);
+      const footerRow = Math.max(1, output.rows ?? 24);
+      const frame = `◆ ${title}\n  ${jobStatus ?? build.status} · ${build.id}\n\n${visible}\x1b[${footerRow};1H\x1b[48;5;24m\x1b[97m${footer}\x1b[0m`;
       if (frame !== previous) {
         output.write(`\x1b[2J\x1b[H${frame}`);
         previous = frame;
