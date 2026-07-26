@@ -15,6 +15,7 @@ export interface PollState {
   pending: PendingComment[];
   seenCommentIds: number[];
   tagRefs?: Array<{ name: string; sha: string }>;
+  tagsPolledAt?: string;
   pendingTags: Array<{ name: string; sha: string }>;
 }
 
@@ -30,6 +31,7 @@ export async function readPollState(repo: string): Promise<PollState> {
     pending: state.pending ?? [],
     seenCommentIds: state.seenCommentIds ?? [],
     tagRefs: state.tagRefs,
+    tagsPolledAt: state.tagsPolledAt,
     pendingTags: state.pendingTags ?? [],
   };
 }

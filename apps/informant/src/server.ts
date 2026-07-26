@@ -7,6 +7,7 @@ import type { InformantConfig, Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
+const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
@@ -167,30 +168,40 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       const defaultSha = await github.branchHead(repository, defaultBranch);
       const bootstrap = await configAt(defaultSha);
       intervalSeconds = bootstrap.pollIntervalSeconds;
+      const state = await loadPollState(repository.fullName);
+      const hasTagTriggers = bootstrap.jobs.some((job) =>
+        (job.triggers ?? bootstrap.triggers ?? []).some((rule) => rule.tag !== undefined),
+      );
+      const shouldPollTags =
+        hasTagTriggers &&
+        (!state.tagsPolledAt ||
+          Date.now() - new Date(state.tagsPolledAt).getTime() >= TAG_POLL_INTERVAL_MS);
       const [branches, tags, prs] = await Promise.all([
         github.branches(repository),
-        github.tags(repository),
+        shouldPollTags ? github.tags(repository) : undefined,
         github.pullRequests(repository),
       ]);
-      const state = await loadPollState(repository.fullName);
       const completedTagEvents = new Set(completedTags);
       if (completedTagEvents.size > 0) {
         state.pendingTags = state.pendingTags.filter(
           (item) => !completedTagEvents.has(`tag:${item.name}:${item.sha}`),
         );
       }
-      if (state.tagRefs !== undefined) {
-        const previous = new Set(state.tagRefs.map((tag) => `${tag.name}\0${tag.sha}`));
-        const pending = new Set(state.pendingTags.map((tag) => `${tag.name}\0${tag.sha}`));
-        for (const tag of tags) {
-          const key = `${tag.name}\0${tag.sha}`;
-          if (!previous.has(key) && !pending.has(key)) {
-            state.pendingTags.push(tag);
-            pending.add(key);
+      if (tags) {
+        if (state.tagRefs !== undefined) {
+          const previous = new Set(state.tagRefs.map((tag) => `${tag.name}\0${tag.sha}`));
+          const pending = new Set(state.pendingTags.map((tag) => `${tag.name}\0${tag.sha}`));
+          for (const tag of tags) {
+            const key = `${tag.name}\0${tag.sha}`;
+            if (!previous.has(key) && !pending.has(key)) {
+              state.pendingTags.push(tag);
+              pending.add(key);
+            }
           }
         }
+        state.tagRefs = tags;
+        state.tagsPolledAt = new Date().toISOString();
       }
-      state.tagRefs = tags;
       await persistPollState(repository.fullName, state);
       for (const id of completedTagEvents) completedTags.delete(id);
       const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));

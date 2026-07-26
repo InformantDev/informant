@@ -86,19 +86,51 @@ describe("serve polling orchestration", () => {
   test("baselines existing tags on the first poll without launching them", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
     let launches = 0;
+    const deps = dependencies(
+      github({ tags: async () => [{ name: "v1", sha: "old" }] }),
+      state,
+      async () => {
+        launches++;
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async () => tagConfig;
     await serve(repository, {
       once: true,
-      dependencies: dependencies(
-        github({ tags: async () => [{ name: "v1", sha: "old" }] }),
-        state,
-        async () => {
-          launches++;
-          return undefined;
-        },
-      ),
+      dependencies: deps,
     });
     expect(launches).toBe(0);
     expect(state.tagRefs).toEqual([{ name: "v1", sha: "old" }]);
+    expect(state.tagsPolledAt).toBeDefined();
+  });
+
+  test("skips tag enumeration without trusted tag triggers and between tag polls", async () => {
+    let tagPolls = 0;
+    const client = github({
+      tags: async () => {
+        tagPolls++;
+        return [];
+      },
+    });
+    await serve(repository, {
+      once: true,
+      dependencies: dependencies(
+        client,
+        { pending: [], seenCommentIds: [], pendingTags: [] },
+        async () => undefined,
+      ),
+    });
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [],
+      tagsPolledAt: new Date().toISOString(),
+    };
+    const deps = dependencies(client, state, async () => undefined);
+    deps.repositoryConfig = async () => tagConfig;
+    await serve(repository, { once: true, dependencies: deps });
+    expect(tagPolls).toBe(0);
   });
 
   test("launches new matching tags with tag context and durable acknowledgement", async () => {
