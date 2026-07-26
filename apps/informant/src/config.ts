@@ -72,13 +72,18 @@ function parseTriggers(value: unknown, label: string): TriggerRule[] {
     const raw = item as Record<string, unknown>;
     if (raw.event !== "commit" && raw.event !== "comment")
       throw new Error(`${label}[${index}].event must be commit or comment`);
-    const allowed = new Set(["event", "branch", "pull_request"]);
+    const allowed = new Set(["event", "branch", "tag", "pull_request"]);
     if (Object.keys(raw).some((key) => !allowed.has(key)))
       throw new Error(`${label}[${index}] contains an unknown field`);
-    if (raw.branch !== undefined && raw.pull_request !== undefined)
-      throw new Error(`${label}[${index}] cannot use both branch and pull_request`);
+    const contexts = [raw.branch, raw.tag, raw.pull_request].filter((value) => value !== undefined);
+    if (contexts.length > 1)
+      throw new Error(
+        `${label}[${index}] cannot use more than one of branch, tag, and pull_request`,
+      );
     if (raw.event === "comment" && raw.branch !== undefined)
       throw new Error(`${label}[${index}] comment cannot use branch`);
+    if (raw.tag !== undefined && raw.event !== "commit")
+      throw new Error(`${label}[${index}] tag can only be used with commit`);
     let branch: TriggerRule["branch"];
     if (raw.branch !== undefined) {
       const table = raw.branch as Record<string, unknown>;
@@ -96,6 +101,24 @@ function parseTriggers(value: unknown, label: string): TriggerRule[] {
       )
         throw new Error(`${label}[${index}].branch.names must contain non-empty strings`);
       branch = { names: table.names as string[] };
+    }
+    let tag: TriggerRule["tag"];
+    if (raw.tag !== undefined) {
+      const table = raw.tag as Record<string, unknown>;
+      if (
+        !table ||
+        typeof table !== "object" ||
+        Array.isArray(table) ||
+        Object.keys(table).some((key) => key !== "patterns")
+      )
+        throw new Error(`${label}[${index}].tag must contain only patterns`);
+      if (
+        !Array.isArray(table.patterns) ||
+        table.patterns.length === 0 ||
+        table.patterns.some((pattern) => typeof pattern !== "string" || !pattern.trim())
+      )
+        throw new Error(`${label}[${index}].tag.patterns must contain non-empty strings`);
+      tag = { patterns: table.patterns as string[] };
     }
     let pullRequest: TriggerRule["pullRequest"];
     if (raw.pull_request !== undefined) {
@@ -126,7 +149,7 @@ function parseTriggers(value: unknown, label: string): TriggerRule[] {
         baseBranches: table.base_branches as string[] | undefined,
       };
     }
-    return { event: raw.event, branch, pullRequest } as TriggerRule;
+    return { event: raw.event, branch, tag, pullRequest } as TriggerRule;
   });
 }
 

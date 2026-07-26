@@ -36,7 +36,15 @@ describe("trigger configuration", () => {
       parseConfig(
         source('[{ event = "commit", branch = { names = ["main"] }, pull_request = {} }]'),
       ),
-    ).toThrow("both branch and pull_request");
+    ).toThrow("more than one");
+    const tagged = parseConfig(source('[{ event = "commit", tag = { patterns = ["v*"] } }]'));
+    expect(tagged.triggers?.[0]?.tag?.patterns).toEqual(["v*"]);
+    expect(() =>
+      parseConfig(source('[{ event = "comment", tag = { patterns = ["v*"] } }]')),
+    ).toThrow("only be used with commit");
+    for (const tag of ["{}", "{ patterns = [] }", '{ patterns = [""] }', '{ names = ["v*"] }']) {
+      expect(() => parseConfig(source(`[{ event = "commit", tag = ${tag} }]`))).toThrow();
+    }
   });
 
   test("legacy branches normalize and cannot coexist with triggers", () => {
@@ -111,4 +119,19 @@ test("commit context is optional and PR state, draft, and base filters compose",
       { type: "comment", pullRequest },
     ),
   ).toBe(false);
+});
+
+test("tag triggers opt in and use whole-name case-sensitive globs across slashes", () => {
+  const context = { type: "commit" as const, tag: "release/v1.2+final" };
+  expect(triggerMatches({ event: "commit" }, context)).toBe(false);
+  expect(
+    triggerMatches({ event: "commit", branch: { names: ["release/v1.2+final"] } }, context),
+  ).toBe(false);
+  expect(triggerMatches({ event: "commit", tag: { patterns: ["release/v?.2+*"] } }, context)).toBe(
+    true,
+  );
+  expect(triggerMatches({ event: "commit", tag: { patterns: ["v*"] } }, context)).toBe(false);
+  expect(triggerMatches({ event: "commit", tag: { patterns: ["RELEASE/*"] } }, context)).toBe(
+    false,
+  );
 });

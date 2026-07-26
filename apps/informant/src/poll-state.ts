@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { dataDirectory } from "./store.ts";
 import type { PullRequest } from "./types.ts";
@@ -13,6 +14,8 @@ export interface PollState {
   cursor?: string;
   pending: PendingComment[];
   seenCommentIds: number[];
+  tagRefs?: Array<{ name: string; sha: string }>;
+  pendingTags: Array<{ name: string; sha: string }>;
 }
 
 function path(repo: string) {
@@ -20,15 +23,28 @@ function path(repo: string) {
 }
 export async function readPollState(repo: string): Promise<PollState> {
   const file = Bun.file(path(repo));
-  if (!(await file.exists())) return { pending: [], seenCommentIds: [] };
+  if (!(await file.exists())) return { pending: [], seenCommentIds: [], pendingTags: [] };
   const state = (await file.json()) as Partial<PollState>;
   return {
     cursor: state.cursor,
     pending: state.pending ?? [],
     seenCommentIds: state.seenCommentIds ?? [],
+    tagRefs: state.tagRefs,
+    pendingTags: state.pendingTags ?? [],
   };
 }
 export async function savePollState(repo: string, state: PollState): Promise<void> {
-  await mkdir(join(dataDirectory(), "poll"), { recursive: true });
-  await Bun.write(path(repo), JSON.stringify(state, null, 2));
+  const directory = join(dataDirectory(), "poll");
+  await mkdir(directory, { recursive: true });
+  const destination = path(repo);
+  const temporary = join(
+    directory,
+    `.${repo.replaceAll("/", "--")}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    await Bun.write(temporary, JSON.stringify(state, null, 2));
+    await rename(temporary, destination);
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
 }
