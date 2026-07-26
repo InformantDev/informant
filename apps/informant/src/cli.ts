@@ -34,6 +34,7 @@ import {
   jobLogPath,
   listActiveBuilds,
   listBuilds,
+  reconcileBuildLiveness,
   removeOrphanedBuildWorkspaces,
 } from "./store.ts";
 import {
@@ -250,6 +251,7 @@ async function tailLog(
   running: (build: NonNullable<Awaited<ReturnType<typeof getBuild>>>) => boolean,
 ): Promise<void> {
   let offset = 0;
+  let livenessCheckedAt = 0;
   const decoder = new TextDecoder();
   const drain = async () => {
     const file = Bun.file(path);
@@ -264,7 +266,11 @@ async function tailLog(
   };
   while (true) {
     await drain();
-    const current = await getBuild(buildId);
+    let current = await getBuild(buildId);
+    if (current?.status === "running" && Date.now() - livenessCheckedAt >= 2_000) {
+      current = await reconcileBuildLiveness(current);
+      livenessCheckedAt = Date.now();
+    }
     if (!current || !running(current)) {
       await drain();
       const remainder = decoder.decode();
@@ -299,7 +305,7 @@ async function showLogs(id?: string): Promise<void> {
   });
   if (isCancel(choice)) return;
   return tailLog(choice.build.id, jobLogPath(choice.build, choice.job), (current) =>
-    Boolean(current.runningJobs?.includes(choice.job)),
+    Boolean(current.status === "running" && current.runningJobs?.includes(choice.job)),
   );
 }
 

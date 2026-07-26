@@ -26,6 +26,7 @@ export function jobLogPath(record: BuildRecord, job: string): string {
 }
 
 const WORKSPACE_OWNER = ".owner.json";
+const ACTIVE_MARKER_GRACE_MS = 60_000;
 const buildSaves = new Map<string, Promise<void>>();
 
 function processStartIdentity(pid: number): string | undefined {
@@ -143,6 +144,15 @@ export async function listAllBuilds(): Promise<BuildRecord[]> {
   return listBuilds(Number.POSITIVE_INFINITY);
 }
 
+export async function reconcileBuildLiveness(build: BuildRecord): Promise<BuildRecord> {
+  if (build.status !== "running" || processOwnerIsLive(build.owner)) return build;
+  build.status = "cancelled";
+  build.completedAt = new Date().toISOString();
+  build.runningJobs = [];
+  await saveBuild(build);
+  return build;
+}
+
 export async function listActiveBuilds(): Promise<BuildRecord[]> {
   const entries = await readdir(activeBuildDirectory(), { withFileTypes: true }).catch(() => []);
   const builds = await Promise.all(
@@ -150,16 +160,19 @@ export async function listActiveBuilds(): Promise<BuildRecord[]> {
       .filter((entry) => entry.isFile())
       .map(async (entry) => {
         const build = await getBuild(entry.name);
-        if (build?.status !== "running") {
+        if (!build) {
+          const marker = await stat(activeBuildPath(entry.name)).catch(() => undefined);
+          if (marker && marker.mtimeMs < Date.now() - ACTIVE_MARKER_GRACE_MS) {
+            await rm(activeBuildPath(entry.name), { force: true });
+          }
+          return undefined;
+        }
+        if (build.status !== "running") {
           await rm(activeBuildPath(entry.name), { force: true });
           return undefined;
         }
-        if (processOwnerIsLive(build.owner)) return build;
-        build.status = "cancelled";
-        build.completedAt = new Date().toISOString();
-        build.runningJobs = [];
-        await saveBuild(build);
-        return undefined;
+        const reconciled = await reconcileBuildLiveness(build);
+        return reconciled.status === "running" ? reconciled : undefined;
       }),
   );
   return builds

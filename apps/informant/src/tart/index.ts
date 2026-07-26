@@ -315,6 +315,14 @@ export function jobEventLine(
   return `[${at.toISOString()}] [${name}] ${event}\n`;
 }
 
+export async function writeWithBestEffortDuplicate(
+  primary: (text: string) => Promise<void>,
+  duplicate: (text: string) => Promise<void>,
+  text: string,
+): Promise<void> {
+  await Promise.all([primary(text), duplicate(text).catch(() => undefined)]);
+}
+
 export interface JobExecutionObserver {
   started?: (job: InformantConfig["jobs"][number]) => Promise<void> | void;
   progress?: (job: InformantConfig["jobs"][number], log: string) => Promise<void> | void;
@@ -464,7 +472,7 @@ export async function runInTart(
       writeJobLog = boundedLogWriter((value) => appendFile(jobLogPath(record, job.name), value));
       jobLogWriters.set(job.name, writeJobLog);
     }
-    await Promise.all([writeLog(text), writeJobLog(text)]);
+    await writeWithBestEffortDuplicate(writeLog, writeJobLog, text);
     if (!progressTimers.has(job.name)) {
       progressTimers.set(
         job.name,

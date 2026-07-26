@@ -86,6 +86,43 @@ test("active builds are indexed and dead owners are reconciled", async () => {
   expect(await listActiveBuilds()).toEqual([]);
 });
 
+test("fresh marker-only builds survive the writer window and abandoned markers expire", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const activeRoot = join(root, "active-builds");
+  const marker = join(activeRoot, "writer-race");
+  await mkdir(activeRoot, { recursive: true });
+  await Bun.write(marker, "");
+
+  expect(await listActiveBuilds()).toEqual([]);
+  expect(await Bun.file(marker).exists()).toBe(true);
+
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
+  const record: BuildRecord = {
+    id: "writer-race",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: [],
+    owner,
+    logPath: join(root, "builds", "writer-race", "build.log"),
+  };
+  await mkdir(join(root, "builds", record.id), { recursive: true });
+  await Bun.write(join(root, "builds", record.id, "build.json"), JSON.stringify(record));
+  expect((await listActiveBuilds()).map((build) => build.id)).toEqual([record.id]);
+
+  const abandoned = join(activeRoot, "abandoned");
+  await Bun.write(abandoned, "");
+  await utimes(abandoned, new Date(0), new Date(0));
+  await listActiveBuilds();
+  expect(await Bun.file(abandoned).exists()).toBe(false);
+});
+
 afterEach(async () => {
   if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
   else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;

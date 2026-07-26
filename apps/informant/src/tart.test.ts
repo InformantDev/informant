@@ -20,6 +20,7 @@ import {
   secretMount,
   streamingSecretRedactor,
   utf8Tail,
+  writeWithBestEffortDuplicate,
 } from "./tart/index.ts";
 import {
   bunCopyfileBackend,
@@ -620,6 +621,27 @@ test("bounded log writes serialize quota accounting", async () => {
   await Promise.all(writes);
 
   expect(output).toBe("123456a!");
+});
+
+test("a failed duplicate log sink does not interrupt parallel jobs", async () => {
+  const output: string[] = [];
+  const duplicate = boundedLogWriter(async () => {
+    throw new Error("too many open files");
+  });
+
+  expect(
+    await scheduleJobs([job("one"), job("two")], async (current) => {
+      await writeWithBestEffortDuplicate(
+        async (text) => {
+          output.push(text);
+        },
+        duplicate,
+        current.name,
+      );
+      return true;
+    }),
+  ).toBe(true);
+  expect(new Set(output)).toEqual(new Set(["one", "two"]));
 });
 
 test("job event lines timestamp lifecycle changes without changing command output", () => {

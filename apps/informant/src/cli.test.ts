@@ -139,3 +139,43 @@ test("builds shows running jobs by default and recent history with --all", async
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("logs stops following a running record when its worker is dead", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-cli-dead-logs-"));
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "dead-build",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "runner-one",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    owner: { pid: 2_147_483_647, startedAt: "dead" },
+    logPath: join(root, "builds", "dead-build", "build.log"),
+  };
+  let output = "";
+  const write = spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    output += String(chunk);
+    return true;
+  });
+  try {
+    await createBuild(record);
+    await Bun.write(record.logPath, "last output\n");
+
+    await main(["logs", record.id]);
+
+    expect(output).toBe("last output\n");
+    expect(await Bun.file(join(root, "builds", record.id, "build.json")).json()).toMatchObject({
+      status: "cancelled",
+      runningJobs: [],
+    });
+  } finally {
+    write.mockRestore();
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
