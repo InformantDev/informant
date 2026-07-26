@@ -278,14 +278,14 @@ const terminalColor = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
   dim: "\x1b[2m",
-  red: "\x1b[38;2;243;139;168m",
-  green: "\x1b[38;2;166;227;161m",
-  yellow: "\x1b[38;2;249;226;175m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[93m",
   blue: "\x1b[34m",
   cyan: "\x1b[36m",
-  orange: "\x1b[38;2;250;179;135m",
-  lightGreen: "\x1b[38;2;148;226;213m",
-  gray: "\x1b[38;2;108;112;134m",
+  orange: "\x1b[33m",
+  lightGreen: "\x1b[92m",
+  gray: "\x1b[90m",
 };
 
 function coloredStatus(status: string): string {
@@ -305,13 +305,12 @@ function coloredStatus(status: string): string {
 }
 
 function statusBarColors(status: string): string {
-  const darkText = "\x1b[38;2;30;30;46m";
-  if (status === "running") return `\x1b[48;2;148;226;213m${darkText}`;
-  if (status === "queued") return `\x1b[48;2;250;179;135m${darkText}`;
-  if (status === "success") return `\x1b[48;2;166;227;161m${darkText}`;
-  if (status === "failure") return `\x1b[48;2;243;139;168m${darkText}`;
-  if (status === "skipped") return `\x1b[48;2;249;226;175m${darkText}`;
-  return "\x1b[48;2;108;112;134m\x1b[97m";
+  if (status === "running") return "\x1b[102m\x1b[30m";
+  if (status === "queued") return "\x1b[43m\x1b[30m";
+  if (status === "success") return "\x1b[42m\x1b[30m";
+  if (status === "failure") return "\x1b[41m\x1b[30m";
+  if (status === "skipped") return "\x1b[103m\x1b[30m";
+  return "\x1b[100m\x1b[97m";
 }
 
 function highlightMatches(text: string, query: string): string {
