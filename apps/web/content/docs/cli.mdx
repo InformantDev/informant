@@ -26,6 +26,7 @@ informant hook uninstall               Remove Informant from the pre-push hook
 informant builds                       List builds currently running on this machine
 informant builds --all                 List recent build history
 informant logs [<build-id>]             Tail a build's logs or select a running job
+informant update                        Update with Homebrew and restart a running worker
 informant doctor                       Verify host tools and GitHub auth
 ```
 
@@ -48,6 +49,10 @@ timestamps job lifecycle events while leaving command output unchanged.
 restarts if it exits and starts again when you log in. Its output is written to `worker.stdout.log`
 and `worker.stderr.log` in the Informant data directory. Run `informant startup enable` again after
 changing any `INFORMANT_*` environment-variable overrides so the service captures the new values.
+
+`informant update` upgrades `informant-ci/tap/informant` with Homebrew. If the startup LaunchAgent was
+already loaded, the command restarts it after the upgrade without rewriting its captured environment.
+It does not start a worker that was stopped or never enabled.
 
 `informant run` accepts repeatable `--job` flags as well as comma-separated job names. Only selected
 jobs and their transitive `needs` dependencies run. Omit `--job` to run the complete job graph.

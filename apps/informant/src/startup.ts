@@ -64,8 +64,8 @@ ${environmentXml}
 `;
 }
 
-function launchDomain(): string {
-  const uid = process.getuid?.();
+function launchDomain(configuredUid?: number): string {
+  const uid = configuredUid ?? process.getuid?.();
   if (uid === undefined) throw new Error("could not determine the current user ID");
   return `gui/${uid}`;
 }
@@ -113,4 +113,36 @@ export async function disableStartup(): Promise<{ path: string; disabled: boolea
   const result = await command(["launchctl", "bootout", launchDomain(), path]);
   await rm(path, { force: true });
   return { path, disabled: existed || result.exitCode === 0 };
+}
+
+export async function updateInformant(
+  options: {
+    command?: typeof command;
+    platform?: string;
+    uid?: number;
+    onOutput?: (text: string) => Promise<void> | void;
+  } = {},
+): Promise<{ restarted: boolean }> {
+  if ((options.platform ?? process.platform) !== "darwin")
+    throw new Error("Homebrew updates are supported only on macOS");
+  const run = options.command ?? command;
+  const domain = launchDomain(options.uid);
+  const service = `${domain}/${LABEL}`;
+  const loaded = (await run(["launchctl", "print", service])).exitCode === 0;
+  const upgraded = await run(["brew", "upgrade", "informant-ci/tap/informant"], {
+    onOutput: options.onOutput,
+  });
+  if (upgraded.exitCode !== 0) {
+    throw new Error(
+      `could not update Informant with Homebrew: ${upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
+    );
+  }
+  if (!loaded) return { restarted: false };
+  const restarted = await run(["launchctl", "kickstart", "-k", service]);
+  if (restarted.exitCode !== 0) {
+    throw new Error(
+      `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,
+    );
+  }
+  return { restarted: true };
 }
