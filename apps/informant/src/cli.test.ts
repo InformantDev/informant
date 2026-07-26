@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { main } from "./cli.ts";
+import { cleanOrphanedBuildWorkspacesInBackground, main } from "./cli.ts";
 import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
 import type { BuildRecord } from "./types.ts";
 
@@ -15,6 +15,25 @@ test("--version prints the package version without help", async () => {
   } finally {
     log.mockRestore();
   }
+});
+
+test("orphan cleanup does not block worker startup", async () => {
+  let finishCleanup: ((removed: number) => void) | undefined;
+  const cleanup = new Promise<number>((resolve) => {
+    finishCleanup = resolve;
+  });
+  const messages: string[] = [];
+
+  cleanOrphanedBuildWorkspacesInBackground(
+    () => cleanup,
+    (message) => messages.push(message),
+  );
+  expect(messages).toEqual([]);
+
+  finishCleanup?.(2);
+  await cleanup;
+  await Bun.sleep(0);
+  expect(messages).toEqual(["Cleaned 2 orphaned build workspaces"]);
 });
 
 test("cache prune preserves shared caches and cache clear removes the cache root", async () => {
