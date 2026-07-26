@@ -27,7 +27,7 @@ import {
 import { command, requireCommand } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
-import { disableStartup, enableStartup } from "./startup.ts";
+import { disableStartup, enableStartup, updateInformant } from "./startup.ts";
 import {
   dataDirectory,
   getBuild,
@@ -62,6 +62,7 @@ Usage:
   informant hook uninstall               Remove Informant from the pre-push hook
   informant builds [--all]               List running builds or recent history
   informant logs [<build-id>]             Tail a build's logs or select a running job
+  informant update                       Update with Homebrew and restart a running worker
   informant doctor                       Check host dependencies and auth
   informant --version
 `;
@@ -471,6 +472,20 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "init") return init();
   if (subcommand === "setup") return setup();
   if (subcommand === "doctor") return doctor();
+  if (subcommand === "update") {
+    if (action) throw new Error("update does not accept arguments");
+    const updated = await updateInformant({
+      onOutput: (output) => {
+        process.stdout.write(output);
+      },
+    });
+    outro(
+      updated.restarted
+        ? "Updated Informant and restarted the worker"
+        : "Updated Informant; the startup worker is not running",
+    );
+    return;
+  }
   if (subcommand === "repo") return manageRepositories(action, id);
   if (subcommand === "image") return manageImages(action);
   if (subcommand === "cache") return manageCaches(action);
