@@ -1,5 +1,5 @@
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { command, requireCommand } from "../process.ts";
 import { dataDirectory } from "../store.ts";
 import type { InformantConfig } from "../types.ts";
@@ -21,6 +21,32 @@ export function preparedImageName(config: InformantConfig): string | undefined {
     : undefined;
 }
 
+const preparedImageReferencesDirectory = () => join(dataDirectory(), "prepared-image-references");
+
+function preparedImageReferencePath(repository: string): string {
+  const separator = repository.indexOf("\0");
+  if (separator < 0) return join(preparedImageReferencesDirectory(), digest(repository));
+  const repo = repository.slice(0, separator);
+  const job = repository.slice(separator + 1);
+  return join(preparedImageReferencesDirectory(), `${digest(repo)}.jobs`, digest(job));
+}
+
+async function preparedImageReferenceValues(
+  excluded?: string,
+  directory = preparedImageReferencesDirectory(),
+): Promise<string[]> {
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+  const values = await Promise.all(
+    entries.map(async (entry) => {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) return preparedImageReferenceValues(excluded, path);
+      if (!entry.isFile() || path === excluded) return [];
+      return [(await readFile(path, "utf8").catch(() => "")).trim()];
+    }),
+  );
+  return values.flat().filter(Boolean);
+}
+
 async function activatePreparedImageLocked(
   repository: string | undefined,
   prepared: string | undefined,
@@ -28,8 +54,8 @@ async function activatePreparedImageLocked(
   signal?: AbortSignal,
 ): Promise<void> {
   if (!repository) return;
-  const directory = join(dataDirectory(), "prepared-image-references");
-  const path = join(directory, digest(repository));
+  const directory = preparedImageReferencesDirectory();
+  const path = preparedImageReferencePath(repository);
   const previous = (await readFile(path, "utf8").catch(() => "")).trim() || undefined;
   if (previous === prepared) return;
 
@@ -37,13 +63,8 @@ async function activatePreparedImageLocked(
     const cleanup = await withImageLock(
       previous,
       async () => {
-        const references = await readdir(directory).catch(() => []);
-        const values = await Promise.all(
-          references
-            .filter((entry) => join(directory, entry) !== path)
-            .map((entry) => readFile(join(directory, entry), "utf8").catch(() => "")),
-        );
-        if (values.some((value) => value.trim() === previous)) return "retained";
+        const values = await preparedImageReferenceValues(path);
+        if (values.includes(previous)) return "retained";
         if (!(await listPreparedImages(signal)).includes(previous)) return "missing";
         const result = await command(["tart", "delete", previous], { timeoutMs: 30_000 });
         return result.exitCode === 0 ? "deleted" : "failed";
@@ -56,7 +77,12 @@ async function activatePreparedImageLocked(
     if (cleanup === "deleted") await onMessage(`Deleted superseded Tart image ${previous}`);
   }
 
-  await mkdir(directory, { recursive: true });
+  if (repository.includes("\0")) {
+    await rm(join(directory, digest(repository.slice(0, repository.indexOf("\0")))), {
+      force: true,
+    });
+  }
+  await mkdir(dirname(path), { recursive: true });
   if (prepared) await Bun.write(path, `${prepared}\n`);
   else await rm(path, { force: true });
 }
@@ -81,12 +107,26 @@ async function activatePreparedImage(
 }
 
 async function preparedImageReferences(): Promise<Set<string>> {
-  const directory = join(dataDirectory(), "prepared-image-references");
-  const references = await readdir(directory).catch(() => []);
-  const values = await Promise.all(
-    references.map((entry) => readFile(join(directory, entry), "utf8").catch(() => "")),
-  );
-  return new Set(values.map((value) => value.trim()).filter(Boolean));
+  return new Set(await preparedImageReferenceValues());
+}
+
+export async function reconcilePreparedImageReferences(
+  repository: string,
+  vmJobs: string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  await withPreparedImageReferencesLock(async () => {
+    const directory = preparedImageReferencesDirectory();
+    const jobDirectory = join(directory, `${digest(repository)}.jobs`);
+    const active = new Set(vmJobs.map(digest));
+    const entries = await readdir(jobDirectory, { withFileTypes: true }).catch(() => []);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && !active.has(entry.name))
+        .map((entry) => rm(join(jobDirectory, entry.name), { force: true })),
+    );
+    await rm(join(directory, digest(repository)), { force: true });
+  }, signal);
 }
 
 export async function ensurePreparedImage(

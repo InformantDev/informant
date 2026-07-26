@@ -36,10 +36,12 @@ export async function cacheMounts(
   user: string,
   guestOs: InformantConfig["vm"]["guestOs"],
   trusted = false,
+  directShared = false,
 ) {
   if (!job.cache)
     return {
       args: [] as string[],
+      mounts: [] as Array<{ name: string; path: string }>,
       restore: "",
       save: "",
       writablePaths: [] as string[],
@@ -53,6 +55,7 @@ export async function cacheMounts(
     digest(job.name).slice(0, 16),
   );
   const args: string[] = [];
+  const mounts: Array<{ name: string; path: string }> = [];
   const restore: string[] = [];
   const save: string[] = [];
   const writablePaths: string[] = [];
@@ -85,13 +88,14 @@ export async function cacheMounts(
     }
     const cacheKey = cache.keyFiles.length > 0 ? key.digest("hex").slice(0, 24) : "default";
     for (const path of cache.paths) {
-      if (cache.shared && guestOs !== "linux") {
+      if (cache.shared && (guestOs !== "linux" || directShared)) {
         const host = trusted
           ? join(persistentRoot, "shared", cachePathIdentity(user, path))
           : join(workspace, "..", "shared-caches", cachePathIdentity(user, path));
         await mkdir(host, { recursive: true });
         const resolvedHost = await realpath(host);
         args.push(`--dir=cache-${mountIndex}:${resolvedHost}`);
+        mounts.push({ name: `cache-${mountIndex}`, path: resolvedHost });
         writablePaths.push(resolvedHost);
         const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
         const parent = guest.slice(0, guest.lastIndexOf("/"));
@@ -116,6 +120,7 @@ export async function cacheMounts(
       await pruneCacheVersions(parent, cacheKey);
       const resolvedHost = await realpath(host);
       args.push(`--dir=cache-${mountIndex}:${resolvedHost}`);
+      mounts.push({ name: `cache-${mountIndex}`, path: resolvedHost });
       writablePaths.push(resolvedHost);
       const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
       const shared = `${guestSharedRoot(guestOs)}/cache-${mountIndex}`;
@@ -133,6 +138,7 @@ export async function cacheMounts(
   }
   return {
     args,
+    mounts,
     restore: restore.join(" && "),
     save: save.length > 0 ? save.join(" && ") : restore.length > 0 ? ":" : "",
     writablePaths,

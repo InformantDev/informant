@@ -1,3 +1,24 @@
+export interface VmRuntime {
+  type: "vm";
+  image: string;
+  guestOs: "macos" | "linux";
+  user: string;
+  password: string;
+  cpu?: number;
+  memoryMb?: number;
+  prepare?: string;
+}
+
+export interface ContainerRuntime {
+  type: "container";
+  image: string;
+  cpu?: number;
+  memoryMb?: number;
+  prepare?: string;
+}
+
+export type JobRuntime = VmRuntime | ContainerRuntime;
+
 export interface JobConfig {
   name: string;
   command: string;
@@ -5,6 +26,7 @@ export interface JobConfig {
   environment: Record<string, string>;
   secrets: string[];
   needs: string[];
+  runtime?: JobRuntime;
   triggers?: TriggerRule[];
   cache?: Array<{
     paths: string[];
@@ -50,15 +72,7 @@ export interface InformantConfig {
   triggers?: TriggerRule[];
   /** Legacy input compatibility; normalized configs omit this field. */
   branches?: string[];
-  vm: {
-    image: string;
-    guestOs: "macos" | "linux";
-    user: string;
-    password: string;
-    cpu?: number;
-    memoryMb?: number;
-    prepare?: string;
-  };
+  vm: VmRuntime;
   jobs: JobConfig[];
 }
 

@@ -1,9 +1,20 @@
 name = "test"
 command = """
-set -euo pipefail
+set -eu
 bun install --frozen-lockfile
 bun test
 """
 timeout_minutes = 15
 environment = { CI = "true" }
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
+container.image = "oven/bun:1"
+container.cpu = 2
+container.memory_mb = 4096
+container.prepare = """
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends git inn2
+ln -sf /usr/lib/news/bin/shlock /usr/local/bin/shlock
+rm -rf /var/lib/apt/lists/*
+"""

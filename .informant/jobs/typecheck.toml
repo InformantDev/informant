@@ -1,9 +1,10 @@
 name = "typecheck"
 command = """
-set -euo pipefail
+set -eu
 bun install --frozen-lockfile
 bun run typecheck
 """
 timeout_minutes = 20
 environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
+container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096 }

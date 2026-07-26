@@ -1,7 +1,8 @@
 # Informant
 
 **Local machines, reporting for CI duty.** Informant polls GitHub from behind your firewall,
-claims commits through the Checks API, and runs TOML-defined jobs in disposable Tart VMs.
+claims commits through the Checks API, and runs TOML-defined jobs in disposable Apple containers or Tart VMs.
+Each job can select and prepare its own runtime image, keeping macOS VMs limited to jobs that need them.
 
 ## Install
 
@@ -14,7 +15,9 @@ gh auth login
 informant setup
 ```
 
-Informant requires macOS on Apple Silicon, [Tart](https://tart.run), GitHub CLI (`gh`), `sshpass`,
+Informant requires macOS on Apple Silicon, GitHub CLI (`gh`), and
+[Apple Container](https://github.com/apple/container) for container jobs or
+[Tart](https://tart.run) and `sshpass` for VM jobs,
 and a GitHub App installation with **Checks: read/write**, **Contents: read**, and **Pull requests:
 read/write** permissions. The interactive setup command creates and installs that App with the required permissions. See the
 [documentation](apps/web/content/docs/index.mdx) for configuration and usage.
