@@ -38,6 +38,32 @@ describe("build workspace cleanup", () => {
     expect(await Bun.file(workspace).exists()).toBe(false);
   });
 
+  test("immediately removes a claimed workspace whose worker died", async () => {
+    const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+    roots.push(root);
+    Bun.env.INFORMANT_DATA_DIR = root;
+    const workspace = join(root, "builds", "recent-orphan", "workspace");
+    await mkdir(workspace, { recursive: true });
+    await Bun.write(
+      join(workspace, ".owner.json"),
+      JSON.stringify({ pid: 2_147_483_647, startedAt: "dead worker" }),
+    );
+
+    expect(await removeOrphanedBuildWorkspaces(0)).toBe(1);
+    expect(await Bun.file(workspace).exists()).toBe(false);
+  });
+
+  test("preserves a recent workspace that has not been claimed yet", async () => {
+    const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+    roots.push(root);
+    Bun.env.INFORMANT_DATA_DIR = root;
+    const workspace = join(root, "builds", "being-created", "workspace");
+    await mkdir(workspace, { recursive: true });
+
+    expect(await removeOrphanedBuildWorkspaces(0)).toBe(0);
+    expect((await stat(workspace)).isDirectory()).toBe(true);
+  });
+
   test("removes an old workspace when its owner PID has been reused", async () => {
     const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
     roots.push(root);

@@ -107,8 +107,9 @@ export async function removeOrphanedBuildWorkspaces(
     const workspace = join(root, entry.name, "workspace");
     try {
       const metadata = await stat(workspace);
-      if (metadata.mtimeMs >= olderThan) continue;
-      if (await workspaceHasLiveOwner(workspace)) continue;
+      const hasOwner = await Bun.file(join(workspace, WORKSPACE_OWNER)).exists();
+      if (hasOwner && (await workspaceHasLiveOwner(workspace))) continue;
+      if (!hasOwner && metadata.mtimeMs >= olderThan) continue;
       await rm(workspace, { recursive: true });
       removed++;
     } catch (error) {
