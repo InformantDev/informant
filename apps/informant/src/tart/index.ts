@@ -519,6 +519,8 @@ export async function runInTart(
       // Check reporting is observational and must not change dependency execution.
     }
   };
+  const eventSeparator = (job: InformantConfig["jobs"][number]) =>
+    jobLogs.get(job.name)?.at(-1) === 0x0a ? "\n" : "\n\n";
 
   let runFailed = false;
   let runError: unknown;
@@ -595,7 +597,10 @@ export async function runInTart(
         const detail = execution.timedOut
           ? `exit ${execution.exitCode}, timed out after ${job.timeoutMinutes}m`
           : `exit ${execution.exitCode}`;
-        await logJob(job, jobEventLine(job.name, `finished (${outcome})`, new Date(), detail));
+        await logJob(
+          job,
+          `${eventSeparator(job)}${jobEventLine(job.name, `finished (${outcome})`, new Date(), detail)}`,
+        );
         await writes;
         await flushProgress(job);
         await notify(() =>
@@ -609,10 +614,10 @@ export async function runInTart(
       async (job) => {
         await logJob(
           job,
-          jobEventLine(
+          `${eventSeparator(job)}${jobEventLine(
             job.name,
             signal?.aborted ? "finished (cancelled)" : "skipped (dependency failed)",
-          ),
+          )}`,
         );
         await writes;
         await flushProgress(job);
@@ -628,7 +633,7 @@ export async function runInTart(
         const outcome = signal?.aborted ? "cancelled" : "failure";
         await logJob(
           job,
-          `${signal?.aborted ? `\n[${job.name}: cancelled]\n` : `\n[${job.name}: ${message}]\n`}${jobEventLine(job.name, `finished (${outcome})`)}`,
+          `${eventSeparator(job)}${signal?.aborted ? `[${job.name}: cancelled]\n` : `[${job.name}: ${message}]\n`}\n${jobEventLine(job.name, `finished (${outcome})`)}`,
         );
         await writes;
         await flushProgress(job);
