@@ -551,6 +551,7 @@ export async function runInTart(
     } catch (error) {
       cleanupError ??= error;
     }
+    // Large node_modules trees can take minutes to unlink; that housekeeping must not hold CI open.
     void rm(root, { recursive: true, force: true }).catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
       await appendLog(record, `\n[workspace cleanup: ${message}]\n`).catch(() => {});
