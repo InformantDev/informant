@@ -5,17 +5,16 @@ description: Put one Mac on CI duty in a few minutes.
 
 ## Requirements
 
-- macOS 13 or newer on Apple Silicon
-- Homebrew, Git, GitHub CLI, Tart, and `sshpass`
+- macOS 13 or newer on Apple Silicon; container jobs require macOS 26 or newer
+- Homebrew, Git, and GitHub CLI
 
 ## Install Informant
 
-Install the standalone Informant binary from its Homebrew tap, then install the tools used to clone
-repositories and run Tart VMs:
+Install the standalone Informant binary from its Homebrew tap and GitHub CLI:
 
 ```bash
 brew install informant-ci/tap/informant
-brew install gh openai/tools/tart cirruslabs/cli/sshpass
+brew install gh
 gh auth login
 informant --version
 ```
@@ -30,14 +29,22 @@ informant setup
 
 Informant will:
 
-1. Ask whether your account or an organization should own the App.
-2. Open GitHub with **Checks: read/write**, **Contents: read**, **Pull requests: read/write**, and
+1. Offer to install Apple's signed Container package, start its services, and verify the default job
+   image. The installation requires an administrator password.
+2. Ask whether your account or an organization should own the App.
+3. Open GitHub with **Checks: read/write**, **Contents: read**, **Pull requests: read/write**, and
    webhooks disabled.
-3. Receive and protect the generated private key automatically.
-4. Open GitHub's installation screen so you can choose repositories.
-5. Detect the installation and save its credentials without changing this machine's registered
+4. Receive and protect the generated private key automatically.
+5. Open GitHub's installation screen so you can choose repositories.
+6. Detect the installation and save its credentials without changing this machine's registered
    repositories.
-6. Offer to start the worker.
+7. Offer to start the worker.
+
+Workers that run macOS VM jobs also need Tart and `sshpass`:
+
+```bash
+brew install openai/tools/tart cirruslabs/cli/sshpass
+```
 
 The browser steps are limited to approving creation and choosing repository access—GitHub requires
 those decisions from the App owner. Informant stores everything else under `~/.config/informant`;
