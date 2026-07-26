@@ -13,6 +13,8 @@ interface ContainerResources {
   memoryMb: number;
 }
 
+const DEFAULT_CONTAINER_RESOURCES: ContainerResources = { cpu: 1, memoryMb: 1024 };
+
 export function containerCapacity(
   hostCpu = availableParallelism(),
   hostMemoryMb = Math.floor(totalmem() / 1024 / 1024),
@@ -225,7 +227,10 @@ export async function runInContainer(
   );
   const executionSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
   const runCommand = operations.command ?? command;
-  const resources = { cpu: runtime.cpu ?? 4, memoryMb: runtime.memoryMb ?? 1024 };
+  const resources = {
+    cpu: runtime.cpu ?? DEFAULT_CONTAINER_RESOURCES.cpu,
+    memoryMb: runtime.memoryMb ?? DEFAULT_CONTAINER_RESOURCES.memoryMb,
+  };
   let releaseSlot: (() => void) | undefined;
   try {
     executionSignal.throwIfAborted();
@@ -269,8 +274,8 @@ export async function runInContainer(
         target: `/mnt/shared/${mount.name}`,
       })),
       secretNames: Object.keys(secrets),
-      cpu: runtime.cpu,
-      memoryMb: runtime.memoryMb,
+      cpu: resources.cpu,
+      memoryMb: resources.memoryMb,
     });
     await started();
     await log(`\n━━ ${job.name} ━━\n[${job.name}] $ ${job.command}\n`);

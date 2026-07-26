@@ -246,6 +246,12 @@ test("passes secrets through the client environment and always removes the conta
   expect(success).toEqual({ success: true, exitCode: 0, timedOut: false });
   expect(invocations[0]?.args).toContain("TOKEN");
   expect(invocations[0]?.args.join(" ")).not.toContain("line one");
+  const args = invocations[0]?.args ?? [];
+  expect(args.slice(args.indexOf("--cpus"), args.indexOf("--cpus") + 2)).toEqual(["--cpus", "1"]);
+  expect(args.slice(args.indexOf("--memory"), args.indexOf("--memory") + 2)).toEqual([
+    "--memory",
+    "1024M",
+  ]);
   expect(invocations[0]?.environment?.TOKEN).toBe("line one\nline two");
   expect(invocations[1]?.args.slice(0, 3)).toEqual(["container", "delete", "--force"]);
   expect(output.join("")).toContain("[REDACTED]");
