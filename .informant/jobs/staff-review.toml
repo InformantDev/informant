@@ -35,6 +35,9 @@ triggers = [{ event = "commit", pull_request = { state = "open", draft = false }
 secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]
 environment = { CI = "true" }
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
+container.image = "oven/bun:1"
+container.cpu = 2
+container.memory_mb = 4096
 container.prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive

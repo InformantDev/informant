@@ -7,3 +7,4 @@ bun run check
 timeout_minutes = 15
 environment = { CI = "true" }
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
+container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096 }

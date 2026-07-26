@@ -7,3 +7,4 @@ bun run build
 environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 needs = ["test", "lint", "typecheck"]
+container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096 }
