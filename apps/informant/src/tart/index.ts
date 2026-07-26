@@ -1,8 +1,8 @@
-import { chmod, mkdir, open, realpath, rm } from "node:fs/promises";
+import { appendFile, chmod, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { runInContainer } from "../container.ts";
 import { command, requireCommand } from "../process.ts";
-import { appendLog, claimBuildWorkspace } from "../store.ts";
+import { appendLog, claimBuildWorkspace, jobLogPath } from "../store.ts";
 import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
 import { cacheMounts } from "./cache.ts";
 import {
@@ -184,7 +184,6 @@ async function runJob(
   config: InformantConfig,
   job: InformantConfig["jobs"][number],
   log: (text: string) => Promise<void>,
-  started: () => Promise<void>,
   runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
 ): Promise<boolean> {
@@ -274,7 +273,6 @@ async function runJob(
         secretValues: secrets.values,
       };
     }, executionSignal);
-    await started();
     await log(`[${job.name}] $ ${job.command}\n`);
     const environment = {
       ...job.environment,
@@ -327,6 +325,22 @@ async function runJob(
 
 export type JobOutcome = "success" | "failure" | "skipped" | "cancelled";
 
+export function jobEventLine(
+  name: string,
+  event: "started" | "skipped (dependency failed)" | `finished (${JobOutcome})`,
+  at = new Date(),
+): string {
+  return `[${at.toISOString()}] [${name}] ${event}\n`;
+}
+
+export async function writeWithBestEffortDuplicate(
+  primary: (text: string) => Promise<void>,
+  duplicate: (text: string) => Promise<void>,
+  text: string,
+): Promise<void> {
+  await Promise.all([primary(text), duplicate(text).catch(() => undefined)]);
+}
+
 export interface JobExecutionObserver {
   started?: (job: InformantConfig["jobs"][number]) => Promise<void> | void;
   progress?: (job: InformantConfig["jobs"][number], log: string) => Promise<void> | void;
@@ -351,21 +365,26 @@ export function boundedLogWriter(
   if (markerBytes.length > maximumBytes) throw new Error("log truncation marker exceeds quota");
   let writtenBytes = 0;
   let truncated = false;
-  return async (text) => {
-    if (truncated) return;
-    const bytes = encoder.encode(text);
-    const contentLimit = maximumBytes - markerBytes.length;
-    if (writtenBytes + bytes.length <= contentLimit) {
-      writtenBytes += bytes.length;
-      await output(text);
-      return;
-    }
-    let length = Math.max(0, contentLimit - writtenBytes);
-    while (length > 0 && length < bytes.length && ((bytes[length] ?? 0) & 0xc0) === 0x80) length--;
-    if (length > 0) await output(decoder.decode(bytes.subarray(0, length)));
-    await output(marker);
-    writtenBytes += length + markerBytes.length;
-    truncated = true;
+  let writes = Promise.resolve();
+  return (text) => {
+    writes = writes.then(async () => {
+      if (truncated) return;
+      const bytes = encoder.encode(text);
+      const contentLimit = maximumBytes - markerBytes.length;
+      if (writtenBytes + bytes.length <= contentLimit) {
+        writtenBytes += bytes.length;
+        await output(text);
+        return;
+      }
+      let length = Math.max(0, contentLimit - writtenBytes);
+      while (length > 0 && length < bytes.length && ((bytes[length] ?? 0) & 0xc0) === 0x80)
+        length--;
+      if (length > 0) await output(decoder.decode(bytes.subarray(0, length)));
+      await output(marker);
+      writtenBytes += length + markerBytes.length;
+      truncated = true;
+    });
+    return writes;
   };
 }
 
@@ -451,6 +470,7 @@ export async function runInTart(
   const repositoryPath = join(root, "repository");
   const workspaces = config.jobs.map((_, index) => join(root, `job-${index}`));
   const jobLogs = new Map<string, Uint8Array>();
+  const jobLogWriters = new Map<string, ReturnType<typeof boundedLogWriter>>();
   const decoder = new TextDecoder();
   let logHandle: Awaited<ReturnType<typeof open>> | undefined;
   let writes = Promise.resolve();
@@ -470,7 +490,12 @@ export async function runInTart(
   };
   const logJob = async (job: InformantConfig["jobs"][number], text: string) => {
     jobLogs.set(job.name, appendUtf8Tail(jobLogs.get(job.name) ?? new Uint8Array(), text));
-    await writeLog(text);
+    let writeJobLog = jobLogWriters.get(job.name);
+    if (!writeJobLog) {
+      writeJobLog = boundedLogWriter((value) => appendFile(jobLogPath(record, job.name), value));
+      jobLogWriters.set(job.name, writeJobLog);
+    }
+    await writeWithBestEffortDuplicate(writeLog, writeJobLog, text);
     if (!progressTimers.has(job.name)) {
       progressTimers.set(
         job.name,
@@ -494,6 +519,7 @@ export async function runInTart(
   try {
     signal?.throwIfAborted();
     await claimBuildWorkspace(root);
+    await mkdir(join(record.logPath, "..", "jobs"), { recursive: true });
     logHandle = await open(record.logPath, "a");
     await writeLog(`$ cloning ${repository.fullName} at ${sha}\n`);
     await requireCommand(
@@ -521,6 +547,8 @@ export async function runInTart(
       async (job, index) => {
         const workspace = workspaces[index];
         if (!workspace) throw new Error(`workspace missing for job ${job.name}`);
+        await logJob(job, jobEventLine(job.name, "started"));
+        await notify(() => observer.started?.(job));
         const runtime = job.runtime ?? config.vm;
         const success =
           runtime.type === "container"
@@ -533,7 +561,7 @@ export async function runInTart(
                 workspace,
                 job,
                 (text) => logJob(job, text),
-                () => notify(() => observer.started?.(job)),
+                async () => {},
                 runtimeSecrets,
                 signal,
               )
@@ -552,11 +580,11 @@ export async function runInTart(
                 { ...config, vm: runtime },
                 job,
                 (text) => logJob(job, text),
-                () => notify(() => observer.started?.(job)),
                 runtimeSecrets,
                 signal,
               );
         const outcome = signal?.aborted ? "cancelled" : success ? "success" : "failure";
+        await logJob(job, jobEventLine(job.name, `finished (${outcome})`));
         await writes;
         await flushProgress(job);
         await notify(() =>
@@ -568,7 +596,10 @@ export async function runInTart(
         return success;
       },
       async (job) => {
-        await logJob(job, `\n━━ ${job.name} ━━\n[skipped: dependency failed]\n`);
+        await logJob(
+          job,
+          `\n━━ ${job.name} ━━\n${jobEventLine(job.name, signal?.aborted ? "finished (cancelled)" : "skipped (dependency failed)")}`,
+        );
         await writes;
         await flushProgress(job);
         await notify(() =>
@@ -580,9 +611,10 @@ export async function runInTart(
       },
       async (job, error) => {
         const message = error instanceof Error ? error.message : String(error);
+        const outcome = signal?.aborted ? "cancelled" : "failure";
         await logJob(
           job,
-          signal?.aborted ? `\n[${job.name}: cancelled]\n` : `\n[${job.name}: ${message}]\n`,
+          `${signal?.aborted ? `\n[${job.name}: cancelled]\n` : `\n[${job.name}: ${message}]\n`}${jobEventLine(job.name, `finished (${outcome})`)}`,
         );
         await writes;
         await flushProgress(job);

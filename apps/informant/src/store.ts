@@ -1,6 +1,7 @@
-import { appendFile, mkdir, readdir, rm, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BuildRecord } from "./types.ts";
 
 export function dataDirectory(): string {
@@ -11,7 +12,22 @@ function buildDirectory(id: string): string {
   return join(dataDirectory(), "builds", id);
 }
 
+function activeBuildDirectory(): string {
+  return join(dataDirectory(), "active-builds");
+}
+
+function activeBuildPath(id: string): string {
+  return join(activeBuildDirectory(), id);
+}
+
+export function jobLogPath(record: BuildRecord, job: string): string {
+  const id = createHash("sha256").update(job).digest("hex");
+  return join(dirname(record.logPath), "jobs", `${id}.log`);
+}
+
 const WORKSPACE_OWNER = ".owner.json";
+const ACTIVE_MARKER_GRACE_MS = 60_000;
+const buildSaves = new Map<string, Promise<void>>();
 
 function processStartIdentity(pid: number): string | undefined {
   const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
@@ -21,6 +37,25 @@ function processStartIdentity(pid: number): string | undefined {
   if (result.exitCode !== 0) return undefined;
   const identity = result.stdout.toString().trim();
   return identity || undefined;
+}
+
+export function currentProcessOwner(): BuildRecord["owner"] {
+  const startedAt = processStartIdentity(process.pid);
+  return startedAt ? { pid: process.pid, startedAt } : undefined;
+}
+
+function processOwnerIsLive(owner: unknown): boolean {
+  if (!owner || typeof owner !== "object") return false;
+  const value = owner as { pid?: unknown; startedAt?: unknown };
+  if (!Number.isInteger(value.pid) || (value.pid as number) <= 0) return false;
+  if (typeof value.startedAt !== "string" || !value.startedAt) return false;
+  try {
+    process.kill(value.pid as number, 0);
+    return processStartIdentity(value.pid as number) === value.startedAt;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
+    return processStartIdentity(value.pid as number) === value.startedAt;
+  }
 }
 
 export async function claimBuildWorkspace(workspace: string): Promise<void> {
@@ -35,19 +70,7 @@ export async function claimBuildWorkspace(workspace: string): Promise<void> {
 
 async function workspaceHasLiveOwner(workspace: string): Promise<boolean> {
   try {
-    const owner = (await Bun.file(join(workspace, WORKSPACE_OWNER)).json()) as {
-      pid?: unknown;
-      startedAt?: unknown;
-    };
-    if (!Number.isInteger(owner.pid) || (owner.pid as number) <= 0) return false;
-    if (typeof owner.startedAt !== "string" || !owner.startedAt) return false;
-    try {
-      process.kill(owner.pid as number, 0);
-      return processStartIdentity(owner.pid as number) === owner.startedAt;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
-      return processStartIdentity(owner.pid as number) === owner.startedAt;
-    }
+    return processOwnerIsLive(await Bun.file(join(workspace, WORKSPACE_OWNER)).json());
   } catch {
     return false;
   }
@@ -60,7 +83,32 @@ export async function createBuild(record: BuildRecord): Promise<void> {
 }
 
 export async function saveBuild(record: BuildRecord): Promise<void> {
-  await Bun.write(join(buildDirectory(record.id), "build.json"), JSON.stringify(record, null, 2));
+  const path = join(buildDirectory(record.id), "build.json");
+  const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
+  const contents = JSON.stringify(record, null, 2);
+  const status = record.status;
+  const previous = buildSaves.get(record.id) ?? Promise.resolve();
+  const save = previous
+    .catch(() => undefined)
+    .then(async () => {
+      try {
+        if (status === "running") {
+          await mkdir(activeBuildDirectory(), { recursive: true });
+          await Bun.write(activeBuildPath(record.id), "");
+        }
+        await Bun.write(temporaryPath, contents);
+        await rename(temporaryPath, path);
+        if (status !== "running") await rm(activeBuildPath(record.id), { force: true });
+      } finally {
+        await rm(temporaryPath, { force: true }).catch(() => undefined);
+      }
+    });
+  buildSaves.set(record.id, save);
+  try {
+    await save;
+  } finally {
+    if (buildSaves.get(record.id) === save) buildSaves.delete(record.id);
+  }
 }
 
 export async function appendLog(record: BuildRecord, text: string): Promise<void> {
@@ -94,6 +142,42 @@ export async function listBuilds(limit = 100): Promise<BuildRecord[]> {
 
 export async function listAllBuilds(): Promise<BuildRecord[]> {
   return listBuilds(Number.POSITIVE_INFINITY);
+}
+
+export async function reconcileBuildLiveness(build: BuildRecord): Promise<BuildRecord> {
+  if (build.status !== "running" || processOwnerIsLive(build.owner)) return build;
+  build.status = "cancelled";
+  build.completedAt = new Date().toISOString();
+  build.runningJobs = [];
+  await saveBuild(build);
+  return build;
+}
+
+export async function listActiveBuilds(): Promise<BuildRecord[]> {
+  const entries = await readdir(activeBuildDirectory(), { withFileTypes: true }).catch(() => []);
+  const builds = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile())
+      .map(async (entry) => {
+        const build = await getBuild(entry.name);
+        if (!build) {
+          const marker = await stat(activeBuildPath(entry.name)).catch(() => undefined);
+          if (marker && marker.mtimeMs < Date.now() - ACTIVE_MARKER_GRACE_MS) {
+            await rm(activeBuildPath(entry.name), { force: true });
+          }
+          return undefined;
+        }
+        if (build.status !== "running") {
+          await rm(activeBuildPath(entry.name), { force: true });
+          return undefined;
+        }
+        const reconciled = await reconcileBuildLiveness(build);
+        return reconciled.status === "running" ? reconciled : undefined;
+      }),
+  );
+  return builds
+    .filter((build): build is BuildRecord => build !== undefined)
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 }
 
 export async function removeOrphanedBuildWorkspaces(

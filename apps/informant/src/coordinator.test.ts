@@ -234,6 +234,72 @@ describe("runCommit", () => {
     expect(context.jobCheckListings()).toBe(0);
   });
 
+  test("persists the jobs that are currently running", async () => {
+    const context = harness();
+
+    await runCommit(context.github, repository, "sha", "main", config, context.dependencies);
+
+    expect(context.saved.some((record) => record.runningJobs?.includes("test"))).toBe(true);
+    expect(context.saved.at(-1)?.runningJobs).toEqual([]);
+  });
+
+  test("job check updates continue when running-job persistence fails", async () => {
+    const context = harness();
+    context.dependencies.saveBuild = async () => {
+      throw new Error("disk full");
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("success");
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.conclusion === "success"),
+    ).toBeDefined();
+  });
+
+  test("records an explicit pull request target", async () => {
+    const context = harness();
+    const pullRequestConfig: InformantConfig = {
+      ...config,
+      jobs: config.jobs.map((job) => ({
+        ...job,
+        triggers: [{ event: "commit", pullRequest: {} }],
+      })),
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "pull/7",
+      pullRequestConfig,
+      context.dependencies,
+      {
+        type: "commit",
+        id: "pr:7:sha",
+        pullRequest: {
+          number: 7,
+          state: "open",
+          draft: false,
+          baseBranch: "main",
+          headSha: "sha",
+          sameRepository: true,
+        },
+      },
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.pullRequest).toBe(7);
+  });
+
   test("supplies the GitHub App token only when a job requests it", async () => {
     const context = harness();
     const job = config.jobs[0];

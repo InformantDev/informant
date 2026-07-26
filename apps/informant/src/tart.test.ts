@@ -12,6 +12,7 @@ import {
   checkoutBuildWorkspace,
   ensurePreparedImage,
   isRetryableSshAuthenticationFailure,
+  jobEventLine,
   preparedImageName,
   prunePreparedImages,
   reconcilePreparedImageReferences,
@@ -20,6 +21,7 @@ import {
   secretMount,
   streamingSecretRedactor,
   utf8Tail,
+  writeWithBestEffortDuplicate,
 } from "./tart/index.ts";
 import {
   bunCopyfileBackend,
@@ -655,6 +657,61 @@ test("persistent build logs stop at their byte quota with a truncation marker", 
   expect(output).toEndWith(BUILD_LOG_TRUNCATION_MARKER);
   expect(output).not.toContain("�");
   expect(output).not.toContain("ignored");
+});
+
+test("bounded log writes serialize quota accounting", async () => {
+  let output = "";
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const write = boundedLogWriter(
+    async (text) => {
+      await blocked;
+      output += text;
+    },
+    8,
+    "!",
+  );
+
+  const writes = [write("123456"), write("abcdef"), write("ghijkl")];
+  await Bun.sleep(0);
+  release();
+  await Promise.all(writes);
+
+  expect(output).toBe("123456a!");
+});
+
+test("a failed duplicate log sink does not interrupt parallel jobs", async () => {
+  const output: string[] = [];
+  const duplicate = boundedLogWriter(async () => {
+    throw new Error("too many open files");
+  });
+
+  expect(
+    await scheduleJobs([job("one"), job("two")], async (current) => {
+      await writeWithBestEffortDuplicate(
+        async (text) => {
+          output.push(text);
+        },
+        duplicate,
+        current.name,
+      );
+      return true;
+    }),
+  ).toBe(true);
+  expect(new Set(output)).toEqual(new Set(["one", "two"]));
+});
+
+test("job event lines timestamp lifecycle changes without changing command output", () => {
+  const timestamp = new Date("2026-07-26T12:34:56.789Z");
+
+  expect(jobEventLine("test", "started", timestamp)).toBe(
+    "[2026-07-26T12:34:56.789Z] [test] started\n",
+  );
+  expect(jobEventLine("test", "finished (success)", timestamp)).toBe(
+    "[2026-07-26T12:34:56.789Z] [test] finished (success)\n",
+  );
 });
 
 describe("job scheduler", () => {
