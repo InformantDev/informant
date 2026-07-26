@@ -186,7 +186,7 @@ async function runJob(
   log: (text: string) => Promise<void>,
   runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
-): Promise<boolean> {
+): Promise<{ success: boolean; exitCode: number; timedOut: boolean }> {
   const timeoutMs = job.timeoutMinutes * 60_000;
   const deadline = new AbortController();
   const timeout = setTimeout(
@@ -300,10 +300,11 @@ async function runJob(
       onOutput: redactor.write,
     });
     await redactor.flush();
-    let output = `\n[${job.name}: exit ${result.exitCode}]\n`;
-    if (result.timedOut) output += `[${job.name}: timed out after ${job.timeoutMinutes}m]\n`;
-    await log(output);
-    return result.exitCode === 0 && !result.timedOut;
+    return {
+      success: result.exitCode === 0 && !result.timedOut,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+    };
   } catch (error) {
     if (deadline.signal.aborted && !signal?.aborted) throw deadline.signal.reason;
     throw error;
@@ -329,8 +330,11 @@ export function jobEventLine(
   name: string,
   event: "started" | "skipped (dependency failed)" | `finished (${JobOutcome})`,
   at = new Date(),
+  detail?: string,
 ): string {
-  return `[${at.toISOString()}] [${name}] ${event}\n`;
+  const rendered =
+    detail && event.startsWith("finished (") ? `${event.slice(0, -1)}, ${detail})` : event;
+  return `[${at.toISOString()}] [${name}] ${rendered}\n`;
 }
 
 export async function writeWithBestEffortDuplicate(
@@ -550,7 +554,7 @@ export async function runInTart(
         await logJob(job, jobEventLine(job.name, "started"));
         await notify(() => observer.started?.(job));
         const runtime = job.runtime ?? config.vm;
-        const success =
+        const execution =
           runtime.type === "container"
             ? await runInContainer(
                 repository,
@@ -583,8 +587,11 @@ export async function runInTart(
                 runtimeSecrets,
                 signal,
               );
-        const outcome = signal?.aborted ? "cancelled" : success ? "success" : "failure";
-        await logJob(job, jobEventLine(job.name, `finished (${outcome})`));
+        const outcome = signal?.aborted ? "cancelled" : execution.success ? "success" : "failure";
+        const detail = execution.timedOut
+          ? `exit ${execution.exitCode}, timed out after ${job.timeoutMinutes}m`
+          : `exit ${execution.exitCode}`;
+        await logJob(job, jobEventLine(job.name, `finished (${outcome})`, new Date(), detail));
         await writes;
         await flushProgress(job);
         await notify(() =>
@@ -593,7 +600,7 @@ export async function runInTart(
             log: decoder.decode(jobLogs.get(job.name)),
           }),
         );
-        return success;
+        return execution.success;
       },
       async (job) => {
         await logJob(

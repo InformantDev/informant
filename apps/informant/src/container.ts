@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { availableParallelism, totalmem } from "node:os";
 import { join } from "node:path";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
@@ -7,39 +8,72 @@ import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from 
 import { withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
-const MAX_CONCURRENT_CONTAINERS = 2;
-let activeContainers = 0;
+interface ContainerResources {
+  cpu: number;
+  memoryMb: number;
+}
+
+export function containerCapacity(
+  hostCpu = availableParallelism(),
+  hostMemoryMb = Math.floor(totalmem() / 1024 / 1024),
+): ContainerResources {
+  return {
+    cpu: Math.max(1, hostCpu - 2),
+    memoryMb: Math.max(1024, Math.floor(hostMemoryMb * 0.75)),
+  };
+}
+
+const capacity = containerCapacity();
+const activeResources: ContainerResources = { cpu: 0, memoryMb: 0 };
 const containerWaiters: Array<{
+  resources: ContainerResources;
   signal?: AbortSignal;
   resolve: (release: () => void) => void;
   reject: (error: unknown) => void;
   abort?: () => void;
 }> = [];
 
-function releaseContainerSlot(): void {
-  activeContainers--;
+function hasContainerCapacity(resources: ContainerResources): boolean {
+  return (
+    activeResources.cpu + resources.cpu <= capacity.cpu &&
+    activeResources.memoryMb + resources.memoryMb <= capacity.memoryMb
+  );
+}
+
+function reserveContainerResources(resources: ContainerResources): () => void {
+  activeResources.cpu += resources.cpu;
+  activeResources.memoryMb += resources.memoryMb;
+  return () => releaseContainerResources(resources);
+}
+
+function releaseContainerResources(resources: ContainerResources): void {
+  activeResources.cpu -= resources.cpu;
+  activeResources.memoryMb -= resources.memoryMb;
   while (containerWaiters.length > 0) {
-    const waiter = containerWaiters.shift();
+    const waiter = containerWaiters[0];
     if (!waiter) return;
-    if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
     if (waiter.signal?.aborted) {
+      containerWaiters.shift();
+      if (waiter.abort) waiter.signal.removeEventListener("abort", waiter.abort);
       waiter.reject(waiter.signal.reason);
       continue;
     }
-    activeContainers++;
-    waiter.resolve(releaseContainerSlot);
-    return;
+    if (!hasContainerCapacity(waiter.resources) && activeResources.cpu > 0) return;
+    containerWaiters.shift();
+    if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
+    waiter.resolve(reserveContainerResources(waiter.resources));
   }
 }
 
-async function acquireContainerSlot(signal?: AbortSignal): Promise<() => void> {
+async function acquireContainerResources(
+  resources: ContainerResources,
+  signal?: AbortSignal,
+): Promise<() => void> {
   signal?.throwIfAborted();
-  if (activeContainers < MAX_CONCURRENT_CONTAINERS) {
-    activeContainers++;
-    return releaseContainerSlot;
-  }
+  if (hasContainerCapacity(resources) || activeResources.cpu === 0)
+    return reserveContainerResources(resources);
   return new Promise<() => void>((resolve, reject) => {
-    const waiter: (typeof containerWaiters)[number] = { signal, resolve, reject };
+    const waiter: (typeof containerWaiters)[number] = { resources, signal, resolve, reject };
     waiter.abort = () => {
       const index = containerWaiters.indexOf(waiter);
       if (index >= 0) containerWaiters.splice(index, 1);
@@ -178,7 +212,7 @@ export async function runInContainer(
   runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
   operations: { command?: typeof command } = {},
-): Promise<boolean> {
+): Promise<{ success: boolean; exitCode: number; timedOut: boolean }> {
   if (job.runtime?.type !== "container")
     throw new Error("container runner requires a container runtime");
   const runtime = job.runtime;
@@ -191,12 +225,13 @@ export async function runInContainer(
   );
   const executionSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
   const runCommand = operations.command ?? command;
+  const resources = { cpu: runtime.cpu ?? 4, memoryMb: runtime.memoryMb ?? 1024 };
   let releaseSlot: (() => void) | undefined;
   try {
     executionSignal.throwIfAborted();
-    if (activeContainers >= MAX_CONCURRENT_CONTAINERS)
+    if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
       await log(`[${job.name}] waiting for an available Apple Container slot\n`);
-    releaseSlot = await acquireContainerSlot(executionSignal);
+    releaseSlot = await acquireContainerResources(resources, executionSignal);
     const secrets = await resolveJobSecrets(job, runtimeSecrets);
     executionSignal.throwIfAborted();
     const caches = await cacheMounts(
@@ -246,10 +281,11 @@ export async function runInContainer(
       onOutput: redactor.write,
     });
     await redactor.flush();
-    let output = `\n[${job.name}: exit ${result.exitCode}]\n`;
-    if (result.timedOut) output += `[${job.name}: timed out after ${job.timeoutMinutes}m]\n`;
-    await log(output);
-    return result.exitCode === 0 && !result.timedOut;
+    return {
+      success: result.exitCode === 0 && !result.timedOut,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+    };
   } catch (error) {
     if (deadline.signal.aborted && !signal?.aborted) throw deadline.signal.reason;
     throw error;

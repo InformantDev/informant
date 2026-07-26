@@ -712,6 +712,9 @@ test("job event lines timestamp lifecycle changes without changing command outpu
   expect(jobEventLine("test", "finished (success)", timestamp)).toBe(
     "[2026-07-26T12:34:56.789Z] [test] finished (success)\n",
   );
+  expect(jobEventLine("test", "finished (success)", timestamp, "exit 0")).toBe(
+    "[2026-07-26T12:34:56.789Z] [test] finished (success, exit 0)\n",
+  );
 });
 
 describe("job scheduler", () => {

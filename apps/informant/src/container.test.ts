@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  containerCapacity,
   containerRunArguments,
   ensurePreparedContainer,
   preparedContainerImage,
@@ -242,7 +243,7 @@ test("passes secrets through the client environment and always removes the conta
     },
   );
 
-  expect(success).toBe(true);
+  expect(success).toEqual({ success: true, exitCode: 0, timedOut: false });
   expect(invocations[0]?.args).toContain("TOKEN");
   expect(invocations[0]?.args.join(" ")).not.toContain("line one");
   expect(invocations[0]?.environment?.TOKEN).toBe("line one\nline two");
@@ -272,7 +273,12 @@ test("limits concurrent Apple containers across jobs", async () => {
         environment: {},
         secrets: [],
         needs: [],
-        runtime: { type: "container", image: "image" },
+        runtime: {
+          type: "container",
+          image: "image",
+          cpu: containerCapacity().cpu,
+          memoryMb: containerCapacity().memoryMb,
+        },
       },
       async (text) => {
         if (text.includes("waiting for")) waiting.push(name);
@@ -293,23 +299,24 @@ test("limits concurrent Apple containers across jobs", async () => {
       },
     );
 
-  const jobs = [run("first"), run("second"), run("third")];
-  while (started.length < 2) await Bun.sleep(1);
-  expect(started).toEqual(["first", "second"]);
-  expect(waiting).toEqual(["third"]);
+  const names = ["first", "second"];
+  const jobs = names.map(run);
+  while (started.length < 1) await Bun.sleep(1);
+  expect(started).toHaveLength(1);
+  expect(waiting).toHaveLength(1);
+  expect(new Set([...started, ...waiting])).toEqual(new Set(names));
 
-  releases.get("first")?.resolve(result());
-  while (started.length < 3) await Bun.sleep(1);
-  expect(started).toEqual(["first", "second", "third"]);
-  releases.get("second")?.resolve(result());
-  releases.get("third")?.resolve(result());
+  releases.get(started[0] ?? "")?.resolve(result());
+  while (started.length < names.length) await Bun.sleep(1);
+  expect(new Set(started)).toEqual(new Set(names));
+  for (const release of releases.values()) release.resolve(result());
   await Promise.all(jobs);
 });
 
 test("cancelling a queued job does not invoke Apple Container", async () => {
   const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
-  const releases = [deferred<ReturnType<typeof result>>(), deferred<ReturnType<typeof result>>()];
+  const release = deferred<ReturnType<typeof result>>();
   const invocations = new Map<string, string[][]>();
   const run = (name: string, signal?: AbortSignal) =>
     runInContainer(
@@ -326,7 +333,12 @@ test("cancelling a queued job does not invoke Apple Container", async () => {
         environment: {},
         secrets: [],
         needs: [],
-        runtime: { type: "container", image: "image" },
+        runtime: {
+          type: "container",
+          image: "image",
+          cpu: containerCapacity().cpu,
+          memoryMb: containerCapacity().memoryMb,
+        },
       },
       async () => {},
       async () => {},
@@ -338,23 +350,26 @@ test("cancelling a queued job does not invoke Apple Container", async () => {
           calls.push(args);
           invocations.set(name, calls);
           if (args[1] === "run" && name !== "queued") {
-            return releases[name === "first" ? 0 : 1]?.promise ?? result();
+            return release.promise;
           }
           return result();
         },
       },
     );
 
-  const first = run("first");
-  const second = run("second");
-  while ((invocations.get("second") ?? []).every((args) => args[1] !== "run")) await Bun.sleep(1);
+  const active = run("active");
+  while ((invocations.get("active") ?? []).every((args) => args[1] !== "run")) await Bun.sleep(1);
   const controller = new AbortController();
   const queued = run("queued", controller.signal).catch((error) => error);
   controller.abort("cancelled");
 
   expect(await queued).toBe("cancelled");
   expect(invocations.get("queued")).toBeUndefined();
-  releases[0]?.resolve(result());
-  releases[1]?.resolve(result());
-  await Promise.all([first, second]);
+  release.resolve(result());
+  await active;
+});
+
+test("derives Apple Container capacity from host CPU and memory", () => {
+  expect(containerCapacity(16, 49_152)).toEqual({ cpu: 14, memoryMb: 36_864 });
+  expect(containerCapacity(1, 512)).toEqual({ cpu: 1, memoryMb: 1024 });
 });
