@@ -399,7 +399,9 @@ async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol
     }
   }, 1_000);
   try {
-    return (await prompt.prompt()) ?? Symbol.for("informant:no-selection");
+    const selection = (await prompt.prompt()) ?? Symbol.for("informant:no-selection");
+    process.stdout.write("\x1b[1A\x1b[2K\r");
+    return selection;
   } finally {
     open = false;
     clearInterval(refresh);
