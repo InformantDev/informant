@@ -296,7 +296,7 @@ async function runJob(
       config.vm.guestOs === "linux" ? `${linuxWorkspaceCopyCommand(jobWorkspace)} && ` : "";
     const execute = `${workspaceSetup}cd ${shellQuote(jobWorkspace)} && /bin/bash -lc ${shellQuote(`${env} ${ready.secretSource} ${runtimeSetup} ${job.command}`)}`;
     const jobCommand = ready.cacheRestore
-      ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; ${ready.cacheSave}; informant_cache_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; exit $informant_cache_status`
+      ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; ${ready.cacheSave}`
       : execute;
     const redactor = streamingSecretRedactor(ready.secretValues, log);
     const result = await sshCommand(ready.ip, config, jobCommand, timeoutMs, {

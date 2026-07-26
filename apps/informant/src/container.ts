@@ -5,6 +5,7 @@ import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
+import { bunCopyfileBackend } from "./tart/layout.ts";
 import { withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
@@ -14,6 +15,17 @@ interface ContainerResources {
 }
 
 const DEFAULT_CONTAINER_RESOURCES: ContainerResources = { cpu: 1, memoryMb: 1024 };
+
+export function containerJobCommand(
+  command: string,
+  cache: { restore: string; save: string; installLock?: string },
+): string {
+  const runtimeSetup = cache.installLock ? `${bunCopyfileBackend(cache.installLock, false)} ` : "";
+  const execute = `${cache.restore ? `${cache.restore} && ` : ""}${runtimeSetup}${command}`;
+  return cache.save
+    ? `( ${execute}\n); status=$?; if [ $status -ne 0 ]; then exit $status; fi; ${cache.save}`
+    : execute;
+}
 
 export function containerCapacity(
   hostCpu = availableParallelism(),
@@ -260,10 +272,7 @@ export async function runInContainer(
       INFORMANT_TRUSTED_SHA: trustedSha,
       HOME: "/home/root",
     };
-    const execute = `${caches.restore ? `${caches.restore} && ` : ""}${job.command}`;
-    const wrapped = caches.save
-      ? `${execute}; status=$?; ${caches.save}; cache_status=$?; test $status -eq 0 && exit $cache_status; exit $status`
-      : execute;
+    const wrapped = containerJobCommand(job.command, caches);
     const image = await ensurePreparedContainer(runtime, log, executionSignal, {
       command: runCommand,
     });
