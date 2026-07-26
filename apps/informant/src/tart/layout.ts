@@ -18,7 +18,7 @@ export function linuxWorkspaceCopyCommand(destination: string): string {
   return `rm -rf ${JSON.stringify(destination)} && mkdir -p ${JSON.stringify(destination)} && cp -a --no-preserve=ownership /mnt/shared/workspace/. ${JSON.stringify(destination)}`;
 }
 
-export function linuxBunCopyfileBackend(lockDirectory?: string): string {
+export function bunCopyfileBackend(lockDirectory?: string): string {
   const acquire = lockDirectory
     ? `while ! mkdir ${JSON.stringify(lockDirectory)} 2>/dev/null; do sleep 1; done; trap 'rmdir ${JSON.stringify(lockDirectory)} 2>/dev/null || true' EXIT TERM INT; `
     : "";

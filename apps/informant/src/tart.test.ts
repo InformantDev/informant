@@ -19,7 +19,7 @@ import {
   utf8Tail,
 } from "./tart/index.ts";
 import {
-  linuxBunCopyfileBackend,
+  bunCopyfileBackend,
   linuxSharedMountCommand,
   linuxWorkspaceCopyCommand,
 } from "./tart/layout.ts";
@@ -456,7 +456,7 @@ test("Linux jobs copy the shared workspace onto the guest filesystem", () => {
   );
 });
 
-test("Linux Bun package commands use the copyfile backend", async () => {
+test("Bun package commands use the copyfile backend", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-linux-bun-"));
   const bun = join(root, "bun");
   const calls = join(root, "calls");
@@ -466,14 +466,14 @@ test("Linux Bun package commands use the copyfile backend", async () => {
     [
       "/bin/bash",
       "-c",
-      `${linuxBunCopyfileBackend()} bun install --frozen-lockfile; bun test; bun add pkg --backend hardlink`,
+      `${bunCopyfileBackend()} bun install --frozen-lockfile; bun test; bun add pkg --backend hardlink`,
     ],
     { env: { ...Bun.env, PATH: `${root}:${Bun.env.PATH}` } },
   );
   try {
     expect(result.exitCode).toBe(0);
     const locked = Bun.spawnSync(
-      ["/bin/bash", "-c", `${linuxBunCopyfileBackend(join(root, "lock"))} bun install`],
+      ["/bin/bash", "-c", `${bunCopyfileBackend(join(root, "lock"))} bun install`],
       { env: { ...Bun.env, PATH: `${root}:${Bun.env.PATH}` } },
     );
     expect(locked.exitCode).toBe(0);
@@ -487,7 +487,7 @@ test("Linux Bun package commands use the copyfile backend", async () => {
 });
 
 test("Linux Bun package commands lease a shared snapshot cache", () => {
-  const setup = linuxBunCopyfileBackend("/mnt/shared/cache-0/.informant-install-lock");
+  const setup = bunCopyfileBackend("/mnt/shared/cache-0/.informant-install-lock");
   expect(setup).toContain('while ! mkdir "/mnt/shared/cache-0/.informant-install-lock"');
   expect(setup).toContain('rmdir "/mnt/shared/cache-0/.informant-install-lock"');
 });

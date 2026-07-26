@@ -6,8 +6,8 @@ import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
 import { cacheMounts } from "./cache.ts";
 import { ensurePreparedImage } from "./images.ts";
 import {
+  bunCopyfileBackend,
   guestSharedRoot,
-  linuxBunCopyfileBackend,
   linuxSharedMountCommand,
   linuxWorkspaceCopyCommand,
 } from "./layout.ts";
@@ -236,8 +236,7 @@ async function runJob(
     const env = Object.entries(environment)
       .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
       .join(" ");
-    const runtimeSetup =
-      config.vm.guestOs === "linux" ? linuxBunCopyfileBackend(ready.installLock) : "";
+    const runtimeSetup = bunCopyfileBackend(ready.installLock);
     const mountedWorkspace = `${guestSharedRoot(config.vm.guestOs)}/workspace`;
     const jobWorkspace =
       config.vm.guestOs === "linux" ? "/tmp/informant-workspace" : mountedWorkspace;
