@@ -22,6 +22,9 @@ describe("startup service", () => {
     expect(service).toContain("<string>serve</string>");
     expect(service).toContain("<key>RunAtLoad</key>\n  <true/>");
     expect(service).toContain("<key>KeepAlive</key>\n  <true/>");
+    expect(service).toContain(
+      "<key>SoftResourceLimits</key>\n  <dict>\n    <key>NumberOfFiles</key>\n    <integer>65536</integer>",
+    );
     expect(service).toContain("<string>/opt/tools&amp;more/bin</string>");
     expect(service).toContain("<string>/tmp/informant logs/worker.stderr.log</string>");
   });

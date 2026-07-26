@@ -104,6 +104,8 @@ export async function cacheMounts(
         const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
         const parent = guest.slice(0, guest.lastIndexOf("/"));
         const shared = `${guestSharedRoot(guestOs)}/cache-${mountIndex}`;
+        if (cache.shared && path === "~/.bun/install/cache")
+          installLock = `${shared}/.informant-install-lock`;
         restore.push(
           `mkdir -p ${shellQuote(parent)} && rm -rf ${shellQuote(guest)} && ln -s ${shellQuote(shared)} ${shellQuote(guest)}`,
         );

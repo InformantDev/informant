@@ -1,6 +1,7 @@
 import { createSign } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
+import { stripVTControlCharacters } from "node:util";
 import { getGitHubCredentials } from "./machine-config.ts";
 import type {
   CheckRun,
@@ -64,10 +65,15 @@ function rateLimitRetryAt(response: Response, body: string): number | undefined 
   return Date.now() + 60_000;
 }
 
+function githubText(value: string): string {
+  return stripVTControlCharacters(value).replaceAll("\r\n", "\n");
+}
+
 function outputTail(value: string | undefined, maximumBytes = 60_000): string | undefined {
   if (!value) return value;
-  const bytes = new TextEncoder().encode(value);
-  if (bytes.length <= maximumBytes) return value;
+  const plain = githubText(value);
+  const bytes = new TextEncoder().encode(plain);
+  if (bytes.length <= maximumBytes) return plain;
   let start = bytes.length - maximumBytes;
   while (start < bytes.length && ((bytes[start] ?? 0) & 0xc0) === 0x80) start++;
   return new TextDecoder().decode(bytes.subarray(start));
@@ -555,12 +561,12 @@ export class GitHubClient {
     return this.api(`/repos/${repository.fullName}/check-runs`, {
       method: "POST",
       body: JSON.stringify({
-        name,
+        name: githubText(name),
         head_sha: sha,
         status,
         external_id: requestId,
         started_at: status === "in_progress" ? new Date().toISOString() : undefined,
-        output: { title: "Informant CI", summary: `Claimed by ${hostname()}` },
+        output: { title: "Informant CI", summary: githubText(`Claimed by ${hostname()}`) },
       }),
     });
   }
@@ -574,11 +580,14 @@ export class GitHubClient {
     return this.api(`/repos/${repository.fullName}/check-runs`, {
       method: "POST",
       body: JSON.stringify({
-        name: `${JOB_CHECK_PREFIX}${jobName}`,
+        name: githubText(`${JOB_CHECK_PREFIX}${jobName}`),
         head_sha: sha,
         status: "queued",
         external_id: `informant-job:${claimId}:${Buffer.from(jobName).toString("base64url")}`,
-        output: { title: jobName, summary: "Waiting for dependencies and an available worker." },
+        output: {
+          title: githubText(jobName),
+          summary: "Waiting for dependencies and an available worker.",
+        },
       }),
     });
   }
@@ -601,7 +610,11 @@ export class GitHubClient {
         conclusion: values.conclusion,
         started_at: values.status === "in_progress" ? new Date().toISOString() : undefined,
         completed_at: values.status === "completed" ? new Date().toISOString() : undefined,
-        output: { title: values.title, summary: values.summary, text: outputTail(values.text) },
+        output: {
+          title: githubText(values.title),
+          summary: githubText(values.summary),
+          text: outputTail(values.text),
+        },
       }),
     });
   }

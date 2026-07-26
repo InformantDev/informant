@@ -26,7 +26,8 @@ test("container cache snapshots are published only after successful jobs", async
   };
   const script = containerJobCommand("bun install && bun test", cache);
 
-  expect(script).toContain("restore-cache && bun() {");
+  expect(script).toContain("restore-cache && { if ! ulimit -n 65536");
+  expect(script).toContain("bun() {");
   expect(script).toContain('while ! mkdir "/mnt/shared/cache-0/.informant-install-lock"');
   expect(script).toContain('command bun "$@" --backend=copyfile');
   expect(script).toContain("if [ $status -ne 0 ]; then exit $status; fi; save-cache");
@@ -34,8 +35,18 @@ test("container cache snapshots are published only after successful jobs", async
   expect(script).not.toContain("export -f bun");
 
   const marker = `/tmp/informant-cache-save-${crypto.randomUUID()}`;
+  const commandMarker = `${marker}-command`;
   const save = `touch ${JSON.stringify(marker)}`;
   try {
+    const restoreFailed = Bun.spawnSync([
+      "/bin/sh",
+      "-c",
+      containerJobCommand(`touch ${JSON.stringify(commandMarker)}`, { restore: "false", save }),
+    ]);
+    expect(restoreFailed.exitCode).toBe(1);
+    expect(await Bun.file(commandMarker).exists()).toBe(false);
+    expect(await Bun.file(marker).exists()).toBe(false);
+
     const failed = Bun.spawnSync([
       "/bin/sh",
       "-c",
@@ -52,7 +63,7 @@ test("container cache snapshots are published only after successful jobs", async
     expect(succeeded.exitCode).toBe(0);
     expect(await Bun.file(marker).exists()).toBe(true);
   } finally {
-    await rm(marker, { force: true });
+    await Promise.all([rm(marker, { force: true }), rm(commandMarker, { force: true })]);
   }
 });
 

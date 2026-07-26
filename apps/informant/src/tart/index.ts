@@ -15,6 +15,7 @@ import {
   guestSharedRoot,
   linuxSharedMountCommand,
   linuxWorkspaceCopyCommand,
+  raiseFileDescriptorLimit,
 } from "./layout.ts";
 import { provisionVm, shellQuote, sshCommand, startVm, stopVm, withImageLock } from "./vm.ts";
 
@@ -294,7 +295,7 @@ async function runJob(
       config.vm.guestOs === "linux" ? "/tmp/informant-workspace" : mountedWorkspace;
     const workspaceSetup =
       config.vm.guestOs === "linux" ? `${linuxWorkspaceCopyCommand(jobWorkspace)} && ` : "";
-    const execute = `${workspaceSetup}cd ${shellQuote(jobWorkspace)} && /bin/bash -lc ${shellQuote(`${env} ${ready.secretSource} ${runtimeSetup} ${job.command}`)}`;
+    const execute = `${workspaceSetup}cd ${shellQuote(jobWorkspace)} && /bin/bash -lc ${shellQuote(`${raiseFileDescriptorLimit()} ${env} ${ready.secretSource} ${runtimeSetup} ${job.command}`)}`;
     const jobCommand = ready.cacheRestore
       ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; ${ready.cacheSave}`
       : execute;

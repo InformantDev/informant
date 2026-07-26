@@ -27,6 +27,7 @@ import {
   bunCopyfileBackend,
   linuxSharedMountCommand,
   linuxWorkspaceCopyCommand,
+  raiseFileDescriptorLimit,
 } from "./tart/layout.ts";
 import { digest, sshCommand } from "./tart/vm.ts";
 import type { InformantConfig } from "./types.ts";
@@ -534,6 +535,7 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(linux.args[0]).toContain(join("caches", "linux"));
     expect(macos.restore).toContain("/Users/admin/.bun/install/cache");
     expect(macos.restore).toContain("/Volumes/My Shared Files/cache-0");
+    expect(macos.installLock).toBe("/Volumes/My Shared Files/cache-0/.informant-install-lock");
     expect(linux.restore).toContain("/home/admin/.bun/install/cache");
     expect(linux.restore).toContain("/mnt/shared/cache-0");
     expect(linux.restore).not.toContain("ln -s");
@@ -560,6 +562,12 @@ test("Linux shared mount setup is non-interactive and verifies the workspace", (
 test("Linux jobs copy the shared workspace onto the guest filesystem", () => {
   expect(linuxWorkspaceCopyCommand("/tmp/informant-workspace")).toBe(
     'rm -rf "/tmp/informant-workspace" && mkdir -p "/tmp/informant-workspace" && cp -a --no-preserve=ownership /mnt/shared/workspace/. "/tmp/informant-workspace"',
+  );
+});
+
+test("job shells raise their file descriptor limit", () => {
+  expect(raiseFileDescriptorLimit()).toBe(
+    "if ! ulimit -n 65536 2>/dev/null; then ulimit -n 10240 2>/dev/null || true; fi;",
   );
 });
 

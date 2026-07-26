@@ -55,6 +55,11 @@ ${environmentXml}
   <integer>10</integer>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65536</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>${escapeXml(join(logs, "worker.stdout.log"))}</string>
   <key>StandardErrorPath</key>

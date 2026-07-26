@@ -74,6 +74,27 @@ test("rate limited requests wait and retry once", async () => {
   expect(requests).toBe(2);
 });
 
+test("check output strips terminal control sequences", async () => {
+  let requestBody: { output?: { text?: string } } | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return Response.json({ id: 1, name: "Informant / test", status: "in_progress" });
+  }) as typeof globalThis.fetch;
+
+  await new GitHubClient({ token: "installation-token", fetch }).updateCheck(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    1,
+    {
+      title: "\x1b[1mtest\x1b[0m",
+      summary: "\x1b[33mrunning\x1b[0m",
+      text: "```text\r\n\x1b[31mfailed\x1b[0m\r\n```",
+    },
+  );
+
+  expect(requestBody?.output).toMatchObject({ title: "test", summary: "running" });
+  expect(requestBody?.output?.text).toBe("```text\nfailed\n```");
+});
+
 test("directory files returns sorted TOML files only", async () => {
   let requested = "";
   const fetch = (async (input: string | URL | Request) => {

@@ -5,7 +5,7 @@ import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
-import { bunCopyfileBackend } from "./tart/layout.ts";
+import { bunCopyfileBackend, raiseFileDescriptorLimit } from "./tart/layout.ts";
 import { withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
@@ -21,7 +21,8 @@ export function containerJobCommand(
   cache: { restore: string; save: string; installLock?: string },
 ): string {
   const runtimeSetup = cache.installLock ? `${bunCopyfileBackend(cache.installLock, false)} ` : "";
-  const execute = `${cache.restore ? `${cache.restore} && ` : ""}${runtimeSetup}${command}`;
+  const setup = `${raiseFileDescriptorLimit()} ${runtimeSetup}${command}`;
+  const execute = cache.restore ? `${cache.restore} && { ${setup}\n}` : setup;
   return cache.save
     ? `( ${execute}\n); status=$?; if [ $status -ne 0 ]; then exit $status; fi; ${cache.save}`
     : execute;
