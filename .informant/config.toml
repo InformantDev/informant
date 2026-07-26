@@ -5,18 +5,7 @@ triggers = [
   { event = "commit", pull_request = { state = "open", draft = false } },
 ]
 
-[vm]
-image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
-user = "admin"
-password = "admin"
-cpu = 4
-memory_mb = 8192
-prepare = """
-set -euo pipefail
-curl -fsSL https://bun.sh/install | bash
-sudo mkdir -p /usr/local/bin
-sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
-brew install gh
-bun add --global @ampcode/cli-darwin-arm64@0.0.1784917055-ge644b2
-sudo ln -sf "$HOME/.bun/install/global/node_modules/@ampcode/cli-darwin-arm64/amp" /usr/local/bin/amp
-"""
+[container]
+image = "oven/bun:1"
+cpu = 2
+memory_mb = 4096

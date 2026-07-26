@@ -1,6 +1,6 @@
 name = "staff-review"
 command = """
-set -euo pipefail
+set -eu
 review_root="$PWD"
 review_home="$(mktemp -d)"
 printf '{}\n' > "$review_home/settings.json"
@@ -35,3 +35,14 @@ triggers = [{ event = "commit", pull_request = { state = "open", draft = false }
 secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]
 environment = { CI = "true" }
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
+container.prepare = """
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends gh git ripgrep
+rm -rf /var/lib/apt/lists/*
+export HOME=/root
+mkdir -p "$HOME/.bun/install/global"
+bun add --global @ampcode/cli-linux-arm64@0.0.1784917055-ge644b2
+ln -sf "$HOME/.bun/install/global/node_modules/@ampcode/cli-linux-arm64/amp" /usr/local/bin/amp
+"""

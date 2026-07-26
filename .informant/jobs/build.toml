@@ -1,6 +1,6 @@
 name = "build"
 command = """
-set -euo pipefail
+set -eu
 bun install --frozen-lockfile
 bun run build
 """
