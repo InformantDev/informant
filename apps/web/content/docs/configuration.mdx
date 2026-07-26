@@ -11,7 +11,7 @@ navigate and review.
 
 ```toml
 version = 1
-timeout_minutes = 30
+timeout_minutes = 60
 triggers = [
   { event = "commit", branch = { names = ["main", "release"] } },
   { event = "comment", pull_request = { state = "open", draft = false, base_branches = ["main"] } }

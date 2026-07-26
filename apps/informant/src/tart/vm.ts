@@ -6,6 +6,23 @@ import type { InformantConfig } from "../types.ts";
 
 let vmProvisioning = Promise.resolve();
 
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener("abort", aborted);
+      resolve();
+    }
+    function aborted() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
+      reject(signal?.reason);
+    }
+    signal?.addEventListener("abort", aborted, { once: true });
+  });
+}
+
 export function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
@@ -64,7 +81,7 @@ async function waitForIp(
     if (exitError) throw exitError;
     const result = await command(["tart", "ip", vm], { signal });
     if (result.exitCode === 0 && result.stdout.trim()) return result.stdout.trim();
-    await Bun.sleep(1_000);
+    await abortableSleep(1_000, signal);
   }
   throw new Error("Tart VM did not acquire an IP address within 60 seconds");
 }
@@ -104,7 +121,7 @@ async function waitForSsh(
       { env: { SSHPASS: password }, signal },
     );
     if (result.exitCode === 0) return;
-    await Bun.sleep(1_000);
+    await abortableSleep(1_000, signal);
   }
   throw new Error("SSH did not become ready within 60 seconds");
 }
@@ -164,7 +181,7 @@ export async function startVm(
           `Tart VM capacity was unavailable for ${timeoutMinutes} minutes: ${message}`,
         );
       }
-      await Bun.sleep(5_000);
+      await abortableSleep(5_000, signal);
     }
   }
 }
@@ -186,7 +203,7 @@ export async function waitForCleanShutdown(vm: string, signal?: AbortSignal): Pr
     ) {
       return;
     }
-    await Bun.sleep(1_000);
+    await abortableSleep(1_000, signal);
   }
   throw new Error("prepared VM did not shut down cleanly within 60 seconds");
 }
@@ -204,7 +221,7 @@ export async function withImageLock<T>(
     const lock = await command(["shlock", "-f", path, "-p", String(process.pid)], { signal });
     if (lock.exitCode === 0) break;
     if (attempt >= 600) throw new Error(`timed out waiting for prepared image lock: ${image}`);
-    await Bun.sleep(1_000);
+    await abortableSleep(1_000, signal);
   }
   try {
     return await callback();
@@ -234,6 +251,7 @@ export async function sshCommand(
   timeoutMs: number,
   options: { signal?: AbortSignal; onOutput?: (text: string) => Promise<void> | void } = {},
 ) {
+  const deadline = Date.now() + timeoutMs;
   const argv = [
     "sshpass",
     "-e",
@@ -252,13 +270,17 @@ export async function sshCommand(
     remote,
   ];
   for (let attempt = 0; ; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return { exitCode: 1, stdout: "", stderr: "", timedOut: true };
+    }
     const result = await command(argv, {
       env: { SSHPASS: config.vm.password },
-      timeoutMs,
+      timeoutMs: remaining,
       signal: options.signal,
       onOutput: options.onOutput,
     });
     if (!isRetryableSshAuthenticationFailure(result) || attempt >= 9) return result;
-    await Bun.sleep(2_000);
+    await abortableSleep(Math.min(2_000, Math.max(0, deadline - Date.now())), options.signal);
   }
 }

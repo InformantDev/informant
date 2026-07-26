@@ -133,24 +133,33 @@ async function runJob(
   runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
 ): Promise<boolean> {
+  const timeoutMs = job.timeoutMinutes * 60_000;
+  const deadline = new AbortController();
+  const timeout = setTimeout(
+    () => deadline.abort(new Error(`${job.name} timed out after ${job.timeoutMinutes} minutes`)),
+    timeoutMs,
+  );
+  const executionSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
   let vmCreated = false;
   let tart: ReturnType<typeof Bun.spawn> | undefined;
   let secretDirectory: string | undefined;
 
   try {
-    signal?.throwIfAborted();
+    executionSignal.throwIfAborted();
     const ready = await provisionVm(async () => {
-      signal?.throwIfAborted();
+      executionSignal.throwIfAborted();
       await log(`\n━━ ${job.name} ━━\n$ tart clone ${image} ${vm}\n`);
       vmCreated = true;
-      const clone = () => requireCommand(["tart", "clone", image, vm], undefined, { signal });
-      if (image.startsWith("informant-prepared-")) await withImageLock(image, clone, signal);
+      const clone = () =>
+        requireCommand(["tart", "clone", image, vm], undefined, { signal: executionSignal });
+      if (image.startsWith("informant-prepared-"))
+        await withImageLock(image, clone, executionSignal);
       else await clone();
       if (config.vm.cpu || config.vm.memoryMb) {
         const args = ["tart", "set", vm];
         if (config.vm.cpu) args.push("--cpu", String(config.vm.cpu));
         if (config.vm.memoryMb) args.push("--memory", String(config.vm.memoryMb));
-        await requireCommand(args, undefined, { signal });
+        await requireCommand(args, undefined, { signal: executionSignal });
       }
 
       const sharedWorkspace = await realpath(workspace);
@@ -172,12 +181,12 @@ async function runJob(
         async () => {
           await log(`[${job.name}] waiting for an available Tart VM slot\n`);
         },
-        signal,
+        executionSignal,
       );
       tart = started.process;
       if (config.vm.guestOs === "linux") {
         const setup = await sshCommand(started.ip, config, linuxSharedMountCommand(), 60_000, {
-          signal,
+          signal: executionSignal,
         });
         if (setup.exitCode !== 0 || setup.timedOut) {
           throw new Error(
@@ -194,7 +203,7 @@ async function runJob(
         secretSource: secrets.source,
         secretValues: secrets.values,
       };
-    }, signal);
+    }, executionSignal);
     await started();
     await log(`[${job.name}] $ ${job.command}\n`);
     const environment = {
@@ -212,8 +221,8 @@ async function runJob(
       ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; ${ready.cacheSave}; informant_cache_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; exit $informant_cache_status`
       : execute;
     const redactor = streamingSecretRedactor(ready.secretValues, log);
-    const result = await sshCommand(ready.ip, config, jobCommand, job.timeoutMinutes * 60_000, {
-      signal,
+    const result = await sshCommand(ready.ip, config, jobCommand, timeoutMs, {
+      signal: executionSignal,
       onOutput: redactor.write,
     });
     await redactor.flush();
@@ -221,7 +230,11 @@ async function runJob(
     if (result.timedOut) output += `[${job.name}: timed out after ${job.timeoutMinutes}m]\n`;
     await log(output);
     return result.exitCode === 0 && !result.timedOut;
+  } catch (error) {
+    if (deadline.signal.aborted && !signal?.aborted) throw deadline.signal.reason;
+    throw error;
   } finally {
+    clearTimeout(timeout);
     try {
       if (tart) await stopVm(vm, tart);
       if (vmCreated) {

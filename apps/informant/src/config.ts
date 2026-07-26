@@ -8,7 +8,7 @@ export const CONFIG_FILE = `${CONFIG_DIRECTORY}/config.toml`;
 export const JOBS_DIRECTORY = `${CONFIG_DIRECTORY}/jobs`;
 
 const defaultDirectoryConfig = `version = 1
-timeout_minutes = 30
+timeout_minutes = 60
 triggers = [{ event = "commit", branch = { names = ["main"] } }]
 
 [vm]
@@ -248,7 +248,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   if (!Array.isArray(rawJobs) || rawJobs.length === 0) {
     throw new Error(`${label} must contain at least one [[jobs]] entry`);
   }
-  const defaultTimeoutMinutes = Number(raw.timeout_minutes ?? 30);
+  const defaultTimeoutMinutes = Number(raw.timeout_minutes ?? 60);
   if (!Number.isFinite(defaultTimeoutMinutes) || defaultTimeoutMinutes <= 0) {
     throw new Error("timeout_minutes must be a positive number");
   }

@@ -19,6 +19,7 @@ import {
   utf8Tail,
 } from "./tart/index.ts";
 import { linuxSharedMountCommand } from "./tart/layout.ts";
+import { sshCommand } from "./tart/vm.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
@@ -147,6 +148,25 @@ test("prepared image identity changes with its source or preparation", () => {
       vm: { ...config().vm, guestOs: "linux", prepare: "install bun" },
     }),
   ).not.toBe(first);
+});
+
+test("SSH authentication retries share one cumulative timeout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-ssh-timeout-"));
+  const sshpass = join(root, "sshpass");
+  await Bun.write(sshpass, "#!/bin/sh\necho 'Permission denied' >&2\nexit 255\n");
+  await chmod(sshpass, 0o755);
+  const originalPath = Bun.env.PATH;
+  Bun.env.PATH = `${root}:${originalPath}`;
+  const started = Date.now();
+  try {
+    const result = await sshCommand("127.0.0.1", config(), "true", 100);
+    expect(result.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  } finally {
+    if (originalPath === undefined) delete Bun.env.PATH;
+    else Bun.env.PATH = originalPath;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("superseded prepared images are deleted after their last repository switches", async () => {

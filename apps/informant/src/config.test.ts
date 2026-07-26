@@ -30,7 +30,7 @@ describe("configuration", () => {
       {
         name: "test",
         command: "bun install --frozen-lockfile && bun test",
-        timeoutMinutes: 30,
+        timeoutMinutes: 60,
         environment: {},
         secrets: [],
         needs: [],
@@ -51,7 +51,7 @@ describe("configuration", () => {
     expect(config.jobs.map((job) => job.name)).toEqual(["test", "build"]);
     expect(config.jobs[0]?.command).toBe("bun install --frozen-lockfile && bun test");
     expect(config.jobs[1]?.needs).toEqual(["test"]);
-    expect(config.jobs.every((job) => job.timeoutMinutes === 30)).toBe(true);
+    expect(config.jobs.every((job) => job.timeoutMinutes === 60)).toBe(true);
   });
 
   test("parses GitHub repository forms", () => {
@@ -150,7 +150,7 @@ describe("configuration", () => {
 
   test("jobs inherit and can override the top-level timeout", () => {
     expect(
-      parseConfig(configTemplate().replace("timeout_minutes = 30", "timeout_minutes = 12")).jobs[0]
+      parseConfig(configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 12")).jobs[0]
         ?.timeoutMinutes,
     ).toBe(12);
     expect(
@@ -162,14 +162,14 @@ describe("configuration", () => {
       ).jobs[0]?.timeoutMinutes,
     ).toBe(5);
     expect(() =>
-      parseConfig(configTemplate().replace("timeout_minutes = 30", "timeout_minutes = 0")),
+      parseConfig(configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 0")),
     ).toThrow("timeout_minutes must be a positive number");
   });
 
   test("jobs inherit top-level environment and caches while allowing overrides", () => {
     const source = configTemplate()
       .replace(
-        "timeout_minutes = 30",
+        "timeout_minutes = 60",
         'timeout_minutes = 30\nenvironment = { CI = true, SHARED = "default" }\ncache = [{ paths = ["~/.cache/turbo"], shared = true }]',
       )
       .replace(
@@ -185,7 +185,7 @@ describe("configuration", () => {
   test("an explicit empty job cache opts out of inherited caches", () => {
     const source = configTemplate()
       .replace(
-        "timeout_minutes = 30",
+        "timeout_minutes = 60",
         'timeout_minutes = 30\ncache = [{ paths = ["~/.cache/turbo"], shared = true }]',
       )
       .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []");
@@ -317,7 +317,7 @@ describe("configuration", () => {
     ).toThrow("cannot combine shared and key_files");
     expect(() =>
       parseConfig(
-        configTemplate().replace("timeout_minutes = 30", "timeout_minutes = 30\ncache = []"),
+        configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 30\ncache = []"),
       ),
     ).toThrow("cache must be a non-empty array");
     expect(() =>
