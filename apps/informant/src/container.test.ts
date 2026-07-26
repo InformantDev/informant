@@ -1,14 +1,14 @@
 import { expect, test } from "bun:test";
 import {
-  dockerRunArguments,
+  containerRunArguments,
   ensurePreparedContainer,
   preparedContainerImage,
-  runInDocker,
-} from "./docker.ts";
+  runInContainer,
+} from "./container.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
-test("builds a bounded Docker invocation without putting secrets in arguments", () => {
-  const args = dockerRunArguments({
+test("builds a bounded Apple Container invocation without putting secrets in arguments", () => {
+  const args = containerRunArguments({
     name: "informant-job",
     image: "oven/bun:1",
     workspace: "/tmp/workspace",
@@ -16,11 +16,11 @@ test("builds a bounded Docker invocation without putting secrets in arguments", 
     environment: { CI: "true" },
     mounts: [{ source: "/tmp/cache", target: "/mnt/shared/cache-0" }],
     secretNames: ["TOKEN"],
-    cpu: 1.5,
+    cpu: 2,
     memoryMb: 512,
   });
   expect(args).toEqual([
-    "docker",
+    "container",
     "run",
     "--rm",
     "--init",
@@ -28,36 +28,39 @@ test("builds a bounded Docker invocation without putting secrets in arguments", 
     "informant-job",
     "--workdir",
     "/workspace",
-    "--mount",
-    "type=bind,source=/tmp/workspace,target=/workspace",
-    "--mount",
-    "type=bind,source=/tmp/cache,target=/mnt/shared/cache-0",
+    "--user",
+    "0:0",
+    "--entrypoint",
+    "/bin/sh",
+    "--volume",
+    "/tmp/workspace:/workspace",
+    "--volume",
+    "/tmp/cache:/mnt/shared/cache-0",
     "--env",
     "CI=true",
     "--env",
     "TOKEN",
     "--cpus",
-    "1.5",
+    "2",
     "--memory",
-    "512m",
+    "512M",
     "oven/bun:1",
-    "/bin/sh",
     "-lc",
     "bun test",
   ]);
   expect(args.join(" ")).not.toContain("secret-value");
 });
 
-test("quotes commas in Docker bind mount fields", () => {
+test("preserves commas in Apple Container volume paths", () => {
   expect(
-    dockerRunArguments({
+    containerRunArguments({
       name: "informant-job",
       image: "image",
       workspace: "/tmp/workspace,one",
       command: "true",
       environment: {},
     }),
-  ).toContain('type=bind,"source=/tmp/workspace,one",target=/workspace');
+  ).toContain("/tmp/workspace,one:/workspace");
 });
 
 test("prepares and reuses a deterministic container image", async () => {
@@ -80,31 +83,38 @@ test("prepares and reuses a deterministic container image", async () => {
   });
   const image = await ensurePreparedContainer(runtime, () => {}, undefined, {
     withImageLock: async (_image, callback) => callback(),
-    command: async (args) => {
+    command: async (args, options) => {
       invocations.push(args);
       if (args[1] === "image") return result(1);
+      if (args[1] === "build") {
+        expect(options?.cwd).toContain("informant-container-build-");
+        expect(await Bun.file(`${options?.cwd}/Dockerfile`).text()).toBe(
+          `FROM oven/bun:1\nUSER 0\nCOPY informant-prepare.sh /tmp/informant-prepare.sh\nRUN /bin/sh -lc '. /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n`,
+        );
+        expect(await Bun.file(`${options?.cwd}/informant-prepare.sh`).text()).toBe(
+          `${runtime.prepare}\n`,
+        );
+      }
       return result(0);
     },
   });
 
   expect(image).toBe(prepared);
   expect(invocations[1]).toEqual([
-    "docker",
-    "run",
-    "--name",
-    expect.stringMatching(/^informant-prepare-/),
+    "container",
+    "build",
+    "--file",
+    "Dockerfile",
+    "--tag",
+    prepared,
+    "--progress",
+    "plain",
     "--cpus",
     "2",
     "--memory",
-    "1024m",
-    "oven/bun:1",
-    "/bin/sh",
-    "-lc",
-    runtime.prepare,
+    "1024M",
+    ".",
   ]);
-  expect(invocations[2]?.slice(0, 2)).toEqual(["docker", "commit"]);
-  expect(invocations[2]?.at(-1)).toBe(prepared);
-  expect(invocations[3]?.slice(0, 4)).toEqual(["docker", "rm", "--force", "--volumes"]);
 
   const reused: string[][] = [];
   expect(
@@ -116,15 +126,14 @@ test("prepares and reuses a deterministic container image", async () => {
       },
     }),
   ).toBe(prepared);
-  expect(reused).toEqual([["docker", "image", "inspect", prepared]]);
+  expect(reused).toEqual([["container", "image", "inspect", prepared]]);
 });
 
 test("serializes concurrent preparation of the same container image", async () => {
   const runtime = { type: "container" as const, image: "base", prepare: "install tools" };
   let tail = Promise.resolve();
   let imageExists = false;
-  let preparations = 0;
-  let commits = 0;
+  let builds = 0;
   const operations = {
     withImageLock: async <T>(_image: string, callback: () => Promise<T>): Promise<T> => {
       const previous = tail;
@@ -142,9 +151,8 @@ test("serializes concurrent preparation of the same container image", async () =
     command: async (args: string[]) => {
       if (args[1] === "image")
         return { exitCode: imageExists ? 0 : 1, stdout: "", stderr: "", timedOut: false };
-      if (args[1] === "run") preparations++;
-      if (args[1] === "commit") {
-        commits++;
+      if (args[1] === "build") {
+        builds++;
         imageExists = true;
       }
       return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
@@ -156,8 +164,7 @@ test("serializes concurrent preparation of the same container image", async () =
     ensurePreparedContainer(runtime, () => {}, undefined, operations),
   ]);
   expect(images[0]).toBe(images[1]);
-  expect(preparations).toBe(1);
-  expect(commits).toBe(1);
+  expect(builds).toBe(1);
 });
 
 test("passes secrets through the client environment and always removes the container", async () => {
@@ -173,7 +180,7 @@ test("passes secrets through the client environment and always removes the conta
     needs: [],
     runtime: { type: "container", image: "oven/bun:1" },
   };
-  const success = await runInDocker(
+  const success = await runInContainer(
     repository,
     "commit-sha",
     "feature",
@@ -200,7 +207,7 @@ test("passes secrets through the client environment and always removes the conta
   expect(invocations[0]?.args).toContain("TOKEN");
   expect(invocations[0]?.args.join(" ")).not.toContain("line one");
   expect(invocations[0]?.environment?.TOKEN).toBe("line one\nline two");
-  expect(invocations[1]?.args.slice(0, 3)).toEqual(["docker", "rm", "--force"]);
+  expect(invocations[1]?.args.slice(0, 3)).toEqual(["container", "delete", "--force"]);
   expect(output.join("")).toContain("[REDACTED]");
   expect(output.join("")).not.toContain("line one");
 });

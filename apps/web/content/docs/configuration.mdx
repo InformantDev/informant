@@ -44,9 +44,10 @@ command = "bun run test:e2e"
 vm = { image = "ghcr.io/cirruslabs/macos-tahoe-base:latest", os = "macos", user = "admin", password = "admin", cpu = 4, memory_mb = 8192, prepare = "brew install playwright" }
 ```
 
-Container jobs require Docker and run with the checkout bind-mounted at `/workspace`. Cache directories use isolated host
-storage under `/home/root` in the container. Declared secrets are inherited by name from the Docker
-client environment, never included in command arguments, and redacted using the same policy as VMs.
+Container jobs require [Apple Container](https://github.com/apple/container) and run as UID 0 with the
+checkout mounted at `/workspace`. Cache directories use isolated host storage under `/home/root` in
+the container. Declared secrets are inherited by name from the Container client environment, never
+included in command arguments, and redacted using the same policy as VMs.
 
 Informant mounts the checkout and other Tart shared directories beneath `/mnt/shared` on Linux;
 Linux user caches are beneath `/home/<user>`. On macOS, these remain `/Volumes/My Shared Files` and
@@ -157,15 +158,16 @@ top-level `triggers`. Manual `informant run` ignores trigger eligibility.
 ## Prepared runtime images
 
 `vm.prepare` and `container.prepare` run once when a worker first sees that image and preparation
-command. Informant keeps the result as a local Tart or Docker image and starts jobs from it, so tools do
-not need to be installed in every job. Preparation does not receive the job checkout, environment, or
-secrets. Changing the source image or preparation command creates a new prepared image. Because
+command. Informant keeps the result as a local Tart or OCI image and starts jobs from it, so tools do
+not need to be installed in every job. Container preparation builds an isolated image with Apple
+Container's BuildKit integration. Preparation does not receive the job checkout, environment, caches,
+or secrets. Changing the source image or preparation command creates a new prepared image. Because
 preparation is part of the runtime table, different jobs can use different preparation commands.
 
 Preparation is automatic. `informant image prepare`, `informant image list`, and `informant image
-prune` currently manage prepared Tart VM images. Docker preparation is warmed automatically by the
-first job that uses it and Docker images can be inspected or removed with the Docker CLI. Every worker
-prepares its own local copy, which keeps multi-machine setup automatic.
+prune` currently manage prepared Tart VM images. Container preparation is warmed automatically by the
+first job that uses it; inspect or remove those images with `container image`. Every worker prepares
+its own local copy, which keeps multi-machine setup automatic.
 
 ## Persistent job caches
 

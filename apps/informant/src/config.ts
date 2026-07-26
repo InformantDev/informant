@@ -306,12 +306,20 @@ function parseContainer(
   defaults?: Record<string, unknown>,
 ): JobRuntime {
   const container = { ...defaults, ...value };
-  if (typeof container.image !== "string" || !container.image.trim())
+  const image = container.image;
+  if (
+    typeof image !== "string" ||
+    !image.trim() ||
+    [...image].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return character.trim() === "" || codePoint < 0x20 || codePoint === 0x7f;
+    })
+  )
     throw new Error(`${label}.image must be a non-empty string`);
   const cpu = container.cpu === undefined ? undefined : Number(container.cpu);
   const memoryMb = container.memory_mb === undefined ? undefined : Number(container.memory_mb);
-  if (cpu !== undefined && (!Number.isFinite(cpu) || cpu <= 0))
-    throw new Error(`${label}.cpu must be a positive number`);
+  if (cpu !== undefined && (!Number.isInteger(cpu) || cpu <= 0))
+    throw new Error(`${label}.cpu must be a positive integer`);
   if (memoryMb !== undefined && (!Number.isInteger(memoryMb) || memoryMb <= 0))
     throw new Error(`${label}.memory_mb must be a positive integer`);
   const rawPrepare = container.prepare;
@@ -322,7 +330,7 @@ function parseContainer(
     throw new Error(`${label}.prepare must be a non-empty string`);
   return {
     type: "container",
-    image: container.image,
+    image,
     cpu,
     memoryMb,
     prepare: typeof rawPrepare === "string" ? rawPrepare.trim() : undefined,

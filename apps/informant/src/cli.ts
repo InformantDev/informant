@@ -330,14 +330,14 @@ async function doctor(): Promise<void> {
       `${okay ? "✓" : "✗"} ${label}${okay ? "" : ` — ${result.stderr.trim() || "not found"}`}`,
     );
   }
-  const docker = await command(["docker", "version"]);
+  const container = await command(["container", "system", "status"]);
   const tart = await command(["tart", "--version"]);
   const sshpass = await command(["sshpass", "-V"]);
   const tartHost = process.platform === "darwin" && process.arch === "arm64";
-  const dockerReady = docker.exitCode === 0;
+  const containerReady = container.exitCode === 0;
   const tartReady = tart.exitCode === 0 && sshpass.exitCode === 0 && tartHost;
   console.log(
-    `${dockerReady ? "✓" : "○"} Docker${dockerReady ? "" : ` — ${docker.stderr.trim() || "not found"}`}`,
+    `${containerReady ? "✓" : "○"} Apple Container${containerReady ? "" : ` — ${container.stderr.trim() || "not found or not running"}`}`,
   );
   console.log(
     `${tart.exitCode === 0 ? "✓" : "○"} Tart${tart.exitCode === 0 ? "" : ` — ${tart.stderr.trim() || "not found"}`}`,
@@ -348,8 +348,10 @@ async function doctor(): Promise<void> {
   console.log(
     `${tartHost ? "✓" : "○"} ${tartHost ? "macOS on Apple Silicon" : "host — Tart requires macOS on Apple Silicon"}`,
   );
-  if (!dockerReady && !tartReady) {
-    console.log("✗ runtime — install Docker for container jobs or Tart and sshpass for VM jobs");
+  if (!containerReady && !tartReady) {
+    console.log(
+      "✗ runtime — install and start Apple Container for container jobs or Tart and sshpass for VM jobs",
+    );
     failed = true;
   }
   try {

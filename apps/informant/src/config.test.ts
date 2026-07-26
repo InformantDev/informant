@@ -182,7 +182,7 @@ describe("configuration", () => {
 
   test("parses container defaults and per-job VM overrides", () => {
     const source = configTemplate()
-      .replace('image = "oven/bun:1"', 'image = "oven/bun:1"\ncpu = 1.5\nmemory_mb = 512')
+      .replace('image = "oven/bun:1"', 'image = "oven/bun:1"\ncpu = 2\nmemory_mb = 512')
       .replace(
         'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
         'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]\nvm = { image = "macos", os = "macos", cpu = 4 }',
@@ -197,7 +197,7 @@ describe("configuration", () => {
     expect(parseConfig(containerOnly).jobs[0]?.runtime).toEqual({
       type: "container",
       image: "oven/bun:1",
-      cpu: 1.5,
+      cpu: 2,
       memoryMb: 512,
       prepare: undefined,
     });
@@ -209,18 +209,18 @@ describe("configuration", () => {
   test("parses container overrides and validates runtime tables", () => {
     const source = configTemplate().replace(
       'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
-      'cache = []\ncontainer = { image = "oven/bun:1", cpu = 0.5 }',
+      'cache = []\ncontainer = { image = "oven/bun:1", cpu = 1 }',
     );
     expect(parseConfig(source).jobs[0]?.runtime).toEqual({
       type: "container",
       image: "oven/bun:1",
-      cpu: 0.5,
+      cpu: 1,
       memoryMb: undefined,
       prepare: undefined,
     });
     expect(() =>
       parseConfig(
-        source.replace('container = { image = "oven/bun:1", cpu = 0.5 }', "container = true"),
+        source.replace('container = { image = "oven/bun:1", cpu = 1 }', "container = true"),
       ),
     ).toThrow("jobs[0].container must be a table");
   });

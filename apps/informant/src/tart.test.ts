@@ -14,6 +14,7 @@ import {
   isRetryableSshAuthenticationFailure,
   preparedImageName,
   prunePreparedImages,
+  reconcilePreparedImageReferences,
   resolveJobSecrets,
   scheduleJobs,
   secretMount,
@@ -25,7 +26,7 @@ import {
   linuxSharedMountCommand,
   linuxWorkspaceCopyCommand,
 } from "./tart/layout.ts";
-import { sshCommand } from "./tart/vm.ts";
+import { digest, sshCommand } from "./tart/vm.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
@@ -342,6 +343,35 @@ fi
   }
 });
 
+test("reconciles removed VM job references and the legacy repository reference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-image-references-"));
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  const data = join(root, "data");
+  Bun.env.INFORMANT_DATA_DIR = data;
+  const repository = "owner/repository";
+  const references = join(data, "prepared-image-references");
+  const jobs = join(references, `${digest(repository)}.jobs`);
+  const active = join(jobs, digest("active"));
+  const removed = join(jobs, digest("removed"));
+  const legacy = join(references, digest(repository));
+  try {
+    await mkdir(jobs, { recursive: true });
+    await Bun.write(active, "active-image\n");
+    await Bun.write(removed, "removed-image\n");
+    await Bun.write(legacy, "legacy-image\n");
+
+    await reconcilePreparedImageReferences(repository, ["active"]);
+
+    expect(await Bun.file(active).text()).toBe("active-image\n");
+    expect(await Bun.file(removed).exists()).toBe(false);
+    expect(await Bun.file(legacy).exists()).toBe(false);
+  } finally {
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cancelling image preparation deletes its staging VM", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-cancel-image-"));
   const bin = join(root, "bin");
@@ -489,6 +519,15 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
   try {
     const macos = await cacheMounts(repository, workspace, cachedJob, "admin", "macos", true);
     const linux = await cacheMounts(repository, workspace, cachedJob, "admin", "linux", true);
+    const directLinux = await cacheMounts(
+      repository,
+      workspace,
+      cachedJob,
+      "root",
+      "linux",
+      true,
+      true,
+    );
     expect(macos.args[0]).not.toContain(join("caches", "linux"));
     expect(linux.args[0]).toContain(join("caches", "linux"));
     expect(macos.restore).toContain("/Users/admin/.bun/install/cache");
@@ -497,6 +536,9 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(linux.restore).toContain("/mnt/shared/cache-0");
     expect(linux.restore).not.toContain("ln -s");
     expect(linux.save).toContain("cache.tar.gz");
+    expect(directLinux.restore).toContain("ln -s");
+    expect(directLinux.restore).not.toContain("cache.tar.gz");
+    expect(directLinux.save).toBe(":");
     expect(linux.writablePaths).toHaveLength(1);
     expect(linux.args[0]).toEndWith(linux.writablePaths[0] ?? "");
     expect(linux.installLock).toBe("/mnt/shared/cache-0/.informant-install-lock");

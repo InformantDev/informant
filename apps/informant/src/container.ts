@@ -1,14 +1,16 @@
-import { realpath } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { command } from "./process.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
 import { withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
-function dockerMount(source: string, target: string): string {
-  const field = (value: string) =>
-    /[",\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
-  return ["type=bind", `source=${source}`, `target=${target}`].map(field).join(",");
+function containerVolume(source: string, target: string): string {
+  if (source.includes(":"))
+    throw new Error(`Apple Container cannot mount a host path containing a colon: ${source}`);
+  return `${source}:${target}`;
 }
 
 export function preparedContainerImage(runtime: ContainerRuntime): string | undefined {
@@ -39,38 +41,49 @@ export async function ensurePreparedContainer(
   return lock(
     prepared,
     async () => {
-      const existing = await runCommand(["docker", "image", "inspect", prepared], { signal });
+      const existing = await runCommand(["container", "image", "inspect", prepared], { signal });
       if (existing.exitCode === 0) return prepared;
 
-      const staging = `informant-prepare-${crypto.randomUUID().slice(0, 12)}`;
-      await onMessage(`Preparing Docker image ${prepared}`);
+      const context = await mkdtemp(join(tmpdir(), "informant-container-build-"));
+      await onMessage(`Preparing container image ${prepared}`);
       try {
-        const args = ["docker", "run", "--name", staging];
+        await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);
+        await Bun.write(
+          join(context, "Dockerfile"),
+          `FROM ${runtime.image}\nUSER 0\nCOPY informant-prepare.sh /tmp/informant-prepare.sh\nRUN /bin/sh -lc '. /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n`,
+        );
+        const args = [
+          "container",
+          "build",
+          "--file",
+          "Dockerfile",
+          "--tag",
+          prepared,
+          "--progress",
+          "plain",
+        ];
         if (runtime.cpu) args.push("--cpus", String(runtime.cpu));
-        if (runtime.memoryMb) args.push("--memory", `${runtime.memoryMb}m`);
-        args.push(runtime.image, "/bin/sh", "-lc", preparationCommand);
-        const preparation = await runCommand(args, { signal, onOutput: onMessage });
+        if (runtime.memoryMb) args.push("--memory", `${runtime.memoryMb}M`);
+        args.push(".");
+        const preparation = await runCommand(args, {
+          cwd: context,
+          signal,
+          onOutput: onMessage,
+        });
         if (preparation.exitCode !== 0 || preparation.timedOut)
           throw new Error(
             `container image preparation failed: ${preparation.stderr.trim() || `exit ${preparation.exitCode}`}`,
           );
-        const committed = await runCommand(["docker", "commit", staging, prepared], { signal });
-        if (committed.exitCode !== 0)
-          throw new Error(
-            `could not commit prepared container image: ${committed.stderr.trim() || `exit ${committed.exitCode}`}`,
-          );
         return prepared;
       } finally {
-        await runCommand(["docker", "rm", "--force", "--volumes", staging], {
-          timeoutMs: 30_000,
-        });
+        await rm(context, { recursive: true, force: true });
       }
     },
     signal,
   );
 }
 
-export function dockerRunArguments(options: {
+export function containerRunArguments(options: {
   name: string;
   image: string;
   workspace: string;
@@ -82,7 +95,7 @@ export function dockerRunArguments(options: {
   memoryMb?: number;
 }): string[] {
   const args = [
-    "docker",
+    "container",
     "run",
     "--rm",
     "--init",
@@ -90,20 +103,24 @@ export function dockerRunArguments(options: {
     options.name,
     "--workdir",
     "/workspace",
+    "--user",
+    "0:0",
+    "--entrypoint",
+    "/bin/sh",
   ];
-  args.push("--mount", dockerMount(options.workspace, "/workspace"));
+  args.push("--volume", containerVolume(options.workspace, "/workspace"));
   for (const mount of options.mounts ?? [])
-    args.push("--mount", dockerMount(mount.source, mount.target));
+    args.push("--volume", containerVolume(mount.source, mount.target));
   for (const [key, value] of Object.entries(options.environment))
     args.push("--env", `${key}=${value}`);
   for (const name of options.secretNames ?? []) args.push("--env", name);
   if (options.cpu) args.push("--cpus", String(options.cpu));
-  if (options.memoryMb) args.push("--memory", `${options.memoryMb}m`);
-  args.push(options.image, "/bin/sh", "-lc", options.command);
+  if (options.memoryMb) args.push("--memory", `${options.memoryMb}M`);
+  args.push(options.image, "-lc", options.command);
   return args;
 }
 
-export async function runInDocker(
+export async function runInContainer(
   repository: Repository,
   sha: string,
   branch: string,
@@ -117,7 +134,8 @@ export async function runInDocker(
   signal?: AbortSignal,
   operations: { command?: typeof command } = {},
 ): Promise<boolean> {
-  if (job.runtime?.type !== "container") throw new Error("Docker requires a container runtime");
+  if (job.runtime?.type !== "container")
+    throw new Error("container runner requires a container runtime");
   const runtime = job.runtime;
   const name = `informant-${crypto.randomUUID().slice(0, 12)}`;
   const timeoutMs = job.timeoutMinutes * 60_000;
@@ -132,7 +150,15 @@ export async function runInDocker(
     executionSignal.throwIfAborted();
     const secrets = await resolveJobSecrets(job, runtimeSecrets);
     executionSignal.throwIfAborted();
-    const caches = await cacheMounts(repository, workspace, job, "root", "linux", trustedCaches);
+    const caches = await cacheMounts(
+      repository,
+      workspace,
+      job,
+      "root",
+      "linux",
+      trustedCaches,
+      true,
+    );
     const environment = {
       ...job.environment,
       INFORMANT_REPOSITORY: repository.fullName,
@@ -148,7 +174,7 @@ export async function runInDocker(
     const image = await ensurePreparedContainer(runtime, log, executionSignal, {
       command: runCommand,
     });
-    const args = dockerRunArguments({
+    const args = containerRunArguments({
       name,
       image,
       workspace: await realpath(workspace),
@@ -180,6 +206,6 @@ export async function runInDocker(
     throw error;
   } finally {
     clearTimeout(timeout);
-    await runCommand(["docker", "rm", "--force", name], { timeoutMs: 30_000 });
+    await runCommand(["container", "delete", "--force", name], { timeoutMs: 30_000 });
   }
 }

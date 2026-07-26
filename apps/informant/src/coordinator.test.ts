@@ -36,7 +36,13 @@ test("readLogTail reads a bounded Unicode-safe tail", async () => {
 });
 
 function harness(
-  options: { claim?: boolean; success?: boolean; error?: Error; manualRequest?: boolean } = {},
+  options: {
+    claim?: boolean;
+    success?: boolean;
+    error?: Error;
+    manualRequest?: boolean;
+    requestedJobs?: string[];
+  } = {},
 ) {
   const updates: Array<{ id: number; values: Record<string, unknown> }> = [];
   const jobChecks: string[] = [];
@@ -48,6 +54,7 @@ function harness(
   }> = [];
   const saved: BuildRecord[] = [];
   let receivedRuntimeSecrets: Record<string, string> | undefined;
+  let receivedConfiguredVmJobs: string[] | undefined;
   let jobCheckListings = 0;
   const aggregateCheck: {
     id: number;
@@ -68,7 +75,7 @@ function harness(
         ? undefined
         : {
             check: aggregateCheck,
-            requestedJobs: [],
+            requestedJobs: options.requestedJobs ?? [],
             manualRequest: options.manualRequest ?? false,
           },
     createJobCheck: async (
@@ -119,7 +126,9 @@ function harness(
       observer,
       _signal,
       runtimeSecrets,
+      configuredVmJobs,
     ) => {
+      receivedConfiguredVmJobs = configuredVmJobs;
       receivedRuntimeSecrets = {};
       for (const [name, value] of Object.entries(runtimeSecrets ?? {})) {
         receivedRuntimeSecrets[name] = typeof value === "function" ? await value() : value;
@@ -144,11 +153,44 @@ function harness(
     jobChecks,
     saved,
     receivedRuntimeSecrets: () => receivedRuntimeSecrets,
+    receivedConfiguredVmJobs: () => receivedConfiguredVmJobs,
     jobCheckListings: () => jobCheckListings,
   };
 }
 
 describe("runCommit", () => {
+  test("keeps the complete VM job inventory when selecting one manual job", async () => {
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const selectedConfig: InformantConfig = {
+      ...config,
+      jobs: [
+        baseJob,
+        {
+          name: "macos-e2e",
+          command: "test e2e",
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          needs: [],
+        },
+      ],
+    };
+    const context = harness({ manualRequest: true, requestedJobs: ["test"] });
+
+    await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      selectedConfig,
+      context.dependencies,
+    );
+
+    expect(context.jobChecks).toEqual(["test"]);
+    expect(context.receivedConfiguredVmJobs()).toEqual(["test", "macos-e2e"]);
+  });
+
   test("returns without persistence when no claim is available", async () => {
     const context = harness({ claim: false });
     expect(

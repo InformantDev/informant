@@ -1,11 +1,15 @@
 import { chmod, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { runInDocker } from "../docker.ts";
+import { runInContainer } from "../container.ts";
 import { command, requireCommand } from "../process.ts";
 import { appendLog, claimBuildWorkspace } from "../store.ts";
 import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
 import { cacheMounts } from "./cache.ts";
-import { ensurePreparedImage, pruneStoppedJobVms } from "./images.ts";
+import {
+  ensurePreparedImage,
+  pruneStoppedJobVms,
+  reconcilePreparedImageReferences,
+} from "./images.ts";
 import {
   bunCopyfileBackend,
   guestSharedRoot,
@@ -21,6 +25,7 @@ export {
   preparedImageName,
   prunePreparedImages,
   pruneStoppedJobVms,
+  reconcilePreparedImageReferences,
 } from "./images.ts";
 export { isRetryableSshAuthenticationFailure } from "./vm.ts";
 
@@ -436,7 +441,11 @@ export async function runInTart(
   observer: JobExecutionObserver = {},
   signal?: AbortSignal,
   runtimeSecrets: RuntimeSecrets = {},
+  configuredVmJobs = config.jobs
+    .filter((job) => job.runtime?.type !== "container")
+    .map((job) => job.name),
 ): Promise<boolean> {
+  await reconcilePreparedImageReferences(repository.fullName, configuredVmJobs, signal);
   if (config.jobs.some((job) => job.runtime?.type !== "container")) await cleanStaleVms();
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
@@ -515,7 +524,7 @@ export async function runInTart(
         const runtime = job.runtime ?? config.vm;
         const success =
           runtime.type === "container"
-            ? await runInDocker(
+            ? await runInContainer(
                 repository,
                 sha,
                 record.branch,

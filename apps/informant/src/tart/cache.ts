@@ -36,6 +36,7 @@ export async function cacheMounts(
   user: string,
   guestOs: InformantConfig["vm"]["guestOs"],
   trusted = false,
+  directShared = false,
 ) {
   if (!job.cache)
     return {
@@ -87,7 +88,7 @@ export async function cacheMounts(
     }
     const cacheKey = cache.keyFiles.length > 0 ? key.digest("hex").slice(0, 24) : "default";
     for (const path of cache.paths) {
-      if (cache.shared && guestOs !== "linux") {
+      if (cache.shared && (guestOs !== "linux" || directShared)) {
         const host = trusted
           ? join(persistentRoot, "shared", cachePathIdentity(user, path))
           : join(workspace, "..", "shared-caches", cachePathIdentity(user, path));

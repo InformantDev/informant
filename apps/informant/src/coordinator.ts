@@ -51,6 +51,9 @@ export async function runCommit(
 ): Promise<BuildRecord | false | undefined> {
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
+  const configuredVmJobs = config.jobs
+    .filter((job) => job.runtime?.type !== "container")
+    .map((job) => job.name);
   const claim = await github.claim(
     repository,
     sha,
@@ -284,6 +287,7 @@ export async function runCommit(
         },
         executionSignal,
         runtimeSecrets,
+        configuredVmJobs,
       );
     } catch (error) {
       executionError = error;
