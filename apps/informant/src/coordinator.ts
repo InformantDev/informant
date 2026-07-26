@@ -97,6 +97,7 @@ export async function runCommit(
     machine: hostname(),
     startedAt: new Date().toISOString(),
     status: "running",
+    runningJobs: [],
     logPath: join(dataDirectory(), "builds", id, "build.log"),
     checkUrl: check.html_url,
     event: claim.manualRequest
@@ -266,6 +267,8 @@ export async function runCommit(
           started: async (job) => {
             const state = jobChecks.get(job.name);
             if (!state) return;
+            record.runningJobs?.push(job.name);
+            await dependencies.saveBuild(record);
             await updateJob(state, {
               status: "in_progress",
               title: `${job.name} is running`,
@@ -279,6 +282,8 @@ export async function runCommit(
           completed: async (job, result) => {
             const state = jobChecks.get(job.name);
             if (!state) return;
+            record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
+            await dependencies.saveBuild(record);
             await updateJob(state, completedValues(job, result.outcome, result.log), true);
           },
         },

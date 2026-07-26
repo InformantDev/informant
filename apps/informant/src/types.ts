@@ -88,6 +88,7 @@ export interface BuildRecord {
   startedAt: string;
   completedAt?: string;
   status: "running" | "success" | "failure" | "cancelled";
+  runningJobs?: string[];
   logPath: string;
   checkUrl?: string;
   event?: { type: TriggerEvent | "manual"; id: string };

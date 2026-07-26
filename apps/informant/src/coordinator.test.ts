@@ -192,6 +192,15 @@ describe("runCommit", () => {
     expect(context.jobCheckListings()).toBe(0);
   });
 
+  test("persists the jobs that are currently running", async () => {
+    const context = harness();
+
+    await runCommit(context.github, repository, "sha", "main", config, context.dependencies);
+
+    expect(context.saved.some((record) => record.runningJobs?.includes("test"))).toBe(true);
+    expect(context.saved.at(-1)?.runningJobs).toEqual([]);
+  });
+
   test("supplies the GitHub App token only when a job requests it", async () => {
     const context = harness();
     const job = config.jobs[0];

@@ -28,7 +28,13 @@ import { command, requireCommand } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup } from "./startup.ts";
-import { dataDirectory, getBuild, listBuilds, removeOrphanedBuildWorkspaces } from "./store.ts";
+import {
+  dataDirectory,
+  getBuild,
+  listAllBuilds,
+  listBuilds,
+  removeOrphanedBuildWorkspaces,
+} from "./store.ts";
 import {
   ensurePreparedImage,
   listPreparedImages,
@@ -57,7 +63,7 @@ Usage:
   informant startup disable              Stop and remove the startup worker
   informant hook install                 Accelerate pushes with a pre-push hook
   informant hook uninstall               Remove Informant from the pre-push hook
-  informant builds                       List builds run on this machine
+  informant builds [--all]               List running builds or recent history
   informant builds logs <id>             Print a build's log
   informant doctor                       Check host dependencies and auth
   informant --version
@@ -206,20 +212,38 @@ async function manualRun(
   if (build.status !== "success") process.exitCode = 1;
 }
 
-async function showBuilds(): Promise<void> {
-  const builds = await listBuilds();
-  const table = new Table({ head: ["ID", "STATUS", "REPOSITORY", "REF", "STARTED", "MACHINE"] });
+function githubUrl(repo: string, branch: string, sha: string): string {
+  const pullRequest = /^pull\/(\d+)$/.exec(branch)?.[1];
+  return pullRequest
+    ? `https://github.com/${repo}/pull/${pullRequest}`
+    : `https://github.com/${repo}/commit/${sha}`;
+}
+
+async function showBuilds(includeHistory: boolean): Promise<void> {
+  const builds = includeHistory
+    ? await listBuilds()
+    : (await listAllBuilds()).filter((build) => build.status === "running");
+  const table = new Table({
+    head: ["ID", "STATUS", "REPOSITORY", "GITHUB", "JOBS", "STARTED", "MACHINE"],
+  });
   for (const build of builds) {
     table.push([
       build.id,
       build.status,
       build.repo,
-      `${build.branch}@${build.sha.slice(0, 7)}`,
+      githubUrl(build.repo, build.branch, build.sha),
+      build.runningJobs?.join(", ") || "—",
       build.startedAt,
       build.machine,
     ]);
   }
-  console.log(builds.length ? table.toString() : "No local builds yet.");
+  console.log(
+    builds.length
+      ? table.toString()
+      : includeHistory
+        ? "No local builds yet."
+        : "No builds running.",
+  );
 }
 
 async function manageImages(action?: string): Promise<void> {
@@ -424,7 +448,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     console.log(await Bun.file(build.logPath).text());
     return;
   }
-  if (subcommand === "builds") return showBuilds();
+  if (subcommand === "builds") return showBuilds(flags.all === true);
 
   if (process.stdin.isTTY) {
     const choice = await select({
