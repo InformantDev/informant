@@ -1,10 +1,127 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, rm, stat, utimes } from "node:fs/promises";
 import { join } from "node:path";
-import { claimBuildWorkspace, removeOrphanedBuildWorkspaces } from "./store.ts";
+import {
+  claimBuildWorkspace,
+  createBuild,
+  currentProcessOwner,
+  getBuild,
+  jobLogPath,
+  listActiveBuilds,
+  removeOrphanedBuildWorkspaces,
+  saveBuild,
+} from "./store.ts";
+import type { BuildRecord } from "./types.ts";
 
 const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
 const roots: string[] = [];
+
+test("job log paths are fixed-length and case-sensitive on every filesystem", () => {
+  const record = { logPath: "/tmp/build/build.log" } as BuildRecord;
+  const lower = jobLogPath(record, "test");
+  const upper = jobLogPath(record, "Test");
+  const long = jobLogPath(record, "a".repeat(1_000));
+  expect(lower).not.toBe(upper);
+  expect(lower).toStartWith("/tmp/build/jobs/");
+  expect(long.split("/").at(-1)).toHaveLength(68);
+});
+
+test("build saves preserve invocation order and complete JSON", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "ordered",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["first"],
+    logPath: join(root, "builds", "ordered", "build.log"),
+  };
+  await createBuild(record);
+
+  const first = saveBuild(record);
+  record.runningJobs = ["second"];
+  const second = saveBuild(record);
+  await Promise.all([first, second]);
+
+  expect((await getBuild(record.id))?.runningJobs).toEqual(["second"]);
+});
+
+test("active builds are indexed and dead owners are reconciled", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
+  const live: BuildRecord = {
+    id: "live",
+    repo: "owner/repo",
+    sha: "live-sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    owner,
+    logPath: join(root, "builds", "live", "build.log"),
+  };
+  const dead: BuildRecord = {
+    ...live,
+    id: "dead",
+    sha: "dead-sha",
+    owner: { pid: 2_147_483_647, startedAt: "dead" },
+    logPath: join(root, "builds", "dead", "build.log"),
+  };
+  await Promise.all([createBuild(live), createBuild(dead)]);
+
+  expect((await listActiveBuilds()).map((build) => build.id)).toEqual(["live"]);
+  expect((await getBuild(dead.id))?.status).toBe("cancelled");
+  live.status = "success";
+  live.completedAt = new Date().toISOString();
+  await saveBuild(live);
+  expect(await listActiveBuilds()).toEqual([]);
+});
+
+test("fresh marker-only builds survive the writer window and abandoned markers expire", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const activeRoot = join(root, "active-builds");
+  const marker = join(activeRoot, "writer-race");
+  await mkdir(activeRoot, { recursive: true });
+  await Bun.write(marker, "");
+
+  expect(await listActiveBuilds()).toEqual([]);
+  expect(await Bun.file(marker).exists()).toBe(true);
+
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
+  const record: BuildRecord = {
+    id: "writer-race",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: [],
+    owner,
+    logPath: join(root, "builds", "writer-race", "build.log"),
+  };
+  await mkdir(join(root, "builds", record.id), { recursive: true });
+  await Bun.write(join(root, "builds", record.id, "build.json"), JSON.stringify(record));
+  expect((await listActiveBuilds()).map((build) => build.id)).toEqual([record.id]);
+
+  const abandoned = join(activeRoot, "abandoned");
+  await Bun.write(abandoned, "");
+  await utimes(abandoned, new Date(0), new Date(0));
+  await listActiveBuilds();
+  expect(await Bun.file(abandoned).exists()).toBe(false);
+});
 
 afterEach(async () => {
   if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;

@@ -28,7 +28,15 @@ import { command, requireCommand } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup } from "./startup.ts";
-import { dataDirectory, getBuild, listBuilds, removeOrphanedBuildWorkspaces } from "./store.ts";
+import {
+  dataDirectory,
+  getBuild,
+  jobLogPath,
+  listActiveBuilds,
+  listBuilds,
+  reconcileBuildLiveness,
+  removeOrphanedBuildWorkspaces,
+} from "./store.ts";
 import {
   ensurePreparedImage,
   listPreparedImages,
@@ -57,8 +65,8 @@ Usage:
   informant startup disable              Stop and remove the startup worker
   informant hook install                 Accelerate pushes with a pre-push hook
   informant hook uninstall               Remove Informant from the pre-push hook
-  informant builds                       List builds run on this machine
-  informant builds logs <id>             Print a build's log
+  informant builds [--all]               List running builds or recent history
+  informant logs [<build-id>]             Tail a build's logs or select a running job
   informant doctor                       Check host dependencies and auth
   informant --version
 `;
@@ -206,20 +214,99 @@ async function manualRun(
   if (build.status !== "success") process.exitCode = 1;
 }
 
-async function showBuilds(): Promise<void> {
-  const builds = await listBuilds();
-  const table = new Table({ head: ["ID", "STATUS", "REPOSITORY", "REF", "STARTED", "MACHINE"] });
+function githubUrl(build: NonNullable<Awaited<ReturnType<typeof getBuild>>>): string {
+  return build.pullRequest
+    ? `https://github.com/${build.repo}/pull/${build.pullRequest}`
+    : `https://github.com/${build.repo}/commit/${build.sha}`;
+}
+
+async function showBuilds(includeHistory: boolean): Promise<void> {
+  const builds = includeHistory ? await listBuilds() : await listActiveBuilds();
+  const table = new Table({
+    head: ["ID", "STATUS", "REPOSITORY", "GITHUB", "JOBS", "STARTED", "MACHINE"],
+  });
   for (const build of builds) {
     table.push([
       build.id,
       build.status,
       build.repo,
-      `${build.branch}@${build.sha.slice(0, 7)}`,
+      githubUrl(build),
+      build.runningJobs?.join(", ") || "—",
       build.startedAt,
       build.machine,
     ]);
   }
-  console.log(builds.length ? table.toString() : "No local builds yet.");
+  console.log(
+    builds.length
+      ? table.toString()
+      : includeHistory
+        ? "No local builds yet."
+        : "No builds running.",
+  );
+}
+
+async function tailLog(
+  buildId: string,
+  path: string,
+  running: (build: NonNullable<Awaited<ReturnType<typeof getBuild>>>) => boolean,
+): Promise<void> {
+  let offset = 0;
+  let livenessCheckedAt = 0;
+  const decoder = new TextDecoder();
+  const drain = async () => {
+    const file = Bun.file(path);
+    if (await file.exists()) {
+      if (file.size < offset) offset = 0;
+      if (file.size > offset) {
+        const bytes = new Uint8Array(await file.slice(offset, file.size).arrayBuffer());
+        offset = file.size;
+        process.stdout.write(decoder.decode(bytes, { stream: true }));
+      }
+    }
+  };
+  while (true) {
+    await drain();
+    let current = await getBuild(buildId);
+    if (current?.status === "running" && Date.now() - livenessCheckedAt >= 2_000) {
+      current = await reconcileBuildLiveness(current);
+      livenessCheckedAt = Date.now();
+    }
+    if (!current || !running(current)) {
+      await drain();
+      const remainder = decoder.decode();
+      if (remainder) process.stdout.write(remainder);
+      return;
+    }
+    await Bun.sleep(250);
+  }
+}
+
+async function showLogs(id?: string): Promise<void> {
+  if (id) {
+    const build = await getBuild(id);
+    if (!build) throw new Error(`build not found: ${id}`);
+    return tailLog(build.id, build.logPath, (current) => current.status === "running");
+  }
+  if (!process.stdin.isTTY)
+    throw new Error("logs requires a build ID when input is not interactive");
+  const choices = (await listActiveBuilds()).flatMap((build) =>
+    (build.runningJobs ?? []).map((job) => ({ build, job })),
+  );
+  if (choices.length === 0) {
+    console.log("No jobs running.");
+    return;
+  }
+  const choice = await select({
+    message: "Select a running job",
+    options: choices.map((choice) => ({
+      value: choice,
+      label: `${choice.job} · ${choice.build.repo} · ${choice.build.branch}@${choice.build.sha.slice(0, 7)}`,
+    })),
+  });
+  if (isCancel(choice)) return;
+  return tailLog(choice.build.id, jobLogPath(choice.build, choice.job), (current) =>
+    Boolean(current.status === "running" && current.runningJobs?.includes(choice.job)),
+  );
 }
 
 async function manageImages(action?: string): Promise<void> {
@@ -417,14 +504,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   if (subcommand === "hook") throw new Error("hook action must be one of: install, uninstall");
-  if (subcommand === "builds" && action === "logs") {
-    if (!id) throw new Error("builds logs requires a build ID");
-    const build = await getBuild(id);
-    if (!build) throw new Error(`build not found: ${id}`);
-    console.log(await Bun.file(build.logPath).text());
-    return;
-  }
-  if (subcommand === "builds") return showBuilds();
+  if (subcommand === "logs") return showLogs(action);
+  if (subcommand === "builds" && action === "logs")
+    throw new Error("builds logs has moved to informant logs [<build-id>]");
+  if (subcommand === "builds") return showBuilds(flags.all === true);
 
   if (process.stdin.isTTY) {
     const choice = await select({
