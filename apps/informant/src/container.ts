@@ -278,7 +278,7 @@ export async function runInContainer(
       memoryMb: resources.memoryMb,
     });
     await started();
-    await log(`\n━━ ${job.name} ━━\n[${job.name}] $ ${job.command}\n`);
+    await log(`\n[${job.name}] $ ${job.command}\n`);
     const redactor = streamingSecretRedactor(Object.values(secrets), log);
     const result = await runCommand(args, {
       env: secrets,

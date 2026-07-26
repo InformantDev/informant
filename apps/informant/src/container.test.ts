@@ -254,6 +254,8 @@ test("passes secrets through the client environment and always removes the conta
   ]);
   expect(invocations[0]?.environment?.TOKEN).toBe("line one\nline two");
   expect(invocations[1]?.args.slice(0, 3)).toEqual(["container", "delete", "--force"]);
+  expect(output.join("")).toStartWith("\n[test] $ bun test\n");
+  expect(output.join("")).not.toContain("━━");
   expect(output.join("")).toContain("[REDACTED]");
   expect(output.join("")).not.toContain("line one");
 });

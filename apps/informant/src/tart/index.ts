@@ -202,7 +202,7 @@ async function runJob(
     executionSignal.throwIfAborted();
     const ready = await provisionVm(async () => {
       executionSignal.throwIfAborted();
-      await log(`\n━━ ${job.name} ━━\n$ tart clone ${image} ${vm}\n`);
+      await log(`$ tart clone ${image} ${vm}\n`);
       vmCreated = true;
       const clone = () =>
         requireCommand(["tart", "clone", image, vm], undefined, { signal: executionSignal });
@@ -273,7 +273,7 @@ async function runJob(
         secretValues: secrets.values,
       };
     }, executionSignal);
-    await log(`[${job.name}] $ ${job.command}\n`);
+    await log(`\n[${job.name}] $ ${job.command}\n`);
     const environment = {
       ...job.environment,
       INFORMANT_REPOSITORY: repository.fullName,
@@ -605,7 +605,10 @@ export async function runInTart(
       async (job) => {
         await logJob(
           job,
-          `\n━━ ${job.name} ━━\n${jobEventLine(job.name, signal?.aborted ? "finished (cancelled)" : "skipped (dependency failed)")}`,
+          jobEventLine(
+            job.name,
+            signal?.aborted ? "finished (cancelled)" : "skipped (dependency failed)",
+          ),
         );
         await writes;
         await flushProgress(job);
