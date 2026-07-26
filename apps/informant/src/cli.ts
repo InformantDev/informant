@@ -114,6 +114,25 @@ function requestedJobs(value: string | boolean | string[] | undefined): string[]
     .filter(Boolean);
 }
 
+export function cleanOrphanedBuildWorkspacesInBackground(
+  cleanup: () => Promise<number> = removeOrphanedBuildWorkspaces,
+  onMessage: (message: string) => void = console.log,
+): void {
+  void cleanup()
+    .then((removed) => {
+      if (removed > 0) {
+        onMessage(
+          `Cleaned ${removed} orphaned build ${removed === 1 ? "workspace" : "workspaces"}`,
+        );
+      }
+    })
+    .catch((error) => {
+      onMessage(
+        `Could not clean orphaned build workspaces: ${error instanceof Error ? error.message : error}`,
+      );
+    });
+}
+
 async function repositoryFromGit(): Promise<ReturnType<typeof parseRepository>> {
   const remote = await requireCommand(["git", "remote", "get-url", "origin"]);
   return parseRepository(remote.replace(/^git@github\.com:/, ""));
@@ -495,15 +514,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     if (repositories.length === 0) {
       throw new Error("no repositories registered; run informant repo add owner/repository");
     }
-    const removedWorkspaces = await removeOrphanedBuildWorkspaces();
     intro(
       `Informant worker · ${repositories.length} ${repositories.length === 1 ? "repository" : "repositories"}`,
     );
-    if (removedWorkspaces > 0) {
-      console.log(
-        `Cleaned ${removedWorkspaces} orphaned build ${removedWorkspaces === 1 ? "workspace" : "workspaces"}`,
-      );
-    }
+    cleanOrphanedBuildWorkspacesInBackground();
     return serveRepositories(repositories, {
       once: flags.once === true,
       onMessage: console.log,

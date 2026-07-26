@@ -10,7 +10,7 @@ Install the standalone binary with Homebrew:
 
 ```bash
 brew install informant-ci/tap/informant
-brew install gh openai/tools/tart cirruslabs/cli/sshpass
+brew install gh
 gh auth login
 informant setup
 ```
@@ -19,7 +19,9 @@ Informant requires macOS on Apple Silicon, GitHub CLI (`gh`), and
 [Apple Container](https://github.com/apple/container) for container jobs or
 [Tart](https://tart.run) and `sshpass` for VM jobs,
 and a GitHub App installation with **Checks: read/write**, **Contents: read**, and **Pull requests:
-read/write** permissions. The interactive setup command creates and installs that App with the required permissions. See the
+read/write** permissions. The interactive setup command installs and verifies Apple Container, then
+creates and installs that App with the required permissions. Install Tart and `sshpass` separately only
+on workers that run VM jobs. See the
 [documentation](apps/web/content/docs/index.mdx) for configuration and usage.
 
 ## Monorepo

@@ -167,6 +167,37 @@ test("serializes concurrent preparation of the same container image", async () =
   expect(builds).toBe(1);
 });
 
+test("serializes preparation of different images through the shared Apple builder", async () => {
+  const locks: string[] = [];
+  const operations = {
+    withImageLock: async <T>(image: string, callback: () => Promise<T>): Promise<T> => {
+      locks.push(image);
+      return callback();
+    },
+    command: async (args: string[]) => ({
+      exitCode: args[1] === "image" ? 1 : 0,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+    }),
+  };
+
+  await ensurePreparedContainer(
+    { type: "container", image: "base-a", prepare: "install a" },
+    () => {},
+    undefined,
+    operations,
+  );
+  await ensurePreparedContainer(
+    { type: "container", image: "base-b", prepare: "install b" },
+    () => {},
+    undefined,
+    operations,
+  );
+
+  expect(locks).toEqual(["container-builder", "container-builder"]);
+});
+
 test("passes secrets through the client environment and always removes the container", async () => {
   const invocations: Array<{ args: string[]; environment?: Record<string, string> }> = [];
   const output: string[] = [];

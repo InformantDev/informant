@@ -1,6 +1,6 @@
 import { createSign } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import {
@@ -14,6 +14,110 @@ import { serveRepositories } from "./server.ts";
 
 const API = "https://api.github.com";
 const APP_URL = "https://github.com/InformantDev/informant";
+const CONTAINER_RELEASE = {
+  version: "1.1.0",
+  url: "https://github.com/apple/container/releases/download/1.1.0/container-1.1.0-installer-signed.pkg",
+  sha256: "0ca1c42a2269c2557efb1d82b1b38ac553e6a3a3da1b1179c439bcee1e7d6714",
+};
+
+interface ContainerSetupOperations {
+  command?: typeof command;
+  installPackage?: (path: string) => Promise<void>;
+  platform?: NodeJS.Platform;
+  arch?: string;
+}
+
+async function installPackage(path: string): Promise<void> {
+  const process = Bun.spawn(["sudo", "/usr/sbin/installer", "-pkg", path, "-target", "/"], {
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  if ((await process.exited) !== 0) throw new Error("Apple Container installer failed");
+}
+
+function commandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
+  return new Error(`${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+}
+
+export async function appleContainerInstalled(runCommand = command): Promise<boolean> {
+  return (await runCommand(["container", "--version"])).exitCode === 0;
+}
+
+export async function prepareAppleContainer(
+  operations: ContainerSetupOperations = {},
+): Promise<void> {
+  const runCommand = operations.command ?? command;
+  const installed = await appleContainerInstalled(runCommand);
+  if (!installed) {
+    if (
+      (operations.platform ?? platform()) !== "darwin" ||
+      (operations.arch ?? arch()) !== "arm64"
+    ) {
+      throw new Error("Apple Container requires macOS on Apple silicon");
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "informant-container-install-"));
+    const packagePath = join(directory, `container-${CONTAINER_RELEASE.version}.pkg`);
+    try {
+      const download = await runCommand([
+        "/usr/bin/curl",
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--output",
+        packagePath,
+        CONTAINER_RELEASE.url,
+      ]);
+      if (download.exitCode !== 0)
+        throw commandError("could not download Apple Container", download);
+
+      const checksum = await runCommand(["/usr/bin/shasum", "-a", "256", packagePath]);
+      if (checksum.exitCode !== 0)
+        throw commandError("could not verify Apple Container download", checksum);
+      if (checksum.stdout.trim().split(/\s+/)[0] !== CONTAINER_RELEASE.sha256) {
+        throw new Error("Apple Container download checksum did not match the official release");
+      }
+
+      await (operations.installPackage ?? installPackage)(packagePath);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  let status = await runCommand(["container", "system", "status", "--format", "json"]);
+  if (status.exitCode !== 0) {
+    const start = await runCommand(["container", "system", "start", "--enable-kernel-install"]);
+    if (start.exitCode !== 0) throw commandError("could not start Apple Container", start);
+    status = await runCommand(["container", "system", "status", "--format", "json"]);
+    if (status.exitCode !== 0) throw commandError("Apple Container is not ready", status);
+  }
+
+  const smokeTest = await runCommand([
+    "container",
+    "run",
+    "--rm",
+    "oven/bun:1",
+    "bun",
+    "--version",
+  ]);
+  if (smokeTest.exitCode !== 0)
+    throw commandError("Apple Container could not run the Informant default image", smokeTest);
+}
+
+async function setupAppleContainer(): Promise<void> {
+  if (!(await appleContainerInstalled())) {
+    const install = await confirm({
+      message: "Install Apple Container for container jobs? (requires an administrator password)",
+      initialValue: true,
+    });
+    if (isCancel(install) || !install) return;
+  }
+  console.log("Preparing Apple Container…");
+  await prepareAppleContainer();
+  console.log("Apple Container is ready.");
+}
 
 interface ManifestApp {
   id: number;
@@ -210,6 +314,7 @@ async function finishSetup(account: string): Promise<void> {
 
 export async function setup(): Promise<void> {
   intro("Informant setup");
+  await setupAppleContainer();
   const setupType = await select({
     message: "How should this machine be configured?",
     options: [

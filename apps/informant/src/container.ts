@@ -1,7 +1,7 @@
-import { mkdtemp, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { command } from "./process.ts";
+import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
 import { withImageLock } from "./tart/vm.ts";
@@ -39,12 +39,14 @@ export async function ensurePreparedContainer(
   const runCommand = operations.command ?? command;
   const lock = operations.withImageLock ?? withImageLock;
   return lock(
-    prepared,
+    "container-builder",
     async () => {
       const existing = await runCommand(["container", "image", "inspect", prepared], { signal });
       if (existing.exitCode === 0) return prepared;
 
-      const context = await mkdtemp(join(tmpdir(), "informant-container-build-"));
+      const contextRoot = join(dataDirectory(), "build-contexts");
+      await mkdir(contextRoot, { recursive: true });
+      const context = await mkdtemp(join(contextRoot, "informant-container-build-"));
       await onMessage(`Preparing container image ${prepared}`);
       try {
         await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);

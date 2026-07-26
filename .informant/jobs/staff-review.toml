@@ -92,7 +92,7 @@ container.prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends curl gh git jq ripgrep
+apt-get install -y --no-install-recommends ca-certificates curl gh git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
 mkdir -p "$HOME/.bun/install/global"
