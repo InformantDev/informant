@@ -106,6 +106,8 @@ export interface BuildRecord {
   owner?: { pid: number; startedAt: string };
   pullRequest?: number;
   logPath: string;
+  checkId?: number;
   checkUrl?: string;
+  checksCompletedAt?: string;
   event?: { type: TriggerEvent | "manual"; id: string };
 }

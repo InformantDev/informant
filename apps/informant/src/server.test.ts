@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { GitHubClient } from "./github.ts";
 import type { PollState } from "./poll-state.ts";
-import { applySecretPolicy, type ServerDependencies, serve } from "./server.ts";
+import {
+  applySecretPolicy,
+  recoverInterruptedBuilds,
+  type ServerDependencies,
+  serve,
+} from "./server.ts";
 import type { BuildRecord, InformantConfig, PullRequest, Repository } from "./types.ts";
 
 const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
@@ -69,9 +74,87 @@ function dependencies(
       state.tagRefs = next.tagRefs ? [...next.tagRefs] : undefined;
       state.pendingTags = [...next.pendingTags];
     },
+    recoverInterruptedBuilds: async () => false,
     sleep,
   };
 }
+
+test("startup recovers old URL-only cancelled builds and leaves failures retryable", async () => {
+  const recovered: number[] = [];
+  const saved: BuildRecord[] = [];
+  const messages: string[] = [];
+  const builds: BuildRecord[] = [
+    {
+      id: "interrupted",
+      repo: repository.fullName,
+      sha: "sha-1",
+      branch: "main",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      logPath: "/tmp/interrupted.log",
+      checkUrl: "https://github.com/owner/repo/runs/123",
+    },
+    {
+      id: "retry",
+      repo: repository.fullName,
+      sha: "sha-2",
+      branch: "main",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      logPath: "/tmp/retry.log",
+      checkId: 456,
+    },
+    {
+      id: "live",
+      repo: repository.fullName,
+      sha: "sha-3",
+      branch: "main",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      status: "running",
+      logPath: "/tmp/live.log",
+      checkId: 789,
+    },
+  ];
+  const client = {
+    recoverInterruptedCheck: async (
+      _repository: Repository,
+      _sha: string,
+      id: number,
+      _conclusion: "success" | "failure" | "cancelled",
+    ) => {
+      recovered.push(id);
+      if (id === 456) throw new Error("temporary outage");
+      return true;
+    },
+  } as unknown as GitHubClient;
+
+  const retry = await recoverInterruptedBuilds(
+    client,
+    repository,
+    (message) => messages.push(message),
+    {
+      listActiveBuilds: async () => [],
+      listAllBuilds: async () => builds,
+      saveBuild: async (build) => {
+        saved.push({ ...build });
+      },
+    },
+  );
+
+  expect(retry).toBe(true);
+  expect(recovered).toEqual([123, 456]);
+  expect(saved.map((build) => build.id)).toEqual(["interrupted"]);
+  expect(saved[0]).toMatchObject({ checkId: 123 });
+  expect(saved[0]?.checksCompletedAt).toBeDefined();
+  expect(messages).toContain("recovered interrupted build interrupted");
+  expect(messages.some((message) => message.includes("temporary outage"))).toBe(true);
+  expect(builds[1]?.checksCompletedAt).toBeUndefined();
+});
 
 describe("serve polling orchestration", () => {
   const tagConfig: InformantConfig = {
@@ -102,6 +185,31 @@ describe("serve polling orchestration", () => {
     expect(launches).toBe(0);
     expect(state.tagRefs).toEqual([{ name: "v1", sha: "old" }]);
     expect(state.tagsPolledAt).toBeDefined();
+  });
+
+  test("retries interrupted-build recovery without blocking polling", async () => {
+    const outer = new AbortController();
+    let recoveries = 0;
+    let polls = 0;
+    const deps = dependencies(
+      github({
+        branches: async () => {
+          polls++;
+          return [];
+        },
+      }),
+      { pending: [], seenCommentIds: [], pendingTags: [] },
+      async () => undefined,
+      async () => {
+        if (recoveries >= 2) outer.abort();
+      },
+    );
+    deps.recoverInterruptedBuilds = async () => ++recoveries === 1;
+
+    await serve(repository, { signal: outer.signal, dependencies: deps });
+
+    expect(recoveries).toBe(2);
+    expect(polls).toBe(2);
   });
 
   test("skips tag enumeration without trusted tag triggers and between tag polls", async () => {
@@ -448,6 +556,73 @@ describe("serve polling orchestration", () => {
 
     expect(receivedSignal.aborted).toBe(true);
     expect(receivedSignal.reason).toBe("Server shutdown requested.");
+  });
+
+  test("does not claim automatic work when shutdown arrives during config loading", async () => {
+    const outer = new AbortController();
+    const pending = deferred<InformantConfig>();
+    const loading = deferred<void>();
+    let launches = 0;
+    const deps = dependencies(
+      github({ branches: async () => [{ name: "main", sha: "next-sha" }] }),
+      { pending: [], seenCommentIds: [], pendingTags: [] },
+      async () => {
+        launches++;
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      loading.resolve();
+      return pending.promise;
+    };
+
+    const running = serve(repository, { signal: outer.signal, dependencies: deps });
+    await loading.promise;
+    outer.abort();
+    pending.resolve(config);
+    await running;
+
+    expect(launches).toBe(0);
+  });
+
+  test("does not claim comment work when shutdown arrives during config loading", async () => {
+    const outer = new AbortController();
+    const pendingConfig = deferred<InformantConfig>();
+    const loading = deferred<void>();
+    let launches = 0;
+    const deps = dependencies(
+      github({}),
+      {
+        pending: [
+          {
+            id: 10,
+            sha: "comment-sha",
+            createdAt: new Date().toISOString(),
+            pullRequest,
+          },
+        ],
+        seenCommentIds: [],
+        pendingTags: [],
+      },
+      async () => {
+        launches++;
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      loading.resolve();
+      return pendingConfig.promise;
+    };
+
+    const running = serve(repository, { signal: outer.signal, dependencies: deps });
+    await loading.promise;
+    outer.abort();
+    pendingConfig.resolve(config);
+    await running;
+
+    expect(launches).toBe(0);
   });
 
   test("does not pass an automatic-lane signal to comment runs", async () => {

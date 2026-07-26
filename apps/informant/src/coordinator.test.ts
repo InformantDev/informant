@@ -243,6 +243,23 @@ describe("runCommit", () => {
     expect(context.saved.at(-1)?.runningJobs).toEqual([]);
   });
 
+  test("persists the terminal outcome before completing the aggregate check", async () => {
+    const context = harness();
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    let persistedBeforeAggregate: BuildRecord | undefined;
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 42 && values.status === "completed") {
+        persistedBeforeAggregate = context.saved.at(-1);
+      }
+      return updateCheck(target, id, values);
+    };
+
+    await runCommit(context.github, repository, "sha", "main", config, context.dependencies);
+
+    expect(persistedBeforeAggregate).toMatchObject({ status: "success" });
+    expect(persistedBeforeAggregate?.checksCompletedAt).toBeUndefined();
+  });
+
   test("job check updates continue when running-job persistence fails", async () => {
     const context = harness();
     context.dependencies.saveBuild = async () => {

@@ -347,6 +347,44 @@ test("stale recovery leaves the aggregate active when a child cannot be cancelle
   expect(created).toBe(false);
 });
 
+test("interrupted build recovery cancels only correlated children before the aggregate", async () => {
+  const updates: number[] = [];
+  const checks: Array<Record<string, unknown>> = [
+    { id: 2, name: "Informant CI", status: "in_progress" },
+    {
+      id: 3,
+      name: "Informant / test",
+      status: "in_progress",
+      external_id: "informant-job:2:dGVzdA",
+    },
+    {
+      id: 4,
+      name: "Informant / unrelated",
+      status: "in_progress",
+      external_id: "informant-job:99:dGVzdA",
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "PATCH") {
+      const id = Number(url.split("/").at(-1));
+      updates.push(id);
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
+    if (/\/check-runs\/2$/.test(url)) return Response.json(checks[0]);
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+  const github = new GitHubClient({ token: "installation-token", fetch });
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+
+  expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(true);
+  expect(updates).toEqual([3, 2]);
+  expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(false);
+  expect(updates).toEqual([3, 2]);
+});
+
 test("claim treats a queued check suite as a GitHub UI re-run request", async () => {
   const checks: Array<Record<string, unknown>> = [
     { id: 1, name: "Informant CI", status: "completed", conclusion: "failure" },

@@ -2,8 +2,9 @@ import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles } from "./config.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
+import { listActiveBuilds, listAllBuilds, saveBuild } from "./store.ts";
 import { triggerMatches } from "./triggers.ts";
-import type { InformantConfig, Repository } from "./types.ts";
+import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
@@ -41,7 +42,60 @@ export interface ServerDependencies {
   runCommit?: typeof runCommit;
   readPollState?: typeof readPollState;
   savePollState?: typeof savePollState;
+  recoverInterruptedBuilds?: typeof recoverInterruptedBuilds;
   sleep?: (milliseconds: number) => Promise<void>;
+}
+
+function persistedCheckId(build: BuildRecord): number | undefined {
+  if (Number.isSafeInteger(build.checkId) && (build.checkId ?? 0) > 0) return build.checkId;
+  const match = build.checkUrl?.match(/\/runs\/(\d+)(?:[/?#]|$)/);
+  if (!match) return undefined;
+  const id = Number(match[1]);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+export async function recoverInterruptedBuilds(
+  github: GitHubClient,
+  repository: Repository,
+  onMessage: (message: string) => void = console.log,
+  dependencies: {
+    listActiveBuilds: typeof listActiveBuilds;
+    listAllBuilds: typeof listAllBuilds;
+    saveBuild: typeof saveBuild;
+  } = { listActiveBuilds, listAllBuilds, saveBuild },
+): Promise<boolean> {
+  await dependencies.listActiveBuilds();
+  const builds = (await dependencies.listAllBuilds()).filter(
+    (build) =>
+      build.repo.toLowerCase() === repository.fullName.toLowerCase() &&
+      build.status !== "running" &&
+      !build.checksCompletedAt &&
+      persistedCheckId(build) !== undefined,
+  );
+  let retry = false;
+  for (const build of builds) {
+    if (build.status === "running") continue;
+    const checkId = persistedCheckId(build);
+    if (!checkId) continue;
+    try {
+      const recovered = await github.recoverInterruptedCheck(
+        repository,
+        build.sha,
+        checkId,
+        build.status,
+      );
+      build.checkId = checkId;
+      build.checksCompletedAt = new Date().toISOString();
+      await dependencies.saveBuild(build);
+      if (recovered) onMessage(`recovered interrupted build ${build.id}`);
+    } catch (error) {
+      retry = true;
+      onMessage(
+        `could not recover interrupted build ${build.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return retry;
 }
 
 export function applySecretPolicy(
@@ -92,6 +146,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const executeCommit = dependencies.runCommit ?? runCommit;
   const loadPollState = dependencies.readPollState ?? readPollState;
   const persistPollState = dependencies.savePollState ?? savePollState;
+  const recoverBuilds = dependencies.recoverInterruptedBuilds ?? recoverInterruptedBuilds;
   const sleep = dependencies.sleep ?? Bun.sleep;
   let intervalSeconds = 30;
   let lastPollError: string | undefined;
@@ -102,6 +157,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const completedComments = new Set<number>();
   const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
+  let recoveryPending = true;
   const configAt = (sha: string) => {
     const cached = configs.get(sha);
     if (cached) return cached;
@@ -158,6 +214,15 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
   };
   do {
+    if (recoveryPending) {
+      try {
+        recoveryPending = await recoverBuilds(github, repository, message);
+      } catch (error) {
+        message(
+          `could not scan interrupted builds: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
     if (rateLimitUntil > Date.now() && !(await waitForDelay(rateLimitUntil - Date.now()))) {
       abortAutomaticRuns();
       await drainRuns();
@@ -282,6 +347,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             }
             if (!(await hasPendingManualRequest(target.sha))) continue;
           }
+          if (options.signal?.aborted) {
+            abortAutomaticRuns();
+            await drainRuns();
+            return;
+          }
           const controller = new AbortController();
           if (!("tag" in target)) {
             automaticLanes.set(target.lane, { sha: target.sha, controller });
@@ -391,6 +461,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             state.pending = state.pending.filter((item) => item.id !== pending.id);
             await persistPollState(repository.fullName, state);
             continue;
+          }
+          if (options.signal?.aborted) {
+            abortAutomaticRuns();
+            await drainRuns();
+            return;
           }
           const run = executeCommit(
             github,

@@ -104,6 +104,7 @@ export async function runCommit(
     owner: currentProcessOwner(),
     pullRequest: event?.type === "manual" ? undefined : event?.pullRequest?.number,
     logPath: join(dataDirectory(), "builds", id, "build.log"),
+    checkId: check.id,
     checkUrl: check.html_url,
     event: claim.manualRequest
       ? { type: "manual", id: check.id.toString() }
@@ -239,6 +240,8 @@ export async function runCommit(
         );
       }
     }
+    record.checksCompletedAt = new Date().toISOString();
+    await dependencies.saveBuild(record).catch(() => undefined);
   };
 
   let childrenReconciled = false;
@@ -346,6 +349,7 @@ export async function runCommit(
     const failed = outcomes.filter((outcome) => outcome === "failure").length;
     const skipped = outcomes.filter((outcome) => outcome === "skipped").length;
     executionFinished = true;
+    await dependencies.saveBuild(record).catch(() => undefined);
     await completeAggregate({
       status: "completed",
       conclusion: success ? "success" : "failure",
@@ -356,6 +360,7 @@ export async function runCommit(
     if (executionFinished) throw error;
     record.status = "failure";
     record.completedAt = new Date().toISOString();
+    await dependencies.saveBuild(record).catch(() => undefined);
     let reportingError: unknown;
     if (!childrenReconciled) {
       try {

@@ -518,10 +518,20 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
       `Informant worker · ${repositories.length} ${repositories.length === 1 ? "repository" : "repositories"}`,
     );
     cleanOrphanedBuildWorkspacesInBackground();
-    return serveRepositories(repositories, {
-      once: flags.once === true,
-      onMessage: console.log,
-    });
+    const shutdown = new AbortController();
+    const stop = () => shutdown.abort("Worker shutdown requested.");
+    process.once("SIGTERM", stop);
+    process.once("SIGINT", stop);
+    try {
+      return await serveRepositories(repositories, {
+        once: flags.once === true,
+        signal: shutdown.signal,
+        onMessage: console.log,
+      });
+    } finally {
+      process.off("SIGTERM", stop);
+      process.off("SIGINT", stop);
+    }
   }
   if (subcommand === "run") {
     return manualRun(

@@ -427,6 +427,47 @@ export class GitHubClient {
     );
   }
 
+  async recoverInterruptedCheck(
+    repository: Repository,
+    sha: string,
+    claimId: number,
+    conclusion: "success" | "failure" | "cancelled" = "cancelled",
+  ): Promise<boolean> {
+    const aggregate = await this.api<CheckRun>(
+      `/repos/${repository.fullName}/check-runs/${claimId}`,
+    );
+    if (aggregate.status === "completed") return false;
+
+    const jobs = (await this.jobChecks(repository, sha, claimId)).filter(
+      (job) => job.status !== "completed",
+    );
+    await Promise.all(
+      jobs.map((job) =>
+        this.updateCheck(repository, job.id, {
+          status: "completed",
+          conclusion: "cancelled",
+          title: "Interrupted worker job",
+          summary: "The worker stopped before this job completed.",
+        }),
+      ),
+    );
+    await this.updateCheck(repository, claimId, {
+      status: "completed",
+      conclusion,
+      title:
+        conclusion === "success"
+          ? "All jobs passed"
+          : conclusion === "failure"
+            ? "A job failed"
+            : "Interrupted worker build",
+      summary:
+        conclusion === "cancelled"
+          ? "The worker stopped before this build completed."
+          : "Recovered the final build result after the worker stopped.",
+    });
+    return true;
+  }
+
   async checkSuiteStatus(
     repository: Repository,
     sha: string,
