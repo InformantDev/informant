@@ -4,8 +4,10 @@ import { join } from "node:path";
 import {
   claimBuildWorkspace,
   createBuild,
+  currentProcessOwner,
   getBuild,
   jobLogPath,
+  listActiveBuilds,
   removeOrphanedBuildWorkspaces,
   saveBuild,
 } from "./store.ts";
@@ -47,6 +49,41 @@ test("build saves preserve invocation order and complete JSON", async () => {
   await Promise.all([first, second]);
 
   expect((await getBuild(record.id))?.runningJobs).toEqual(["second"]);
+});
+
+test("active builds are indexed and dead owners are reconciled", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
+  const live: BuildRecord = {
+    id: "live",
+    repo: "owner/repo",
+    sha: "live-sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    owner,
+    logPath: join(root, "builds", "live", "build.log"),
+  };
+  const dead: BuildRecord = {
+    ...live,
+    id: "dead",
+    sha: "dead-sha",
+    owner: { pid: 2_147_483_647, startedAt: "dead" },
+    logPath: join(root, "builds", "dead", "build.log"),
+  };
+  await Promise.all([createBuild(live), createBuild(dead)]);
+
+  expect((await listActiveBuilds()).map((build) => build.id)).toEqual(["live"]);
+  expect((await getBuild(dead.id))?.status).toBe("cancelled");
+  live.status = "success";
+  live.completedAt = new Date().toISOString();
+  await saveBuild(live);
+  expect(await listActiveBuilds()).toEqual([]);
 });
 
 afterEach(async () => {

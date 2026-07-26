@@ -3,6 +3,7 @@ import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "./cli.ts";
+import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
 import type { BuildRecord } from "./types.ts";
 
 test("--version prints the package version without help", async () => {
@@ -44,6 +45,8 @@ test("builds shows running jobs by default and recent history with --all", async
   const root = await mkdtemp(join(tmpdir(), "informant-cli-builds-"));
   const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
   Bun.env.INFORMANT_DATA_DIR = root;
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
   const records: BuildRecord[] = [
     {
       id: "running-build",
@@ -54,6 +57,8 @@ test("builds shows running jobs by default and recent history with --all", async
       startedAt: "2026-07-26T12:00:00.000Z",
       status: "running",
       runningJobs: ["test", "lint"],
+      owner,
+      pullRequest: 42,
       logPath: join(root, "builds", "running-build", "build.log"),
     },
     {
@@ -67,13 +72,22 @@ test("builds shows running jobs by default and recent history with --all", async
       status: "success",
       logPath: join(root, "builds", "finished-build", "build.log"),
     },
+    {
+      id: "branch-shaped-like-pr",
+      repo: "owner/repo",
+      sha: "3333333333333333333333333333333333333333",
+      branch: "pull/99",
+      machine: "runner-one",
+      startedAt: "2026-07-26T10:00:00.000Z",
+      completedAt: "2026-07-26T10:05:00.000Z",
+      status: "success",
+      logPath: join(root, "builds", "branch-shaped-like-pr", "build.log"),
+    },
   ];
   const log = spyOn(console, "log").mockImplementation(() => {});
   try {
     for (const record of records) {
-      const directory = join(root, "builds", record.id);
-      await mkdir(directory, { recursive: true });
-      await Bun.write(join(directory, "build.json"), JSON.stringify(record));
+      await createBuild(record);
       await Bun.write(record.logPath, `${record.id} output\n`);
     }
 
@@ -91,6 +105,10 @@ test("builds shows running jobs by default and recent history with --all", async
     expect(historyOutput).toContain(
       "https://github.com/owner/repo/commit/2222222222222222222222222222222222222222",
     );
+    expect(historyOutput).toContain(
+      "https://github.com/owner/repo/commit/3333333333333333333333333333333333333333",
+    );
+    expect(historyOutput).not.toContain("https://github.com/owner/repo/pull/99");
 
     let output = "";
     const write = spyOn(process.stdout, "write").mockImplementation((chunk) => {
@@ -104,7 +122,7 @@ test("builds shows running jobs by default and recent history with --all", async
       if (!running) throw new Error("expected a running build");
       await appendFile(running.logPath, "more output\n");
       running.status = "success";
-      await Bun.write(join(root, "builds", running.id, "build.json"), JSON.stringify(running));
+      await saveBuild(running);
       await followed;
       expect(output).toBe("running-build output\nmore output\n");
 

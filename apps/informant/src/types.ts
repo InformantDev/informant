@@ -89,6 +89,8 @@ export interface BuildRecord {
   completedAt?: string;
   status: "running" | "success" | "failure" | "cancelled";
   runningJobs?: string[];
+  owner?: { pid: number; startedAt: string };
+  pullRequest?: number;
   logPath: string;
   checkUrl?: string;
   event?: { type: TriggerEvent | "manual"; id: string };

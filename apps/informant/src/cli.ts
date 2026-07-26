@@ -32,7 +32,7 @@ import {
   dataDirectory,
   getBuild,
   jobLogPath,
-  listAllBuilds,
+  listActiveBuilds,
   listBuilds,
   removeOrphanedBuildWorkspaces,
 } from "./store.ts";
@@ -213,17 +213,14 @@ async function manualRun(
   if (build.status !== "success") process.exitCode = 1;
 }
 
-function githubUrl(repo: string, branch: string, sha: string): string {
-  const pullRequest = /^pull\/(\d+)$/.exec(branch)?.[1];
-  return pullRequest
-    ? `https://github.com/${repo}/pull/${pullRequest}`
-    : `https://github.com/${repo}/commit/${sha}`;
+function githubUrl(build: NonNullable<Awaited<ReturnType<typeof getBuild>>>): string {
+  return build.pullRequest
+    ? `https://github.com/${build.repo}/pull/${build.pullRequest}`
+    : `https://github.com/${build.repo}/commit/${build.sha}`;
 }
 
 async function showBuilds(includeHistory: boolean): Promise<void> {
-  const builds = includeHistory
-    ? await listBuilds()
-    : (await listAllBuilds()).filter((build) => build.status === "running");
+  const builds = includeHistory ? await listBuilds() : await listActiveBuilds();
   const table = new Table({
     head: ["ID", "STATUS", "REPOSITORY", "GITHUB", "JOBS", "STARTED", "MACHINE"],
   });
@@ -232,7 +229,7 @@ async function showBuilds(includeHistory: boolean): Promise<void> {
       build.id,
       build.status,
       build.repo,
-      githubUrl(build.repo, build.branch, build.sha),
+      githubUrl(build),
       build.runningJobs?.join(", ") || "—",
       build.startedAt,
       build.machine,
@@ -286,7 +283,7 @@ async function showLogs(id?: string): Promise<void> {
   }
   if (!process.stdin.isTTY)
     throw new Error("logs requires a build ID when input is not interactive");
-  const choices = (await listAllBuilds()).flatMap((build) =>
+  const choices = (await listActiveBuilds()).flatMap((build) =>
     (build.runningJobs ?? []).map((job) => ({ build, job })),
   );
   if (choices.length === 0) {

@@ -2,7 +2,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { selectJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
-import { createBuild, dataDirectory, saveBuild } from "./store.ts";
+import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
 import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, CheckRun, InformantConfig, JobConfig, Repository } from "./types.ts";
@@ -98,6 +98,8 @@ export async function runCommit(
     startedAt: new Date().toISOString(),
     status: "running",
     runningJobs: [],
+    owner: currentProcessOwner(),
+    pullRequest: event?.type === "manual" ? undefined : event?.pullRequest?.number,
     logPath: join(dataDirectory(), "builds", id, "build.log"),
     checkUrl: check.html_url,
     event: claim.manualRequest
@@ -268,7 +270,7 @@ export async function runCommit(
             const state = jobChecks.get(job.name);
             if (!state) return;
             record.runningJobs?.push(job.name);
-            await dependencies.saveBuild(record);
+            await dependencies.saveBuild(record).catch(() => undefined);
             await updateJob(state, {
               status: "in_progress",
               title: `${job.name} is running`,
@@ -283,7 +285,7 @@ export async function runCommit(
             const state = jobChecks.get(job.name);
             if (!state) return;
             record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
-            await dependencies.saveBuild(record);
+            await dependencies.saveBuild(record).catch(() => undefined);
             await updateJob(state, completedValues(job, result.outcome, result.log), true);
           },
         },
