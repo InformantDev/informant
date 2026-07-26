@@ -283,18 +283,55 @@ const terminalColor = {
   yellow: "\x1b[33m",
   blue: "\x1b[34m",
   cyan: "\x1b[36m",
+  orange: "\x1b[38;5;208m",
+  lightGreen: "\x1b[38;5;114m",
+  gray: "\x1b[38;5;245m",
 };
 
 function coloredStatus(status: string): string {
   const color =
     status === "success"
       ? terminalColor.green
-      : status === "failure" || status === "cancelled"
+      : status === "failure"
         ? terminalColor.red
         : status === "running"
-          ? terminalColor.cyan
-          : terminalColor.yellow;
+          ? terminalColor.lightGreen
+          : status === "queued"
+            ? terminalColor.orange
+            : status === "cancelled"
+              ? terminalColor.gray
+              : terminalColor.yellow;
   return `${color}${status}${terminalColor.reset}`;
+}
+
+function statusBarColors(status: string): string {
+  if (status === "running") return "\x1b[48;5;114m\x1b[30m";
+  if (status === "queued") return "\x1b[48;5;208m\x1b[30m";
+  if (status === "success") return "\x1b[48;5;34m\x1b[30m";
+  if (status === "failure") return "\x1b[48;5;160m\x1b[97m";
+  if (status === "skipped") return "\x1b[48;5;178m\x1b[30m";
+  return "\x1b[48;5;240m\x1b[97m";
+}
+
+function highlightMatches(text: string, query: string): string {
+  if (!query) return text;
+  const lowerText = text.toLowerCase();
+  const lowerQuery = query.toLowerCase();
+  let result = "";
+  let offset = 0;
+  while (offset < text.length) {
+    const match = lowerText.indexOf(lowerQuery, offset);
+    if (match < 0) return result + text.slice(offset);
+    result += `${text.slice(offset, match)}\x1b[7m${text.slice(match, match + query.length)}\x1b[27m`;
+    offset = match + query.length;
+  }
+  return result;
+}
+
+function statusFooter(left: string, status: string, width: number): string {
+  const right = `${status.toUpperCase()}  `;
+  if (right.length >= width) return right.slice(-width);
+  return left.slice(0, width - right.length).padEnd(width - right.length) + right;
 }
 
 function buildBrowserOptions(builds: Build[]): BrowserOption[] {
@@ -384,14 +421,38 @@ async function browseLog(buildId: string, job?: string): Promise<"back" | "exit"
   if (!initial) throw new Error(`build not found: ${buildId}`);
   const path = job ? jobLogPath(initial, job) : initial.logPath;
   let action: "view" | "back" | "exit" = "view";
+  let search = "";
+  let editingSearch = false;
+  let matchCursor = -1;
   let previous = "";
   let livenessCheckedAt = 0;
   const input = process.stdin;
   const output = process.stdout;
   emitKeypressEvents(input);
-  const keypress = (_character: string | undefined, key: { name?: string; ctrl?: boolean }) => {
+  const keypress = (
+    character: string | undefined,
+    key: { name?: string; ctrl?: boolean; meta?: boolean; shift?: boolean },
+  ) => {
     if (key.ctrl && key.name === "c") action = "exit";
-    else if (key.name === "escape" || key.name === "backspace") action = "back";
+    else if (editingSearch) {
+      if (key.name === "escape") {
+        editingSearch = false;
+        search = "";
+        matchCursor = -1;
+      } else if (key.name === "return") editingSearch = false;
+      else if (key.name === "backspace") {
+        search = search.slice(0, -1);
+        matchCursor = -1;
+      } else if (character && !key.ctrl && !key.meta && character >= " ") {
+        search += character;
+        matchCursor = -1;
+      }
+    } else if (character === "/") editingSearch = true;
+    else if (search && key.name === "n") matchCursor += key.shift ? -1 : 1;
+    else if (search && key.name === "escape") {
+      search = "";
+      matchCursor = -1;
+    } else if (key.name === "escape" || key.name === "backspace") action = "back";
   };
   input.on("keypress", keypress);
   input.setRawMode?.(true);
@@ -407,19 +468,44 @@ async function browseLog(buildId: string, job?: string): Promise<"back" | "exit"
       if (!build) return "back";
       const contents = await logTail(path);
       const availableRows = Math.max(1, (output.rows ?? 24) - 5);
-      const visible = contents.trimEnd().split("\n").slice(-availableRows).join("\n");
+      const lines = contents.trimEnd().split("\n");
+      const matches = search
+        ? lines.flatMap((line, index) =>
+            line.toLowerCase().includes(search.toLowerCase()) ? [index] : [],
+          )
+        : [];
+      let visibleLines: string[];
+      if (matches.length > 0) {
+        matchCursor = ((matchCursor % matches.length) + matches.length) % matches.length;
+        const target = matches[matchCursor] ?? matches.at(-1) ?? lines.length - 1;
+        const start = Math.max(
+          0,
+          Math.min(target - Math.floor(availableRows / 2), lines.length - availableRows),
+        );
+        visibleLines = lines.slice(start, start + availableRows);
+      } else {
+        visibleLines = lines.slice(-availableRows);
+      }
+      const visible = highlightMatches(visibleLines.join("\n"), search);
       const title = job
         ? `${job} · ${build.repo} · ${build.branch}@${build.sha.slice(0, 7)}`
         : `${build.repo} · ${build.branch}@${build.sha.slice(0, 7)}`;
       const jobStatus = job
         ? jobsForBuild(build).find((item) => item.name === job)?.status
         : undefined;
+      const status = jobStatus ?? build.status;
       const footerWidth = Math.max(1, output.columns ?? 80);
-      const footer = "  Esc  Back to list    Ctrl-C  Exit"
-        .slice(0, footerWidth)
-        .padEnd(footerWidth);
+      const searchSummary = search
+        ? `${matches.length} match${matches.length === 1 ? "" : "es"}`
+        : "";
+      const footerLeft = editingSearch
+        ? `  Search: ${search}█`
+        : search
+          ? `  / ${search} · ${searchSummary}    n/N Next/Previous    Esc Back`
+          : "  / Search    Esc Back to list    Ctrl-C Exit";
+      const footer = statusFooter(footerLeft, status, footerWidth);
       const footerRow = Math.max(1, output.rows ?? 24);
-      const frame = `◆ ${title}\n  ${jobStatus ?? build.status} · ${build.id}\n\n${visible}\x1b[${footerRow};1H\x1b[48;5;24m\x1b[97m${footer}\x1b[0m`;
+      const frame = `◆ ${title}\n  ${coloredStatus(status)} · ${build.id}\n\n${visible}\x1b[${footerRow};1H${statusBarColors(status)}${footer}\x1b[0m`;
       if (frame !== previous) {
         output.write(`\x1b[2J\x1b[H${frame}`);
         previous = frame;
