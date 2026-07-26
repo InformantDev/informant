@@ -7,6 +7,14 @@ import {
 } from "./container.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 test("builds a bounded Apple Container invocation without putting secrets in arguments", () => {
   const args = containerRunArguments({
     name: "informant-job",
@@ -241,4 +249,112 @@ test("passes secrets through the client environment and always removes the conta
   expect(invocations[1]?.args.slice(0, 3)).toEqual(["container", "delete", "--force"]);
   expect(output.join("")).toContain("[REDACTED]");
   expect(output.join("")).not.toContain("line one");
+});
+
+test("limits concurrent Apple containers across jobs", async () => {
+  const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const started: string[] = [];
+  const waiting: string[] = [];
+  const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
+  const releases = new Map<string, ReturnType<typeof deferred<ReturnType<typeof result>>>>();
+  const run = (name: string) =>
+    runInContainer(
+      repository,
+      "commit-sha",
+      "main",
+      "commit-sha",
+      true,
+      process.cwd(),
+      {
+        name,
+        command: "true",
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        needs: [],
+        runtime: { type: "container", image: "image" },
+      },
+      async (text) => {
+        if (text.includes("waiting for")) waiting.push(name);
+      },
+      async () => {},
+      {},
+      undefined,
+      {
+        command: async (args) => {
+          if (args[1] === "run") {
+            started.push(name);
+            const release = deferred<ReturnType<typeof result>>();
+            releases.set(name, release);
+            return release.promise;
+          }
+          return result();
+        },
+      },
+    );
+
+  const jobs = [run("first"), run("second"), run("third")];
+  while (started.length < 2) await Bun.sleep(1);
+  expect(started).toEqual(["first", "second"]);
+  expect(waiting).toEqual(["third"]);
+
+  releases.get("first")?.resolve(result());
+  while (started.length < 3) await Bun.sleep(1);
+  expect(started).toEqual(["first", "second", "third"]);
+  releases.get("second")?.resolve(result());
+  releases.get("third")?.resolve(result());
+  await Promise.all(jobs);
+});
+
+test("cancelling a queued job does not invoke Apple Container", async () => {
+  const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
+  const releases = [deferred<ReturnType<typeof result>>(), deferred<ReturnType<typeof result>>()];
+  const invocations = new Map<string, string[][]>();
+  const run = (name: string, signal?: AbortSignal) =>
+    runInContainer(
+      repository,
+      "commit-sha",
+      "main",
+      "commit-sha",
+      true,
+      process.cwd(),
+      {
+        name,
+        command: "true",
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        needs: [],
+        runtime: { type: "container", image: "image" },
+      },
+      async () => {},
+      async () => {},
+      {},
+      signal,
+      {
+        command: async (args) => {
+          const calls = invocations.get(name) ?? [];
+          calls.push(args);
+          invocations.set(name, calls);
+          if (args[1] === "run" && name !== "queued") {
+            return releases[name === "first" ? 0 : 1]?.promise ?? result();
+          }
+          return result();
+        },
+      },
+    );
+
+  const first = run("first");
+  const second = run("second");
+  while ((invocations.get("second") ?? []).every((args) => args[1] !== "run")) await Bun.sleep(1);
+  const controller = new AbortController();
+  const queued = run("queued", controller.signal).catch((error) => error);
+  controller.abort("cancelled");
+
+  expect(await queued).toBe("cancelled");
+  expect(invocations.get("queued")).toBeUndefined();
+  releases[0]?.resolve(result());
+  releases[1]?.resolve(result());
+  await Promise.all([first, second]);
 });

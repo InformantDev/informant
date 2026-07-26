@@ -88,7 +88,11 @@ export async function cacheMounts(
     }
     const cacheKey = cache.keyFiles.length > 0 ? key.digest("hex").slice(0, 24) : "default";
     for (const path of cache.paths) {
-      if (cache.shared && (guestOs !== "linux" || directShared)) {
+      const direct =
+        cache.shared &&
+        (guestOs !== "linux" || directShared) &&
+        !(directShared && guestOs === "linux" && path === "~/.bun/install/cache");
+      if (direct) {
         const host = trusted
           ? join(persistentRoot, "shared", cachePathIdentity(user, path))
           : join(workspace, "..", "shared-caches", cachePathIdentity(user, path));

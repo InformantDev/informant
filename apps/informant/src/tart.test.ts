@@ -538,9 +538,9 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(linux.restore).toContain("/mnt/shared/cache-0");
     expect(linux.restore).not.toContain("ln -s");
     expect(linux.save).toContain("cache.tar.gz");
-    expect(directLinux.restore).toContain("ln -s");
-    expect(directLinux.restore).not.toContain("cache.tar.gz");
-    expect(directLinux.save).toBe(":");
+    expect(directLinux.restore).not.toContain("ln -s");
+    expect(directLinux.restore).toContain("cache.tar.gz");
+    expect(directLinux.save).toContain("cache.tar.gz");
     expect(linux.writablePaths).toHaveLength(1);
     expect(linux.args[0]).toEndWith(linux.writablePaths[0] ?? "");
     expect(linux.installLock).toBe("/mnt/shared/cache-0/.informant-install-lock");

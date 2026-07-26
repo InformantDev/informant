@@ -7,6 +7,49 @@ import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from 
 import { withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
+const MAX_CONCURRENT_CONTAINERS = 2;
+let activeContainers = 0;
+const containerWaiters: Array<{
+  signal?: AbortSignal;
+  resolve: (release: () => void) => void;
+  reject: (error: unknown) => void;
+  abort?: () => void;
+}> = [];
+
+function releaseContainerSlot(): void {
+  activeContainers--;
+  while (containerWaiters.length > 0) {
+    const waiter = containerWaiters.shift();
+    if (!waiter) return;
+    if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
+    if (waiter.signal?.aborted) {
+      waiter.reject(waiter.signal.reason);
+      continue;
+    }
+    activeContainers++;
+    waiter.resolve(releaseContainerSlot);
+    return;
+  }
+}
+
+async function acquireContainerSlot(signal?: AbortSignal): Promise<() => void> {
+  signal?.throwIfAborted();
+  if (activeContainers < MAX_CONCURRENT_CONTAINERS) {
+    activeContainers++;
+    return releaseContainerSlot;
+  }
+  return new Promise<() => void>((resolve, reject) => {
+    const waiter: (typeof containerWaiters)[number] = { signal, resolve, reject };
+    waiter.abort = () => {
+      const index = containerWaiters.indexOf(waiter);
+      if (index >= 0) containerWaiters.splice(index, 1);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", waiter.abort, { once: true });
+    containerWaiters.push(waiter);
+  });
+}
+
 function containerVolume(source: string, target: string): string {
   if (source.includes(":"))
     throw new Error(`Apple Container cannot mount a host path containing a colon: ${source}`);
@@ -148,8 +191,12 @@ export async function runInContainer(
   );
   const executionSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
   const runCommand = operations.command ?? command;
+  let releaseSlot: (() => void) | undefined;
   try {
     executionSignal.throwIfAborted();
+    if (activeContainers >= MAX_CONCURRENT_CONTAINERS)
+      await log(`[${job.name}] waiting for an available Apple Container slot\n`);
+    releaseSlot = await acquireContainerSlot(executionSignal);
     const secrets = await resolveJobSecrets(job, runtimeSecrets);
     executionSignal.throwIfAborted();
     const caches = await cacheMounts(
@@ -208,6 +255,12 @@ export async function runInContainer(
     throw error;
   } finally {
     clearTimeout(timeout);
-    await runCommand(["container", "delete", "--force", name], { timeoutMs: 30_000 });
+    if (releaseSlot) {
+      try {
+        await runCommand(["container", "delete", "--force", name], { timeoutMs: 30_000 });
+      } finally {
+        releaseSlot();
+      }
+    }
   }
 }
