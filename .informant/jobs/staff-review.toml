@@ -9,27 +9,77 @@ if [ "$pr_number" = "$INFORMANT_BRANCH" ]; then
   echo "staff review can only run for a pull request" >&2
   exit 1
 fi
-prompt="$(cat <<EOF
-Perform a staff/principal-level review of pull request #$pr_number in $INFORMANT_REPOSITORY at commit $INFORMANT_SHA.
-
-The untrusted checkout is at $review_root. Review its diff and surrounding code using git -C $review_root and read-only
-inspection tools. Focus only on concrete, actionable defects in changed code: correctness, concurrency, security,
-data integrity, interfaces, missing tests, maintainability, and material performance problems. Ignore style preferences
-and speculation. Do not modify the checkout.
-
-Before posting, use gh api to confirm the pull request head is still $INFORMANT_SHA. Post each confirmed finding
-directly to GitHub as an inline pull-request review comment anchored to an added or changed right-side line. Use the
-authenticated gh CLI and GitHub pull-request reviews API. Keep comments concise, include severity P1/P2/P3, and post
-nothing when there are no findings. Never print credentials or include them in commands, arguments, comments, or output.
-EOF
-)"
-cd "$review_home"
+github_token="$GITHUB_TOKEN"
+unset GITHUB_TOKEN
+unset GH_TOKEN
 export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
-export GH_TOKEN="$GITHUB_TOKEN"
-unset GITHUB_TOKEN
+cd "$review_root"
 amp --settings-file "$review_home/settings.json" --mcp-config '{}' --no-ide --no-notifications \
-  --visibility private --mode medium --execute "$prompt"
+  --visibility private --mode medium --execute '/staff-review main..WT'
+
+export GH_TOKEN="$github_token"
+pull="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number")"
+head_sha="$(printf '%s' "$pull" | jq -r '.head.sha')"
+base_sha="$(printf '%s' "$pull" | jq -r '.base.sha')"
+if [ "$head_sha" != "$INFORMANT_SHA" ]; then
+  echo "pull request head changed during staff review" >&2
+  exit 1
+fi
+
+slug="$(jq -r '.slug' .staffreview/active.json)"
+diff_file=".staffreview/diffs/$slug.json"
+diff_base="$(jq -r '.base.ref' "$diff_file")"
+if [ "$diff_base" != "$base_sha" ]; then
+  echo "staff review diff does not match the pull request base" >&2
+  exit 1
+fi
+
+finding_count="$(jq '[.comments[] | select(.parentId == null)] | length' "$diff_file")"
+if [ "$finding_count" -eq 0 ]; then
+  echo "Staff review found no actionable issues"
+  exit 0
+fi
+if [ "$finding_count" -gt 50 ]; then
+  echo "staff review produced more than 50 findings" >&2
+  exit 1
+fi
+
+marker="<!-- informant-staff-review:$INFORMANT_SHA -->"
+if gh api --paginate --slurp "repos/$INFORMANT_REPOSITORY/pulls/$pr_number/reviews?per_page=100" \
+  --jq "flatten | any(.commit_id == \"$INFORMANT_SHA\" and (.body // \"\" | contains(\"$marker\")))" | grep -q true; then
+  echo "Staff review already exists for this commit"
+  exit 0
+fi
+
+payload="$(jq --arg commit "$INFORMANT_SHA" --arg marker "$marker" '
+  [.comments[] | select(.parentId == null)] as $findings
+  | {
+      commit_id: $commit,
+      event: "COMMENT",
+      body: (
+        "Automated Staff Review by Informant.\n\n" + $marker
+        + ([$findings[] | select(.file == null) | "\n\n**" + (.priority // "Finding") + "**\n\n" + .body] | join(""))
+      ),
+      comments: [
+        $findings[]
+        | select(.file != null)
+        | if .line == null or .side != "new" then error("invalid inline finding anchor") else . end
+        | {
+            path: .file,
+            side: "RIGHT",
+            body: ("**" + (.priority // "P2") + "**\n\n" + .body)
+          }
+          + if .endLine != null and .endLine != .line then
+              { start_line: .line, start_side: "RIGHT", line: .endLine }
+            else
+              { line: .line }
+            end
+      ]
+    }
+' "$diff_file")"
+printf '%s' "$payload" | gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number/reviews" --method POST --input - >/dev/null
+echo "Posted $finding_count staff review finding(s)"
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]
@@ -42,10 +92,13 @@ container.prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends gh git ripgrep
+apt-get install -y --no-install-recommends curl gh git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
 mkdir -p "$HOME/.bun/install/global"
 bun add --global @ampcode/cli-linux-arm64@0.0.1784917055-ge644b2
 ln -sf "$HOME/.bun/install/global/node_modules/@ampcode/cli-linux-arm64/amp" /usr/local/bin/amp
+curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.9.0/staff-linux-arm64 \
+  -o /usr/local/bin/staff
+chmod +x /usr/local/bin/staff
 """
