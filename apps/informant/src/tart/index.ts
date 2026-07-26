@@ -124,6 +124,38 @@ export function streamingSecretRedactor(
   };
 }
 
+export async function checkoutBuildWorkspace(
+  repositoryPath: string,
+  workspace: string,
+  sha: string,
+  isolated: boolean,
+  signal?: AbortSignal,
+) {
+  if (!isolated) {
+    return command(["git", "worktree", "add", "--detach", workspace, sha], {
+      cwd: repositoryPath,
+      timeoutMs: 60_000,
+      signal,
+    });
+  }
+  const clone = await command(
+    ["git", "clone", "--no-local", "--no-checkout", repositoryPath, workspace],
+    { timeoutMs: 60_000, signal },
+  );
+  if (clone.exitCode !== 0) return clone;
+  const fetch = await command(["git", "fetch", "--no-tags", repositoryPath, sha], {
+    cwd: workspace,
+    timeoutMs: 60_000,
+    signal,
+  });
+  if (fetch.exitCode !== 0) return fetch;
+  return command(["git", "checkout", "--detach", sha], {
+    cwd: workspace,
+    timeoutMs: 60_000,
+    signal,
+  });
+}
+
 async function runJob(
   vm: string,
   image: string,
@@ -456,23 +488,13 @@ export async function runInTart(
     );
     for (const [index, workspace] of workspaces.entries()) {
       const job = config.jobs[index];
-      const checkout = job?.secrets.length
-        ? await command(
-            ["git", "clone", "--no-local", "--no-checkout", repositoryPath, workspace],
-            { timeoutMs: 60_000, signal },
-          ).then(async (clone) => {
-            if (clone.exitCode !== 0) return clone;
-            return command(["git", "checkout", "--detach", sha], {
-              cwd: workspace,
-              timeoutMs: 60_000,
-              signal,
-            });
-          })
-        : await command(["git", "worktree", "add", "--detach", workspace, sha], {
-            cwd: repositoryPath,
-            timeoutMs: 60_000,
-            signal,
-          });
+      const checkout = await checkoutBuildWorkspace(
+        repositoryPath,
+        workspace,
+        sha,
+        Boolean(job?.secrets.length),
+        signal,
+      );
       if (checkout.exitCode !== 0) {
         throw new Error(
           `could not check out ${sha}${job ? ` for ${job.name}` : ""}: ${checkout.stderr}`,

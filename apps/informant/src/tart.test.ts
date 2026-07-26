@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { requireCommand } from "./process.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import {
   appendUtf8Tail,
   BUILD_LOG_TRUNCATION_MARKER,
   boundedLogWriter,
   cachePathIdentity,
+  checkoutBuildWorkspace,
   ensurePreparedImage,
   isRetryableSshAuthenticationFailure,
   preparedImageName,
@@ -116,6 +118,50 @@ test("removes plaintext secrets when mount preparation fails", async () => {
       ),
     ).rejects.toThrow("realpath failed");
     expect((await Array.fromAsync(new Bun.Glob("secrets-*").scan(root))).length).toBe(0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("isolated workspaces fetch commits that only have remote-tracking refs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-isolated-checkout-"));
+  const remote = join(root, "remote.git");
+  const seed = join(root, "seed");
+  const repository = join(root, "repository");
+  const workspace = join(root, "workspace");
+  try {
+    await requireCommand(["git", "init", "--quiet", "--bare", remote]);
+    await requireCommand(["git", "init", "--quiet", seed]);
+    await requireCommand(["git", "config", "user.email", "informant@example.com"], undefined, {
+      cwd: seed,
+    });
+    await requireCommand(["git", "config", "user.name", "Informant"], undefined, { cwd: seed });
+    await Bun.write(join(seed, "README.md"), "main\n");
+    await requireCommand(["git", "add", "README.md"], undefined, { cwd: seed });
+    await requireCommand(["git", "commit", "--quiet", "-m", "main"], undefined, { cwd: seed });
+    await requireCommand(["git", "branch", "-M", "main"], undefined, { cwd: seed });
+    await requireCommand(["git", "remote", "add", "origin", remote], undefined, { cwd: seed });
+    await requireCommand(["git", "push", "--quiet", "origin", "main"], undefined, { cwd: seed });
+    await requireCommand(["git", "symbolic-ref", "HEAD", "refs/heads/main"], undefined, {
+      cwd: remote,
+    });
+    await Bun.write(join(seed, "feature.txt"), "feature\n");
+    await requireCommand(["git", "add", "feature.txt"], undefined, { cwd: seed });
+    await requireCommand(["git", "commit", "--quiet", "-m", "feature"], undefined, { cwd: seed });
+    const sha = await requireCommand(["git", "rev-parse", "HEAD"], undefined, { cwd: seed });
+    await requireCommand(
+      ["git", "push", "--quiet", "origin", `HEAD:refs/heads/feature`],
+      undefined,
+      {
+        cwd: seed,
+      },
+    );
+    await requireCommand(["git", "clone", "--quiet", "--no-checkout", remote, repository]);
+
+    const checkout = await checkoutBuildWorkspace(repository, workspace, sha, true);
+
+    expect(checkout.exitCode).toBe(0);
+    expect(await Bun.file(join(workspace, "feature.txt")).text()).toBe("feature\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
