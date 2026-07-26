@@ -103,6 +103,10 @@ export interface BuildRecord {
   completedAt?: string;
   status: "running" | "success" | "failure" | "cancelled";
   runningJobs?: string[];
+  jobs?: Array<{
+    name: string;
+    status: "queued" | "running" | "success" | "failure" | "skipped" | "cancelled";
+  }>;
   owner?: { pid: number; startedAt: string };
   pullRequest?: number;
   logPath: string;

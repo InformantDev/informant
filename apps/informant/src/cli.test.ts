@@ -113,7 +113,8 @@ test("builds shows running jobs by default and recent history with --all", async
     await main(["builds"]);
     const activeOutput = String(log.mock.calls.at(-1)?.[0]);
     expect(activeOutput).toContain("running-build");
-    expect(activeOutput).toContain("test, lint");
+    expect(activeOutput).toContain("├─ test · running");
+    expect(activeOutput).toContain("└─ lint · running");
     expect(activeOutput).toContain("https://github.com/owner/repo/pull/42");
     expect(activeOutput).not.toContain("finished-build");
 

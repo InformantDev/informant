@@ -2,8 +2,9 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { emitKeypressEvents } from "node:readline";
+import { SelectPrompt } from "@clack/core";
 import { cancel, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
-import Table from "cli-table3";
 import packageJson from "../package.json" with { type: "json" };
 import {
   CONFIG_FILE,
@@ -236,28 +237,182 @@ function githubUrl(build: NonNullable<Awaited<ReturnType<typeof getBuild>>>): st
 }
 
 async function showBuilds(includeHistory: boolean): Promise<void> {
+  if (process.stdin.isTTY) return browseBuilds(includeHistory);
   const builds = includeHistory ? await listBuilds() : await listActiveBuilds();
-  const table = new Table({
-    head: ["ID", "STATUS", "REPOSITORY", "GITHUB", "JOBS", "STARTED", "MACHINE"],
+  console.log(buildList(builds, includeHistory));
+}
+
+type Build = NonNullable<Awaited<ReturnType<typeof getBuild>>>;
+
+function jobsForBuild(build: Build): NonNullable<Build["jobs"]> {
+  if (build.jobs) return build.jobs;
+  return (build.runningJobs ?? []).map((name) => ({ name, status: "running" as const }));
+}
+
+function buildList(builds: Build[], includeHistory: boolean): string {
+  if (builds.length === 0) return includeHistory ? "No local builds yet." : "No builds running.";
+  return builds
+    .map((build) => {
+      const jobs = jobsForBuild(build);
+      const lines = [
+        `● ${build.repo} · ${build.branch}@${build.sha.slice(0, 7)} · ${build.status}`,
+        `  ${build.id} · ${build.startedAt} · ${build.machine}`,
+        `  ${githubUrl(build)}`,
+      ];
+      for (const [index, job] of jobs.entries()) {
+        lines.push(`  ${index === jobs.length - 1 ? "└─" : "├─"} ${job.name} · ${job.status}`);
+      }
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+
+interface BrowserOption {
+  value: string;
+  label: string;
+  hint?: string;
+  disabled?: boolean;
+}
+
+function buildBrowserOptions(builds: Build[]): BrowserOption[] {
+  if (builds.length === 0) return [{ value: "none", label: "No builds available", disabled: true }];
+  return builds.flatMap((build) => [
+    {
+      value: build.id,
+      label: `${build.repo} · ${build.branch}@${build.sha.slice(0, 7)}`,
+      hint: `${build.status} · ${build.id}`,
+    },
+    ...jobsForBuild(build).map((job) => ({
+      value: `${build.id}\0${job.name}`,
+      label: `  ↳ ${job.name}`,
+      hint: job.status,
+    })),
+  ]);
+}
+
+async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol> {
+  const load = async () =>
+    buildBrowserOptions(includeHistory ? await listBuilds() : await listActiveBuilds());
+  const options = await load();
+  const prompt = new SelectPrompt<BrowserOption>({
+    options,
+    render() {
+      const active = this.options[this.cursor];
+      if (this.state === "submit") return `◆  ${active?.label ?? "Builds"}`;
+      if (this.state === "cancel") return "◇  Back";
+      const rows = Math.max(5, Math.min(15, (process.stdout.rows ?? 20) - 5));
+      const start = Math.max(
+        0,
+        Math.min(this.cursor - Math.floor(rows / 2), this.options.length - rows),
+      );
+      const visible = this.options.slice(start, start + rows);
+      const lines = visible.map((option, index) => {
+        const selected = start + index === this.cursor;
+        const marker = option.disabled ? "─" : selected ? "◆" : "◇";
+        return `│  ${marker} ${option.label}${option.hint ? `  (${option.hint})` : ""}`;
+      });
+      return `◆  ${includeHistory ? "Recent builds" : "Running builds"}\n${lines.join("\n")}\n└  ↑/↓ navigate · Enter open logs · Esc back`;
+    },
   });
-  for (const build of builds) {
-    table.push([
-      build.id,
-      build.status,
-      build.repo,
-      githubUrl(build),
-      build.runningJobs?.join(", ") || "—",
-      build.startedAt,
-      build.machine,
-    ]);
+  let open = true;
+  let refreshing = false;
+  const refresh = setInterval(async () => {
+    if (!open || refreshing) return;
+    refreshing = true;
+    try {
+      const selected = prompt.value;
+      const next = await load();
+      prompt.options.splice(0, prompt.options.length, ...next);
+      const selectedIndex = next.findIndex((option) => option.value === selected);
+      prompt.cursor = selectedIndex >= 0 ? selectedIndex : Math.min(prompt.cursor, next.length - 1);
+      prompt.value = prompt.options[prompt.cursor]?.value;
+      (prompt as unknown as { render: () => void }).render();
+    } catch {
+      // The next refresh retries transient filesystem reads.
+    } finally {
+      refreshing = false;
+    }
+  }, 1_000);
+  try {
+    return (await prompt.prompt()) ?? Symbol.for("informant:no-selection");
+  } finally {
+    open = false;
+    clearInterval(refresh);
   }
-  console.log(
-    builds.length
-      ? table.toString()
-      : includeHistory
-        ? "No local builds yet."
-        : "No builds running.",
-  );
+}
+
+async function logTail(path: string, maximumBytes = 256 * 1024): Promise<string> {
+  const file = Bun.file(path);
+  if (!(await file.exists())) return "Waiting for log output…";
+  const start = Math.max(0, file.size - maximumBytes);
+  const bytes = new Uint8Array(await file.slice(start, file.size).arrayBuffer());
+  let offset = 0;
+  while (offset < bytes.length && ((bytes[offset] ?? 0) & 0xc0) === 0x80) offset++;
+  return new TextDecoder().decode(bytes.subarray(offset));
+}
+
+async function browseLog(buildId: string, job?: string): Promise<"back" | "exit"> {
+  const initial = await getBuild(buildId);
+  if (!initial) throw new Error(`build not found: ${buildId}`);
+  const path = job ? jobLogPath(initial, job) : initial.logPath;
+  let action: "view" | "back" | "exit" = "view";
+  let previous = "";
+  let livenessCheckedAt = 0;
+  const input = process.stdin;
+  const output = process.stdout;
+  emitKeypressEvents(input);
+  const keypress = (_character: string | undefined, key: { name?: string; ctrl?: boolean }) => {
+    if (key.ctrl && key.name === "c") action = "exit";
+    else if (key.name === "escape" || key.name === "backspace") action = "back";
+  };
+  input.on("keypress", keypress);
+  input.setRawMode?.(true);
+  input.resume();
+  output.write("\x1b[?1049h\x1b[?25l");
+  try {
+    while (action === "view") {
+      let build = await getBuild(buildId);
+      if (build?.status === "running" && Date.now() - livenessCheckedAt >= 2_000) {
+        build = await reconcileBuildLiveness(build);
+        livenessCheckedAt = Date.now();
+      }
+      if (!build) return "back";
+      const contents = await logTail(path);
+      const availableRows = Math.max(1, (output.rows ?? 24) - 4);
+      const visible = contents.trimEnd().split("\n").slice(-availableRows).join("\n");
+      const title = job
+        ? `${job} · ${build.repo} · ${build.branch}@${build.sha.slice(0, 7)}`
+        : `${build.repo} · ${build.branch}@${build.sha.slice(0, 7)}`;
+      const jobStatus = job
+        ? jobsForBuild(build).find((item) => item.name === job)?.status
+        : undefined;
+      const frame = `◆ ${title}\n  ${jobStatus ?? build.status} · ${build.id}\n\n${visible}\n\nEsc/Backspace: back`;
+      if (frame !== previous) {
+        output.write(`\x1b[2J\x1b[H${frame}`);
+        previous = frame;
+      }
+      await Bun.sleep(250);
+    }
+    return action;
+  } finally {
+    input.off("keypress", keypress);
+    input.setRawMode?.(false);
+    output.write("\x1b[?25h\x1b[?1049l");
+  }
+}
+
+async function browseBuilds(includeHistory: boolean, initialBuildId?: string): Promise<void> {
+  let initial = initialBuildId;
+  while (true) {
+    if (initial) {
+      if ((await browseLog(initial)) === "exit") return;
+      initial = undefined;
+    }
+    const choice = await liveBuildSelect(includeHistory);
+    if (isCancel(choice) || typeof choice !== "string" || choice === "none") return;
+    const [buildId, job] = choice.split("\0", 2);
+    if (buildId && (await browseLog(buildId, job)) === "exit") return;
+  }
 }
 
 async function tailLog(
@@ -300,28 +455,12 @@ async function showLogs(id?: string): Promise<void> {
   if (id) {
     const build = await getBuild(id);
     if (!build) throw new Error(`build not found: ${id}`);
+    if (process.stdin.isTTY) return browseBuilds(true, id);
     return tailLog(build.id, build.logPath, (current) => current.status === "running");
   }
   if (!process.stdin.isTTY)
     throw new Error("logs requires a build ID when input is not interactive");
-  const choices = (await listActiveBuilds()).flatMap((build) =>
-    (build.runningJobs ?? []).map((job) => ({ build, job })),
-  );
-  if (choices.length === 0) {
-    console.log("No jobs running.");
-    return;
-  }
-  const choice = await select({
-    message: "Select a running job",
-    options: choices.map((choice) => ({
-      value: choice,
-      label: `${choice.job} · ${choice.build.repo} · ${choice.build.branch}@${choice.build.sha.slice(0, 7)}`,
-    })),
-  });
-  if (isCancel(choice)) return;
-  return tailLog(choice.build.id, jobLogPath(choice.build, choice.job), (current) =>
-    Boolean(current.status === "running" && current.runningJobs?.includes(choice.job)),
-  );
+  return browseBuilds(true);
 }
 
 async function manageImages(action?: string): Promise<void> {
@@ -568,7 +707,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "logs") return showLogs(action);
   if (subcommand === "builds" && action === "logs")
     throw new Error("builds logs has moved to informant logs [<build-id>]");
-  if (subcommand === "builds") return showBuilds(flags.all === true);
+  if (subcommand === "builds") {
+    if (process.stdin.isTTY) return browseBuilds(flags.all === true);
+    return showBuilds(flags.all === true);
+  }
 
   if (process.stdin.isTTY) {
     const choice = await select({

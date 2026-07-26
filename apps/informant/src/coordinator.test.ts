@@ -240,7 +240,13 @@ describe("runCommit", () => {
     await runCommit(context.github, repository, "sha", "main", config, context.dependencies);
 
     expect(context.saved.some((record) => record.runningJobs?.includes("test"))).toBe(true);
+    expect(
+      context.saved.some((record) =>
+        record.jobs?.some((job) => job.name === "test" && job.status === "running"),
+      ),
+    ).toBe(true);
     expect(context.saved.at(-1)?.runningJobs).toEqual([]);
+    expect(context.saved.at(-1)?.jobs).toEqual([{ name: "test", status: "success" }]);
   });
 
   test("persists the terminal outcome before completing the aggregate check", async () => {

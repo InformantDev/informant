@@ -101,6 +101,7 @@ export async function runCommit(
     startedAt: new Date().toISOString(),
     status: "running",
     runningJobs: [],
+    jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
     owner: currentProcessOwner(),
     pullRequest: event?.type === "manual" ? undefined : event?.pullRequest?.number,
     logPath: join(dataDirectory(), "builds", id, "build.log"),
@@ -276,6 +277,9 @@ export async function runCommit(
             const state = jobChecks.get(job.name);
             if (!state) return;
             record.runningJobs?.push(job.name);
+            record.jobs = record.jobs?.map((item) =>
+              item.name === job.name ? { ...item, status: "running" } : item,
+            );
             await dependencies.saveBuild(record).catch(() => undefined);
             await updateJob(state, {
               status: "in_progress",
@@ -291,6 +295,9 @@ export async function runCommit(
             const state = jobChecks.get(job.name);
             if (!state) return;
             record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
+            record.jobs = record.jobs?.map((item) =>
+              item.name === job.name ? { ...item, status: result.outcome } : item,
+            );
             await dependencies.saveBuild(record).catch(() => undefined);
             await updateJob(state, completedValues(job, result.outcome, result.log), true);
           },
@@ -305,6 +312,10 @@ export async function runCommit(
 
     if (executionSignal?.aborted) {
       record.status = "cancelled";
+      record.runningJobs = [];
+      record.jobs = record.jobs?.map((job) =>
+        job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
+      );
       record.completedAt = new Date().toISOString();
       executionFinished = true;
       await dependencies.saveBuild(record);
@@ -359,6 +370,10 @@ export async function runCommit(
   } catch (error) {
     if (executionFinished) throw error;
     record.status = "failure";
+    record.runningJobs = [];
+    record.jobs = record.jobs?.map((job) =>
+      job.status === "queued" || job.status === "running" ? { ...job, status: "failure" } : job,
+    );
     record.completedAt = new Date().toISOString();
     await dependencies.saveBuild(record).catch(() => undefined);
     let reportingError: unknown;
