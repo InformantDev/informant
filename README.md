@@ -2,6 +2,7 @@
 
 **Local machines, reporting for CI duty.** Informant polls GitHub from behind your firewall,
 claims commits through the Checks API, and runs TOML-defined jobs in disposable Docker containers or Tart VMs.
+Each job can select and prepare its own runtime image, keeping macOS VMs limited to jobs that need them.
 
 ## Install
 

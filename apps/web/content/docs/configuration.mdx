@@ -21,6 +21,7 @@ triggers = [
 image = "oven/bun:1"
 cpu = 2
 memory_mb = 2048
+prepare = "apt-get update && apt-get install -y git"
 ```
 
 Informant polls every 30 seconds by default. Set `poll_interval_seconds` only when a repository needs
@@ -28,13 +29,19 @@ a different cadence; values below five seconds are clamped to five.
 
 The top-level `container` or `vm` table is the default runtime for every job. Existing configurations
 with `[vm]` remain valid. A job can override the default with an inline `container` or `vm` table; the
-two are mutually exclusive. For example, a macOS E2E job in an otherwise container-based pipeline is:
+two are mutually exclusive. An override of the same runtime type inherits omitted fields, so jobs can
+provide their own preparation without repeating the image. For example:
 
 ```toml
 [[jobs]]
+name = "linux-e2e"
+command = "bun run test:e2e"
+container = { prepare = "apt-get update && apt-get install -y chromium" }
+
+[[jobs]]
 name = "macos-e2e"
 command = "bun run test:e2e"
-vm = { image = "ghcr.io/cirruslabs/macos-tahoe-base:latest", os = "macos", user = "admin", password = "admin", cpu = 4, memory_mb = 8192 }
+vm = { image = "ghcr.io/cirruslabs/macos-tahoe-base:latest", os = "macos", user = "admin", password = "admin", cpu = 4, memory_mb = 8192, prepare = "brew install playwright" }
 ```
 
 Container jobs require Docker and run with the checkout bind-mounted at `/workspace`. Cache directories use isolated host
@@ -147,16 +154,18 @@ or dependency-only. Matching rules are ORed, and dependencies of matching root j
 Legacy `branches` still becomes commit branch rules (default `main`), but cannot be combined with
 top-level `triggers`. Manual `informant run` ignores trigger eligibility.
 
-## Prepared VM images
+## Prepared runtime images
 
-`vm.prepare` runs once when a worker first sees that image and preparation command. Informant keeps the
-stopped result as a local Tart image and clones jobs from it, so tools such as Bun do not need to be
-installed in every job. Changing `vm.image`, `vm.os`, `vm.user`, or `vm.prepare` creates a new prepared image.
+`vm.prepare` and `container.prepare` run once when a worker first sees that image and preparation
+command. Informant keeps the result as a local Tart or Docker image and starts jobs from it, so tools do
+not need to be installed in every job. Preparation does not receive the job checkout, environment, or
+secrets. Changing the source image or preparation command creates a new prepared image. Because
+preparation is part of the runtime table, different jobs can use different preparation commands.
 
-Preparation is automatic. Use `informant image prepare` to warm all configured VM job images ahead of a build,
-`informant image list` to inspect prepared images, and `informant image prune` to remove images that
-no repository still references. Every worker prepares its own local copy, which keeps multi-machine
-setup automatic.
+Preparation is automatic. `informant image prepare`, `informant image list`, and `informant image
+prune` currently manage prepared Tart VM images. Docker preparation is warmed automatically by the
+first job that uses it and Docker images can be inspected or removed with the Docker CLI. Every worker
+prepares its own local copy, which keeps multi-machine setup automatic.
 
 ## Persistent job caches
 

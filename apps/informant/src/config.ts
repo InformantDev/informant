@@ -300,20 +300,32 @@ function parseVm(
   };
 }
 
-function parseContainer(value: Record<string, unknown>, label: string): JobRuntime {
-  if (typeof value.image !== "string" || !value.image.trim())
+function parseContainer(
+  value: Record<string, unknown>,
+  label: string,
+  defaults?: Record<string, unknown>,
+): JobRuntime {
+  const container = { ...defaults, ...value };
+  if (typeof container.image !== "string" || !container.image.trim())
     throw new Error(`${label}.image must be a non-empty string`);
-  const cpu = value.cpu === undefined ? undefined : Number(value.cpu);
-  const memoryMb = value.memory_mb === undefined ? undefined : Number(value.memory_mb);
+  const cpu = container.cpu === undefined ? undefined : Number(container.cpu);
+  const memoryMb = container.memory_mb === undefined ? undefined : Number(container.memory_mb);
   if (cpu !== undefined && (!Number.isFinite(cpu) || cpu <= 0))
     throw new Error(`${label}.cpu must be a positive number`);
   if (memoryMb !== undefined && (!Number.isInteger(memoryMb) || memoryMb <= 0))
     throw new Error(`${label}.memory_mb must be a positive integer`);
+  const rawPrepare = container.prepare;
+  if (
+    rawPrepare !== undefined &&
+    (typeof rawPrepare !== "string" || rawPrepare.trim().length === 0)
+  )
+    throw new Error(`${label}.prepare must be a non-empty string`);
   return {
     type: "container",
-    image: value.image,
+    image: container.image,
     cpu,
     memoryMb,
+    prepare: typeof rawPrepare === "string" ? rawPrepare.trim() : undefined,
   };
 }
 
@@ -389,6 +401,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         ? parseContainer(
             runtimeTable(job.container, `jobs[${index}].container`),
             `jobs[${index}].container`,
+            container,
           )
         : job.vm !== undefined
           ? parseVm(runtimeTable(job.vm, `jobs[${index}].vm`), `jobs[${index}].vm`, vm)

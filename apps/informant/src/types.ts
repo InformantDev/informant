@@ -14,6 +14,7 @@ export interface ContainerRuntime {
   image: string;
   cpu?: number;
   memoryMb?: number;
+  prepare?: string;
 }
 
 export type JobRuntime = VmRuntime | ContainerRuntime;

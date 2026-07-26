@@ -2,12 +2,72 @@ import { realpath } from "node:fs/promises";
 import { command } from "./process.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
-import type { JobConfig, Repository } from "./types.ts";
+import { withImageLock } from "./tart/vm.ts";
+import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
 function dockerMount(source: string, target: string): string {
   const field = (value: string) =>
     /[",\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
   return ["type=bind", `source=${source}`, `target=${target}`].map(field).join(",");
+}
+
+export function preparedContainerImage(runtime: ContainerRuntime): string | undefined {
+  return runtime.prepare
+    ? `informant-prepared-container:${new Bun.CryptoHasher("sha256")
+        .update(`${runtime.image}\0${runtime.prepare}`)
+        .digest("hex")
+        .slice(0, 16)}`
+    : undefined;
+}
+
+export interface ContainerPreparationOperations {
+  command?: typeof command;
+  withImageLock?: typeof withImageLock;
+}
+
+export async function ensurePreparedContainer(
+  runtime: ContainerRuntime,
+  onMessage: (message: string) => Promise<void> | void = console.log,
+  signal?: AbortSignal,
+  operations: ContainerPreparationOperations = {},
+): Promise<string> {
+  const prepared = preparedContainerImage(runtime);
+  const preparationCommand = runtime.prepare;
+  if (!prepared || !preparationCommand) return runtime.image;
+  const runCommand = operations.command ?? command;
+  const lock = operations.withImageLock ?? withImageLock;
+  return lock(
+    prepared,
+    async () => {
+      const existing = await runCommand(["docker", "image", "inspect", prepared], { signal });
+      if (existing.exitCode === 0) return prepared;
+
+      const staging = `informant-prepare-${crypto.randomUUID().slice(0, 12)}`;
+      await onMessage(`Preparing Docker image ${prepared}`);
+      try {
+        const args = ["docker", "run", "--name", staging];
+        if (runtime.cpu) args.push("--cpus", String(runtime.cpu));
+        if (runtime.memoryMb) args.push("--memory", `${runtime.memoryMb}m`);
+        args.push(runtime.image, "/bin/sh", "-lc", preparationCommand);
+        const preparation = await runCommand(args, { signal, onOutput: onMessage });
+        if (preparation.exitCode !== 0 || preparation.timedOut)
+          throw new Error(
+            `container image preparation failed: ${preparation.stderr.trim() || `exit ${preparation.exitCode}`}`,
+          );
+        const committed = await runCommand(["docker", "commit", staging, prepared], { signal });
+        if (committed.exitCode !== 0)
+          throw new Error(
+            `could not commit prepared container image: ${committed.stderr.trim() || `exit ${committed.exitCode}`}`,
+          );
+        return prepared;
+      } finally {
+        await runCommand(["docker", "rm", "--force", "--volumes", staging], {
+          timeoutMs: 30_000,
+        });
+      }
+    },
+    signal,
+  );
 }
 
 export function dockerRunArguments(options: {
@@ -85,9 +145,12 @@ export async function runInDocker(
     const wrapped = caches.save
       ? `${execute}; status=$?; ${caches.save}; cache_status=$?; test $status -eq 0 && exit $cache_status; exit $status`
       : execute;
+    const image = await ensurePreparedContainer(runtime, log, executionSignal, {
+      command: runCommand,
+    });
     const args = dockerRunArguments({
       name,
-      image: runtime.image,
+      image,
       workspace: await realpath(workspace),
       command: wrapped,
       environment,

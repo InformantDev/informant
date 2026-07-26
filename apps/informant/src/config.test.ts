@@ -54,6 +54,7 @@ describe("configuration", () => {
           image: "oven/bun:1",
           cpu: undefined,
           memoryMb: undefined,
+          prepare: undefined,
         },
       },
     ]);
@@ -167,6 +168,18 @@ describe("configuration", () => {
     ).toThrow("vm.prepare must be a non-empty string");
   });
 
+  test("VM preparation can be overridden per job", () => {
+    const source = vmConfigTemplate().replace(
+      'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+      'cache = []\nvm = { prepare = "install job tools" }',
+    );
+    expect(parseConfig(source).jobs[0]?.runtime).toMatchObject({
+      type: "vm",
+      image: "ghcr.io/cirruslabs/macos-tahoe-base:latest",
+      prepare: "install job tools",
+    });
+  });
+
   test("parses container defaults and per-job VM overrides", () => {
     const source = configTemplate()
       .replace('image = "oven/bun:1"', 'image = "oven/bun:1"\ncpu = 1.5\nmemory_mb = 512')
@@ -186,6 +199,7 @@ describe("configuration", () => {
       image: "oven/bun:1",
       cpu: 1.5,
       memoryMb: 512,
+      prepare: undefined,
     });
     expect(() => parseConfig(containerOnly.replace('image = "oven/bun:1"', 'image = ""'))).toThrow(
       "container.image must be a non-empty string",
@@ -202,12 +216,32 @@ describe("configuration", () => {
       image: "oven/bun:1",
       cpu: 0.5,
       memoryMb: undefined,
+      prepare: undefined,
     });
     expect(() =>
       parseConfig(
         source.replace('container = { image = "oven/bun:1", cpu = 0.5 }', "container = true"),
       ),
     ).toThrow("jobs[0].container must be a table");
+  });
+
+  test("container preparation can be inherited and overridden per job", () => {
+    const source = configTemplate()
+      .replace('image = "oven/bun:1"', 'image = "oven/bun:1"\nprepare = "install shared"')
+      .replace(
+        'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+        'cache = []\ncontainer = { prepare = "install job tools" }',
+      );
+    expect(parseConfig(source).jobs[0]?.runtime).toEqual({
+      type: "container",
+      image: "oven/bun:1",
+      cpu: undefined,
+      memoryMb: undefined,
+      prepare: "install job tools",
+    });
+    expect(() =>
+      parseConfig(source.replace('prepare = "install job tools"', 'prepare = ""')),
+    ).toThrow("jobs[0].container.prepare must be a non-empty string");
   });
 
   test("jobs inherit and can override the top-level timeout", () => {
