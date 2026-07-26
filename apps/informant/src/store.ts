@@ -1,6 +1,7 @@
-import { appendFile, mkdir, readdir, rm, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BuildRecord } from "./types.ts";
 
 export function dataDirectory(): string {
@@ -11,7 +12,13 @@ function buildDirectory(id: string): string {
   return join(dataDirectory(), "builds", id);
 }
 
+export function jobLogPath(record: BuildRecord, job: string): string {
+  const id = createHash("sha256").update(job).digest("hex");
+  return join(dirname(record.logPath), "jobs", `${id}.log`);
+}
+
 const WORKSPACE_OWNER = ".owner.json";
+const buildSaves = new Map<string, Promise<void>>();
 
 function processStartIdentity(pid: number): string | undefined {
   const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
@@ -60,7 +67,26 @@ export async function createBuild(record: BuildRecord): Promise<void> {
 }
 
 export async function saveBuild(record: BuildRecord): Promise<void> {
-  await Bun.write(join(buildDirectory(record.id), "build.json"), JSON.stringify(record, null, 2));
+  const path = join(buildDirectory(record.id), "build.json");
+  const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
+  const contents = JSON.stringify(record, null, 2);
+  const previous = buildSaves.get(record.id) ?? Promise.resolve();
+  const save = previous
+    .catch(() => undefined)
+    .then(async () => {
+      try {
+        await Bun.write(temporaryPath, contents);
+        await rename(temporaryPath, path);
+      } finally {
+        await rm(temporaryPath, { force: true }).catch(() => undefined);
+      }
+    });
+  buildSaves.set(record.id, save);
+  try {
+    await save;
+  } finally {
+    if (buildSaves.get(record.id) === save) buildSaves.delete(record.id);
+  }
 }
 
 export async function appendLog(record: BuildRecord, text: string): Promise<void> {

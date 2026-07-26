@@ -31,6 +31,7 @@ import { disableStartup, enableStartup } from "./startup.ts";
 import {
   dataDirectory,
   getBuild,
+  jobLogPath,
   listAllBuilds,
   listBuilds,
   removeOrphanedBuildWorkspaces,
@@ -64,7 +65,7 @@ Usage:
   informant hook install                 Accelerate pushes with a pre-push hook
   informant hook uninstall               Remove Informant from the pre-push hook
   informant builds [--all]               List running builds or recent history
-  informant builds logs <id>             Print a build's log
+  informant logs [<build-id>]             Tail a build's logs or select a running job
   informant doctor                       Check host dependencies and auth
   informant --version
 `;
@@ -243,6 +244,65 @@ async function showBuilds(includeHistory: boolean): Promise<void> {
       : includeHistory
         ? "No local builds yet."
         : "No builds running.",
+  );
+}
+
+async function tailLog(
+  buildId: string,
+  path: string,
+  running: (build: NonNullable<Awaited<ReturnType<typeof getBuild>>>) => boolean,
+): Promise<void> {
+  let offset = 0;
+  const decoder = new TextDecoder();
+  const drain = async () => {
+    const file = Bun.file(path);
+    if (await file.exists()) {
+      if (file.size < offset) offset = 0;
+      if (file.size > offset) {
+        const bytes = new Uint8Array(await file.slice(offset, file.size).arrayBuffer());
+        offset = file.size;
+        process.stdout.write(decoder.decode(bytes, { stream: true }));
+      }
+    }
+  };
+  while (true) {
+    await drain();
+    const current = await getBuild(buildId);
+    if (!current || !running(current)) {
+      await drain();
+      const remainder = decoder.decode();
+      if (remainder) process.stdout.write(remainder);
+      return;
+    }
+    await Bun.sleep(250);
+  }
+}
+
+async function showLogs(id?: string): Promise<void> {
+  if (id) {
+    const build = await getBuild(id);
+    if (!build) throw new Error(`build not found: ${id}`);
+    return tailLog(build.id, build.logPath, (current) => current.status === "running");
+  }
+  if (!process.stdin.isTTY)
+    throw new Error("logs requires a build ID when input is not interactive");
+  const choices = (await listAllBuilds()).flatMap((build) =>
+    (build.runningJobs ?? []).map((job) => ({ build, job })),
+  );
+  if (choices.length === 0) {
+    console.log("No jobs running.");
+    return;
+  }
+  const choice = await select({
+    message: "Select a running job",
+    options: choices.map((choice) => ({
+      value: choice,
+      label: `${choice.job} · ${choice.build.repo} · ${choice.build.branch}@${choice.build.sha.slice(0, 7)}`,
+    })),
+  });
+  if (isCancel(choice)) return;
+  return tailLog(choice.build.id, jobLogPath(choice.build, choice.job), (current) =>
+    Boolean(current.runningJobs?.includes(choice.job)),
   );
 }
 
@@ -441,13 +501,9 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   if (subcommand === "hook") throw new Error("hook action must be one of: install, uninstall");
-  if (subcommand === "builds" && action === "logs") {
-    if (!id) throw new Error("builds logs requires a build ID");
-    const build = await getBuild(id);
-    if (!build) throw new Error(`build not found: ${id}`);
-    console.log(await Bun.file(build.logPath).text());
-    return;
-  }
+  if (subcommand === "logs") return showLogs(action);
+  if (subcommand === "builds" && action === "logs")
+    throw new Error("builds logs has moved to informant logs [<build-id>]");
   if (subcommand === "builds") return showBuilds(flags.all === true);
 
   if (process.stdin.isTTY) {

@@ -25,7 +25,7 @@ informant hook install                 Install the push-accelerating pre-push ho
 informant hook uninstall               Remove Informant from the pre-push hook
 informant builds                       List builds currently running on this machine
 informant builds --all                 List recent build history
-informant builds logs <id>             Print the retained local log for a build
+informant logs [<build-id>]             Tail a build's logs or select a running job
 informant doctor                       Verify host tools and GitHub auth
 ```
 
@@ -40,7 +40,9 @@ repository list.
 Local build records live under `~/.local/share/informant`; set `INFORMANT_DATA_DIR` to move them.
 The build list shows running jobs and links each build to its GitHub pull request or commit. Pass
 `--all` to show the 100 most recently updated local records. Retained logs contain at most the final
-1 MiB of stdout and 1 MiB of stderr from each command.
+1 MiB of stdout and 1 MiB of stderr from each command. Run `informant logs` interactively to select
+and follow a currently running job, or pass a build ID to follow its combined log directly. Informant
+timestamps job lifecycle events while leaving command output unchanged.
 
 `informant startup enable` installs and immediately loads a per-user macOS LaunchAgent. The worker
 restarts if it exits and starts again when you log in. Its output is written to `worker.stdout.log`

@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "./cli.ts";
@@ -74,6 +74,7 @@ test("builds shows running jobs by default and recent history with --all", async
       const directory = join(root, "builds", record.id);
       await mkdir(directory, { recursive: true });
       await Bun.write(join(directory, "build.json"), JSON.stringify(record));
+      await Bun.write(record.logPath, `${record.id} output\n`);
     }
 
     await main(["builds"]);
@@ -90,6 +91,29 @@ test("builds shows running jobs by default and recent history with --all", async
     expect(historyOutput).toContain(
       "https://github.com/owner/repo/commit/2222222222222222222222222222222222222222",
     );
+
+    let output = "";
+    const write = spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      output += String(chunk);
+      return true;
+    });
+    try {
+      const followed = main(["logs", "running-build"]);
+      await Bun.sleep(20);
+      const running = records[0];
+      if (!running) throw new Error("expected a running build");
+      await appendFile(running.logPath, "more output\n");
+      running.status = "success";
+      await Bun.write(join(root, "builds", running.id, "build.json"), JSON.stringify(running));
+      await followed;
+      expect(output).toBe("running-build output\nmore output\n");
+
+      output = "";
+      await main(["logs", "finished-build"]);
+      expect(output).toBe("finished-build output\n");
+    } finally {
+      write.mockRestore();
+    }
   } finally {
     log.mockRestore();
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;

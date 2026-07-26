@@ -12,6 +12,7 @@ import {
   checkoutBuildWorkspace,
   ensurePreparedImage,
   isRetryableSshAuthenticationFailure,
+  jobEventLine,
   preparedImageName,
   prunePreparedImages,
   resolveJobSecrets,
@@ -596,6 +597,40 @@ test("persistent build logs stop at their byte quota with a truncation marker", 
   expect(output).toEndWith(BUILD_LOG_TRUNCATION_MARKER);
   expect(output).not.toContain("�");
   expect(output).not.toContain("ignored");
+});
+
+test("bounded log writes serialize quota accounting", async () => {
+  let output = "";
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const write = boundedLogWriter(
+    async (text) => {
+      await blocked;
+      output += text;
+    },
+    8,
+    "!",
+  );
+
+  const writes = [write("123456"), write("abcdef"), write("ghijkl")];
+  await Bun.sleep(0);
+  release();
+  await Promise.all(writes);
+
+  expect(output).toBe("123456a!");
+});
+
+test("job event lines timestamp lifecycle changes without changing command output", () => {
+  const timestamp = new Date("2026-07-26T12:34:56.789Z");
+
+  expect(jobEventLine("test", "started", timestamp)).toBe(
+    "[2026-07-26T12:34:56.789Z] [test] started\n",
+  );
+  expect(jobEventLine("test", "finished (success)", timestamp)).toBe(
+    "[2026-07-26T12:34:56.789Z] [test] finished (success)\n",
+  );
 });
 
 describe("job scheduler", () => {
