@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { InformantConfig, JobConfig, Repository, TriggerRule } from "./types.ts";
+import type { InformantConfig, JobConfig, JobRuntime, Repository, TriggerRule } from "./types.ts";
 
 export const CONFIG_DIRECTORY = ".informant";
 export const CONFIG_FILE = `${CONFIG_DIRECTORY}/config.toml`;
@@ -11,17 +11,8 @@ const defaultDirectoryConfig = `version = 1
 timeout_minutes = 60
 triggers = [{ event = "commit", branch = { names = ["main"] } }]
 
-[vm]
-image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
-os = "macos"
-user = "admin"
-password = "admin"
-prepare = """
-set -euo pipefail
-curl -fsSL https://bun.sh/install | bash
-sudo mkdir -p /usr/local/bin
-sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
-"""
+[container]
+image = "oven/bun:1"
 `;
 
 const defaultJob = `name = "test"
@@ -252,12 +243,92 @@ function parseCaches(value: unknown, label: string, allowEmpty = false): JobConf
   });
 }
 
+function runtimeTable(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error(`${label} must be a table`);
+  return value as Record<string, unknown>;
+}
+
+const fallbackVm = {
+  image: "ghcr.io/cirruslabs/macos-tahoe-base:latest",
+  os: "macos",
+  user: "admin",
+  password: "admin",
+} satisfies Record<string, unknown>;
+
+function parseVm(
+  value: Record<string, unknown>,
+  label: string,
+  defaults?: Record<string, unknown>,
+): InformantConfig["vm"] {
+  const vm = { ...defaults, ...value };
+  if (typeof vm.image !== "string" || vm.image.trim().length === 0)
+    throw new Error(`${label}.image must be a non-empty string`);
+  const guestOs = vm.os ?? "macos";
+  if (guestOs !== "macos" && guestOs !== "linux")
+    throw new Error(`${label}.os must be "macos" or "linux"`);
+  const cpu = vm.cpu === undefined ? undefined : Number(vm.cpu);
+  if (cpu !== undefined && (!Number.isFinite(cpu) || cpu <= 0 || !Number.isInteger(cpu)))
+    throw new Error(`${label}.cpu must be a positive integer`);
+  const memoryMb = vm.memory_mb === undefined ? undefined : Number(vm.memory_mb);
+  if (
+    memoryMb !== undefined &&
+    (!Number.isFinite(memoryMb) || memoryMb <= 0 || !Number.isInteger(memoryMb))
+  )
+    throw new Error(`${label}.memory_mb must be a positive integer`);
+  const user = vm.user ?? "admin";
+  const password = vm.password ?? "admin";
+  if (typeof user !== "string" || !/^[A-Za-z_][A-Za-z0-9._-]*$/.test(user))
+    throw new Error(`${label}.user must be a valid account name`);
+  if (typeof password !== "string")
+    throw new Error(`${label}.password must be a string (an empty password is allowed)`);
+  const rawPrepare = vm.prepare;
+  if (
+    rawPrepare !== undefined &&
+    (typeof rawPrepare !== "string" || rawPrepare.trim().length === 0)
+  )
+    throw new Error(`${label}.prepare must be a non-empty string`);
+  return {
+    type: "vm",
+    image: vm.image,
+    guestOs,
+    user,
+    password,
+    cpu,
+    memoryMb,
+    prepare: typeof rawPrepare === "string" ? rawPrepare.trim() : undefined,
+  };
+}
+
+function parseContainer(value: Record<string, unknown>, label: string): JobRuntime {
+  if (typeof value.image !== "string" || !value.image.trim())
+    throw new Error(`${label}.image must be a non-empty string`);
+  const cpu = value.cpu === undefined ? undefined : Number(value.cpu);
+  const memoryMb = value.memory_mb === undefined ? undefined : Number(value.memory_mb);
+  if (cpu !== undefined && (!Number.isFinite(cpu) || cpu <= 0))
+    throw new Error(`${label}.cpu must be a positive number`);
+  if (memoryMb !== undefined && (!Number.isInteger(memoryMb) || memoryMb <= 0))
+    throw new Error(`${label}.memory_mb must be a positive integer`);
+  return {
+    type: "container",
+    image: value.image,
+    cpu,
+    memoryMb,
+  };
+}
+
 export function parseConfig(source: string, label = CONFIG_FILE): InformantConfig {
   const raw = Bun.TOML.parse(source) as Record<string, unknown>;
   if (raw.version !== 1) {
     throw new Error(`${label} version must be 1`);
   }
-  const vm = (raw.vm ?? {}) as Record<string, unknown>;
+  const vm = raw.vm === undefined ? fallbackVm : runtimeTable(raw.vm, "vm");
+  const container =
+    raw.container === undefined ? undefined : runtimeTable(raw.container, "container");
+  if (raw.vm !== undefined && container !== undefined)
+    throw new Error("configure only one default runtime: vm or container");
+  const parsedVm = parseVm(vm, "vm");
+  const defaultRuntime = container ? parseContainer(container, "container") : parsedVm;
   const rawJobs = raw.jobs;
   if (raw.branches !== undefined && raw.triggers !== undefined)
     throw new Error("branches and triggers cannot both be set");
@@ -311,6 +382,17 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     }
     const cache =
       job.cache === undefined ? defaultCache : parseCaches(job.cache, `jobs[${index}].cache`, true);
+    if (job.vm !== undefined && job.container !== undefined)
+      throw new Error(`jobs[${index}] must configure only one runtime`);
+    const runtime =
+      job.container !== undefined
+        ? parseContainer(
+            runtimeTable(job.container, `jobs[${index}].container`),
+            `jobs[${index}].container`,
+          )
+        : job.vm !== undefined
+          ? parseVm(runtimeTable(job.vm, `jobs[${index}].vm`), `jobs[${index}].vm`, vm)
+          : defaultRuntime;
     return {
       name: job.name,
       command: job.command.trim(),
@@ -327,6 +409,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
           ? topTriggers
           : parseTriggers(job.triggers, `jobs[${index}].triggers`),
       cache,
+      runtime,
     };
   });
   const jobNames = new Set(jobs.map((job) => job.name));
@@ -349,57 +432,15 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     visited.add(name);
   };
   for (const job of jobs) visit(job.name);
-  if (typeof vm.image !== "string" || vm.image.trim().length === 0) {
-    throw new Error("vm.image must be a non-empty string");
-  }
-  const guestOs = vm.os ?? "macos";
-  if (guestOs !== "macos" && guestOs !== "linux") {
-    throw new Error('vm.os must be "macos" or "linux"');
-  }
-  const cpu = vm.cpu === undefined ? undefined : Number(vm.cpu);
-  if (cpu !== undefined && (!Number.isFinite(cpu) || cpu <= 0 || !Number.isInteger(cpu))) {
-    throw new Error("vm.cpu must be a positive integer");
-  }
-  const memoryMb = vm.memory_mb === undefined ? undefined : Number(vm.memory_mb);
-  if (
-    memoryMb !== undefined &&
-    (!Number.isFinite(memoryMb) || memoryMb <= 0 || !Number.isInteger(memoryMb))
-  ) {
-    throw new Error("vm.memory_mb must be a positive integer");
-  }
   const pollIntervalSeconds = Number(raw.poll_interval_seconds ?? 30);
   if (!Number.isFinite(pollIntervalSeconds) || pollIntervalSeconds <= 0) {
     throw new Error("poll_interval_seconds must be a positive number");
   }
-  const user = vm.user ?? "admin";
-  const password = vm.password ?? "admin";
-  if (typeof user !== "string" || !/^[A-Za-z_][A-Za-z0-9._-]*$/.test(user)) {
-    throw new Error("vm.user must be a valid account name");
-  }
-  if (typeof password !== "string") {
-    throw new Error("vm.password must be a string (an empty password is allowed)");
-  }
-  const rawPrepare = vm.prepare;
-  if (
-    rawPrepare !== undefined &&
-    (typeof rawPrepare !== "string" || rawPrepare.trim().length === 0)
-  ) {
-    throw new Error("vm.prepare must be a non-empty string");
-  }
-  const prepare = typeof rawPrepare === "string" ? rawPrepare.trim() : undefined;
   return {
     version: raw.version,
     pollIntervalSeconds: Math.max(5, pollIntervalSeconds),
     triggers: topTriggers,
-    vm: {
-      image: vm.image,
-      guestOs,
-      user,
-      password,
-      cpu,
-      memoryMb,
-      prepare,
-    },
+    vm: parsedVm,
     jobs,
   };
 }

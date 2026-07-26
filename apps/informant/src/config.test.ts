@@ -15,17 +15,28 @@ command = "bun install --frozen-lockfile && bun test"
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 `;
 
+const vmConfigTemplate = () =>
+  configTemplate().replace(
+    '[container]\nimage = "oven/bun:1"',
+    `[vm]
+image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+os = "macos"
+user = "admin"
+password = "admin"
+prepare = """
+set -euo pipefail
+curl -fsSL https://bun.sh/install | bash
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
+"""`,
+  );
+
 describe("configuration", () => {
   test("parses the generated template", () => {
     const config = parseConfig(configTemplate());
     expect(directoryConfigTemplate()).not.toContain("poll_interval_seconds");
     expect(config.pollIntervalSeconds).toBe(30);
-    expect(config.vm).toMatchObject({
-      guestOs: "macos",
-      user: "admin",
-      prepare:
-        'set -euo pipefail\ncurl -fsSL https://bun.sh/install | bash\nsudo mkdir -p /usr/local/bin\nsudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun',
-    });
+    expect(config.vm).toMatchObject({ guestOs: "macos", user: "admin" });
     expect(config.jobs).toEqual([
       {
         name: "test",
@@ -38,6 +49,12 @@ describe("configuration", () => {
           { event: "commit", branch: { names: ["main"] }, tag: undefined, pullRequest: undefined },
         ],
         cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
+        runtime: {
+          type: "container",
+          image: "oven/bun:1",
+          cpu: undefined,
+          memoryMb: undefined,
+        },
       },
     ]);
   });
@@ -98,7 +115,7 @@ describe("configuration", () => {
       ["memory_mb", "0"],
     ]) {
       expect(() =>
-        parseConfig(configTemplate().replace("[vm]", `[vm]\n${field} = ${value}`)),
+        parseConfig(vmConfigTemplate().replace("[vm]", `[vm]\n${field} = ${value}`)),
       ).toThrow(`vm.${field} must be a positive integer`);
     }
   });
@@ -106,7 +123,7 @@ describe("configuration", () => {
   test("requires a non-empty VM image", () => {
     expect(() =>
       parseConfig(
-        configTemplate().replace(
+        vmConfigTemplate().replace(
           'image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"',
           'image = "   "',
         ),
@@ -115,11 +132,11 @@ describe("configuration", () => {
   });
 
   test("defaults the guest OS to macOS and accepts Linux", () => {
-    expect(parseConfig(configTemplate().replace('os = "macos"\n', "")).vm.guestOs).toBe("macos");
-    expect(parseConfig(configTemplate().replace('os = "macos"', 'os = "linux"')).vm.guestOs).toBe(
+    expect(parseConfig(vmConfigTemplate().replace('os = "macos"\n', "")).vm.guestOs).toBe("macos");
+    expect(parseConfig(vmConfigTemplate().replace('os = "macos"', 'os = "linux"')).vm.guestOs).toBe(
       "linux",
     );
-    expect(() => parseConfig(configTemplate().replace('os = "macos"', 'os = "windows"'))).toThrow(
+    expect(() => parseConfig(vmConfigTemplate().replace('os = "macos"', 'os = "windows"'))).toThrow(
       'vm.os must be "macos" or "linux"',
     );
   });
@@ -127,27 +144,70 @@ describe("configuration", () => {
   test("validates VM credentials while allowing an explicitly empty password", () => {
     expect(
       parseConfig(
-        configTemplate().replace(
+        vmConfigTemplate().replace(
           'user = "admin"\npassword = "admin"',
           'user = "builder"\npassword = ""',
         ),
       ).vm,
     ).toMatchObject({ user: "builder", password: "" });
     expect(() =>
-      parseConfig(configTemplate().replace('user = "admin"', 'user = "-oProxyCommand=bad"')),
+      parseConfig(vmConfigTemplate().replace('user = "admin"', 'user = "-oProxyCommand=bad"')),
     ).toThrow("vm.user must be a valid account name");
-    expect(() => parseConfig(configTemplate().replace('user = "admin"', "user = [1]"))).toThrow(
+    expect(() => parseConfig(vmConfigTemplate().replace('user = "admin"', "user = [1]"))).toThrow(
       "vm.user must be a valid account name",
     );
     expect(() =>
-      parseConfig(configTemplate().replace('password = "admin"', "password = { value = 1 }")),
+      parseConfig(vmConfigTemplate().replace('password = "admin"', "password = { value = 1 }")),
     ).toThrow("vm.password must be a string");
   });
 
   test("requires a non-empty VM preparation command", () => {
     expect(() =>
-      parseConfig(configTemplate().replace(/prepare = """[\s\S]*?"""/, 'prepare = ""')),
+      parseConfig(vmConfigTemplate().replace(/prepare = """[\s\S]*?"""/, 'prepare = ""')),
     ).toThrow("vm.prepare must be a non-empty string");
+  });
+
+  test("parses container defaults and per-job VM overrides", () => {
+    const source = configTemplate()
+      .replace('image = "oven/bun:1"', 'image = "oven/bun:1"\ncpu = 1.5\nmemory_mb = 512')
+      .replace(
+        'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+        'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]\nvm = { image = "macos", os = "macos", cpu = 4 }',
+      );
+    expect(parseConfig(source).jobs[0]?.runtime).toMatchObject({
+      type: "vm",
+      image: "macos",
+      guestOs: "macos",
+      cpu: 4,
+    });
+    const containerOnly = source.replace(/\nvm = \{[^\n]+\}/, "");
+    expect(parseConfig(containerOnly).jobs[0]?.runtime).toEqual({
+      type: "container",
+      image: "oven/bun:1",
+      cpu: 1.5,
+      memoryMb: 512,
+    });
+    expect(() => parseConfig(containerOnly.replace('image = "oven/bun:1"', 'image = ""'))).toThrow(
+      "container.image must be a non-empty string",
+    );
+  });
+
+  test("parses container overrides and validates runtime tables", () => {
+    const source = configTemplate().replace(
+      'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+      'cache = []\ncontainer = { image = "oven/bun:1", cpu = 0.5 }',
+    );
+    expect(parseConfig(source).jobs[0]?.runtime).toEqual({
+      type: "container",
+      image: "oven/bun:1",
+      cpu: 0.5,
+      memoryMb: undefined,
+    });
+    expect(() =>
+      parseConfig(
+        source.replace('container = { image = "oven/bun:1", cpu = 0.5 }', "container = true"),
+      ),
+    ).toThrow("jobs[0].container must be a table");
   });
 
   test("jobs inherit and can override the top-level timeout", () => {

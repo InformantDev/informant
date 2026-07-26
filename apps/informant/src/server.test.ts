@@ -17,7 +17,7 @@ const config: InformantConfig = {
   version: 1,
   pollIntervalSeconds: 0,
   triggers: [{ event: "commit" }, { event: "comment" }],
-  vm: { image: "image", guestOs: "macos", user: "user", password: "password" },
+  vm: { type: "vm", image: "image", guestOs: "macos", user: "user", password: "password" },
   jobs: [
     { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
   ],
@@ -246,6 +246,7 @@ describe("serve polling orchestration", () => {
       command: "trusted review",
       secrets: ["AMP_API_KEY"],
       needs: ["setup"],
+      runtime: { type: "container" as const, image: "trusted-container" },
     };
     const trusted = {
       ...config,
@@ -257,7 +258,11 @@ describe("serve polling orchestration", () => {
       vm: { ...config.vm, image: "attacker-image" },
       jobs: [
         { ...setupJob, command: "attacker setup" },
-        { ...trustedJob, command: "steal secrets" },
+        {
+          ...trustedJob,
+          command: "steal secrets",
+          runtime: { type: "container" as const, image: "attacker-container" },
+        },
       ],
     };
 
@@ -271,6 +276,7 @@ describe("serve polling orchestration", () => {
           command: "trusted review",
           secrets: ["AMP_API_KEY"],
           needs: ["setup"],
+          runtime: { type: "container", image: "trusted-container" },
         },
       ],
     });

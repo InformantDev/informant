@@ -29,12 +29,7 @@ import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup } from "./startup.ts";
 import { dataDirectory, getBuild, listBuilds, removeOrphanedBuildWorkspaces } from "./store.ts";
-import {
-  ensurePreparedImage,
-  listPreparedImages,
-  prunePreparedImages,
-  pruneStoppedJobVms,
-} from "./tart/index.ts";
+import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Macs
 
@@ -47,7 +42,7 @@ Usage:
   informant serve [--once]                Poll all registered repositories
   informant run [--ref <ref>] [--job <name>]
                                         Manually request all or selected jobs
-  informant image prepare                Prepare this repository's cached VM image
+  informant image prepare                Prepare this repository's configured VM job images
   informant image list                   List Informant-prepared VM images
   informant image prune                  Delete unused prepared VM images
   informant cache path                   Print the persistent job cache directory
@@ -225,8 +220,21 @@ async function showBuilds(): Promise<void> {
 async function manageImages(action?: string): Promise<void> {
   if (action === "prepare") {
     const repository = await repositoryFromGit();
-    const image = await ensurePreparedImage(await readConfig(), console.log, repository.fullName);
-    outro(`Prepared ${image}`);
+    const config = await readConfig();
+    const vmJobs = config.jobs.filter((job) => job.runtime?.type === "vm");
+    if (vmJobs.length === 0) throw new Error("configuration has no VM jobs to prepare");
+    const images = new Set<string>();
+    for (const job of vmJobs) {
+      if (job.runtime?.type !== "vm") continue;
+      images.add(
+        await ensurePreparedImage(
+          { ...config, vm: job.runtime },
+          console.log,
+          `${repository.fullName}\0${job.name}`,
+        ),
+      );
+    }
+    outro(`Prepared ${[...images].join(", ")}`);
     return;
   }
   if (action === "list" || !action) {
@@ -309,14 +317,12 @@ async function manageRepositories(action?: string, value?: string): Promise<void
 }
 
 async function doctor(): Promise<void> {
-  const checks: Array<[string, string[]]> = [
+  const requiredChecks: Array<[string, string[]]> = [
     ["git", ["git", "--version"]],
     ["GitHub CLI", ["gh", "auth", "status"]],
-    ["Tart", ["tart", "--version"]],
-    ["sshpass", ["sshpass", "-V"]],
   ];
   let failed = false;
-  for (const [label, argv] of checks) {
+  for (const [label, argv] of requiredChecks) {
     const result = await command(argv);
     const okay = result.exitCode === 0;
     failed ||= !okay;
@@ -324,10 +330,28 @@ async function doctor(): Promise<void> {
       `${okay ? "✓" : "✗"} ${label}${okay ? "" : ` — ${result.stderr.trim() || "not found"}`}`,
     );
   }
-  if (process.platform !== "darwin" || process.arch !== "arm64") {
-    console.log("✗ host — Tart requires macOS on Apple Silicon");
+  const docker = await command(["docker", "version"]);
+  const tart = await command(["tart", "--version"]);
+  const sshpass = await command(["sshpass", "-V"]);
+  const tartHost = process.platform === "darwin" && process.arch === "arm64";
+  const dockerReady = docker.exitCode === 0;
+  const tartReady = tart.exitCode === 0 && sshpass.exitCode === 0 && tartHost;
+  console.log(
+    `${dockerReady ? "✓" : "○"} Docker${dockerReady ? "" : ` — ${docker.stderr.trim() || "not found"}`}`,
+  );
+  console.log(
+    `${tart.exitCode === 0 ? "✓" : "○"} Tart${tart.exitCode === 0 ? "" : ` — ${tart.stderr.trim() || "not found"}`}`,
+  );
+  console.log(
+    `${sshpass.exitCode === 0 ? "✓" : "○"} sshpass${sshpass.exitCode === 0 ? "" : ` — ${sshpass.stderr.trim() || "not found"}`}`,
+  );
+  console.log(
+    `${tartHost ? "✓" : "○"} ${tartHost ? "macOS on Apple Silicon" : "host — Tart requires macOS on Apple Silicon"}`,
+  );
+  if (!dockerReady && !tartReady) {
+    console.log("✗ runtime — install Docker for container jobs or Tart and sshpass for VM jobs");
     failed = true;
-  } else console.log("✓ macOS on Apple Silicon");
+  }
   try {
     const apps = await listGitHubCredentials();
     if (apps.length === 0) throw new Error("run informant setup");
@@ -368,7 +392,6 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
       throw new Error("no repositories registered; run informant repo add owner/repository");
     }
     const removedWorkspaces = await removeOrphanedBuildWorkspaces();
-    const removedVms = await pruneStoppedJobVms();
     intro(
       `Informant worker · ${repositories.length} ${repositories.length === 1 ? "repository" : "repositories"}`,
     );
@@ -376,9 +399,6 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
       console.log(
         `Cleaned ${removedWorkspaces} orphaned build ${removedWorkspaces === 1 ? "workspace" : "workspaces"}`,
       );
-    }
-    if (removedVms > 0) {
-      console.log(`Deleted ${removedVms} stale Tart ${removedVms === 1 ? "VM" : "VMs"}`);
     }
     return serveRepositories(repositories, {
       once: flags.once === true,

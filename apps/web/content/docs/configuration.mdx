@@ -17,34 +17,29 @@ triggers = [
   { event = "comment", pull_request = { state = "open", draft = false, base_branches = ["main"] } }
 ]
 
-[vm]
-image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
-os = "macos"
-user = "admin"
-password = "admin"
-cpu = 4
-memory_mb = 8192
-prepare = """
-set -euo pipefail
-curl -fsSL https://bun.sh/install | bash
-sudo mkdir -p /usr/local/bin
-sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
-"""
+[container]
+image = "oven/bun:1"
+cpu = 2
+memory_mb = 2048
 ```
 
 Informant polls every 30 seconds by default. Set `poll_interval_seconds` only when a repository needs
 a different cadence; values below five seconds are clamped to five.
 
-`vm.os` defaults to `"macos"`, preserving existing configurations. To use an official Tart Linux
-image, select Linux explicitly:
+The top-level `container` or `vm` table is the default runtime for every job. Existing configurations
+with `[vm]` remain valid. A job can override the default with an inline `container` or `vm` table; the
+two are mutually exclusive. For example, a macOS E2E job in an otherwise container-based pipeline is:
 
 ```toml
-[vm]
-os = "linux"
-image = "ghcr.io/cirruslabs/ubuntu:latest"
-user = "admin"
-password = "admin"
+[[jobs]]
+name = "macos-e2e"
+command = "bun run test:e2e"
+vm = { image = "ghcr.io/cirruslabs/macos-tahoe-base:latest", os = "macos", user = "admin", password = "admin", cpu = 4, memory_mb = 8192 }
 ```
+
+Container jobs require Docker and run with the checkout bind-mounted at `/workspace`. Cache directories use isolated host
+storage under `/home/root` in the container. Declared secrets are inherited by name from the Docker
+client environment, never included in command arguments, and redacted using the same policy as VMs.
 
 Informant mounts the checkout and other Tart shared directories beneath `/mnt/shared` on Linux;
 Linux user caches are beneath `/home/<user>`. On macOS, these remain `/Volumes/My Shared Files` and
@@ -93,8 +88,8 @@ needs = ["test", "lint"]
 Top-level `timeout_minutes` is inherited by every job. Set `timeout_minutes` on an individual job only
 when it needs a different limit.
 
-Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh Tart VM and isolated
-checkout mounted at `/Volumes/My Shared Files/workspace`. Use `needs` to make a job wait for one or
+Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh container or Tart VM
+and isolated checkout. Use `needs` to make a job wait for one or
 more other jobs. Linux guests instead use `/mnt/shared/workspace`. In this example, `test` and `lint`
 start together; `build` starts only after both pass.
 If a dependency fails or times out, jobs that need it are skipped.
@@ -158,7 +153,7 @@ top-level `triggers`. Manual `informant run` ignores trigger eligibility.
 stopped result as a local Tart image and clones jobs from it, so tools such as Bun do not need to be
 installed in every job. Changing `vm.image`, `vm.os`, `vm.user`, or `vm.prepare` creates a new prepared image.
 
-Preparation is automatic. Use `informant image prepare` to warm the image ahead of a build,
+Preparation is automatic. Use `informant image prepare` to warm all configured VM job images ahead of a build,
 `informant image list` to inspect prepared images, and `informant image prune` to remove images that
 no repository still references. Every worker prepares its own local copy, which keeps multi-machine
 setup automatic.

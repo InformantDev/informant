@@ -1,10 +1,11 @@
 import { chmod, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { runInDocker } from "../docker.ts";
 import { command, requireCommand } from "../process.ts";
 import { appendLog, claimBuildWorkspace } from "../store.ts";
 import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
 import { cacheMounts } from "./cache.ts";
-import { ensurePreparedImage } from "./images.ts";
+import { ensurePreparedImage, pruneStoppedJobVms } from "./images.ts";
 import {
   bunCopyfileBackend,
   guestSharedRoot,
@@ -24,6 +25,16 @@ export {
 export { isRetryableSshAuthenticationFailure } from "./vm.ts";
 
 export type RuntimeSecrets = Record<string, string | (() => Promise<string>)>;
+
+let staleVmCleanup: Promise<number> | undefined;
+
+async function cleanStaleVms(): Promise<void> {
+  staleVmCleanup ??= pruneStoppedJobVms().catch((error) => {
+    staleVmCleanup = undefined;
+    throw error;
+  });
+  await staleVmCleanup;
+}
 
 export async function resolveJobSecrets(
   job: InformantConfig["jobs"][number],
@@ -88,7 +99,9 @@ export function streamingSecretRedactor(
   secrets: string[],
   output: (text: string) => Promise<void>,
 ): { write: (text: string) => Promise<void>; flush: () => Promise<void> } {
-  const values = [...new Set(secrets)].sort((a, b) => b.length - a.length);
+  const values = [...new Set(secrets.filter((value) => value.length > 0))].sort(
+    (a, b) => b.length - a.length,
+  );
   const retainedCharacters = Math.max(0, ...values.map((value) => value.length - 1));
   let pending = "";
   const drain = async (final: boolean) => {
@@ -424,6 +437,7 @@ export async function runInTart(
   signal?: AbortSignal,
   runtimeSecrets: RuntimeSecrets = {},
 ): Promise<boolean> {
+  if (config.jobs.some((job) => job.runtime?.type !== "container")) await cleanStaleVms();
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
   const workspaces = config.jobs.map((_, index) => join(root, `job-${index}`));
@@ -473,14 +487,6 @@ export async function runInTart(
     await claimBuildWorkspace(root);
     logHandle = await open(record.logPath, "a");
     await writeLog(`$ cloning ${repository.fullName} at ${sha}\n`);
-    const image = await ensurePreparedImage(
-      config,
-      async (message) => {
-        await writeLog(`$ ${message}\n`);
-      },
-      repository.fullName,
-      signal,
-    );
     await requireCommand(
       ["gh", "repo", "clone", repository.fullName, repositoryPath, "--", "--no-checkout"],
       `could not clone ${repository.fullName}`,
@@ -506,20 +512,41 @@ export async function runInTart(
       async (job, index) => {
         const workspace = workspaces[index];
         if (!workspace) throw new Error(`workspace missing for job ${job.name}`);
-        const success = await runJob(
-          `informant-${record.id}-${index}`,
-          image,
-          repository,
-          sha,
-          record.branch,
-          workspace,
-          config,
-          job,
-          (text) => logJob(job, text),
-          () => notify(() => observer.started?.(job)),
-          runtimeSecrets,
-          signal,
-        );
+        const runtime = job.runtime ?? config.vm;
+        const success =
+          runtime.type === "container"
+            ? await runInDocker(
+                repository,
+                sha,
+                record.branch,
+                config.trustedSha ?? sha,
+                config.trustedSha === sha,
+                workspace,
+                job,
+                (text) => logJob(job, text),
+                () => notify(() => observer.started?.(job)),
+                runtimeSecrets,
+                signal,
+              )
+            : await runJob(
+                `informant-${record.id}-${index}`,
+                await ensurePreparedImage(
+                  { ...config, vm: runtime },
+                  async (message) => writeLog(`$ ${message}\n`),
+                  `${repository.fullName}\0${job.name}`,
+                  signal,
+                ),
+                repository,
+                sha,
+                record.branch,
+                workspace,
+                { ...config, vm: runtime },
+                job,
+                (text) => logJob(job, text),
+                () => notify(() => observer.started?.(job)),
+                runtimeSecrets,
+                signal,
+              );
         const outcome = signal?.aborted ? "cancelled" : success ? "success" : "failure";
         await writes;
         await flushProgress(job);

@@ -65,6 +65,16 @@ test("redacts secrets split across streamed log chunks", async () => {
   expect(output).toBe("before [REDACTED] after");
 });
 
+test("ignores empty values while redacting streamed secrets", async () => {
+  let output = "";
+  const redactor = streamingSecretRedactor(["", "secret"], async (text) => {
+    output += text;
+  });
+  await redactor.write("before secret after");
+  await redactor.flush();
+  expect(output).toBe("before [REDACTED] after");
+});
+
 test("prepares and cleans up a restricted secret mount", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-secrets-"));
   const workspace = join(root, "workspace");
@@ -171,7 +181,14 @@ const config = (prepare?: string): InformantConfig => ({
   version: 1,
   pollIntervalSeconds: 20,
   branches: ["main"],
-  vm: { image: "base", guestOs: "macos", user: "admin", password: "admin", prepare },
+  vm: {
+    type: "vm",
+    image: "base",
+    guestOs: "macos",
+    user: "admin",
+    password: "admin",
+    prepare,
+  },
   jobs: [job("test")],
 });
 
