@@ -16,6 +16,15 @@ export const COMMENT_CLAIM_NAME = "Informant CI / comment";
 export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
 const rateLimitGates = new Map<string, number>();
+const RETRYABLE_CHECK_CONCLUSIONS = new Set([
+  "action_required",
+  "cancelled",
+  "failure",
+  "skipped",
+  "stale",
+  "startup_failure",
+  "timed_out",
+]);
 
 export interface ClaimResult {
   check?: CheckRun;
@@ -616,6 +625,22 @@ export class GitHubClient {
       requestedChecks.length === 0 &&
       initialChecks.some((check) => check.status === "completed") &&
       (await this.checkSuiteStatus(repository, sha, initialName)) === "queued";
+    const previousAggregate = suiteRerun
+      ? initialChecks
+          .filter((check) => check.status === "completed" && check.conclusion !== "neutral")
+          .sort((a, b) => b.id - a.id)[0]
+      : undefined;
+    const failedRerunJobs = previousAggregate
+      ? [
+          ...new Set(
+            (await this.jobChecks(repository, sha, previousAggregate.id))
+              .filter((check) =>
+                check.conclusion ? RETRYABLE_CHECK_CONCLUSIONS.has(check.conclusion) : false,
+              )
+              .map((check) => check.name.slice(JOB_CHECK_PREFIX.length)),
+          ),
+        ]
+      : [];
     const claimEvent =
       requestedChecks.length > 0 || suiteRerun ? { type: "manual" as const, id: sha } : event;
     const name = claimEvent.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
@@ -719,6 +744,10 @@ export class GitHubClient {
       const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
         ? []
         : [...new Set(jobRequests.flat())];
+      // GitHub's polling API does not expose whether a queued failed suite was
+      // rerequested as "all" or "failed". Prefer retrying its unsuccessful and
+      // incomplete jobs; explicit Informant requests still support all jobs.
+      if (suiteRerun && failedRerunJobs.length > 0) requestedJobs.push(...failedRerunJobs);
       await Promise.all(
         queued.map((check) =>
           this.updateCheck(repository, check.id, {

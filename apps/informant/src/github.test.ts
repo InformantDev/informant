@@ -385,7 +385,7 @@ test("interrupted build recovery cancels only correlated children before the agg
   expect(updates).toEqual([3, 2]);
 });
 
-test("claim treats a queued check suite as a GitHub UI re-run request", async () => {
+test("claim treats a queued failed check suite as a failed-jobs re-run request", async () => {
   const checks: Array<Record<string, unknown>> = [
     { id: 1, name: "Informant CI", status: "completed", conclusion: "failure" },
   ];
@@ -405,6 +405,40 @@ test("claim treats a queued check suite as a GitHub UI re-run request", async ()
     if (url.includes("check-suites")) {
       return Response.json({ check_suites: [{ status: "queued" }] });
     }
+    if (!new URL(url).searchParams.has("check_name")) {
+      return Response.json({
+        check_runs: [
+          {
+            id: 10,
+            name: "Informant / lint",
+            status: "completed",
+            conclusion: "success",
+            external_id: "informant-job:1:bGludA",
+          },
+          {
+            id: 11,
+            name: "Informant / typecheck",
+            status: "completed",
+            conclusion: "failure",
+            external_id: "informant-job:1:dHlwZWNoZWNr",
+          },
+          {
+            id: 12,
+            name: "Informant / deploy",
+            status: "completed",
+            conclusion: "skipped",
+            external_id: "informant-job:1:ZGVwbG95",
+          },
+          {
+            id: 13,
+            name: "Informant / cleanup",
+            status: "completed",
+            conclusion: "cancelled",
+            external_id: "informant-job:1:Y2xlYW51cA",
+          },
+        ],
+      });
+    }
     return Response.json({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
@@ -415,6 +449,33 @@ test("claim treats a queued check suite as a GitHub UI re-run request", async ()
   );
 
   expect(claim?.check?.id).toBe(2);
+  expect(claim?.requestedJobs).toEqual(["typecheck", "deploy", "cleanup"]);
+});
+
+test("claim falls back to all jobs when a queued suite has no failed job history", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    { id: 1, name: "Informant CI", status: "completed", conclusion: "success" },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = { id: 2, name: body.name, status: body.status, external_id: body.external_id };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (url.includes("check-suites"))
+      return Response.json({ check_suites: [{ status: "queued" }] });
+    if (!new URL(url).searchParams.has("check_name")) return Response.json({ check_runs: [] });
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "machine",
+  );
+
   expect(claim?.requestedJobs).toEqual([]);
 });
 
