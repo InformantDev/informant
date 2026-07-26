@@ -7,6 +7,7 @@ import type { InformantConfig, Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
+const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
@@ -99,6 +100,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const inFlightRuns = new Map<string, Promise<void>>();
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
   const completedComments = new Set<number>();
+  const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
   const configAt = (sha: string) => {
     const cached = configs.get(sha);
@@ -142,12 +144,17 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   };
   const drainRuns = async () => {
     await Promise.allSettled(inFlightRuns.values());
-    if (completedComments.size > 0) {
+    if (completedComments.size > 0 || completedTags.size > 0) {
       const completed = new Set(completedComments);
+      const completedTagEvents = new Set(completedTags);
       const state = await loadPollState(repository.fullName);
       state.pending = state.pending.filter((item) => !completed.has(item.id));
+      state.pendingTags = state.pendingTags.filter(
+        (item) => !completedTagEvents.has(`tag:${item.name}:${item.sha}`),
+      );
       await persistPollState(repository.fullName, state);
       for (const id of completed) completedComments.delete(id);
+      for (const id of completedTagEvents) completedTags.delete(id);
     }
   };
   do {
@@ -161,10 +168,42 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       const defaultSha = await github.branchHead(repository, defaultBranch);
       const bootstrap = await configAt(defaultSha);
       intervalSeconds = bootstrap.pollIntervalSeconds;
-      const [branches, prs] = await Promise.all([
+      const state = await loadPollState(repository.fullName);
+      const hasTagTriggers = bootstrap.jobs.some((job) =>
+        (job.triggers ?? bootstrap.triggers ?? []).some((rule) => rule.tag !== undefined),
+      );
+      const shouldPollTags =
+        hasTagTriggers &&
+        (!state.tagsPolledAt ||
+          Date.now() - new Date(state.tagsPolledAt).getTime() >= TAG_POLL_INTERVAL_MS);
+      const [branches, tags, prs] = await Promise.all([
         github.branches(repository),
+        shouldPollTags ? github.tags(repository) : undefined,
         github.pullRequests(repository),
       ]);
+      const completedTagEvents = new Set(completedTags);
+      if (completedTagEvents.size > 0) {
+        state.pendingTags = state.pendingTags.filter(
+          (item) => !completedTagEvents.has(`tag:${item.name}:${item.sha}`),
+        );
+      }
+      if (tags) {
+        if (state.tagRefs !== undefined) {
+          const previous = new Set(state.tagRefs.map((tag) => `${tag.name}\0${tag.sha}`));
+          const pending = new Set(state.pendingTags.map((tag) => `${tag.name}\0${tag.sha}`));
+          for (const tag of tags) {
+            const key = `${tag.name}\0${tag.sha}`;
+            if (!previous.has(key) && !pending.has(key)) {
+              state.pendingTags.push(tag);
+              pending.add(key);
+            }
+          }
+        }
+        state.tagRefs = tags;
+        state.tagsPolledAt = new Date().toISOString();
+      }
+      await persistPollState(repository.fullName, state);
+      for (const id of completedTagEvents) completedTags.delete(id);
       const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
       const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
       for (const [lane, active] of automaticLanes) {
@@ -202,6 +241,14 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             eventId: `pr:${pullRequest.number}:${pullRequest.headSha}`,
             lane: `pr:${pullRequest.number}`,
           })),
+        ...state.pendingTags.map((tag) => ({
+          sha: tag.sha,
+          branch: tag.name,
+          tag: tag.name,
+          pullRequest: undefined,
+          eventId: `tag:${tag.name}:${tag.sha}`,
+          lane: `tag:${tag.name}`,
+        })),
       ]) {
         if (options.signal?.aborted) {
           abortAutomaticRuns();
@@ -209,14 +256,15 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           return;
         }
         const previous = automaticLanes.get(target.lane);
-        if (previous && previous.sha !== target.sha) {
+        if (!("tag" in target) && previous && previous.sha !== target.sha) {
           previous.controller.abort(`Superseded by ${target.branch}@${target.sha.slice(0, 7)}.`);
           automaticLanes.delete(target.lane);
         }
         if (inFlightRuns.has(target.eventId)) continue;
         const context = {
           type: "commit" as const,
-          branch: target.pullRequest ? undefined : target.branch,
+          branch: target.pullRequest || "tag" in target ? undefined : target.branch,
+          tag: "tag" in target && typeof target.tag === "string" ? target.tag : undefined,
           pullRequest: target.pullRequest,
         };
         try {
@@ -224,9 +272,20 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           const matches = config.jobs.some((job) =>
             (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
           );
-          if (!matches && !(await hasPendingManualRequest(target.sha))) continue;
+          if (!matches) {
+            if ("tag" in target) {
+              state.pendingTags = state.pendingTags.filter(
+                (item) => item.name !== target.tag || item.sha !== target.sha,
+              );
+              await persistPollState(repository.fullName, state);
+              continue;
+            }
+            if (!(await hasPendingManualRequest(target.sha))) continue;
+          }
           const controller = new AbortController();
-          automaticLanes.set(target.lane, { sha: target.sha, controller });
+          if (!("tag" in target)) {
+            automaticLanes.set(target.lane, { sha: target.sha, controller });
+          }
           const run = executeCommit(
             github,
             repository,
@@ -238,18 +297,28 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               ...context,
               id: target.eventId,
             },
-            controller.signal,
+            "tag" in target ? undefined : controller.signal,
           )
             .then((build) => {
               if (build)
                 message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
+              if (
+                "tag" in target &&
+                build !== false &&
+                (!build || (build.event?.id === target.eventId && build.status !== "cancelled"))
+              ) {
+                completedTags.add(target.eventId);
+              }
             })
             .catch((error) => {
               message(`${target.branch}@${target.sha.slice(0, 7)} failed: ${errorDetail(error)}`);
             })
             .finally(() => {
               inFlightRuns.delete(target.eventId);
-              if (automaticLanes.get(target.lane)?.controller === controller) {
+              if (
+                !("tag" in target) &&
+                automaticLanes.get(target.lane)?.controller === controller
+              ) {
                 automaticLanes.delete(target.lane);
               }
             });
@@ -259,7 +328,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         }
       }
 
-      const state = await loadPollState(repository.fullName);
       if (completedComments.size > 0) {
         const completed = new Set(completedComments);
         state.pending = state.pending.filter((item) => !completed.has(item.id));

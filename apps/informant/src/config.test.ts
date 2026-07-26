@@ -34,7 +34,9 @@ describe("configuration", () => {
         environment: {},
         secrets: [],
         needs: [],
-        triggers: [{ event: "commit", branch: { names: ["main"] }, pullRequest: undefined }],
+        triggers: [
+          { event: "commit", branch: { names: ["main"] }, tag: undefined, pullRequest: undefined },
+        ],
         cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
       },
     ]);

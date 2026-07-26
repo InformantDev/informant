@@ -14,6 +14,9 @@ describe("hook uninstall", () => {
 
     expect(await installPostPushHook(repo)).toBe(hookPath);
     expect((await Bun.file(hookPath).text()).includes("# informant push accelerator")).toBe(true);
+    expect(await Bun.file(hookPath).text()).toContain(
+      'case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac',
+    );
     expect((await stat(hookPath)).mode & 0o111).not.toBe(0);
 
     expect(await uninstallPostPushHook(repo)).toEqual({ path: hookPath, removed: true });
@@ -45,6 +48,30 @@ describe("hook uninstall", () => {
     expect(await installPostPushHook(worktree)).toBe(expected);
     expect(await Bun.file(expected).text()).toContain("# informant push accelerator");
     expect(await uninstallPostPushHook(worktree)).toEqual({ path: expected, removed: true });
+  });
+
+  test("upgrades a previously installed hook", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "informant-hook-upgrade-"));
+    await requireCommand(["git", "init", "--quiet", repo]);
+    const hookPath = join(repo, ".git", "hooks", "pre-push");
+    const legacy = `#!/bin/sh
+
+# informant push accelerator
+if command -v informant >/dev/null 2>&1; then
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
+    branch="\${remote_ref#refs/heads/}"
+    nohup informant run --ref "$local_sha" --branch "$branch" --wait-for-github </dev/null >>/tmp/informant-post-push.log 2>&1 &
+  done
+fi
+# end informant push accelerator
+`;
+    await Bun.write(hookPath, legacy);
+
+    await installPostPushHook(repo);
+    const upgraded = await Bun.file(hookPath).text();
+    expect(upgraded.match(/# informant push accelerator/g)).toHaveLength(1);
+    expect(upgraded).toContain('case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac');
   });
 
   test("removes only the managed section", () => {
