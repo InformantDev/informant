@@ -18,7 +18,11 @@ import {
   streamingSecretRedactor,
   utf8Tail,
 } from "./tart/index.ts";
-import { linuxSharedMountCommand } from "./tart/layout.ts";
+import {
+  linuxBunCopyfileBackend,
+  linuxSharedMountCommand,
+  linuxWorkspaceCopyCommand,
+} from "./tart/layout.ts";
 import { sshCommand } from "./tart/vm.ts";
 import type { InformantConfig } from "./types.ts";
 
@@ -416,7 +420,7 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
   Bun.env.INFORMANT_DATA_DIR = join(root, "data");
   const cachedJob = {
     ...job("test"),
-    cache: [{ paths: ["~/.npm"], keyFiles: [], shared: false }],
+    cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
   };
   const repository = { owner: "one", repo: "repo", fullName: "one/repo" };
   try {
@@ -424,10 +428,15 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     const linux = await cacheMounts(repository, workspace, cachedJob, "admin", "linux", true);
     expect(macos.args[0]).not.toContain(join("caches", "linux"));
     expect(linux.args[0]).toContain(join("caches", "linux"));
-    expect(macos.restore).toContain("/Users/admin/.npm");
+    expect(macos.restore).toContain("/Users/admin/.bun/install/cache");
     expect(macos.restore).toContain("/Volumes/My Shared Files/cache-0");
-    expect(linux.restore).toContain("/home/admin/.npm");
+    expect(linux.restore).toContain("/home/admin/.bun/install/cache");
     expect(linux.restore).toContain("/mnt/shared/cache-0");
+    expect(linux.restore).not.toContain("ln -s");
+    expect(linux.save).toContain("cache.tar.gz");
+    expect(linux.writablePaths).toHaveLength(1);
+    expect(linux.args[0]).toEndWith(linux.writablePaths[0] ?? "");
+    expect(linux.installLock).toBe("/mnt/shared/cache-0/.informant-install-lock");
   } finally {
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
@@ -439,6 +448,48 @@ test("Linux shared mount setup is non-interactive and verifies the workspace", (
   expect(linuxSharedMountCommand()).toBe(
     "sudo -n mkdir -p /mnt/shared && (mountpoint -q /mnt/shared || sudo -n mount -t virtiofs com.apple.virtio-fs.automount /mnt/shared) && test -d /mnt/shared/workspace",
   );
+});
+
+test("Linux jobs copy the shared workspace onto the guest filesystem", () => {
+  expect(linuxWorkspaceCopyCommand("/tmp/informant-workspace")).toBe(
+    'rm -rf "/tmp/informant-workspace" && mkdir -p "/tmp/informant-workspace" && cp -a --no-preserve=ownership /mnt/shared/workspace/. "/tmp/informant-workspace"',
+  );
+});
+
+test("Linux Bun package commands use the copyfile backend", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-linux-bun-"));
+  const bun = join(root, "bun");
+  const calls = join(root, "calls");
+  await Bun.write(bun, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(calls)}\n`);
+  await chmod(bun, 0o755);
+  const result = Bun.spawnSync(
+    [
+      "/bin/bash",
+      "-c",
+      `${linuxBunCopyfileBackend()} bun install --frozen-lockfile; bun test; bun add pkg --backend hardlink`,
+    ],
+    { env: { ...Bun.env, PATH: `${root}:${Bun.env.PATH}` } },
+  );
+  try {
+    expect(result.exitCode).toBe(0);
+    const locked = Bun.spawnSync(
+      ["/bin/bash", "-c", `${linuxBunCopyfileBackend(join(root, "lock"))} bun install`],
+      { env: { ...Bun.env, PATH: `${root}:${Bun.env.PATH}` } },
+    );
+    expect(locked.exitCode).toBe(0);
+    expect(await Bun.file(calls).text()).toBe(
+      "install --frozen-lockfile --backend=copyfile\ntest\nadd pkg --backend hardlink\ninstall --backend=copyfile\n",
+    );
+    expect(await Bun.file(join(root, "lock")).exists()).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Linux Bun package commands lease a shared snapshot cache", () => {
+  const setup = linuxBunCopyfileBackend("/mnt/shared/cache-0/.informant-install-lock");
+  expect(setup).toContain('while ! mkdir "/mnt/shared/cache-0/.informant-install-lock"');
+  expect(setup).toContain('rmdir "/mnt/shared/cache-0/.informant-install-lock"');
 });
 
 test("retries SSH only when authentication failed before the command started", () => {

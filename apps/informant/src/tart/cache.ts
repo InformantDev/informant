@@ -37,7 +37,14 @@ export async function cacheMounts(
   guestOs: InformantConfig["vm"]["guestOs"],
   trusted = false,
 ) {
-  if (!job.cache) return { args: [] as string[], restore: "", save: "" };
+  if (!job.cache)
+    return {
+      args: [] as string[],
+      restore: "",
+      save: "",
+      writablePaths: [] as string[],
+      installLock: undefined as string | undefined,
+    };
   const workspaceRoot = await realpath(workspace);
   const persistentRoot = join(dataDirectory(), "caches", ...(guestOs === "linux" ? ["linux"] : []));
   const root = join(
@@ -48,6 +55,8 @@ export async function cacheMounts(
   const args: string[] = [];
   const restore: string[] = [];
   const save: string[] = [];
+  const writablePaths: string[] = [];
+  let installLock: string | undefined;
   let mountIndex = 0;
   for (const cache of job.cache) {
     const key = new Bun.CryptoHasher("sha256");
@@ -76,12 +85,14 @@ export async function cacheMounts(
     }
     const cacheKey = cache.keyFiles.length > 0 ? key.digest("hex").slice(0, 24) : "default";
     for (const path of cache.paths) {
-      if (cache.shared) {
+      if (cache.shared && guestOs !== "linux") {
         const host = trusted
           ? join(persistentRoot, "shared", cachePathIdentity(user, path))
           : join(workspace, "..", "shared-caches", cachePathIdentity(user, path));
         await mkdir(host, { recursive: true });
-        args.push(`--dir=cache-${mountIndex}:${await realpath(host)}`);
+        const resolvedHost = await realpath(host);
+        args.push(`--dir=cache-${mountIndex}:${resolvedHost}`);
+        writablePaths.push(resolvedHost);
         const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
         const parent = guest.slice(0, guest.lastIndexOf("/"));
         const shared = `${guestSharedRoot(guestOs)}/cache-${mountIndex}`;
@@ -91,17 +102,25 @@ export async function cacheMounts(
         mountIndex++;
         continue;
       }
-      const parent = trusted
-        ? join(root, cachePathIdentity(user, path))
-        : join(workspace, "..", "keyed-caches", cachePathIdentity(user, path));
+      const parent = cache.shared
+        ? trusted
+          ? join(persistentRoot, "shared", cachePathIdentity(user, path))
+          : join(workspace, "..", "shared-caches", cachePathIdentity(user, path))
+        : trusted
+          ? join(root, cachePathIdentity(user, path))
+          : join(workspace, "..", "keyed-caches", cachePathIdentity(user, path));
       const host = join(parent, cacheKey);
       await mkdir(host, { recursive: true });
       const now = new Date();
       await utimes(host, now, now);
       await pruneCacheVersions(parent, cacheKey);
-      args.push(`--dir=cache-${mountIndex}:${await realpath(host)}`);
+      const resolvedHost = await realpath(host);
+      args.push(`--dir=cache-${mountIndex}:${resolvedHost}`);
+      writablePaths.push(resolvedHost);
       const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
       const shared = `${guestSharedRoot(guestOs)}/cache-${mountIndex}`;
+      if (cache.shared && guestOs === "linux" && path === "~/.bun/install/cache")
+        installLock = `${shared}/.informant-install-lock`;
       const temporary = `${shared}/cache-${crypto.randomUUID().slice(0, 8)}.tar.gz.tmp`;
       restore.push(
         `mkdir -p ${shellQuote(guest)} && if [ -f ${shellQuote(`${shared}/cache.tar.gz`)} ]; then tar -xzpf ${shellQuote(`${shared}/cache.tar.gz`)} -C ${shellQuote(guest)}; fi`,
@@ -116,5 +135,7 @@ export async function cacheMounts(
     args,
     restore: restore.join(" && "),
     save: save.length > 0 ? save.join(" && ") : restore.length > 0 ? ":" : "",
+    writablePaths,
+    installLock,
   };
 }

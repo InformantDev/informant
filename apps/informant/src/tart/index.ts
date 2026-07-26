@@ -5,7 +5,12 @@ import { appendLog, claimBuildWorkspace } from "../store.ts";
 import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
 import { cacheMounts } from "./cache.ts";
 import { ensurePreparedImage } from "./images.ts";
-import { guestSharedRoot, linuxSharedMountCommand } from "./layout.ts";
+import {
+  guestSharedRoot,
+  linuxBunCopyfileBackend,
+  linuxSharedMountCommand,
+  linuxWorkspaceCopyCommand,
+} from "./layout.ts";
 import { provisionVm, shellQuote, sshCommand, startVm, stopVm, withImageLock } from "./vm.ts";
 
 export { cachePathIdentity } from "./cache.ts";
@@ -171,6 +176,20 @@ async function runJob(
         config.vm.guestOs,
         config.trustedSha === sha,
       );
+      if (config.vm.guestOs === "linux") {
+        await requireCommand(
+          ["chmod", "a+rwx", sharedWorkspace],
+          "could not make the Linux workspace writable",
+          { signal: executionSignal },
+        );
+        if (caches.writablePaths.length > 0) {
+          await requireCommand(
+            ["chmod", "a+rwx", ...caches.writablePaths],
+            "could not make Linux caches writable",
+            { signal: executionSignal },
+          );
+        }
+      }
       const secrets = await secretMount(workspace, job, runtimeSecrets, config.vm.guestOs);
       secretDirectory = secrets.directory;
       const started = await startVm(
@@ -200,6 +219,7 @@ async function runJob(
         ip: started.ip,
         cacheRestore: caches.restore,
         cacheSave: caches.save,
+        installLock: caches.installLock,
         secretSource: secrets.source,
         secretValues: secrets.values,
       };
@@ -216,7 +236,14 @@ async function runJob(
     const env = Object.entries(environment)
       .map(([key, value]) => `export ${key}=${shellQuote(value)};`)
       .join(" ");
-    const execute = `cd ${shellQuote(`${guestSharedRoot(config.vm.guestOs)}/workspace`)} && /bin/bash -lc ${shellQuote(`${env} ${ready.secretSource} ${job.command}`)}`;
+    const runtimeSetup =
+      config.vm.guestOs === "linux" ? linuxBunCopyfileBackend(ready.installLock) : "";
+    const mountedWorkspace = `${guestSharedRoot(config.vm.guestOs)}/workspace`;
+    const jobWorkspace =
+      config.vm.guestOs === "linux" ? "/tmp/informant-workspace" : mountedWorkspace;
+    const workspaceSetup =
+      config.vm.guestOs === "linux" ? `${linuxWorkspaceCopyCommand(jobWorkspace)} && ` : "";
+    const execute = `${workspaceSetup}cd ${shellQuote(jobWorkspace)} && /bin/bash -lc ${shellQuote(`${env} ${ready.secretSource} ${runtimeSetup} ${job.command}`)}`;
     const jobCommand = ready.cacheRestore
       ? `${ready.cacheRestore} && ${execute}; informant_job_status=$?; ${ready.cacheSave}; informant_cache_status=$?; if [ $informant_job_status -ne 0 ]; then exit $informant_job_status; fi; exit $informant_cache_status`
       : execute;
