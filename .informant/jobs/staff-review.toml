@@ -10,25 +10,34 @@ if [ "$pr_number" = "$INFORMANT_BRANCH" ]; then
   exit 1
 fi
 github_token="$GITHUB_TOKEN"
+export GH_TOKEN="$github_token"
+pull="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number")"
+head_sha="$(printf '%s' "$pull" | jq -r '.head.sha')"
+base_sha="$(printf '%s' "$pull" | jq -r '.base.sha')"
+if [ "$head_sha" != "$INFORMANT_SHA" ]; then
+  echo "pull request head changed before staff review" >&2
+  exit 1
+fi
+
+diff_json="$(staff diff --base "$base_sha" --head working-tree --json)"
+slug="$(printf '%s' "$diff_json" | jq -r '.slug')"
+diff_file=".staffreview/diffs/$slug.json"
+
 unset GITHUB_TOKEN
 unset GH_TOKEN
 export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
 cd "$review_root"
 amp --settings-file "$review_home/settings.json" --mcp-config '{}' --no-ide --no-notifications \
-  --visibility private --mode medium --execute '/staff-review main..WT'
+  --visibility private --mode medium --execute "/staff-review $slug"
 
 export GH_TOKEN="$github_token"
-pull="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number")"
-head_sha="$(printf '%s' "$pull" | jq -r '.head.sha')"
-base_sha="$(printf '%s' "$pull" | jq -r '.base.sha')"
+head_sha="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number" --jq '.head.sha')"
 if [ "$head_sha" != "$INFORMANT_SHA" ]; then
   echo "pull request head changed during staff review" >&2
   exit 1
 fi
 
-slug="$(jq -r '.slug' .staffreview/active.json)"
-diff_file=".staffreview/diffs/$slug.json"
 diff_base="$(jq -r '.base.ref' "$diff_file")"
 if [ "$diff_base" != "$base_sha" ]; then
   echo "staff review diff does not match the pull request base" >&2
