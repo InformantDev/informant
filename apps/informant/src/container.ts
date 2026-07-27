@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { availableParallelism, totalmem } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
@@ -105,13 +105,83 @@ function containerVolume(source: string, target: string): string {
   return `${source}:${target}`;
 }
 
-export function preparedContainerImage(runtime: ContainerRuntime): string | undefined {
+export function preparedContainerImage(
+  runtime: ContainerRuntime,
+  prepareInputsDigest?: string,
+): string | undefined {
   return runtime.prepare
     ? `informant-prepared-container:${new Bun.CryptoHasher("sha256")
-        .update(`${runtime.image}\0${runtime.prepare}`)
+        .update(
+          `${runtime.image}\0${runtime.prepare}${prepareInputsDigest ? `\0prepareInputs\0${prepareInputsDigest}` : ""}`,
+        )
         .digest("hex")
         .slice(0, 16)}`
     : undefined;
+}
+
+interface PreparedContainerInput {
+  path: string;
+  source: string;
+  mode: number;
+}
+
+function containedPath(root: string, path: string): boolean {
+  const fromRoot = relative(root, path);
+  return fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot);
+}
+
+async function snapshotPreparedContainerInputs(
+  runtime: ContainerRuntime,
+  context: string,
+  workspace?: string,
+): Promise<string | undefined> {
+  if (!runtime.prepareInputs) return undefined;
+  if (!workspace) throw new Error("container.prepareInputs requires a job workspace");
+  const root = await realpath(workspace);
+  const files = new Map<string, PreparedContainerInput>();
+  for (const pattern of runtime.prepareInputs) {
+    const matches = await Array.fromAsync(
+      new Bun.Glob(pattern).scan({ cwd: root, dot: true, onlyFiles: true }),
+    );
+    if (matches.length === 0)
+      throw new Error(`container.prepareInputs pattern matched no files: ${pattern}`);
+    for (const path of matches) {
+      const source = resolve(root, path);
+      if (!containedPath(root, source))
+        throw new Error(`container.prepareInputs escaped the job workspace: ${path}`);
+      const canonical = await realpath(source);
+      if (!containedPath(root, canonical) || canonical !== source)
+        throw new Error(`container.prepareInputs cannot traverse a symbolic link: ${path}`);
+      const metadata = await lstat(source);
+      if (metadata.isSymbolicLink())
+        throw new Error(`container.prepareInputs cannot include a symbolic link: ${path}`);
+      if (!metadata.isFile())
+        throw new Error(`container.prepareInputs can only include files: ${path}`);
+      files.set(relative(root, source), {
+        path: relative(root, source),
+        source,
+        mode: metadata.mode,
+      });
+    }
+  }
+  const sorted = [...files.values()].sort((left, right) => left.path.localeCompare(right.path));
+  const inputRoot = join(context, "informant-prepare-inputs");
+  const records: Array<[string, number, string]> = [];
+  for (const file of sorted) {
+    const destination = join(inputRoot, file.path);
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(file.source, destination);
+    const mode = file.mode & 0o7777;
+    await chmod(destination, mode);
+    records.push([
+      file.path,
+      mode,
+      new Bun.CryptoHasher("sha256")
+        .update(await Bun.file(destination).arrayBuffer())
+        .digest("hex"),
+    ]);
+  }
+  return new Bun.CryptoHasher("sha256").update(JSON.stringify(records)).digest("hex");
 }
 
 export interface ContainerPreparationOperations {
@@ -121,31 +191,40 @@ export interface ContainerPreparationOperations {
 
 export async function ensurePreparedContainer(
   runtime: ContainerRuntime,
+  workspace?: string,
   onMessage: (message: string) => Promise<void> | void = console.log,
   signal?: AbortSignal,
   operations: ContainerPreparationOperations = {},
 ): Promise<string> {
-  const prepared = preparedContainerImage(runtime);
   const preparationCommand = runtime.prepare;
-  if (!prepared || !preparationCommand) return runtime.image;
+  if (!preparationCommand) return runtime.image;
   const runCommand = operations.command ?? command;
   const lock = operations.withImageLock ?? withImageLock;
-  return lock(
-    "container-builder",
-    async () => {
-      const existing = await runCommand(["container", "image", "inspect", prepared], { signal });
-      if (existing.exitCode === 0) return prepared;
+  const contextRoot = join(dataDirectory(), "build-contexts");
+  await mkdir(contextRoot, { recursive: true });
+  const context = await mkdtemp(join(contextRoot, "informant-container-build-"));
+  try {
+    const inputDigest = await snapshotPreparedContainerInputs(runtime, context, workspace);
+    const prepared = preparedContainerImage(runtime, inputDigest);
+    if (!prepared) return runtime.image;
+    await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);
+    const inputSetup = inputDigest
+      ? "COPY informant-prepare-inputs /informant/prepare-inputs\nENV HOME=/home/root\n"
+      : "";
+    const preparationLayer = inputDigest
+      ? `RUN INFORMANT_PREPARE_ROOT=/informant/prepare-inputs /bin/sh -lc 'cd "$INFORMANT_PREPARE_ROOT" && . /tmp/informant-prepare.sh' && rm -rf /informant/prepare-inputs /tmp/informant-prepare.sh\n`
+      : "RUN /bin/sh -lc '. /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n";
+    await Bun.write(
+      join(context, "Dockerfile"),
+      `FROM ${runtime.image}\nUSER 0\nCOPY informant-prepare.sh /tmp/informant-prepare.sh\n${inputSetup}${preparationLayer}`,
+    );
+    return await lock(
+      "container-builder",
+      async () => {
+        const existing = await runCommand(["container", "image", "inspect", prepared], { signal });
+        if (existing.exitCode === 0) return prepared;
 
-      const contextRoot = join(dataDirectory(), "build-contexts");
-      await mkdir(contextRoot, { recursive: true });
-      const context = await mkdtemp(join(contextRoot, "informant-container-build-"));
-      await onMessage(`Preparing container image ${prepared}`);
-      try {
-        await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);
-        await Bun.write(
-          join(context, "Dockerfile"),
-          `FROM ${runtime.image}\nUSER 0\nCOPY informant-prepare.sh /tmp/informant-prepare.sh\nRUN /bin/sh -lc '. /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n`,
-        );
+        await onMessage(`Preparing container image ${prepared}`);
         const args = [
           "container",
           "build",
@@ -169,12 +248,12 @@ export async function ensurePreparedContainer(
             `container image preparation failed: ${preparation.stderr.trim() || `exit ${preparation.exitCode}`}`,
           );
         return prepared;
-      } finally {
-        await rm(context, { recursive: true, force: true });
-      }
-    },
-    signal,
-  );
+      },
+      signal,
+    );
+  } finally {
+    await rm(context, { recursive: true, force: true });
+  }
 }
 
 export function containerRunArguments(options: {
@@ -276,7 +355,7 @@ export async function runInContainer(
       HOME: "/home/root",
     };
     const wrapped = containerJobCommand(job.command, caches);
-    const image = await ensurePreparedContainer(runtime, log, executionSignal, {
+    const image = await ensurePreparedContainer(runtime, workspace, log, executionSignal, {
       command: runCommand,
     });
     const args = containerRunArguments({

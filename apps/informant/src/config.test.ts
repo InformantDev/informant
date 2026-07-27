@@ -55,6 +55,7 @@ describe("configuration", () => {
           cpu: undefined,
           memoryMb: undefined,
           prepare: undefined,
+          prepareInputs: undefined,
         },
       },
     ]);
@@ -200,6 +201,7 @@ describe("configuration", () => {
       cpu: 2,
       memoryMb: 512,
       prepare: undefined,
+      prepareInputs: undefined,
     });
     expect(() => parseConfig(containerOnly.replace('image = "oven/bun:1"', 'image = ""'))).toThrow(
       "container.image must be a non-empty string",
@@ -217,6 +219,7 @@ describe("configuration", () => {
       cpu: 1,
       memoryMb: undefined,
       prepare: undefined,
+      prepareInputs: undefined,
     });
     expect(() =>
       parseConfig(
@@ -238,10 +241,43 @@ describe("configuration", () => {
       cpu: undefined,
       memoryMb: undefined,
       prepare: "install job tools",
+      prepareInputs: undefined,
     });
     expect(() =>
       parseConfig(source.replace('prepare = "install job tools"', 'prepare = ""')),
     ).toThrow("jobs[0].container.prepare must be a non-empty string");
+  });
+
+  test("container preparation inputs can be inherited and overridden per job", () => {
+    const source = configTemplate()
+      .replace(
+        'image = "oven/bun:1"',
+        'image = "oven/bun:1"\nprepare = "seed cache"\nprepareInputs = ["bun.lock", "packages/*/package.json"]',
+      )
+      .replace(
+        'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+        'cache = []\ncontainer = { prepareInputs = ["package.json"] }',
+      );
+    expect(parseConfig(source).jobs[0]?.runtime).toMatchObject({
+      type: "container",
+      prepare: "seed cache",
+      prepareInputs: ["package.json"],
+    });
+    expect(() => parseConfig(source.replace('["package.json"]', '["../package.json"]'))).toThrow(
+      "jobs[0].container.prepareInputs must contain relative paths or glob patterns without ..",
+    );
+    expect(() =>
+      parseConfig(
+        configTemplate().replace(
+          'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+          'cache = []\ncontainer = { prepareInputs = ["bun.lock"] }',
+        ),
+      ),
+    ).toThrow("jobs[0].container.prepareInputs requires prepare");
+    expect(parseConfig(source.replace('["package.json"]', "[]")).jobs[0]?.runtime).toMatchObject({
+      prepare: "seed cache",
+      prepareInputs: undefined,
+    });
   });
 
   test("jobs inherit and can override the top-level timeout", () => {

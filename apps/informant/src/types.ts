@@ -15,6 +15,7 @@ export interface ContainerRuntime {
   cpu?: number;
   memoryMb?: number;
   prepare?: string;
+  prepareInputs?: string[];
 }
 
 export type JobRuntime = VmRuntime | ContainerRuntime;

@@ -160,9 +160,27 @@ top-level `triggers`. Manual `informant run` ignores trigger eligibility.
 `vm.prepare` and `container.prepare` run once when a worker first sees that image and preparation
 command. Informant keeps the result as a local Tart or OCI image and starts jobs from it, so tools do
 not need to be installed in every job. Container preparation builds an isolated image with Apple
-Container's BuildKit integration. Preparation does not receive the job checkout, environment, caches,
-or secrets. Changing the source image or preparation command creates a new prepared image. Because
-preparation is part of the runtime table, different jobs can use different preparation commands.
+Container's BuildKit integration. It does not receive the job checkout, environment, caches, or
+secrets by default. Changing the source image or preparation command creates a new prepared image.
+Because preparation is part of the runtime table, different jobs can use different preparation
+commands.
+
+Container runtimes can declare repository-relative files or glob patterns with `prepareInputs`.
+Informant copies matching files into `$INFORMANT_PREPARE_ROOT` while preparing the image and includes
+their paths, modes, and contents in the image identity. Every pattern must match at least one regular
+file; absolute paths, parent traversal, and symbolic links are rejected. The inputs are removed from
+the resulting filesystem after preparation. This can seed an immutable package cache without sharing
+a writable cache between concurrent jobs:
+
+```toml
+container.image = "oven/bun:1"
+container.prepareInputs = ["bun.lock", "package.json", "apps/*/package.json"]
+cache = []
+container.prepare = """
+cd "$INFORMANT_PREPARE_ROOT"
+bun install --frozen-lockfile --ignore-scripts
+"""
+```
 
 Preparation is automatic. `informant image prepare`, `informant image list`, and `informant image
 prune` currently manage prepared Tart VM images. Container preparation is warmed automatically by the

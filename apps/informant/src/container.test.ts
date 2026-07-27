@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
-import { rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   containerCapacity,
   containerJobCommand,
@@ -143,7 +145,7 @@ test("prepares and reuses a deterministic container image", async () => {
     stderr: "",
     timedOut: false,
   });
-  const image = await ensurePreparedContainer(runtime, () => {}, undefined, {
+  const image = await ensurePreparedContainer(runtime, undefined, () => {}, undefined, {
     withImageLock: async (_image, callback) => callback(),
     command: async (args, options) => {
       invocations.push(args);
@@ -180,7 +182,7 @@ test("prepares and reuses a deterministic container image", async () => {
 
   const reused: string[][] = [];
   expect(
-    await ensurePreparedContainer(runtime, () => {}, undefined, {
+    await ensurePreparedContainer(runtime, undefined, () => {}, undefined, {
       withImageLock: async (_image, callback) => callback(),
       command: async (args) => {
         reused.push(args);
@@ -189,6 +191,100 @@ test("prepares and reuses a deterministic container image", async () => {
     }),
   ).toBe(prepared);
   expect(reused).toEqual([["container", "image", "inspect", prepared]]);
+});
+
+test("copies preparation inputs and includes their contents in the image identity", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-prepare-inputs-"));
+  await mkdir(join(workspace, "packages", "shared"), { recursive: true });
+  await Bun.write(join(workspace, "package.json"), '{"name":"workspace"}\n');
+  await Bun.write(join(workspace, "packages", "shared", "package.json"), '{"name":"shared"}\n');
+  await Bun.write(join(workspace, "bun.lock"), "lock-v1\n");
+  const runtime = {
+    type: "container" as const,
+    image: "oven/bun:1",
+    prepare: "bun install --frozen-lockfile --ignore-scripts",
+    prepareInputs: ["package.json", "packages/*/package.json", "bun.lock"],
+  };
+  const result = (exitCode: number) => ({
+    exitCode,
+    stdout: "",
+    stderr: "",
+    timedOut: false,
+  });
+  let expectedLock = "lock-v1\n";
+  const build = async (args: string[], options?: { cwd?: string }) => {
+    if (args[1] === "image") return result(1);
+    if (args[1] === "build") {
+      const context = options?.cwd;
+      if (!context) throw new Error("missing build context");
+      expect(await Bun.file(join(context, "informant-prepare-inputs", "bun.lock")).text()).toBe(
+        expectedLock,
+      );
+      expect(
+        await Bun.file(
+          join(context, "informant-prepare-inputs", "packages", "shared", "package.json"),
+        ).text(),
+      ).toBe('{"name":"shared"}\n');
+      const dockerfile = await Bun.file(join(context, "Dockerfile")).text();
+      expect(dockerfile).toContain(
+        "COPY informant-prepare-inputs /informant/prepare-inputs\nENV HOME=/home/root\n",
+      );
+      expect(dockerfile).not.toContain("ENV INFORMANT_PREPARE_ROOT");
+      expect(dockerfile).toContain('cd "$INFORMANT_PREPARE_ROOT"');
+    }
+    return result(0);
+  };
+  const operations = {
+    withImageLock: async <T>(_image: string, callback: () => Promise<T>): Promise<T> => callback(),
+    command: build,
+  };
+
+  try {
+    const first = await ensurePreparedContainer(
+      runtime,
+      workspace,
+      () => {},
+      undefined,
+      operations,
+    );
+    expectedLock = "lock-v2\n";
+    await Bun.write(join(workspace, "bun.lock"), "lock-v2\n");
+    const second = await ensurePreparedContainer(
+      runtime,
+      workspace,
+      () => {},
+      undefined,
+      operations,
+    );
+    expect(first).not.toBe(second);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("preparation inputs cannot traverse a symbolic link", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-prepare-workspace-"));
+  const outside = await mkdtemp(join(tmpdir(), "informant-prepare-outside-"));
+  await Bun.write(join(outside, "secret.txt"), "secret\n");
+  await symlink(outside, join(workspace, "leak"));
+  try {
+    expect(
+      ensurePreparedContainer(
+        {
+          type: "container",
+          image: "base",
+          prepare: "cat leak/secret.txt",
+          prepareInputs: ["leak/secret.txt"],
+        },
+        workspace,
+      ),
+    ).rejects.toThrow("container.prepareInputs");
+  } finally {
+    await Promise.all([
+      rm(workspace, { recursive: true, force: true }),
+      rm(outside, { recursive: true, force: true }),
+    ]);
+  }
 });
 
 test("serializes concurrent preparation of the same container image", async () => {
@@ -222,8 +318,8 @@ test("serializes concurrent preparation of the same container image", async () =
   };
 
   const images = await Promise.all([
-    ensurePreparedContainer(runtime, () => {}, undefined, operations),
-    ensurePreparedContainer(runtime, () => {}, undefined, operations),
+    ensurePreparedContainer(runtime, undefined, () => {}, undefined, operations),
+    ensurePreparedContainer(runtime, undefined, () => {}, undefined, operations),
   ]);
   expect(images[0]).toBe(images[1]);
   expect(builds).toBe(1);
@@ -246,12 +342,14 @@ test("serializes preparation of different images through the shared Apple builde
 
   await ensurePreparedContainer(
     { type: "container", image: "base-a", prepare: "install a" },
+    undefined,
     () => {},
     undefined,
     operations,
   );
   await ensurePreparedContainer(
     { type: "container", image: "base-b", prepare: "install b" },
+    undefined,
     () => {},
     undefined,
     operations,

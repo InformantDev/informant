@@ -328,12 +328,34 @@ function parseContainer(
     (typeof rawPrepare !== "string" || rawPrepare.trim().length === 0)
   )
     throw new Error(`${label}.prepare must be a non-empty string`);
+  const prepareInputs = container.prepareInputs;
+  if (
+    prepareInputs !== undefined &&
+    (!Array.isArray(prepareInputs) ||
+      prepareInputs.some(
+        (input) =>
+          typeof input !== "string" ||
+          !input.trim() ||
+          input.startsWith("/") ||
+          input.split("/").includes(".."),
+      ))
+  )
+    throw new Error(
+      `${label}.prepareInputs must contain relative paths or glob patterns without ..`,
+    );
+  const normalizedPrepareInputs =
+    Array.isArray(prepareInputs) && prepareInputs.length > 0
+      ? (prepareInputs as string[])
+      : undefined;
+  if (normalizedPrepareInputs && rawPrepare === undefined)
+    throw new Error(`${label}.prepareInputs requires prepare`);
   return {
     type: "container",
     image,
     cpu,
     memoryMb,
     prepare: typeof rawPrepare === "string" ? rawPrepare.trim() : undefined,
+    prepareInputs: normalizedPrepareInputs,
   };
 }
 
