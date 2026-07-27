@@ -11,16 +11,15 @@ if [ "$pr_number" = "$INFORMANT_BRANCH" ]; then
 fi
 github_token="$GITHUB_TOKEN"
 export GH_TOKEN="$github_token"
-pull="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number")"
-head_sha="$(printf '%s' "$pull" | jq -r '.head.sha')"
-base_sha="$(printf '%s' "$pull" | jq -r '.base.sha')"
+head_sha="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number" --jq '.head.sha')"
+base_sha="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number" --jq '.base.sha')"
 if [ "$head_sha" != "$INFORMANT_SHA" ]; then
   echo "pull request head changed before staff review" >&2
   exit 1
 fi
 
-diff_json="$(staff diff --base "$base_sha" --head working-tree --json)"
-slug="$(printf '%s' "$diff_json" | jq -r '.slug')"
+staff diff --base "$base_sha" --head working-tree --json >/dev/null
+slug="$base_sha..WT"
 diff_file=".staffreview/diffs/$slug.json"
 
 unset GITHUB_TOKEN
