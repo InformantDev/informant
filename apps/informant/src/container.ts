@@ -6,7 +6,7 @@ import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
 import { bunCopyfileBackend, raiseFileDescriptorLimit } from "./tart/layout.ts";
-import { withImageLock } from "./tart/vm.ts";
+import { shellQuote, withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
 interface ContainerResources {
@@ -112,7 +112,7 @@ export function preparedContainerImage(
   return runtime.prepare
     ? `informant-prepared-container:${new Bun.CryptoHasher("sha256")
         .update(
-          `${runtime.image}\0${runtime.prepare}${prepareInputsDigest ? `\0prepareInputs\0${prepareInputsDigest}` : ""}`,
+          `${runtime.image}\0${runtime.prepare}${prepareInputsDigest ? `\0preparedWorkspaceV1\0${prepareInputsDigest}` : ""}`,
         )
         .digest("hex")
         .slice(0, 16)}`
@@ -209,10 +209,10 @@ export async function ensurePreparedContainer(
     if (!prepared) return runtime.image;
     await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);
     const inputSetup = inputDigest
-      ? "COPY informant-prepare-inputs /informant/prepare-inputs\nENV HOME=/home/root\n"
+      ? "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n"
       : "";
     const preparationLayer = inputDigest
-      ? `RUN INFORMANT_PREPARE_ROOT=/informant/prepare-inputs /bin/sh -lc 'cd "$INFORMANT_PREPARE_ROOT" && . /tmp/informant-prepare.sh' && rm -rf /informant/prepare-inputs /tmp/informant-prepare.sh\n`
+      ? `RUN INFORMANT_PREPARE_ROOT=/workspace /bin/sh -lc 'cd "$INFORMANT_PREPARE_ROOT" && . /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n`
       : "RUN /bin/sh -lc '. /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n";
     await Bun.write(
       join(context, "Dockerfile"),
@@ -266,6 +266,7 @@ export function containerRunArguments(options: {
   secretNames?: string[];
   cpu?: number;
   memoryMb?: number;
+  preparedWorkspace?: boolean;
 }): string[] {
   const args = [
     "container",
@@ -283,7 +284,13 @@ export function containerRunArguments(options: {
     "--entrypoint",
     "/bin/sh",
   ];
-  args.push("--volume", containerVolume(options.workspace, "/workspace"));
+  args.push(
+    "--volume",
+    containerVolume(
+      options.workspace,
+      options.preparedWorkspace ? options.workspace : "/workspace",
+    ),
+  );
   for (const mount of options.mounts ?? [])
     args.push("--volume", containerVolume(mount.source, mount.target));
   for (const [key, value] of Object.entries(options.environment))
@@ -354,23 +361,32 @@ export async function runInContainer(
       INFORMANT_TRUSTED_SHA: trustedSha,
       HOME: "/home/root",
     };
-    const wrapped = containerJobCommand(job.command, caches);
+    const hostWorkspace = await realpath(workspace);
+    const usesPreparedWorkspace = Boolean(runtime.prepareInputs);
+    const hasStandaloneGitDirectory =
+      usesPreparedWorkspace && (await lstat(join(hostWorkspace, ".git"))).isDirectory();
+    const sourceSetup = usesPreparedWorkspace
+      ? `cp -R ${shellQuote(hostWorkspace)}/. /workspace/ &&\n${hasStandaloneGitDirectory ? "" : "rm -f /workspace/.git &&\n"}`
+      : "";
+    const wrapped = containerJobCommand(`${sourceSetup}${job.command}`, caches);
     const image = await ensurePreparedContainer(runtime, workspace, log, executionSignal, {
       command: runCommand,
     });
+    const mounts = caches.mounts.map((mount) => ({
+      source: mount.path,
+      target: `/mnt/shared/${mount.name}`,
+    }));
     const args = containerRunArguments({
       name,
       image,
-      workspace: await realpath(workspace),
+      workspace: hostWorkspace,
       command: wrapped,
       environment,
-      mounts: caches.mounts.map((mount) => ({
-        source: mount.path,
-        target: `/mnt/shared/${mount.name}`,
-      })),
+      mounts,
       secretNames: Object.keys(secrets),
       cpu: resources.cpu,
       memoryMb: resources.memoryMb,
+      preparedWorkspace: usesPreparedWorkspace,
     });
     await started();
     await log(`\n[${job.name}] $ ${job.command}\n`);

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
   preparedContainerImage,
   runInContainer,
 } from "./container.ts";
+import { shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
 function deferred<T>() {
@@ -227,10 +228,11 @@ test("copies preparation inputs and includes their contents in the image identit
       ).toBe('{"name":"shared"}\n');
       const dockerfile = await Bun.file(join(context, "Dockerfile")).text();
       expect(dockerfile).toContain(
-        "COPY informant-prepare-inputs /informant/prepare-inputs\nENV HOME=/home/root\n",
+        "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n",
       );
       expect(dockerfile).not.toContain("ENV INFORMANT_PREPARE_ROOT");
       expect(dockerfile).toContain('cd "$INFORMANT_PREPARE_ROOT"');
+      expect(dockerfile).not.toContain("rm -rf /workspace");
     }
     return result(0);
   };
@@ -413,6 +415,59 @@ test("passes secrets through the client environment and always removes the conta
   expect(output.join("")).not.toContain("━━");
   expect(output.join("")).toContain("[REDACTED]");
   expect(output.join("")).not.toContain("line one");
+});
+
+test("prepared jobs copy source into the baked workspace before running", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-$'-prepared-run-"));
+  await Bun.write(join(workspace, "package.json"), '{"name":"test"}\n');
+  await Bun.write(join(workspace, ".git"), "gitdir: /outside/worktree\n");
+  const invocations: string[][] = [];
+  const result = (exitCode = 0) => ({ exitCode, stdout: "", stderr: "", timedOut: false });
+  const job: JobConfig = {
+    name: "test",
+    command: "true",
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    needs: [],
+    runtime: {
+      type: "container",
+      image: "base",
+      prepare: "prepare dependencies",
+      prepareInputs: ["package.json"],
+    },
+  };
+
+  try {
+    await runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "main",
+      "trusted-sha",
+      false,
+      workspace,
+      job,
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        command: async (args) => {
+          invocations.push(args);
+          return result();
+        },
+      },
+    );
+    const hostWorkspace = await realpath(workspace);
+    const run = invocations.find((args) => args[1] === "run");
+    expect(run).toBeDefined();
+    expect(run).toContain(`${hostWorkspace}:${hostWorkspace}`);
+    const script = run?.at(-1) ?? "";
+    expect(script).toContain(`cp -R ${shellQuote(hostWorkspace)}/. /workspace/ &&\n`);
+    expect(script).toContain("rm -f /workspace/.git &&\ntrue");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
 
 test("limits concurrent Apple containers across jobs", async () => {

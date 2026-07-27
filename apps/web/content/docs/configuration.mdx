@@ -166,11 +166,13 @@ Because preparation is part of the runtime table, different jobs can use differe
 commands.
 
 Container runtimes can declare repository-relative files or glob patterns with `prepareInputs`.
-Informant copies matching files into `$INFORMANT_PREPARE_ROOT` while preparing the image and includes
-their paths, modes, and contents in the image identity. Every pattern must match at least one regular
-file; absolute paths, parent traversal, and symbolic links are rejected. The inputs are removed from
-the resulting filesystem after preparation. This can seed an immutable package cache without sharing
-a writable cache between concurrent jobs:
+Informant copies matching files into the image's `/workspace`, exposes that path as
+`$INFORMANT_PREPARE_ROOT` during preparation, and includes their paths, modes, and contents in the
+image identity. Every pattern must match at least one regular file; absolute paths, parent traversal,
+and symbolic links are rejected. Preparation output such as `node_modules` remains in the image as an
+immutable layer. At runtime, Informant copies the job checkout into this container-local workspace
+without removing prepared files, then runs the job there. A lockfile change prepares a new image;
+ordinary source changes reuse the installed dependencies:
 
 ```toml
 container.image = "oven/bun:1"
@@ -181,6 +183,9 @@ cd "$INFORMANT_PREPARE_ROOT"
 bun install --frozen-lockfile --ignore-scripts
 """
 ```
+
+The corresponding job command should use the baked dependencies directly rather than running
+`bun install` again.
 
 Preparation is automatic. `informant image prepare`, `informant image list`, and `informant image
 prune` currently manage prepared Tart VM images. Container preparation is warmed automatically by the
