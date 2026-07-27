@@ -4,9 +4,5 @@ set -eu
 bun run typecheck
 """
 timeout_minutes = 20
-environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }
-container.image = "oven/bun:1"
-container.cpu = 2
-container.memory_mb = 4096
-container.prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"]
-container.prepare = "bun install --frozen-lockfile --ignore-scripts"
+environment = { NEXT_TELEMETRY_DISABLED = "1" }
+container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = "bun install --frozen-lockfile --ignore-scripts" }

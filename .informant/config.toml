@@ -1,5 +1,6 @@
 version = 1
 timeout_minutes = 30
+environment = { CI = "true" }
 triggers = [
   { event = "commit", branch = { names = ["main"] } },
   { event = "commit", pull_request = { state = "open", draft = false } },

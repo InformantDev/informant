@@ -4,9 +4,4 @@ set -eu
 bun run check
 """
 timeout_minutes = 15
-environment = { CI = "true" }
-container.image = "oven/bun:1"
-container.cpu = 2
-container.memory_mb = 4096
-container.prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"]
-container.prepare = "bun install --frozen-lockfile --ignore-scripts"
+container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = "bun install --frozen-lockfile --ignore-scripts" }

@@ -92,12 +92,8 @@ echo "Posted $finding_count staff review finding(s)"
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]
-environment = { CI = "true" }
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
-container.image = "oven/bun:1"
-container.cpu = 2
-container.memory_mb = 4096
-container.prepare = """
+container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -110,4 +106,4 @@ ln -sf "$HOME/.bun/install/global/node_modules/@ampcode/cli-linux-arm64/amp" /us
 curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.9.0/staff-linux-arm64 \
   -o /usr/local/bin/staff
 chmod +x /usr/local/bin/staff
-"""
+""" }
