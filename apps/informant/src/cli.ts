@@ -360,7 +360,7 @@ async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol
       const active = this.options[this.cursor];
       if (this.state === "submit") return `◆  ${active?.label ?? "Builds"}`;
       if (this.state === "cancel") return "◇  Back";
-      const rows = Math.max(5, Math.min(15, (process.stdout.rows ?? 20) - 5));
+      const rows = Math.max(5, (process.stdout.rows ?? 20) - 2);
       const start = Math.max(
         0,
         Math.min(this.cursor - Math.floor(rows / 2), this.options.length - rows),
