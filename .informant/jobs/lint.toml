@@ -1,10 +1,13 @@
 name = "lint"
 command = """
 set -eu
-bun install --frozen-lockfile
+bun install --frozen-lockfile --backend=copyfile
 bun run check
 """
 timeout_minutes = 15
 environment = { CI = "true" }
-cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
-container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096 }
+container.image = "oven/bun:1"
+container.cpu = 2
+container.memory_mb = 4096
+container.prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"]
+container.prepare = "bun install --frozen-lockfile --ignore-scripts"
