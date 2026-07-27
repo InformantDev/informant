@@ -1,7 +1,6 @@
 name = "build"
 command = """
 set -eu
-bun install --frozen-lockfile --backend=copyfile
 bun run build
 """
 environment = { CI = "true", NEXT_TELEMETRY_DISABLED = "1" }

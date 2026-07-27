@@ -1,7 +1,6 @@
 name = "test"
 command = """
 set -eu
-bun install --frozen-lockfile --backend=copyfile
 bun test
 """
 timeout_minutes = 15

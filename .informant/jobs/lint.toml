@@ -1,7 +1,6 @@
 name = "lint"
 command = """
 set -eu
-bun install --frozen-lockfile --backend=copyfile
 bun run check
 """
 timeout_minutes = 15

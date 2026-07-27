@@ -1,7 +1,6 @@
 name = "typecheck"
 command = """
 set -eu
-bun install --frozen-lockfile --backend=copyfile
 bun run typecheck
 """
 timeout_minutes = 20
