@@ -193,6 +193,8 @@ export function containerRunArguments(options: {
     "run",
     "--rm",
     "--init",
+    "--ulimit",
+    "nofile=65536:65536",
     "--name",
     options.name,
     "--workdir",

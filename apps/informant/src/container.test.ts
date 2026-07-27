@@ -84,6 +84,8 @@ test("builds a bounded Apple Container invocation without putting secrets in arg
     "run",
     "--rm",
     "--init",
+    "--ulimit",
+    "nofile=65536:65536",
     "--name",
     "informant-job",
     "--workdir",
