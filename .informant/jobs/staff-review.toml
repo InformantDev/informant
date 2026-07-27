@@ -54,8 +54,8 @@ if [ "$finding_count" -gt 50 ]; then
 fi
 
 marker="<!-- informant-staff-review:$INFORMANT_SHA -->"
-if gh api --paginate --slurp "repos/$INFORMANT_REPOSITORY/pulls/$pr_number/reviews?per_page=100" \
-  --jq "flatten | any(.commit_id == \"$INFORMANT_SHA\" and (.body // \"\" | contains(\"$marker\")))" | grep -q true; then
+if gh api --paginate "repos/$INFORMANT_REPOSITORY/pulls/$pr_number/reviews?per_page=100" \
+  --jq ".[] | select(.commit_id == \"$INFORMANT_SHA\" and ((.body // \"\") | contains(\"$marker\"))) | .id" | grep -q .; then
   echo "Staff review already exists for this commit"
   exit 0
 fi
