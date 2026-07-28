@@ -28,7 +28,7 @@ export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
 cd "$review_root"
 amp --settings-file "$review_home/settings.json" --mcp-config '{}' --no-ide --no-notifications \
-  --visibility private --mode medium --execute "/staff-review $slug"
+  --visibility unlisted --mode medium --execute "/staff-review $slug"
 
 export GH_TOKEN="$github_token"
 head_sha="$(gh api "repos/$INFORMANT_REPOSITORY/pulls/$pr_number" --jq '.head.sha')"
