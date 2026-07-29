@@ -31,6 +31,7 @@ export interface ClaimResult {
   check?: CheckRun;
   requestedJobs: string[];
   manualRequest: boolean;
+  originalPullRequest?: number;
   retry?: boolean;
 }
 
@@ -643,6 +644,16 @@ export class GitHubClient {
           .filter((check) => check.status === "completed" && check.conclusion !== "neutral")
           .sort((a, b) => b.id - a.id)[0]
       : undefined;
+    const originalPullRequestMatch = previousAggregate?.external_id?.match(
+      /:event:commit:pr:(\d+):([^:]+)$/,
+    );
+    const originalPullRequestNumber = Number(originalPullRequestMatch?.[1]);
+    const originalPullRequest =
+      Number.isSafeInteger(originalPullRequestNumber) &&
+      originalPullRequestNumber > 0 &&
+      originalPullRequestMatch?.[2] === sha
+        ? originalPullRequestNumber
+        : undefined;
     const failedRerunJobs = previousAggregate
       ? [
           ...new Set(
@@ -654,8 +665,14 @@ export class GitHubClient {
           ),
         ]
       : [];
-    const claimEvent =
-      requestedChecks.length > 0 || suiteRerun ? { type: "manual" as const, id: sha } : event;
+    const manualRequest = requestedChecks.length > 0 || suiteRerun;
+    const claimEvent = manualRequest
+      ? (suiteRerun &&
+          originalPullRequest && {
+            type: "commit" as const,
+            id: `pr:${originalPullRequest}:${sha}`,
+          }) || { type: "manual" as const, id: sha }
+      : event;
     const name = claimEvent.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const scope = `${claimEvent.type}:${claimEvent.id}`;
     const acceptsLegacyCommit =
@@ -704,8 +721,7 @@ export class GitHubClient {
         });
       }),
     );
-    if (active.length > stale.length)
-      return { requestedJobs: [], manualRequest: claimEvent.type === "manual", retry: true };
+    if (active.length > stale.length) return { requestedJobs: [], manualRequest, retry: true };
     const requested = suiteRerun || existing.some((check) => check.status === "queued");
     if (
       !requested &&
@@ -774,7 +790,8 @@ export class GitHubClient {
       return {
         check: candidate,
         requestedJobs,
-        manualRequest: claimEvent.type === "manual",
+        manualRequest,
+        originalPullRequest,
       };
     }
 
@@ -784,8 +801,6 @@ export class GitHubClient {
       title: "Claim lost",
       summary: "Another Informant machine claimed this commit first.",
     });
-    return completed
-      ? undefined
-      : { requestedJobs: [], manualRequest: claimEvent.type === "manual", retry: true };
+    return completed ? undefined : { requestedJobs: [], manualRequest, retry: true };
   }
 }
