@@ -406,13 +406,37 @@ describe("serve polling orchestration", () => {
     expect(
       applySecretPolicy({ ...untrusted, jobs: [trustedJob] }, trusted, "trusted-sha").jobs,
     ).toEqual([trustedJob, setupJob]);
-    expect(() =>
-      applySecretPolicy(
-        { ...untrusted, jobs: [{ ...trustedJob, name: "steal" }] },
-        trusted,
-        "trusted-sha",
-      ),
-    ).toThrow("not authorized on the default branch");
+  });
+
+  test("pins or omits unauthorized secret jobs without blocking independent jobs", () => {
+    const configuredJob = config.jobs[0];
+    if (!configuredJob) throw new Error("expected a configured job");
+    const trustedCoverage = { ...configuredJob, name: "coverage", command: "trusted coverage" };
+    const lint = { ...configuredJob, name: "lint", command: "lint pull request" };
+    const publish = {
+      ...configuredJob,
+      name: "publish",
+      command: "publish",
+      secrets: ["GITHUB_TOKEN"],
+    };
+    const report = { ...configuredJob, name: "report", command: "report", needs: ["publish"] };
+    const summary = { ...configuredJob, name: "summary", command: "summary", needs: ["report"] };
+    const result = applySecretPolicy(
+      {
+        ...config,
+        jobs: [
+          lint,
+          { ...trustedCoverage, command: "post coverage", secrets: ["GITHUB_TOKEN"] },
+          publish,
+          report,
+          summary,
+        ],
+      },
+      { ...config, jobs: [trustedCoverage, lint] },
+      "trusted-sha",
+    );
+
+    expect(result.jobs).toEqual([lint, trustedCoverage]);
   });
 
   test("supersedes only the previous automatic lane controller", async () => {
