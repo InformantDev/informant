@@ -16,6 +16,30 @@ interface ContainerResources {
 
 const DEFAULT_CONTAINER_RESOURCES: ContainerResources = { cpu: 1, memoryMb: 1024 };
 
+function containerCommandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
+  return new Error(`${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+}
+
+export async function appleContainerInstalled(runCommand = command): Promise<boolean> {
+  return (await runCommand(["container", "--version"])).exitCode === 0;
+}
+
+export async function ensureAppleContainerSystem(runCommand = command): Promise<void> {
+  let status = await runCommand(["container", "system", "status", "--format", "json"]);
+  if (status.exitCode === 0) return;
+
+  const start = await runCommand(["container", "system", "start", "--enable-kernel-install"]);
+  if (start.exitCode !== 0) throw containerCommandError("could not start Apple Container", start);
+  status = await runCommand(["container", "system", "status", "--format", "json"]);
+  if (status.exitCode !== 0) throw containerCommandError("Apple Container is not ready", status);
+}
+
+export async function startAppleContainerSystem(runCommand = command): Promise<boolean> {
+  if (!(await appleContainerInstalled(runCommand))) return false;
+  await ensureAppleContainerSystem(runCommand);
+  return true;
+}
+
 export function containerJobCommand(
   command: string,
   cache: { restore: string; save: string; installLock?: string },

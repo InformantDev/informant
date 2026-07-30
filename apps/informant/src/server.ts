@@ -1,4 +1,5 @@
 import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles } from "./config.ts";
+import { startAppleContainerSystem } from "./container.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
@@ -43,6 +44,7 @@ export interface ServerDependencies {
   readPollState?: typeof readPollState;
   savePollState?: typeof savePollState;
   recoverInterruptedBuilds?: typeof recoverInterruptedBuilds;
+  startAppleContainerSystem?: typeof startAppleContainerSystem;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -520,6 +522,7 @@ export async function serveRepositories(
   repositories: Repository[],
   options: ServerOptions = {},
 ): Promise<void> {
+  await (options.dependencies?.startAppleContainerSystem ?? startAppleContainerSystem)();
   const owners = new Set(repositories.map((repository) => repository.owner.toLowerCase()));
   const hasEnvironmentCredentials = Boolean(
     Bun.env.INFORMANT_GITHUB_TOKEN ||

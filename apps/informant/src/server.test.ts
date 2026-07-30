@@ -6,6 +6,7 @@ import {
   recoverInterruptedBuilds,
   type ServerDependencies,
   serve,
+  serveRepositories,
 } from "./server.ts";
 import type { BuildRecord, InformantConfig, PullRequest, Repository } from "./types.ts";
 
@@ -27,6 +28,20 @@ const config: InformantConfig = {
     { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
   ],
 };
+
+test("starts Apple Container when the repository worker starts", async () => {
+  let starts = 0;
+  await serveRepositories([], {
+    dependencies: {
+      startAppleContainerSystem: async () => {
+        starts++;
+        return true;
+      },
+    },
+  });
+
+  expect(starts).toBe(1);
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
