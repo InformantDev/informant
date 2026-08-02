@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { statfs } from "node:fs/promises";
+import { readdir, statfs } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { type CommandResult, command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
@@ -38,7 +38,8 @@ export interface StorageReport {
 }
 
 interface StorageOperations {
-  directorySize?: (path: string) => Promise<number>;
+  dataEntries?: (path: string) => Promise<string[]>;
+  directorySizes?: (paths: string[]) => Promise<Map<string, number>>;
   fileSystemSpace?: (path: string) => Promise<FileSystemSpace>;
   listTartImages?: typeof tartImages;
   runCommand?: (argv: string[]) => Promise<CommandResult>;
@@ -49,15 +50,28 @@ function errorMessage(error: unknown): string {
   return message.trim().split("\n", 1)[0] || "not available";
 }
 
-async function directorySize(path: string): Promise<number> {
-  if (!existsSync(path)) return 0;
-  const result = await command(["du", "-sk", path]);
+export async function allocatedDirectorySizes(paths: string[]): Promise<Map<string, number>> {
+  if (paths.length === 0) return new Map();
+  const result = await command(["du", "-sk", ...paths]);
   if (result.exitCode !== 0) {
-    throw new Error(result.stderr.trim() || `could not measure ${path}`);
+    throw new Error(result.stderr.trim() || "could not measure Informant data");
   }
-  const kibibytes = Number.parseInt(result.stdout.trim().split(/\s+/, 1)[0] ?? "", 10);
-  if (!Number.isFinite(kibibytes)) throw new Error(`could not parse disk usage for ${path}`);
-  return kibibytes * 1024;
+  const sizes = new Map<string, number>();
+  for (const line of result.stdout.trim().split("\n")) {
+    if (!line) continue;
+    const match = line.match(/^(\d+)\s+(.+)$/);
+    const kibibytes = Number.parseInt(match?.[1] ?? "", 10);
+    const path = match?.[2];
+    if (!path || !Number.isFinite(kibibytes))
+      throw new Error(`could not parse disk usage: ${line}`);
+    sizes.set(path, kibibytes * 1024);
+  }
+  return sizes;
+}
+
+export async function allocatedDirectorySize(path: string): Promise<number> {
+  if (!existsSync(path)) return 0;
+  return (await allocatedDirectorySizes([path])).get(path) ?? 0;
 }
 
 export async function fileSystemSpace(path: string): Promise<FileSystemSpace> {
@@ -146,18 +160,30 @@ export async function collectStorageReport(
   path = dataDirectory(),
   operations: StorageOperations = {},
 ): Promise<StorageReport> {
-  const measure = operations.directorySize ?? directorySize;
+  const listDataEntries =
+    operations.dataEntries ??
+    (async (dataPath: string) => {
+      try {
+        return (await readdir(dataPath, { withFileTypes: true })).map((entry) => entry.name);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      }
+    });
+  const measure = operations.directorySizes ?? allocatedDirectorySizes;
   const measureFileSystem = operations.fileSystemSpace ?? fileSystemSpace;
   const listImages = operations.listTartImages ?? tartImages;
   const runCommand = operations.runCommand ?? command;
-  const [totalBytes, cacheBytes, buildBytes, tart, container, disk] = await Promise.all([
-    measure(path),
-    measure(join(path, "caches")),
-    measure(join(path, "builds")),
+  const dataPaths = (await listDataEntries(path)).map((entry) => join(path, entry));
+  const [dataSizes, tart, container, disk] = await Promise.all([
+    measure(dataPaths),
     tartStorage(listImages),
     containerStorage(runCommand),
     measureFileSystem(path),
   ]);
+  const cacheBytes = dataSizes.get(join(path, "caches")) ?? 0;
+  const buildBytes = dataSizes.get(join(path, "builds")) ?? 0;
+  const totalBytes = [...dataSizes.values()].reduce((total, size) => total + size, 0);
   return {
     dataPath: path,
     data: {
@@ -186,10 +212,55 @@ export function formatBytes(bytes: number): string {
 
 export type DiskSpaceStatus = "healthy" | "warning" | "critical";
 
-export function assessDiskSpace(space: FileSystemSpace): DiskSpaceStatus {
+export interface DiskSpaceThresholds {
+  minimumFreeBytes: number;
+  minimumFreeRatio: number;
+  criticalFreeBytes: number;
+  criticalFreeRatio: number;
+}
+
+function environmentNumber(
+  environment: Record<string, string | undefined>,
+  name: string,
+  fallback: number,
+): number {
+  const value = Number(environment[name]);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+export function diskSpaceThresholds(
+  environment: Record<string, string | undefined> = Bun.env,
+): DiskSpaceThresholds {
+  return {
+    minimumFreeBytes: environmentNumber(environment, "INFORMANT_MIN_FREE_SPACE_GB", 25) * GIGABYTE,
+    minimumFreeRatio: environmentNumber(environment, "INFORMANT_MIN_FREE_SPACE_PERCENT", 10) / 100,
+    criticalFreeBytes: 10 * GIGABYTE,
+    criticalFreeRatio: 0.05,
+  };
+}
+
+export function minimumFreeSpace(
+  space: FileSystemSpace,
+  thresholds = diskSpaceThresholds(),
+): number {
+  return Math.max(thresholds.minimumFreeBytes, space.totalBytes * thresholds.minimumFreeRatio);
+}
+
+export function assessDiskSpace(
+  space: FileSystemSpace,
+  thresholds = diskSpaceThresholds(),
+): DiskSpaceStatus {
   const availableRatio = space.totalBytes > 0 ? space.availableBytes / space.totalBytes : 0;
-  if (space.availableBytes < 10 * GIGABYTE || availableRatio < 0.05) return "critical";
-  if (space.availableBytes < 25 * GIGABYTE || availableRatio < 0.1) return "warning";
+  if (
+    space.availableBytes < thresholds.criticalFreeBytes ||
+    availableRatio < thresholds.criticalFreeRatio
+  )
+    return "critical";
+  if (
+    space.availableBytes < thresholds.minimumFreeBytes ||
+    availableRatio < thresholds.minimumFreeRatio
+  )
+    return "warning";
   return "healthy";
 }
 
@@ -258,10 +329,17 @@ export function formatStorageReport(report: StorageReport): string {
     "",
     `Data path: ${report.dataPath}`,
     "",
+    "Automatic cleanup",
+    row("Worker housekeeping", "Runs at startup and whenever all builds are idle"),
+    row(
+      "Free-space target",
+      `${formatBytes(minimumFreeSpace(report.disk))} (${(diskSpaceThresholds().minimumFreeRatio * 100).toFixed(0)}% or configured minimum)`,
+    ),
+    "",
     "Manage space",
     row("informant cache prune", "Remove keyed caches; keep shared caches"),
     row("informant cache clear", "Remove all persistent job caches"),
-    row("informant image prune", "Remove unused prepared Tart images"),
+    row("informant image prune", "Remove unused prepared runtime images"),
     row(
       "container image prune --all",
       "Remove unused runtime images, including non-Informant images",

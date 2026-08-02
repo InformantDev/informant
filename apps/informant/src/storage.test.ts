@@ -4,8 +4,10 @@ import type { CommandResult } from "./process.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
+  diskSpaceThresholds,
   formatBytes,
   formatStorageReport,
+  minimumFreeSpace,
 } from "./storage.ts";
 
 function result(stdout = "", stderr = "", exitCode = 0): CommandResult {
@@ -16,12 +18,17 @@ describe("storage reporting", () => {
   test("collects attributable data and shared runtime usage separately", async () => {
     const root = "/tmp/informant-storage-test";
     const sizes = new Map([
-      [root, 20_000_000_000],
       [join(root, "caches"), 12_000_000_000],
       [join(root, "builds"), 5_000_000_000],
+      [join(root, "state"), 3_000_000_000],
     ]);
+    let measuredPaths: string[] = [];
     const report = await collectStorageReport(root, {
-      directorySize: async (path) => sizes.get(path) ?? 0,
+      dataEntries: async () => ["caches", "builds", "state"],
+      directorySizes: async (paths) => {
+        measuredPaths = paths;
+        return new Map(paths.map((path) => [path, sizes.get(path) ?? 0]));
+      },
       fileSystemSpace: async () => ({
         availableBytes: 80_000_000_000,
         totalBytes: 1_000_000_000_000,
@@ -60,6 +67,11 @@ describe("storage reporting", () => {
       buildBytes: 5_000_000_000,
       otherBytes: 3_000_000_000,
     });
+    expect(measuredPaths).toEqual([
+      join(root, "caches"),
+      join(root, "builds"),
+      join(root, "state"),
+    ]);
     expect(report.tart).toMatchObject({
       available: true,
       count: 2,
@@ -84,7 +96,8 @@ describe("storage reporting", () => {
 
   test("keeps the report useful when optional runtimes are unavailable", async () => {
     const report = await collectStorageReport("/tmp/informant-storage-test", {
-      directorySize: async () => 0,
+      dataEntries: async () => [],
+      directorySizes: async () => new Map(),
       fileSystemSpace: async () => ({ availableBytes: 100, totalBytes: 1_000 }),
       listTartImages: async () => {
         throw new Error("tart not found");
@@ -113,6 +126,16 @@ describe("disk space health", () => {
     expect(assessDiskSpace({ availableBytes: 5_000_000_000, totalBytes: 500_000_000_000 })).toBe(
       "critical",
     );
+  });
+
+  test("uses configurable cleanup warning thresholds", () => {
+    const thresholds = diskSpaceThresholds({
+      INFORMANT_MIN_FREE_SPACE_GB: "40",
+      INFORMANT_MIN_FREE_SPACE_PERCENT: "15",
+    });
+    const disk = { availableBytes: 30_000_000_000, totalBytes: 100_000_000_000 };
+    expect(minimumFreeSpace(disk, thresholds)).toBe(40_000_000_000);
+    expect(assessDiskSpace(disk, thresholds)).toBe("warning");
   });
 
   test("formats human-readable decimal units", () => {

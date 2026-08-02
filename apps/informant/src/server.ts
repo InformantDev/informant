@@ -1,9 +1,18 @@
 import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles } from "./config.ts";
-import { startAppleContainerSystem } from "./container.ts";
+import {
+  reconcilePreparedContainerImageReferences,
+  startAppleContainerSystem,
+} from "./container.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
+import {
+  formatHousekeepingSummary,
+  runHousekeeping,
+  updateCacheConfiguration,
+} from "./housekeeping.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
 import { listActiveBuilds, listAllBuilds, saveBuild } from "./store.ts";
+import { reconcilePreparedImageReferences } from "./tart/images.ts";
 import { triggerMatches } from "./triggers.ts";
 import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 
@@ -30,6 +39,7 @@ export interface ServerOptions {
   once?: boolean;
   signal?: AbortSignal;
   onMessage?: (message: string) => void;
+  onIdle?: () => Promise<void> | void;
   dependencies?: ServerDependencies;
 }
 
@@ -45,6 +55,10 @@ export interface ServerDependencies {
   savePollState?: typeof savePollState;
   recoverInterruptedBuilds?: typeof recoverInterruptedBuilds;
   startAppleContainerSystem?: typeof startAppleContainerSystem;
+  housekeeping?: typeof runHousekeeping;
+  updateCacheConfiguration?: typeof updateCacheConfiguration;
+  reconcilePreparedImageReferences?: typeof reconcilePreparedImageReferences;
+  reconcilePreparedContainerImageReferences?: typeof reconcilePreparedContainerImageReferences;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -172,6 +186,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const completedComments = new Set<number>();
   const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
+  const idle = () => {
+    if (inFlightRuns.size > 0 || !options.onIdle) return;
+    void Promise.resolve(options.onIdle()).catch((error) => {
+      message(`housekeeping failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  };
   let recoveryPending = true;
   const configAt = (sha: string) => {
     const cached = configs.get(sha);
@@ -247,6 +267,45 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
       const bootstrap = await configAt(defaultSha);
+      const storageReferences = await Promise.allSettled([
+        (dependencies.reconcilePreparedImageReferences ?? reconcilePreparedImageReferences)(
+          repository.fullName,
+          bootstrap.jobs
+            .filter(
+              (job) =>
+                job.runtime?.type !== "container" &&
+                (job.runtime?.type === "vm" ? job.runtime.prepare : bootstrap.vm.prepare),
+            )
+            .map((job) => job.name),
+          options.signal,
+        ),
+        (
+          dependencies.reconcilePreparedContainerImageReferences ??
+          reconcilePreparedContainerImageReferences
+        )(
+          repository.fullName,
+          bootstrap.jobs
+            .filter((job) => job.runtime?.type === "container" && job.runtime.prepare)
+            .map((job) => job.name),
+          options.signal,
+        ),
+        (dependencies.updateCacheConfiguration ?? updateCacheConfiguration)(
+          repository.fullName,
+          bootstrap.jobs.filter((job) => (job.cache?.length ?? 0) > 0).map((job) => job.name),
+        ),
+      ]);
+      const removedStorageReferences = storageReferences.reduce(
+        (sum, result) => sum + (result.status === "fulfilled" ? result.value : 0),
+        0,
+      );
+      for (const result of storageReferences) {
+        if (result.status === "rejected") {
+          message(
+            `could not reconcile storage references: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+          );
+        }
+      }
+      if (removedStorageReferences > 0) idle();
       intervalSeconds = bootstrap.pollIntervalSeconds;
       const state = await loadPollState(repository.fullName);
       const hasTagTriggers = bootstrap.jobs.some((job) =>
@@ -406,6 +465,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               ) {
                 automaticLanes.delete(target.lane);
               }
+              idle();
             });
           inFlightRuns.set(target.eventId, run);
         } catch (error) {
@@ -499,6 +559,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(eventId);
+              idle();
             });
           inFlightRuns.set(eventId, run);
         } catch (error) {
@@ -536,6 +597,30 @@ export async function serveRepositories(
   options: ServerOptions = {},
 ): Promise<void> {
   await (options.dependencies?.startAppleContainerSystem ?? startAppleContainerSystem)();
+  const performHousekeeping = options.dependencies?.housekeeping ?? runHousekeeping;
+  let pendingHousekeeping: Promise<void> | undefined;
+  let housekeepingRequested = false;
+  const clean = () => {
+    housekeepingRequested = true;
+    pendingHousekeeping ??= (async () => {
+      while (housekeepingRequested) {
+        housekeepingRequested = false;
+        try {
+          const summary = await performHousekeeping(repositories);
+          const result = formatHousekeepingSummary(summary);
+          if (result) options.onMessage?.(result);
+        } catch (error) {
+          options.onMessage?.(
+            `housekeeping failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    })().finally(() => {
+      pendingHousekeeping = undefined;
+    });
+    return pendingHousekeeping;
+  };
+  await clean();
   const owners = new Set(repositories.map((repository) => repository.owner.toLowerCase()));
   const hasEnvironmentCredentials = Boolean(
     Bun.env.INFORMANT_GITHUB_TOKEN ||
@@ -554,6 +639,7 @@ export async function serveRepositories(
     repositories.map((repository) =>
       serve(repository, {
         ...options,
+        onIdle: clean,
         onMessage: (message) => options.onMessage?.(`${repository.fullName} · ${message}`),
       }),
     ),

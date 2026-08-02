@@ -39,16 +39,32 @@ const config: InformantConfig = {
 
 test("starts Apple Container when the repository worker starts", async () => {
   let starts = 0;
+  let cleanups = 0;
   await serveRepositories([], {
     dependencies: {
       startAppleContainerSystem: async () => {
         starts++;
         return true;
       },
+      housekeeping: async () => {
+        cleanups++;
+        return {
+          skipped: false,
+          builds: 0,
+          cacheRepositories: 0,
+          cacheJobs: 0,
+          cacheVersions: 0,
+          sharedCaches: 0,
+          tartImages: 0,
+          containerImages: 0,
+          pressure: false,
+        };
+      },
     },
   });
 
   expect(starts).toBe(1);
+  expect(cleanups).toBe(1);
 });
 
 function deferred<T>() {
@@ -98,6 +114,9 @@ function dependencies(
       state.pendingTags = [...next.pendingTags];
     },
     recoverInterruptedBuilds: async () => false,
+    reconcilePreparedImageReferences: async () => 0,
+    reconcilePreparedContainerImageReferences: async () => 0,
+    updateCacheConfiguration: async () => 0,
     sleep,
   };
 }
@@ -188,6 +207,56 @@ describe("serve polling orchestration", () => {
       triggers: [{ event: "commit", tag: { patterns: ["v*"] } }],
     })),
   };
+
+  test("reconciles only configured caches and prepared runtime jobs", async () => {
+    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const deps = dependencies(github({}), state, async () => undefined);
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected a job");
+    deps.repositoryConfig = async () => ({
+      ...config,
+      vm: { ...config.vm, prepare: "install vm tools" },
+      jobs: [
+        { ...baseJob, name: "vm" },
+        {
+          ...baseJob,
+          name: "container",
+          runtime: { type: "container", image: "base", prepare: "install container tools" },
+        },
+        {
+          ...baseJob,
+          name: "plain-container",
+          runtime: { type: "container", image: "base" },
+        },
+        {
+          ...baseJob,
+          name: "cached",
+          cache: [{ paths: ["~/.cache/test"], keyFiles: [], shared: false }],
+        },
+      ],
+    });
+    let vmJobs: string[] = [];
+    let containerJobs: string[] = [];
+    let cacheJobs: string[] = [];
+    deps.reconcilePreparedImageReferences = async (_repository, jobs) => {
+      vmJobs = jobs;
+      return 0;
+    };
+    deps.reconcilePreparedContainerImageReferences = async (_repository, jobs) => {
+      containerJobs = jobs;
+      return 0;
+    };
+    deps.updateCacheConfiguration = async (_repository, jobs) => {
+      cacheJobs = jobs;
+      return 0;
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(vmJobs).toEqual(["vm", "cached"]);
+    expect(containerJobs).toEqual(["container"]);
+    expect(cacheJobs).toEqual(["cached"]);
+  });
 
   test("baselines existing tags on the first poll without launching them", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };

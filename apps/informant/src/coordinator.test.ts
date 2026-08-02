@@ -126,6 +126,7 @@ function harness(
   } as unknown as GitHubClient;
   const dependencies: CoordinatorDependencies = {
     createBuild: async () => {},
+    housekeepingBarrier: async (callback) => callback(),
     saveBuild: async (record) => {
       saved.push({ ...record });
     },

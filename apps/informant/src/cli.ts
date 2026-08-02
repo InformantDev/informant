@@ -16,9 +16,11 @@ import {
   readConfig,
   selectJobs,
 } from "./config.ts";
+import { prunePreparedContainerImages } from "./container.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubClient } from "./github.ts";
 import { installPostPushHook, uninstallPostPushHook } from "./hook.ts";
+import { formatHousekeepingSummary, runHousekeeping } from "./housekeeping.ts";
 import {
   addRepository,
   listGitHubCredentials,
@@ -60,7 +62,7 @@ Usage:
                                         Manually request all or selected jobs
   informant image prepare                Prepare this repository's configured VM job images
   informant image list                   List Informant-prepared VM images
-  informant image prune                  Delete unused prepared VM images
+  informant image prune                  Delete unused prepared runtime images
   informant cache path                   Print the persistent job cache directory
   informant cache prune                  Delete keyed caches while preserving shared caches
   informant cache clear                  Delete all persistent job caches
@@ -221,6 +223,19 @@ async function manualRun(
   await github.createCheck(repository, sha, `manual:${crypto.randomUUID()}`, "queued", jobs);
   const progress = spinner();
   progress.start(`Claiming ${repository.fullName}@${sha.slice(0, 7)}`);
+  const clean = async () => {
+    const repositories: Awaited<ReturnType<typeof listRepositories>> =
+      await listRepositories().catch(() => []);
+    if (!repositories.some((configured) => configured.fullName === repository.fullName)) {
+      repositories.push(repository);
+    }
+    await runHousekeeping(repositories)
+      .then((summary) => {
+        const message = formatHousekeepingSummary(summary);
+        if (message) console.log(message);
+      })
+      .catch(() => undefined);
+  };
   const build = await runCommit(
     github,
     repository,
@@ -232,9 +247,11 @@ async function manualRun(
   );
   if (!build) {
     progress.stop("Another machine is already running this commit.");
+    await clean();
     return;
   }
   progress.stop(`${build.status}: ${build.id}`);
+  await clean();
   if (build.status !== "success") process.exitCode = 1;
 }
 
@@ -618,7 +635,18 @@ async function manageImages(action?: string): Promise<void> {
     return;
   }
   if (action === "prune") {
-    const count = await prunePreparedImages();
+    const pruned = await Promise.allSettled([
+      prunePreparedImages(),
+      prunePreparedContainerImages(),
+    ]);
+    if (pruned.every((result) => result.status === "rejected")) {
+      const failure = pruned[0];
+      if (failure?.status === "rejected") throw failure.reason;
+    }
+    const count = pruned.reduce(
+      (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+      0,
+    );
     outro(`Deleted ${count} unused prepared ${count === 1 ? "image" : "images"}`);
     return;
   }

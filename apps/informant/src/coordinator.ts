@@ -4,6 +4,7 @@ import { selectJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
+import { withImageLock } from "./tart/vm.ts";
 import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, CheckRun, InformantConfig, JobConfig, Repository } from "./types.ts";
 
@@ -14,6 +15,7 @@ export interface CoordinatorDependencies {
   saveBuild: typeof saveBuild;
   runInTart: typeof runInTart;
   readLogTail: (path: string) => Promise<string>;
+  housekeepingBarrier?: <T>(callback: () => Promise<T>) => Promise<T>;
 }
 
 const CHECK_LOG_CHARACTERS = 55_000;
@@ -256,7 +258,9 @@ export async function runCommit(
   let childrenReconciled = false;
   let executionFinished = false;
   try {
-    await dependencies.createBuild(record);
+    await (
+      dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
+    )(() => dependencies.createBuild(record));
     let executionError: unknown;
     let success = false;
     try {

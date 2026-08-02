@@ -8,6 +8,8 @@ import {
   containerRunArguments,
   ensurePreparedContainer,
   preparedContainerImage,
+  pruneKnownPreparedContainerImages,
+  prunePreparedContainerImages,
   runInContainer,
 } from "./container.ts";
 import { shellQuote } from "./tart/vm.ts";
@@ -192,6 +194,68 @@ test("prepares and reuses a deterministic container image", async () => {
     }),
   ).toBe(prepared);
   expect(reused).toEqual([["container", "image", "inspect", prepared]]);
+});
+
+test("tracks prepared container image references and prunes images after their last user moves", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-container-references-"));
+  const dataPath = join(root, "data");
+  const firstRuntime = { type: "container" as const, image: "base", prepare: "install first" };
+  const secondRuntime = { type: "container" as const, image: "base", prepare: "install second" };
+  const first = preparedContainerImage(firstRuntime);
+  const second = preparedContainerImage(secondRuntime);
+  const orphan = "informant-prepared-container:aaaaaaaaaaaaaaaa";
+  if (!first || !second) throw new Error("expected prepared container image names");
+  const images = new Set([first, second, orphan]);
+  const deleted: string[] = [];
+  const command = async (args: string[]) => {
+    if (args[1] === "image" && args[2] === "inspect") {
+      return {
+        exitCode: images.has(args[3] ?? "") ? 0 : 1,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+      };
+    }
+    if (args[1] === "image" && args[2] === "list") {
+      return { exitCode: 0, stdout: [...images].join("\n"), stderr: "", timedOut: false };
+    }
+    if (args[1] === "image" && args[2] === "delete") {
+      const image = args.at(-1) ?? "";
+      images.delete(image);
+      deleted.push(image);
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+    }
+    return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+  };
+  const withImageLock = async <T>(_image: string, callback: () => Promise<T>) => callback();
+  try {
+    for (const reference of ["owner/one\0job", "owner/two\0job"])
+      await ensurePreparedContainer(firstRuntime, undefined, () => {}, undefined, {
+        command,
+        withImageLock,
+        reference,
+        dataPath,
+      });
+    await ensurePreparedContainer(secondRuntime, undefined, () => {}, undefined, {
+      command,
+      withImageLock,
+      reference: "owner/one\0job",
+      dataPath,
+    });
+    expect(deleted).toEqual([]);
+    await ensurePreparedContainer(secondRuntime, undefined, () => {}, undefined, {
+      command,
+      withImageLock,
+      reference: "owner/two\0job",
+      dataPath,
+    });
+    expect(deleted).toEqual([first]);
+    expect(await pruneKnownPreparedContainerImages(command, dataPath, withImageLock)).toBe(0);
+    expect(await prunePreparedContainerImages(command, dataPath, withImageLock)).toBe(1);
+    expect(deleted).toEqual([first, orphan]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("copies preparation inputs and includes their contents in the image identity", async () => {

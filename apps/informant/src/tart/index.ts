@@ -27,6 +27,7 @@ export {
   prunePreparedImages,
   pruneStoppedJobVms,
   reconcilePreparedImageReferences,
+  reconcilePreparedImageRepositories,
 } from "./images.ts";
 export { isRetryableSshAuthenticationFailure } from "./vm.ts";
 

@@ -114,19 +114,32 @@ export async function reconcilePreparedImageReferences(
   repository: string,
   vmJobs: string[],
   signal?: AbortSignal,
-): Promise<void> {
-  await withPreparedImageReferencesLock(async () => {
+): Promise<number> {
+  return withPreparedImageReferencesLock(async () => {
     const directory = preparedImageReferencesDirectory();
     const jobDirectory = join(directory, `${digest(repository)}.jobs`);
     const active = new Set(vmJobs.map(digest));
     const entries = await readdir(jobDirectory, { withFileTypes: true }).catch(() => []);
-    await Promise.all(
-      entries
-        .filter((entry) => entry.isFile() && !active.has(entry.name))
-        .map((entry) => rm(join(jobDirectory, entry.name), { force: true })),
-    );
+    const stale = entries.filter((entry) => entry.isFile() && !active.has(entry.name));
+    await Promise.all(stale.map((entry) => rm(join(jobDirectory, entry.name), { force: true })));
     await rm(join(directory, digest(repository)), { force: true });
+    return stale.length;
   }, signal);
+}
+
+export async function reconcilePreparedImageRepositories(repositories: string[]): Promise<number> {
+  return withPreparedImageReferencesLock(async () => {
+    const directory = preparedImageReferencesDirectory();
+    const active = new Set(
+      repositories.flatMap((repository) => [digest(repository), `${digest(repository)}.jobs`]),
+    );
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+    const stale = entries.filter((entry) => !active.has(entry.name));
+    await Promise.all(
+      stale.map((entry) => rm(join(directory, entry.name), { recursive: true, force: true })),
+    );
+    return stale.length;
+  });
 }
 
 export async function ensurePreparedImage(
