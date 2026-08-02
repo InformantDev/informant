@@ -7,6 +7,7 @@ import {
 } from "./container.ts";
 import {
   allocatedDirectorySize,
+  allocatedDirectorySizes,
   type FileSystemSpace,
   fileSystemSpace,
   minimumFreeSpace,
@@ -44,6 +45,7 @@ interface HousekeepingOperations {
   now?: number;
   activeBuildIds?: () => Promise<string[]>;
   directorySize?: (path: string) => Promise<number>;
+  directorySizes?: (paths: string[]) => Promise<Map<string, number>>;
   diskSpace?: (path: string) => Promise<FileSystemSpace>;
   withLock?: typeof withImageLock;
   reconcileTartRepositories?: typeof reconcilePreparedImageRepositories;
@@ -243,12 +245,14 @@ async function pruneStaleCacheVersions(
 async function pruneCacheQuota(
   dataPath: string,
   maximumBytes: number,
-  measure: (path: string) => Promise<number>,
+  measure: (paths: string[]) => Promise<Map<string, number>>,
 ): Promise<{ removed: number; freedBytes: number }> {
-  const entries: Array<DirectoryEntry & { bytes: number }> = [];
-  for (const entry of await keyedCacheVersions(dataPath)) {
-    entries.push({ ...entry, bytes: await measure(entry.path) });
-  }
+  const versions = await keyedCacheVersions(dataPath);
+  const sizes = await measure(versions.map((entry) => entry.path));
+  const entries: Array<DirectoryEntry & { bytes: number }> = versions.map((entry) => ({
+    ...entry,
+    bytes: sizes.get(entry.path) ?? 0,
+  }));
   let total = entries.reduce((sum, entry) => sum + entry.bytes, 0);
   let removed = 0;
   let freedBytes = 0;
@@ -319,6 +323,14 @@ export async function runHousekeeping(
 ): Promise<HousekeepingSummary> {
   const dataPath = operations.dataPath ?? dataDirectory();
   const measure = operations.directorySize ?? allocatedDirectorySize;
+  const measureMany =
+    operations.directorySizes ??
+    (operations.directorySize
+      ? async (paths: string[]) =>
+          new Map(
+            await Promise.all(paths.map(async (path) => [path, await measure(path)] as const)),
+          )
+      : allocatedDirectorySizes);
   const inspectDisk = operations.diskSpace ?? fileSystemSpace;
   const lock = operations.withLock ?? withImageLock;
   return lock("housekeeping", async () => {
@@ -345,7 +357,7 @@ export async function runHousekeeping(
     empty.cacheRepositories += await pruneOrphanedCacheRepositories(dataPath, repositories);
     empty.cacheJobs += await pruneOrphanedCacheJobs(dataPath, repositories);
     empty.cacheVersions += await pruneStaleCacheVersions(dataPath, now, policy);
-    const quota = await pruneCacheQuota(dataPath, policy.keyedCacheMaxBytes, measure);
+    const quota = await pruneCacheQuota(dataPath, policy.keyedCacheMaxBytes, measureMany);
     empty.cacheVersions += quota.removed;
 
     const repositoryNames = repositories.map((repository) => repository.fullName);

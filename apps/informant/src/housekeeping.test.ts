@@ -62,10 +62,18 @@ describe("automatic housekeeping", () => {
     await updateCacheConfiguration(repository.fullName, ["active"], root);
     await directory(root, "caches/orphaned-repository/job/cache/version", now);
     const shared = await directory(root, "caches/shared/dependencies", now);
+    const measuredBatches: string[][] = [];
 
     const summary = await runHousekeeping(
       [repository],
-      { ...operations(root), now },
+      {
+        ...operations(root),
+        now,
+        directorySizes: async (paths) => {
+          measuredBatches.push(paths);
+          return new Map(paths.map((path) => [path, 0]));
+        },
+      },
       {
         ...housekeepingPolicy({}),
         buildRetentionMs: 24 * 60 * 60 * 1_000,
@@ -84,6 +92,10 @@ describe("automatic housekeeping", () => {
     });
     expect(await Bun.file(join(root, "builds", "build-0", "data")).exists()).toBe(true);
     expect(await Bun.file(join(root, "builds", "build-3", "data")).exists()).toBe(false);
+    expect(measuredBatches).toHaveLength(1);
+    expect(new Set(measuredBatches[0])).toEqual(
+      new Set([join(root, `${cache}/version-0`), join(root, `${cache}/version-1`)]),
+    );
     expect(
       await Bun.file(
         join(root, "caches", "orphaned-repository", "job", "cache", "version", "data"),

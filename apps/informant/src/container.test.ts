@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,23 @@ import {
 } from "./container.ts";
 import { shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
+
+const temporaryDataPaths: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDataPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
+});
+
+function temporaryContainerDataPath(): string {
+  const path = join(tmpdir(), `informant-container-data-${crypto.randomUUID()}`);
+  temporaryDataPaths.push(path);
+  return path;
+}
+
+const passthroughImageLock = async <T>(_image: string, callback: () => Promise<T>): Promise<T> =>
+  callback();
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -427,6 +444,7 @@ test("serializes preparation of different images through the shared Apple builde
 test("passes secrets through the client environment and always removes the container", async () => {
   const invocations: Array<{ args: string[]; environment?: Record<string, string> }> = [];
   const output: string[] = [];
+  const locks: string[] = [];
   const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const job: JobConfig = {
     name: "test",
@@ -453,6 +471,11 @@ test("passes secrets through the client environment and always removes the conta
     { TOKEN: "line one\nline two" },
     undefined,
     {
+      dataPath: temporaryContainerDataPath(),
+      withImageLock: async (image, callback) => {
+        locks.push(image);
+        return callback();
+      },
       command: async (args, options) => {
         invocations.push({ args, environment: options?.env });
         await options?.onOutput?.("line one\nline two");
@@ -476,6 +499,7 @@ test("passes secrets through the client environment and always removes the conta
   expect(args).toContain("CLICOLOR_FORCE=1");
   expect(invocations[0]?.environment?.TOKEN).toBe("line one\nline two");
   expect(invocations[1]?.args.slice(0, 3)).toEqual(["container", "delete", "--force"]);
+  expect(locks).toEqual(["prepared-container-image-references"]);
   expect(output.join("")).toStartWith("\n[test] $ bun test\n");
   expect(output.join("")).not.toContain("━━");
   expect(output.join("")).toContain("[REDACTED]");
@@ -518,6 +542,8 @@ test("prepared jobs copy source into the baked workspace before running", async 
       {},
       undefined,
       {
+        dataPath: temporaryContainerDataPath(),
+        withImageLock: passthroughImageLock,
         command: async (args) => {
           invocations.push(args);
           return result();
@@ -542,6 +568,7 @@ test("limits concurrent Apple containers across jobs", async () => {
   const waiting: string[] = [];
   const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
   const releases = new Map<string, ReturnType<typeof deferred<ReturnType<typeof result>>>>();
+  const dataPath = temporaryContainerDataPath();
   const run = (name: string) =>
     runInContainer(
       repository,
@@ -572,6 +599,8 @@ test("limits concurrent Apple containers across jobs", async () => {
       {},
       undefined,
       {
+        dataPath,
+        withImageLock: passthroughImageLock,
         command: async (args) => {
           if (args[1] === "run") {
             started.push(name);
@@ -603,6 +632,7 @@ test("cancelling a queued job does not invoke Apple Container", async () => {
   const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
   const release = deferred<ReturnType<typeof result>>();
   const invocations = new Map<string, string[][]>();
+  const dataPath = temporaryContainerDataPath();
   const run = (name: string, signal?: AbortSignal) =>
     runInContainer(
       repository,
@@ -631,6 +661,8 @@ test("cancelling a queued job does not invoke Apple Container", async () => {
       {},
       signal,
       {
+        dataPath,
+        withImageLock: passthroughImageLock,
         command: async (args) => {
           const calls = invocations.get(name) ?? [];
           calls.push(args);

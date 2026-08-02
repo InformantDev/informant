@@ -225,6 +225,11 @@ export interface ContainerPreparationOperations {
   dataPath?: string;
 }
 
+type ContainerRunOperations = Pick<
+  ContainerPreparationOperations,
+  "command" | "withImageLock" | "dataPath"
+>;
+
 const preparedContainerReferencesDirectory = (dataPath = dataDirectory()) =>
   join(dataPath, "prepared-container-image-references");
 
@@ -551,7 +556,7 @@ export async function runInContainer(
   started: () => Promise<void>,
   runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
-  operations: { command?: typeof command } = {},
+  operations: ContainerRunOperations = {},
 ): Promise<{ success: boolean; exitCode: number; timedOut: boolean }> {
   if (job.runtime?.type !== "container")
     throw new Error("container runner requires a container runtime");
@@ -608,7 +613,9 @@ export async function runInContainer(
     const wrapped = containerJobCommand(`${sourceSetup}${job.command}`, caches);
     const image = await ensurePreparedContainer(runtime, workspace, log, executionSignal, {
       command: runCommand,
+      withImageLock: operations.withImageLock ?? withImageLock,
       reference: `${repository.fullName}\0${job.name}`,
+      dataPath: operations.dataPath,
     });
     const mounts = caches.mounts.map((mount) => ({
       source: mount.path,
