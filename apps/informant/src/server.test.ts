@@ -41,6 +41,7 @@ test("starts Apple Container when the repository worker starts", async () => {
   let starts = 0;
   let cleanups = 0;
   await serveRepositories([], {
+    once: true,
     dependencies: {
       startAppleContainerSystem: async () => {
         starts++;
@@ -65,6 +66,53 @@ test("starts Apple Container when the repository worker starts", async () => {
 
   expect(starts).toBe(1);
   expect(cleanups).toBe(1);
+});
+
+test("refreshes repository registrations without restarting the worker", async () => {
+  const outer = new AbortController();
+  const added: Repository = { owner: "owner", repo: "added", fullName: "owner/added" };
+  const started: string[] = [];
+  const stopped: string[] = [];
+  let refreshes = 0;
+
+  await serveRepositories([repository], {
+    signal: outer.signal,
+    dependencies: {
+      startAppleContainerSystem: async () => true,
+      housekeeping: async () => ({
+        skipped: false,
+        builds: 0,
+        cacheRepositories: 0,
+        cacheJobs: 0,
+        cacheVersions: 0,
+        sharedCaches: 0,
+        tartImages: 0,
+        containerImages: 0,
+        pressure: false,
+      }),
+      sleep: async () => {},
+      listRepositories: async () => {
+        refreshes++;
+        if (refreshes === 1) return [repository, added];
+        if (refreshes === 2) return [added];
+        outer.abort();
+        return [added];
+      },
+      serveRepository: async (current, options) => {
+        started.push(current.fullName);
+        const signal = options?.signal;
+        if (!signal) throw new Error("expected a repository abort signal");
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        stopped.push(current.fullName);
+      },
+    },
+  });
+
+  expect(started).toEqual([repository.fullName, added.fullName]);
+  expect(stopped).toEqual([repository.fullName, added.fullName]);
 });
 
 function deferred<T>() {
@@ -182,7 +230,7 @@ test("serveRepositories reruns housekeeping requested while the current run sett
     },
   };
 
-  await serveRepositories([repository], { dependencies: deps });
+  await serveRepositories([repository], { once: true, dependencies: deps });
   expect(cleanups).toBe(1);
   if (!idle) throw new Error("expected an idle callback");
 

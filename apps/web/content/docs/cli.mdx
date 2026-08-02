@@ -37,8 +37,8 @@ overrides for headless provisioning and external secret managers. The separate `
 clone repositories. See [GitHub App credentials](/docs/github-app) for details.
 
 Registered repositories are machine-local and persist in `~/.config/informant/config.json`. Set
-`INFORMANT_CONFIG_FILE` to use a different location. Restart a running worker after changing its
-repository list.
+`INFORMANT_CONFIG_FILE` to use a different location. A running worker automatically starts polling
+newly registered repositories and stops polling repositories after they are removed.
 
 Local build records live under `~/.local/share/informant`; set `INFORMANT_DATA_DIR` to move them.
 The build list shows running jobs and links each build to its GitHub pull request or commit. Pass
