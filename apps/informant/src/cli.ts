@@ -30,6 +30,13 @@ import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup, updateInformant } from "./startup.ts";
 import {
+  assessDiskSpace,
+  collectStorageReport,
+  fileSystemSpace,
+  formatBytes,
+  formatStorageReport,
+} from "./storage.ts";
+import {
   dataDirectory,
   getBuild,
   jobLogPath,
@@ -64,7 +71,8 @@ Usage:
   informant builds [--all]               List running builds or recent history
   informant logs [<build-id>]             Tail a build's logs or select a running job
   informant update                       Update with Homebrew and restart a running worker
-  informant doctor                       Check host dependencies and auth
+  informant storage                      Show Informant disk usage and available space
+  informant doctor                       Check host dependencies, auth, and disk space
   informant --version
 `;
 
@@ -697,6 +705,21 @@ async function doctor(): Promise<void> {
       `${okay ? "✓" : "✗"} ${label}${okay ? "" : ` — ${result.stderr.trim() || "not found"}`}`,
     );
   }
+  try {
+    const disk = await fileSystemSpace(dataDirectory());
+    const status = assessDiskSpace(disk);
+    const detail = `${formatBytes(disk.availableBytes)} free of ${formatBytes(disk.totalBytes)}`;
+    if (status === "healthy") console.log(`✓ disk space — ${detail}`);
+    else if (status === "warning")
+      console.log(`○ disk space — ${detail}; space is getting low, run informant storage`);
+    else {
+      console.log(`✗ disk space — ${detail}; free space is critically low, run informant storage`);
+      failed = true;
+    }
+  } catch (error) {
+    console.log(`✗ disk space — ${error instanceof Error ? error.message : error}`);
+    failed = true;
+  }
   const container = await command(["container", "system", "status"]);
   const tart = await command(["tart", "--version"]);
   const sshpass = await command(["sshpass", "-V"]);
@@ -751,6 +774,11 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "init") return init();
   if (subcommand === "setup") return setup();
   if (subcommand === "doctor") return doctor();
+  if (subcommand === "storage") {
+    if (action) throw new Error("storage does not accept arguments");
+    console.log(formatStorageReport(await collectStorageReport()));
+    return;
+  }
   if (subcommand === "update") {
     if (action) throw new Error("update does not accept arguments");
     const updated = await updateInformant({
