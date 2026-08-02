@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
+import { appleContainerInstalled, ensureAppleContainerSystem } from "./container.ts";
 import {
   listGitHubCredentials,
   listRepositories,
@@ -38,10 +39,6 @@ async function installPackage(path: string): Promise<void> {
 
 function commandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
   return new Error(`${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
-}
-
-export async function appleContainerInstalled(runCommand = command): Promise<boolean> {
-  return (await runCommand(["container", "--version"])).exitCode === 0;
 }
 
 export async function prepareAppleContainer(
@@ -86,13 +83,7 @@ export async function prepareAppleContainer(
     }
   }
 
-  let status = await runCommand(["container", "system", "status", "--format", "json"]);
-  if (status.exitCode !== 0) {
-    const start = await runCommand(["container", "system", "start", "--enable-kernel-install"]);
-    if (start.exitCode !== 0) throw commandError("could not start Apple Container", start);
-    status = await runCommand(["container", "system", "status", "--format", "json"]);
-    if (status.exitCode !== 0) throw commandError("Apple Container is not ready", status);
-  }
+  await ensureAppleContainerSystem(runCommand);
 
   const smokeTest = await runCommand([
     "container",

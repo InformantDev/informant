@@ -1,4 +1,5 @@
 import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles } from "./config.ts";
+import { startAppleContainerSystem } from "./container.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
@@ -43,6 +44,7 @@ export interface ServerDependencies {
   readPollState?: typeof readPollState;
   savePollState?: typeof savePollState;
   recoverInterruptedBuilds?: typeof recoverInterruptedBuilds;
+  startAppleContainerSystem?: typeof startAppleContainerSystem;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -104,12 +106,6 @@ export function applySecretPolicy(
   trustedSha: string,
 ): InformantConfig {
   const trustedSecretJobs = trusted.jobs.filter((job) => job.secrets.length > 0);
-  if (trustedSecretJobs.length === 0) {
-    if (config.jobs.some((job) => job.secrets.length > 0)) {
-      throw new Error("secret-bearing jobs must be authorized on the default branch");
-    }
-    return { ...config, trustedSha };
-  }
   const allTrustedByName = new Map(trusted.jobs.map((job) => [job.name, job]));
   const trustedByName = new Map<string, (typeof trusted.jobs)[number]>();
   const includeTrustedJob = (name: string) => {
@@ -121,22 +117,41 @@ export function applySecretPolicy(
   };
   for (const job of trustedSecretJobs) includeTrustedJob(job.name);
   const trustedSecretNames = new Set(trustedSecretJobs.map((job) => job.name));
+  const blocked = new Set<string>();
   for (const job of config.jobs) {
     if (job.secrets.length > 0 && !trustedSecretNames.has(job.name)) {
-      throw new Error(`secret-bearing job ${job.name} is not authorized on the default branch`);
+      if (allTrustedByName.has(job.name)) includeTrustedJob(job.name);
+      else blocked.add(job.name);
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const job of config.jobs) {
+      if (!blocked.has(job.name) && job.needs.some((dependency) => blocked.has(dependency))) {
+        blocked.add(job.name);
+        changed = true;
+      }
     }
   }
   const included = new Set<string>();
-  const jobs = config.jobs.map((job) => {
-    const trustedJob = trustedByName.get(job.name);
-    if (!trustedJob) return job;
-    included.add(job.name);
-    return trustedJob;
-  });
+  const jobs = config.jobs
+    .filter((job) => !blocked.has(job.name))
+    .map((job) => {
+      const trustedJob = trustedByName.get(job.name);
+      if (!trustedJob) return job;
+      included.add(job.name);
+      return trustedJob;
+    });
   for (const job of trustedByName.values()) {
     if (!included.has(job.name)) jobs.push(job);
   }
-  return { ...config, vm: trusted.vm, jobs, trustedSha };
+  return {
+    ...config,
+    vm: trustedSecretJobs.length > 0 ? trusted.vm : config.vm,
+    jobs,
+    trustedSha,
+  };
 }
 
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
@@ -520,6 +535,7 @@ export async function serveRepositories(
   repositories: Repository[],
   options: ServerOptions = {},
 ): Promise<void> {
+  await (options.dependencies?.startAppleContainerSystem ?? startAppleContainerSystem)();
   const owners = new Set(repositories.map((repository) => repository.owner.toLowerCase()));
   const hasEnvironmentCredentials = Boolean(
     Bun.env.INFORMANT_GITHUB_TOKEN ||
