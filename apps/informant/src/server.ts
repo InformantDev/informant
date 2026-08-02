@@ -635,11 +635,15 @@ export async function serveRepositories(
       "INFORMANT_GITHUB_ACCOUNT is required when environment credentials serve multiple repository owners",
     );
   }
+  const onIdle = async () => {
+    await clean();
+    await options.onIdle?.();
+  };
   await Promise.all(
     repositories.map((repository) =>
       serve(repository, {
         ...options,
-        onIdle: clean,
+        onIdle,
         onMessage: (message) => options.onMessage?.(`${repository.fullName} · ${message}`),
       }),
     ),

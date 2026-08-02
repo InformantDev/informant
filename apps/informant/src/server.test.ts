@@ -121,6 +121,41 @@ function dependencies(
   };
 }
 
+test("serveRepositories preserves caller idle notifications after housekeeping", async () => {
+  const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+  const deps = dependencies(github({}), state, async () => undefined);
+  let cleanups = 0;
+  let idleNotifications = 0;
+  deps.startAppleContainerSystem = async () => true;
+  deps.housekeeping = async () => {
+    cleanups++;
+    return {
+      skipped: false,
+      builds: 0,
+      cacheRepositories: 0,
+      cacheJobs: 0,
+      cacheVersions: 0,
+      sharedCaches: 0,
+      tartImages: 0,
+      containerImages: 0,
+      pressure: false,
+    };
+  };
+  deps.reconcilePreparedImageReferences = async () => 1;
+
+  await serveRepositories([repository], {
+    once: true,
+    dependencies: deps,
+    onIdle: () => {
+      idleNotifications++;
+    },
+  });
+  while (idleNotifications === 0) await Bun.sleep(1);
+
+  expect(cleanups).toBe(2);
+  expect(idleNotifications).toBe(1);
+});
+
 test("startup recovers old URL-only cancelled builds and leaves failures retryable", async () => {
   const recovered: number[] = [];
   const saved: BuildRecord[] = [];
