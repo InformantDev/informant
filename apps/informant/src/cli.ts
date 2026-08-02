@@ -48,6 +48,7 @@ import {
   removeOrphanedBuildWorkspaces,
 } from "./store.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
+import type { Repository } from "./types.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Macs
 
@@ -204,6 +205,27 @@ async function configAtGitRef(sha: string) {
   throw new Error(`could not find ${CONFIG_FILE} at ${sha.slice(0, 7)}`);
 }
 
+export async function runManualHousekeeping(
+  repository: Repository,
+  operations: {
+    listRepositories?: typeof listRepositories;
+    housekeeping?: typeof runHousekeeping;
+    onMessage?: (message: string) => void;
+  } = {},
+): Promise<void> {
+  try {
+    const repositories = await (operations.listRepositories ?? listRepositories)();
+    if (!repositories.some((configured) => configured.fullName === repository.fullName)) {
+      repositories.push(repository);
+    }
+    const summary = await (operations.housekeeping ?? runHousekeeping)(repositories);
+    const message = formatHousekeepingSummary(summary);
+    if (message) (operations.onMessage ?? console.log)(message);
+  } catch {
+    // Cleanup is best-effort, but must not run with an incomplete repository list.
+  }
+}
+
 async function manualRun(
   ref: string,
   branchOverride?: string,
@@ -223,19 +245,7 @@ async function manualRun(
   await github.createCheck(repository, sha, `manual:${crypto.randomUUID()}`, "queued", jobs);
   const progress = spinner();
   progress.start(`Claiming ${repository.fullName}@${sha.slice(0, 7)}`);
-  const clean = async () => {
-    const repositories: Awaited<ReturnType<typeof listRepositories>> =
-      await listRepositories().catch(() => []);
-    if (!repositories.some((configured) => configured.fullName === repository.fullName)) {
-      repositories.push(repository);
-    }
-    await runHousekeeping(repositories)
-      .then((summary) => {
-        const message = formatHousekeepingSummary(summary);
-        if (message) console.log(message);
-      })
-      .catch(() => undefined);
-  };
+  const clean = () => runManualHousekeeping(repository);
   const build = await runCommit(
     github,
     repository,

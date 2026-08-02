@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -254,13 +255,19 @@ async function preparedContainerReferenceValues(
   excluded?: string,
   directory = preparedContainerReferencesDirectory(),
 ): Promise<string[]> {
-  const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+  let entries: Dirent<string>[];
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
   const values = await Promise.all(
     entries.map(async (entry) => {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) return preparedContainerReferenceValues(excluded, path);
       if (!entry.isFile() || path === excluded) return [];
-      return [(await readFile(path, "utf8").catch(() => "")).trim()];
+      return [(await readFile(path, "utf8")).trim()];
     }),
   );
   return values.flat().filter(Boolean);

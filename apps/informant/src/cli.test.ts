@@ -2,9 +2,14 @@ import { expect, spyOn, test } from "bun:test";
 import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cleanOrphanedBuildWorkspacesInBackground, main, pruneRuntimeImages } from "./cli.ts";
+import {
+  cleanOrphanedBuildWorkspacesInBackground,
+  main,
+  pruneRuntimeImages,
+  runManualHousekeeping,
+} from "./cli.ts";
 import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
-import type { BuildRecord } from "./types.ts";
+import type { BuildRecord, Repository } from "./types.ts";
 
 test("--version prints the package version without help", async () => {
   const log = spyOn(console, "log").mockImplementation(() => {});
@@ -34,6 +39,23 @@ test("orphan cleanup does not block worker startup", async () => {
   await cleanup;
   await Bun.sleep(0);
   expect(messages).toEqual(["Cleaned 2 orphaned build workspaces"]);
+});
+
+test("manual housekeeping skips cleanup when repository enumeration fails", async () => {
+  const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  let cleanups = 0;
+
+  await runManualHousekeeping(repository, {
+    listRepositories: async () => {
+      throw new Error("configuration temporarily unavailable");
+    },
+    housekeeping: async () => {
+      cleanups++;
+      throw new Error("must not run");
+    },
+  });
+
+  expect(cleanups).toBe(0);
 });
 
 test("image prune reports partial runtime failures and preserves the successful count", async () => {

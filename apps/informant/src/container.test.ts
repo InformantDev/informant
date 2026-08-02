@@ -275,6 +275,25 @@ test("tracks prepared container image references and prunes images after their l
   }
 });
 
+test("container image pruning fails safely when references cannot be enumerated", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  await Bun.write(join(dataPath, "prepared-container-image-references"), "not a directory\n");
+  let commands = 0;
+
+  await expect(
+    prunePreparedContainerImages(
+      async () => {
+        commands++;
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+      dataPath,
+      passthroughImageLock,
+    ),
+  ).rejects.toThrow();
+  expect(commands).toBe(0);
+});
+
 test("copies preparation inputs and includes their contents in the image identity", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "informant-prepare-inputs-"));
   await mkdir(join(workspace, "packages", "shared"), { recursive: true });
