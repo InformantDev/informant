@@ -156,6 +156,47 @@ test("serveRepositories preserves caller idle notifications after housekeeping",
   expect(idleNotifications).toBe(1);
 });
 
+test("serveRepositories reruns housekeeping requested while the current run settles", async () => {
+  const summary = {
+    skipped: false,
+    builds: 0,
+    cacheRepositories: 0,
+    cacheJobs: 0,
+    cacheVersions: 0,
+    sharedCaches: 0,
+    tartImages: 0,
+    containerImages: 0,
+    pressure: false,
+  };
+  const settling = deferred<typeof summary>();
+  let cleanups = 0;
+  let idle: (() => Promise<void> | void) | undefined;
+  const deps: ServerDependencies = {
+    startAppleContainerSystem: async () => true,
+    housekeeping: () => {
+      cleanups++;
+      return cleanups === 2 ? settling.promise : Promise.resolve(summary);
+    },
+    serveRepository: async (_repository, options) => {
+      idle = options?.onIdle;
+    },
+  };
+
+  await serveRepositories([repository], { dependencies: deps });
+  expect(cleanups).toBe(1);
+  if (!idle) throw new Error("expected an idle callback");
+
+  const first = Promise.resolve(idle());
+  while (cleanups < 2) await Bun.sleep(1);
+  settling.resolve(summary);
+  const late = new Promise<void>((resolve, reject) => {
+    queueMicrotask(() => Promise.resolve(idle?.()).then(() => resolve(), reject));
+  });
+  await Promise.all([first, late]);
+
+  expect(cleanups).toBe(3);
+});
+
 test("startup recovers old URL-only cancelled builds and leaves failures retryable", async () => {
   const recovered: number[] = [];
   const saved: BuildRecord[] = [];

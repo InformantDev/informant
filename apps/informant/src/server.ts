@@ -59,6 +59,7 @@ export interface ServerDependencies {
   updateCacheConfiguration?: typeof updateCacheConfiguration;
   reconcilePreparedImageReferences?: typeof reconcilePreparedImageReferences;
   reconcilePreparedContainerImageReferences?: typeof reconcilePreparedContainerImageReferences;
+  serveRepository?: typeof serve;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -615,8 +616,9 @@ export async function serveRepositories(
           );
         }
       }
-    })().finally(() => {
+    })().finally(async () => {
       pendingHousekeeping = undefined;
+      if (housekeepingRequested) await clean();
     });
     return pendingHousekeeping;
   };
@@ -639,9 +641,10 @@ export async function serveRepositories(
     await clean();
     await options.onIdle?.();
   };
+  const serveRepository = options.dependencies?.serveRepository ?? serve;
   await Promise.all(
     repositories.map((repository) =>
-      serve(repository, {
+      serveRepository(repository, {
         ...options,
         onIdle,
         onMessage: (message) => options.onMessage?.(`${repository.fullName} · ${message}`),

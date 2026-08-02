@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cleanOrphanedBuildWorkspacesInBackground, main } from "./cli.ts";
+import { cleanOrphanedBuildWorkspacesInBackground, main, pruneRuntimeImages } from "./cli.ts";
 import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
 import type { BuildRecord } from "./types.ts";
 
@@ -34,6 +34,19 @@ test("orphan cleanup does not block worker startup", async () => {
   await cleanup;
   await Bun.sleep(0);
   expect(messages).toEqual(["Cleaned 2 orphaned build workspaces"]);
+});
+
+test("image prune reports partial runtime failures and preserves the successful count", async () => {
+  await expect(
+    pruneRuntimeImages({
+      tart: async () => 2,
+      container: async () => {
+        throw new Error("runtime unavailable");
+      },
+    }),
+  ).rejects.toThrow(
+    "Deleted 2 unused prepared images, but failed to prune Apple Container images: runtime unavailable",
+  );
 });
 
 test("cache prune preserves shared caches and cache clear removes the cache root", async () => {

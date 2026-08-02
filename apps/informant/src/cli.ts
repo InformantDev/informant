@@ -609,6 +609,37 @@ async function showLogs(id?: string): Promise<void> {
   return browseBuilds(true);
 }
 
+export async function pruneRuntimeImages(
+  operations: { tart?: () => Promise<number>; container?: () => Promise<number> } = {},
+): Promise<number> {
+  const runtimes = [
+    { label: "Tart images", prune: operations.tart ?? prunePreparedImages },
+    {
+      label: "Apple Container images",
+      prune: operations.container ?? prunePreparedContainerImages,
+    },
+  ];
+  const results = await Promise.allSettled(runtimes.map(({ prune }) => prune()));
+  const count = results.reduce(
+    (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+    0,
+  );
+  const failures = results.flatMap((result, index) =>
+    result.status === "rejected"
+      ? [
+          `${runtimes[index]?.label ?? "runtime images"}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+        ]
+      : [],
+  );
+  if (failures.length > 0) {
+    const images = count === 1 ? "image" : "images";
+    throw new Error(
+      `Deleted ${count} unused prepared ${images}, but failed to prune ${failures.join("; ")}`,
+    );
+  }
+  return count;
+}
+
 async function manageImages(action?: string): Promise<void> {
   if (action === "prepare") {
     const repository = await repositoryFromGit();
@@ -635,18 +666,7 @@ async function manageImages(action?: string): Promise<void> {
     return;
   }
   if (action === "prune") {
-    const pruned = await Promise.allSettled([
-      prunePreparedImages(),
-      prunePreparedContainerImages(),
-    ]);
-    if (pruned.every((result) => result.status === "rejected")) {
-      const failure = pruned[0];
-      if (failure?.status === "rejected") throw failure.reason;
-    }
-    const count = pruned.reduce(
-      (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
-      0,
-    );
+    const count = await pruneRuntimeImages();
     outro(`Deleted ${count} unused prepared ${count === 1 ? "image" : "images"}`);
     return;
   }
