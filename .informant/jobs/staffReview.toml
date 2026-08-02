@@ -1,4 +1,5 @@
 name = "Staff Review"
+optional = true
 command = """
 set -eu
 review_root="$PWD"

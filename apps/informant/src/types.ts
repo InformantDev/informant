@@ -23,6 +23,7 @@ export type JobRuntime = VmRuntime | ContainerRuntime;
 export interface JobConfig {
   name: string;
   command: string;
+  optional: boolean;
   timeoutMinutes: number;
   environment: Record<string, string>;
   secrets: string[];

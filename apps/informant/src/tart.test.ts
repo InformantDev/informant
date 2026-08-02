@@ -32,10 +32,15 @@ import {
 import { digest, sshCommand } from "./tart/vm.ts";
 import type { InformantConfig } from "./types.ts";
 
-const job = (name: string, needs: string[] = []): InformantConfig["jobs"][number] => ({
+const job = (
+  name: string,
+  needs: string[] = [],
+  optional = false,
+): InformantConfig["jobs"][number] => ({
   name,
   needs,
   command: name,
+  optional,
   environment: {},
   secrets: [],
   timeoutMinutes: 1,
@@ -775,5 +780,33 @@ describe("job scheduler", () => {
     ).toBe(false);
     expect(executed).toEqual(["base"]);
     expect(skipped).toEqual(["child", "grandchild"]);
+  });
+
+  test("optional failures do not fail the build or block dependent jobs", async () => {
+    const executed: string[] = [];
+    expect(
+      await scheduleJobs([job("review", [], true), job("publish", ["review"])], async (current) => {
+        executed.push(current.name);
+        return current.name !== "review";
+      }),
+    ).toBe(true);
+    expect(executed).toEqual(["review", "publish"]);
+  });
+
+  test("optional execution errors do not fail the build", async () => {
+    const failed: string[] = [];
+    expect(
+      await scheduleJobs(
+        [job("review", [], true)],
+        async () => {
+          throw new Error("review crashed");
+        },
+        undefined,
+        async (current) => {
+          failed.push(current.name);
+        },
+      ),
+    ).toBe(true);
+    expect(failed).toEqual(["review"]);
   });
 });

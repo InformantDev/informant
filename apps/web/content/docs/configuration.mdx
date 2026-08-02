@@ -76,6 +76,7 @@ command = """
 bun run check
 """
 timeout_minutes = 10
+optional = true
 triggers = [
   { event = "commit", pull_request = { state = "open", draft = false } },
   { event = "comment", pull_request = { state = "open" } }
@@ -95,6 +96,11 @@ needs = ["test", "lint"]
 
 Top-level `timeout_minutes` is inherited by every job. Set `timeout_minutes` on an individual job only
 when it needs a different limit.
+
+Jobs are required by default. Set `optional = true` on a non-blocking job: Informant still records
+and displays a failure, but reports its GitHub check as neutral, keeps the aggregate build successful,
+and allows jobs that depend on it to run. Setup and reporting errors outside the job itself still fail
+the build.
 
 Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh container or Tart VM
 and isolated checkout. Use `needs` to make a job wait for one or

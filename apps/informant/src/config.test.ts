@@ -41,6 +41,7 @@ describe("configuration", () => {
       {
         name: "test",
         command: "bun install --frozen-lockfile && bun test",
+        optional: false,
         timeoutMinutes: 60,
         environment: {},
         secrets: [],
@@ -296,6 +297,17 @@ describe("configuration", () => {
     expect(() =>
       parseConfig(configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 0")),
     ).toThrow("timeout_minutes must be a positive number");
+  });
+
+  test("jobs are required by default and can be optional", () => {
+    expect(parseConfig(configTemplate()).jobs[0]?.optional).toBe(false);
+    expect(
+      parseConfig(configTemplate().replace('name = "test"', 'name = "test"\noptional = true'))
+        .jobs[0]?.optional,
+    ).toBe(true);
+    expect(() =>
+      parseConfig(configTemplate().replace('name = "test"', 'name = "test"\noptional = "yes"')),
+    ).toThrow("jobs[0].optional must be a boolean");
   });
 
   test("jobs inherit top-level environment and caches while allowing overrides", () => {

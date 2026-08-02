@@ -121,25 +121,30 @@ export async function runCommit(
       ? String(executionSignal.reason || "Superseded by a newer commit.")
       : "The build stopped before this job completed.",
   });
-  const completedValues = (job: JobConfig, outcome: JobOutcome, log: string): CheckUpdate => ({
-    status: "completed",
-    conclusion: outcome,
-    title:
-      outcome === "success"
-        ? `${job.name} passed`
-        : outcome === "failure"
-          ? `${job.name} failed`
+  const completedValues = (job: JobConfig, outcome: JobOutcome, log: string): CheckUpdate => {
+    const optionalFailure = outcome === "failure" && job.optional;
+    return {
+      status: "completed",
+      conclusion: optionalFailure ? "neutral" : outcome,
+      title:
+        outcome === "success"
+          ? `${job.name} passed`
+          : outcome === "failure"
+            ? `${job.name} failed${optionalFailure ? " (optional)" : ""}`
+            : outcome === "cancelled"
+              ? `${job.name} cancelled`
+              : `${job.name} skipped`,
+      summary:
+        outcome === "skipped"
+          ? "Skipped because a dependency failed."
           : outcome === "cancelled"
-            ? `${job.name} cancelled`
-            : `${job.name} skipped`,
-    summary:
-      outcome === "skipped"
-        ? "Skipped because a dependency failed."
-        : outcome === "cancelled"
-          ? String(executionSignal?.reason || "The build was cancelled.")
-          : `Ran on ${record.machine}.`,
-    text: log ? `\`\`\`text\n${log}\n\`\`\`` : undefined,
-  });
+            ? String(executionSignal?.reason || "The build was cancelled.")
+            : optionalFailure
+              ? "This optional job failed without failing the build."
+              : `Ran on ${record.machine}.`,
+      text: log ? `\`\`\`text\n${log}\n\`\`\`` : undefined,
+    };
+  };
   const updateJob = async (state: JobCheckState, values: CheckUpdate, terminal = false) => {
     if (terminal) {
       state.desired = values;
@@ -358,14 +363,19 @@ export async function runCommit(
     const outcomes = [...jobChecks.values()].map((state) => state.desired?.conclusion);
     const passed = outcomes.filter((outcome) => outcome === "success").length;
     const failed = outcomes.filter((outcome) => outcome === "failure").length;
+    const optionalFailures = outcomes.filter((outcome) => outcome === "neutral").length;
     const skipped = outcomes.filter((outcome) => outcome === "skipped").length;
     executionFinished = true;
     await dependencies.saveBuild(record).catch(() => undefined);
     await completeAggregate({
       status: "completed",
       conclusion: success ? "success" : "failure",
-      title: success ? "All jobs passed" : "A job failed",
-      summary: `${passed} passed, ${failed} failed, and ${skipped} skipped on ${record.machine}.`,
+      title: success
+        ? optionalFailures > 0
+          ? "All required jobs passed"
+          : "All jobs passed"
+        : "A job failed",
+      summary: `${passed} passed, ${failed} failed, ${optionalFailures} optional failure${optionalFailures === 1 ? "" : "s"}, and ${skipped} skipped on ${record.machine}.`,
     });
   } catch (error) {
     if (executionFinished) throw error;
