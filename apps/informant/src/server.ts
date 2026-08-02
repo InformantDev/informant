@@ -2,6 +2,7 @@ import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles } from "./config.ts";
 import { startAppleContainerSystem } from "./container.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
+import { listRepositories } from "./machine-config.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
 import { listActiveBuilds, listAllBuilds, saveBuild } from "./store.ts";
 import { triggerMatches } from "./triggers.ts";
@@ -10,6 +11,7 @@ import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
 const TAG_POLL_INTERVAL_MS = 5 * 60_000;
+const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
 
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
@@ -45,6 +47,8 @@ export interface ServerDependencies {
   savePollState?: typeof savePollState;
   recoverInterruptedBuilds?: typeof recoverInterruptedBuilds;
   startAppleContainerSystem?: typeof startAppleContainerSystem;
+  listRepositories?: () => Promise<Repository[]>;
+  serveRepository?: (repository: Repository, options?: ServerOptions) => Promise<void>;
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
@@ -536,26 +540,117 @@ export async function serveRepositories(
   options: ServerOptions = {},
 ): Promise<void> {
   await (options.dependencies?.startAppleContainerSystem ?? startAppleContainerSystem)();
-  const owners = new Set(repositories.map((repository) => repository.owner.toLowerCase()));
-  const hasEnvironmentCredentials = Boolean(
-    Bun.env.INFORMANT_GITHUB_TOKEN ||
-      Bun.env.GITHUB_TOKEN ||
-      Bun.env.INFORMANT_GITHUB_APP_ID ||
-      Bun.env.INFORMANT_GITHUB_INSTALLATION_ID ||
-      Bun.env.INFORMANT_GITHUB_PRIVATE_KEY ||
-      Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE,
-  );
-  if (owners.size > 1 && hasEnvironmentCredentials && !Bun.env.INFORMANT_GITHUB_ACCOUNT) {
-    throw new Error(
-      "INFORMANT_GITHUB_ACCOUNT is required when environment credentials serve multiple repository owners",
+  const validateOwners = (configured: Repository[]) => {
+    const owners = new Set(configured.map((repository) => repository.owner.toLowerCase()));
+    const hasEnvironmentCredentials = Boolean(
+      Bun.env.INFORMANT_GITHUB_TOKEN ||
+        Bun.env.GITHUB_TOKEN ||
+        Bun.env.INFORMANT_GITHUB_APP_ID ||
+        Bun.env.INFORMANT_GITHUB_INSTALLATION_ID ||
+        Bun.env.INFORMANT_GITHUB_PRIVATE_KEY ||
+        Bun.env.INFORMANT_GITHUB_PRIVATE_KEY_FILE,
     );
+    if (owners.size > 1 && hasEnvironmentCredentials && !Bun.env.INFORMANT_GITHUB_ACCOUNT) {
+      throw new Error(
+        "INFORMANT_GITHUB_ACCOUNT is required when environment credentials serve multiple repository owners",
+      );
+    }
+  };
+  validateOwners(repositories);
+
+  const serveRepository = options.dependencies?.serveRepository ?? serve;
+  const repositoryOptions = (repository: Repository, signal = options.signal): ServerOptions => ({
+    ...options,
+    signal,
+    onMessage: (message) => options.onMessage?.(`${repository.fullName} · ${message}`),
+  });
+  if (options.once) {
+    await Promise.all(
+      repositories.map((repository) => serveRepository(repository, repositoryOptions(repository))),
+    );
+    return;
   }
-  await Promise.all(
-    repositories.map((repository) =>
-      serve(repository, {
-        ...options,
-        onMessage: (message) => options.onMessage?.(`${repository.fullName} · ${message}`),
-      }),
-    ),
-  );
+
+  const loadRepositories = options.dependencies?.listRepositories ?? listRepositories;
+  const sleep = options.dependencies?.sleep ?? Bun.sleep;
+  const workers = new Map<
+    string,
+    { repository: Repository; controller: AbortController; task: Promise<void> }
+  >();
+  const waitForRefresh = async () => {
+    if (options.signal?.aborted) return false;
+    if (!options.signal) {
+      await sleep(REPOSITORY_REFRESH_INTERVAL_MS);
+      return true;
+    }
+    let stopWaiting: (() => void) | undefined;
+    const aborted = new Promise<false>((resolve) => {
+      stopWaiting = () => resolve(false);
+      options.signal?.addEventListener("abort", stopWaiting, { once: true });
+    });
+    try {
+      return await Promise.race([
+        sleep(REPOSITORY_REFRESH_INTERVAL_MS).then(() => true as const),
+        aborted,
+      ]);
+    } finally {
+      if (stopWaiting) options.signal.removeEventListener("abort", stopWaiting);
+    }
+  };
+  const reconcile = (configured: Repository[]) => {
+    const next = new Map(
+      configured.map((repository) => [repository.fullName.toLowerCase(), repository]),
+    );
+    for (const [key, worker] of workers) {
+      if (!next.has(key) && !worker.controller.signal.aborted) {
+        worker.controller.abort(`${worker.repository.fullName} is no longer registered.`);
+      }
+    }
+    for (const [key, repository] of next) {
+      if (workers.has(key)) continue;
+      const controller = new AbortController();
+      const stop = () => controller.abort(options.signal?.reason);
+      if (options.signal?.aborted) stop();
+      else options.signal?.addEventListener("abort", stop, { once: true });
+      let task!: Promise<void>;
+      task = serveRepository(repository, repositoryOptions(repository, controller.signal))
+        .catch((error) => {
+          if (!controller.signal.aborted) {
+            options.onMessage?.(
+              `${repository.fullName} · worker stopped: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        })
+        .finally(() => {
+          options.signal?.removeEventListener("abort", stop);
+          if (workers.get(key)?.task === task) workers.delete(key);
+        });
+      workers.set(key, { repository, controller, task });
+    }
+  };
+
+  let lastRefreshError: string | undefined;
+  try {
+    if (!options.signal?.aborted) reconcile(repositories);
+    while (await waitForRefresh()) {
+      try {
+        const configured = await loadRepositories();
+        if (options.signal?.aborted) break;
+        validateOwners(configured);
+        reconcile(configured);
+        lastRefreshError = undefined;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (detail !== lastRefreshError) {
+          options.onMessage?.(`could not refresh repository registrations: ${detail}`);
+          lastRefreshError = detail;
+        }
+      }
+    }
+  } finally {
+    for (const worker of workers.values()) {
+      worker.controller.abort(options.signal?.reason ?? "Worker shutdown requested.");
+    }
+    await Promise.allSettled([...workers.values()].map((worker) => worker.task));
+  }
 }
