@@ -50,6 +50,7 @@ function harness(
     error?: Error;
     manualRequest?: boolean;
     requestedJobs?: string[];
+    originalPullRequest?: number;
   } = {},
 ) {
   const updates: Array<{ id: number; values: Record<string, unknown> }> = [];
@@ -63,6 +64,7 @@ function harness(
   const saved: BuildRecord[] = [];
   let receivedRuntimeSecrets: Record<string, string> | undefined;
   let receivedConfiguredVmJobs: string[] | undefined;
+  const receivedBranches: string[] = [];
   let jobCheckListings = 0;
   const aggregateCheck: {
     id: number;
@@ -85,6 +87,7 @@ function harness(
             check: aggregateCheck,
             requestedJobs: options.requestedJobs ?? [],
             manualRequest: options.manualRequest ?? false,
+            originalPullRequest: options.originalPullRequest,
           },
     createJobCheck: async (
       _repository: Repository,
@@ -130,12 +133,13 @@ function harness(
       _repository,
       _sha,
       selectedConfig,
-      _record,
+      record,
       observer,
       _signal,
       runtimeSecrets,
       configuredVmJobs,
     ) => {
+      receivedBranches.push(record.branch);
       receivedConfiguredVmJobs = configuredVmJobs;
       receivedRuntimeSecrets = {};
       for (const [name, value] of Object.entries(runtimeSecrets ?? {})) {
@@ -162,6 +166,7 @@ function harness(
     saved,
     receivedRuntimeSecrets: () => receivedRuntimeSecrets,
     receivedConfiguredVmJobs: () => receivedConfiguredVmJobs,
+    receivedBranches,
     jobCheckListings: () => jobCheckListings,
   };
 }
@@ -378,6 +383,58 @@ describe("runCommit", () => {
 
     if (!record) throw new Error("expected a build record");
     expect(record.pullRequest).toBe(7);
+  });
+
+  test("preserves the pull request environment when its check is rerun", async () => {
+    const initial = harness();
+    const rerun = harness({
+      manualRequest: true,
+      originalPullRequest: 7,
+    });
+    const pullRequestConfig: InformantConfig = {
+      ...config,
+      jobs: config.jobs.map((job) => ({
+        ...job,
+        triggers: [{ event: "commit", pullRequest: {} }],
+      })),
+    };
+    const pullRequestEvent = {
+      type: "commit" as const,
+      id: "pr:7:sha",
+      pullRequest: {
+        number: 7,
+        state: "open" as const,
+        draft: false,
+        baseBranch: "main",
+        headSha: "sha",
+        sameRepository: true,
+      },
+    };
+
+    const initialRecord = await runCommit(
+      initial.github,
+      repository,
+      "sha",
+      "pull/7",
+      pullRequestConfig,
+      initial.dependencies,
+      pullRequestEvent,
+    );
+    const rerunRecord = await runCommit(
+      rerun.github,
+      repository,
+      "sha",
+      "feature-branch",
+      pullRequestConfig,
+      rerun.dependencies,
+      { type: "commit", id: "branch:feature-branch:sha", branch: "feature-branch" },
+    );
+
+    if (!initialRecord || !rerunRecord) throw new Error("expected both build records");
+    expect(initial.receivedBranches).toEqual(["pull/7"]);
+    expect(rerun.receivedBranches).toEqual(initial.receivedBranches);
+    expect(initialRecord.pullRequest).toBe(7);
+    expect(rerunRecord.pullRequest).toBe(7);
   });
 
   test("supplies the GitHub App token only when a job requests it", async () => {

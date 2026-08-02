@@ -63,6 +63,8 @@ export async function runCommit(
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;
   const { check } = claim;
+  const rerunPullRequest = claim.originalPullRequest;
+  if (rerunPullRequest !== undefined) branch = `pull/${rerunPullRequest}`;
   const executionSignal = claim.manualRequest ? undefined : signal;
   config = claim.manualRequest
     ? selectJobs(config, claim.requestedJobs)
@@ -103,7 +105,8 @@ export async function runCommit(
     runningJobs: [],
     jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
     owner: currentProcessOwner(),
-    pullRequest: event?.type === "manual" ? undefined : event?.pullRequest?.number,
+    pullRequest:
+      rerunPullRequest ?? (event?.type === "manual" ? undefined : event?.pullRequest?.number),
     logPath: join(dataDirectory(), "builds", id, "build.log"),
     checkId: check.id,
     checkUrl: check.html_url,

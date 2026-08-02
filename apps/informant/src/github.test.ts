@@ -408,7 +408,20 @@ test("interrupted build recovery cancels only correlated children before the agg
 
 test("claim treats a queued failed check suite as a failed-jobs re-run request", async () => {
   const checks: Array<Record<string, unknown>> = [
-    { id: 1, name: "Informant CI", status: "completed", conclusion: "failure" },
+    {
+      id: 0,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "failure",
+      external_id: "other-worker:event:commit:pr:44:abc123",
+    },
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "failure",
+      external_id: "original-worker:event:commit:pr:43:abc123",
+    },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
@@ -471,6 +484,8 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
 
   expect(claim?.check?.id).toBe(2);
   expect(claim?.requestedJobs).toEqual(["typecheck", "deploy", "cleanup"]);
+  expect(claim?.originalPullRequest).toBe(43);
+  expect(checks.at(-1)?.external_id).toBe("machine:event:commit:pr:43:abc123");
 });
 
 test("claim falls back to all jobs when a queued suite has no failed job history", async () => {
@@ -498,6 +513,8 @@ test("claim falls back to all jobs when a queued suite has no failed job history
   );
 
   expect(claim?.requestedJobs).toEqual([]);
+  expect(claim?.originalPullRequest).toBeUndefined();
+  expect(checks.at(-1)?.external_id).toBe("machine:event:manual:abc123");
 });
 
 test("claim does not repeat a completed check suite", async () => {
