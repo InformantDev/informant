@@ -6,6 +6,8 @@ import { dataDirectory } from "./store.ts";
 import { tartImages } from "./tart/vm.ts";
 
 const GIGABYTE = 1_000_000_000;
+const DIRECTORY_SIZE_ARGUMENT_BYTES = 64 * 1024;
+const DIRECTORY_SIZE_PATHS_PER_BATCH = 256;
 
 export interface FileSystemSpace {
   availableBytes: number;
@@ -50,21 +52,46 @@ function errorMessage(error: unknown): string {
   return message.trim().split("\n", 1)[0] || "not available";
 }
 
-export async function allocatedDirectorySizes(paths: string[]): Promise<Map<string, number>> {
+export async function allocatedDirectorySizes(
+  paths: string[],
+  runCommand: typeof command = command,
+  maximumArgumentBytes = DIRECTORY_SIZE_ARGUMENT_BYTES,
+): Promise<Map<string, number>> {
   if (paths.length === 0) return new Map();
-  const result = await command(["du", "-sk", ...paths]);
-  if (result.exitCode !== 0) {
-    throw new Error(result.stderr.trim() || "could not measure Informant data");
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let argumentBytes = 0;
+  for (const path of paths) {
+    const pathBytes = Buffer.byteLength(path) + 1;
+    if (
+      batch.length > 0 &&
+      (batch.length >= DIRECTORY_SIZE_PATHS_PER_BATCH ||
+        argumentBytes + pathBytes > maximumArgumentBytes)
+    ) {
+      batches.push(batch);
+      batch = [];
+      argumentBytes = 0;
+    }
+    batch.push(path);
+    argumentBytes += pathBytes;
   }
+  if (batch.length > 0) batches.push(batch);
+
   const sizes = new Map<string, number>();
-  for (const line of result.stdout.trim().split("\n")) {
-    if (!line) continue;
-    const match = line.match(/^(\d+)\s+(.+)$/);
-    const kibibytes = Number.parseInt(match?.[1] ?? "", 10);
-    const path = match?.[2];
-    if (!path || !Number.isFinite(kibibytes))
-      throw new Error(`could not parse disk usage: ${line}`);
-    sizes.set(path, kibibytes * 1024);
+  for (const paths of batches) {
+    const result = await runCommand(["du", "-sk", ...paths]);
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.trim() || "could not measure Informant data");
+    }
+    for (const line of result.stdout.trim().split("\n")) {
+      if (!line) continue;
+      const match = line.match(/^(\d+)\s+(.+)$/);
+      const kibibytes = Number.parseInt(match?.[1] ?? "", 10);
+      const path = match?.[2];
+      if (!path || !Number.isFinite(kibibytes))
+        throw new Error(`could not parse disk usage: ${line}`);
+      sizes.set(path, kibibytes * 1024);
+    }
   }
   return sizes;
 }

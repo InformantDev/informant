@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import type { CommandResult } from "./process.ts";
 import {
+  allocatedDirectorySizes,
   assessDiskSpace,
   collectStorageReport,
   diskSpaceThresholds,
@@ -13,6 +14,32 @@ import {
 function result(stdout = "", stderr = "", exitCode = 0): CommandResult {
   return { stdout, stderr, exitCode, timedOut: false };
 }
+
+test("allocated directory sizes use bounded multi-path batches", async () => {
+  const calls: string[][] = [];
+  const sizes = await allocatedDirectorySizes(
+    ["/one", "/two", "/three"],
+    async (argv) => {
+      calls.push(argv);
+      return result(
+        argv
+          .slice(2)
+          .map((path) => `1\t${path}`)
+          .join("\n"),
+      );
+    },
+    10,
+  );
+
+  expect(calls.map((argv) => argv.slice(2))).toEqual([["/one", "/two"], ["/three"]]);
+  expect(sizes).toEqual(
+    new Map([
+      ["/one", 1024],
+      ["/two", 1024],
+      ["/three", 1024],
+    ]),
+  );
+});
 
 describe("storage reporting", () => {
   test("collects attributable data and shared runtime usage separately", async () => {
