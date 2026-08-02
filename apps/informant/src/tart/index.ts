@@ -436,7 +436,6 @@ export async function scheduleJobs(
   const execute = (job: InformantConfig["jobs"][number], index: number): Promise<boolean> => {
     const existing = executions.get(job.name);
     if (existing) return existing;
-    let attempted = false;
     const execution = Promise.all(
       job.needs.map((name) => {
         const dependency = jobsByName.get(name);
@@ -449,12 +448,11 @@ export async function scheduleJobs(
           await skipJob(job);
           return false;
         }
-        attempted = true;
         return (await executeJob(job, index)) || job.optional;
       })
       .catch(async (error: unknown) => {
         await failJob(job, error);
-        return attempted && job.optional;
+        return false;
       });
     executions.set(job.name, execution);
     return execution;

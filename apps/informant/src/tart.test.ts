@@ -793,20 +793,27 @@ describe("job scheduler", () => {
     expect(executed).toEqual(["review", "publish"]);
   });
 
-  test("optional execution errors do not fail the build", async () => {
+  test("optional execution errors still fail the build and block dependent jobs", async () => {
+    const executed: string[] = [];
     const failed: string[] = [];
+    const skipped: string[] = [];
     expect(
       await scheduleJobs(
-        [job("review", [], true)],
-        async () => {
+        [job("review", [], true), job("publish", ["review"])],
+        async (current) => {
+          executed.push(current.name);
           throw new Error("review crashed");
         },
-        undefined,
+        async (current) => {
+          skipped.push(current.name);
+        },
         async (current) => {
           failed.push(current.name);
         },
       ),
-    ).toBe(true);
+    ).toBe(false);
+    expect(executed).toEqual(["review"]);
     expect(failed).toEqual(["review"]);
+    expect(skipped).toEqual(["publish"]);
   });
 });
