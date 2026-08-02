@@ -367,6 +367,7 @@ test("passes secrets through the client environment and always removes the conta
   const job: JobConfig = {
     name: "test",
     command: "bun test",
+    optional: false,
     timeoutMinutes: 1,
     environment: {},
     secrets: ["TOKEN"],
@@ -426,6 +427,7 @@ test("prepared jobs copy source into the baked workspace before running", async 
   const job: JobConfig = {
     name: "test",
     command: "true",
+    optional: false,
     timeoutMinutes: 1,
     environment: {},
     secrets: [],
@@ -487,6 +489,7 @@ test("limits concurrent Apple containers across jobs", async () => {
       {
         name,
         command: "true",
+        optional: false,
         timeoutMinutes: 1,
         environment: {},
         secrets: [],
@@ -547,6 +550,7 @@ test("cancelling a queued job does not invoke Apple Container", async () => {
       {
         name,
         command: "true",
+        optional: false,
         timeoutMinutes: 1,
         environment: {},
         secrets: [],

@@ -25,7 +25,15 @@ const config: InformantConfig = {
   triggers: [{ event: "commit" }, { event: "comment" }],
   vm: { type: "vm", image: "image", guestOs: "macos", user: "user", password: "password" },
   jobs: [
-    { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
+    {
+      name: "test",
+      command: "test",
+      optional: false,
+      timeoutMinutes: 1,
+      environment: {},
+      secrets: [],
+      needs: [],
+    },
   ],
 };
 

@@ -422,6 +422,10 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
       throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
     }
+    const optional = job.optional ?? false;
+    if (typeof optional !== "boolean") {
+      throw new Error(`jobs[${index}].optional must be a boolean`);
+    }
     const cache =
       job.cache === undefined ? defaultCache : parseCaches(job.cache, `jobs[${index}].cache`, true);
     if (job.vm !== undefined && job.container !== undefined)
@@ -439,6 +443,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     return {
       name: job.name,
       command: job.command.trim(),
+      optional,
       timeoutMinutes,
       needs: Array.isArray(job.needs)
         ? job.needs.map(String)

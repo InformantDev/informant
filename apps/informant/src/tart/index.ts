@@ -448,7 +448,7 @@ export async function scheduleJobs(
           await skipJob(job);
           return false;
         }
-        return executeJob(job, index);
+        return (await executeJob(job, index)) || job.optional;
       })
       .catch(async (error: unknown) => {
         await failJob(job, error);

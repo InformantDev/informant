@@ -13,7 +13,15 @@ const config: InformantConfig = {
   branches: ["main"],
   vm: { type: "vm", image: "image", guestOs: "macos", user: "user", password: "password" },
   jobs: [
-    { name: "test", command: "test", timeoutMinutes: 1, environment: {}, secrets: [], needs: [] },
+    {
+      name: "test",
+      command: "test",
+      optional: false,
+      timeoutMinutes: 1,
+      environment: {},
+      secrets: [],
+      needs: [],
+    },
   ],
 };
 
@@ -174,6 +182,7 @@ describe("runCommit", () => {
         {
           name: "macos-e2e",
           command: "test e2e",
+          optional: false,
           timeoutMinutes: 1,
           environment: {},
           secrets: [],
@@ -237,6 +246,54 @@ describe("runCommit", () => {
     expect(aggregate?.text).toBeUndefined();
     expect(context.saved.at(-1)?.status).toBe(status);
     expect(context.jobCheckListings()).toBe(0);
+  });
+
+  test("reports an optional failure as neutral without failing the build", async () => {
+    const context = harness();
+    const optionalConfig: InformantConfig = {
+      ...config,
+      jobs: config.jobs.map((job) => ({ ...job, optional: true })),
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const [job] = selectedConfig.jobs;
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      await observer?.completed?.(job, { outcome: "failure", log: "review failed" });
+      return true;
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      optionalConfig,
+      context.dependencies,
+    );
+
+    expect(record).toMatchObject({
+      status: "success",
+      jobs: [{ name: "test", status: "failure" }],
+    });
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({
+      conclusion: "neutral",
+      title: "test failed (optional)",
+      summary: "This optional job failed without failing the build.",
+    });
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "success",
+      title: "All required jobs passed",
+      summary: expect.stringContaining("1 optional failure"),
+    });
   });
 
   test("persists the jobs that are currently running", async () => {
@@ -528,6 +585,7 @@ describe("runCommit", () => {
         {
           name: "lint",
           command: "lint",
+          optional: false,
           timeoutMinutes: 1,
           environment: {},
           secrets: [],
