@@ -1,6 +1,7 @@
 node_modules
 dist
 .next
+.turbo
 .source
 *.tsbuildinfo
 .DS_Store

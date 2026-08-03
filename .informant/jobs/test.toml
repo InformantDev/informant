@@ -1,7 +1,7 @@
 name = "test"
 command = """
 set -eu
-bun test
+bun run test
 """
 timeout_minutes = 15
 container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = """

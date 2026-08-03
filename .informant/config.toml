@@ -1,6 +1,10 @@
 version = 1
 timeout_minutes = 30
-environment = { CI = "true" }
+environment = { CI = "true", TURBO_CACHE_DIR = "/home/root/.cache/turborepo", TURBO_CACHE_MAX_AGE = "14d", TURBO_CACHE_MAX_SIZE = "10GB" }
+cache = [
+  { paths = ["~/.bun/install/cache"], shared = true },
+  { paths = ["~/.cache/turborepo"], shared = true },
+]
 triggers = [
   { event = "commit", branch = { names = ["main"] } },
   { event = "commit", pull_request = { state = "open", draft = false } },
