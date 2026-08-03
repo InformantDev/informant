@@ -16,9 +16,11 @@ import {
   readConfig,
   selectJobs,
 } from "./config.ts";
+import { prunePreparedContainerImages } from "./container.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubClient } from "./github.ts";
 import { installPostPushHook, uninstallPostPushHook } from "./hook.ts";
+import { formatHousekeepingSummary, runHousekeeping } from "./housekeeping.ts";
 import {
   addRepository,
   listGitHubCredentials,
@@ -30,6 +32,13 @@ import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
 import { disableStartup, enableStartup, updateInformant } from "./startup.ts";
 import {
+  assessDiskSpace,
+  collectStorageReport,
+  fileSystemSpace,
+  formatBytes,
+  formatStorageReport,
+} from "./storage.ts";
+import {
   dataDirectory,
   getBuild,
   jobLogPath,
@@ -39,6 +48,7 @@ import {
   removeOrphanedBuildWorkspaces,
 } from "./store.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
+import type { Repository } from "./types.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Macs
 
@@ -53,7 +63,7 @@ Usage:
                                         Manually request all or selected jobs
   informant image prepare                Prepare this repository's configured VM job images
   informant image list                   List Informant-prepared VM images
-  informant image prune                  Delete unused prepared VM images
+  informant image prune                  Delete unused prepared runtime images
   informant cache path                   Print the persistent job cache directory
   informant cache prune                  Delete keyed caches while preserving shared caches
   informant cache clear                  Delete all persistent job caches
@@ -64,7 +74,8 @@ Usage:
   informant builds [--all]               List running builds or recent history
   informant logs [<build-id>]             Tail a build's logs or select a running job
   informant update                       Update with Homebrew and restart a running worker
-  informant doctor                       Check host dependencies and auth
+  informant storage                      Show Informant disk usage and available space
+  informant doctor                       Check host dependencies, auth, and disk space
   informant --version
 `;
 
@@ -194,6 +205,27 @@ async function configAtGitRef(sha: string) {
   throw new Error(`could not find ${CONFIG_FILE} at ${sha.slice(0, 7)}`);
 }
 
+export async function runManualHousekeeping(
+  repository: Repository,
+  operations: {
+    listRepositories?: typeof listRepositories;
+    housekeeping?: typeof runHousekeeping;
+    onMessage?: (message: string) => void;
+  } = {},
+): Promise<void> {
+  try {
+    const repositories = await (operations.listRepositories ?? listRepositories)();
+    if (!repositories.some((configured) => configured.fullName === repository.fullName)) {
+      repositories.push(repository);
+    }
+    const summary = await (operations.housekeeping ?? runHousekeeping)(repositories);
+    const message = formatHousekeepingSummary(summary);
+    if (message) (operations.onMessage ?? console.log)(message);
+  } catch {
+    // Cleanup is best-effort, but must not run with an incomplete repository list.
+  }
+}
+
 async function manualRun(
   ref: string,
   branchOverride?: string,
@@ -213,6 +245,7 @@ async function manualRun(
   await github.createCheck(repository, sha, `manual:${crypto.randomUUID()}`, "queued", jobs);
   const progress = spinner();
   progress.start(`Claiming ${repository.fullName}@${sha.slice(0, 7)}`);
+  const clean = () => runManualHousekeeping(repository);
   const build = await runCommit(
     github,
     repository,
@@ -224,9 +257,11 @@ async function manualRun(
   );
   if (!build) {
     progress.stop("Another machine is already running this commit.");
+    await clean();
     return;
   }
   progress.stop(`${build.status}: ${build.id}`);
+  await clean();
   if (build.status !== "success") process.exitCode = 1;
 }
 
@@ -584,6 +619,37 @@ async function showLogs(id?: string): Promise<void> {
   return browseBuilds(true);
 }
 
+export async function pruneRuntimeImages(
+  operations: { tart?: () => Promise<number>; container?: () => Promise<number> } = {},
+): Promise<number> {
+  const runtimes = [
+    { label: "Tart images", prune: operations.tart ?? prunePreparedImages },
+    {
+      label: "Apple Container images",
+      prune: operations.container ?? prunePreparedContainerImages,
+    },
+  ];
+  const results = await Promise.allSettled(runtimes.map(({ prune }) => prune()));
+  const count = results.reduce(
+    (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+    0,
+  );
+  const failures = results.flatMap((result, index) =>
+    result.status === "rejected"
+      ? [
+          `${runtimes[index]?.label ?? "runtime images"}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+        ]
+      : [],
+  );
+  if (failures.length > 0) {
+    const images = count === 1 ? "image" : "images";
+    throw new Error(
+      `Deleted ${count} unused prepared ${images}, but failed to prune ${failures.join("; ")}`,
+    );
+  }
+  return count;
+}
+
 async function manageImages(action?: string): Promise<void> {
   if (action === "prepare") {
     const repository = await repositoryFromGit();
@@ -610,7 +676,7 @@ async function manageImages(action?: string): Promise<void> {
     return;
   }
   if (action === "prune") {
-    const count = await prunePreparedImages();
+    const count = await pruneRuntimeImages();
     outro(`Deleted ${count} unused prepared ${count === 1 ? "image" : "images"}`);
     return;
   }
@@ -697,6 +763,21 @@ async function doctor(): Promise<void> {
       `${okay ? "✓" : "✗"} ${label}${okay ? "" : ` — ${result.stderr.trim() || "not found"}`}`,
     );
   }
+  try {
+    const disk = await fileSystemSpace(dataDirectory());
+    const status = assessDiskSpace(disk);
+    const detail = `${formatBytes(disk.availableBytes)} free of ${formatBytes(disk.totalBytes)}`;
+    if (status === "healthy") console.log(`✓ disk space — ${detail}`);
+    else if (status === "warning")
+      console.log(`○ disk space — ${detail}; space is getting low, run informant storage`);
+    else {
+      console.log(`✗ disk space — ${detail}; free space is critically low, run informant storage`);
+      failed = true;
+    }
+  } catch (error) {
+    console.log(`✗ disk space — ${error instanceof Error ? error.message : error}`);
+    failed = true;
+  }
   const container = await command(["container", "system", "status"]);
   const tart = await command(["tart", "--version"]);
   const sshpass = await command(["sshpass", "-V"]);
@@ -751,6 +832,11 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "init") return init();
   if (subcommand === "setup") return setup();
   if (subcommand === "doctor") return doctor();
+  if (subcommand === "storage") {
+    if (action) throw new Error("storage does not accept arguments");
+    console.log(formatStorageReport(await collectStorageReport()));
+    return;
+  }
   if (subcommand === "update") {
     if (action) throw new Error("update does not accept arguments");
     const updated = await updateInformant({

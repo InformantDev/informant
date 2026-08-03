@@ -16,9 +16,10 @@ informant run --job test               Run one job and the jobs it needs
 informant run --job test --job lint    Run multiple selected jobs
 informant image prepare                Prepare configured Tart VM job images
 informant image list                   List Informant-prepared Tart images
-informant image prune                  Delete unused prepared Tart images
+informant image prune                  Delete unused prepared runtime images
 informant cache path                   Print the persistent job cache directory
-informant cache prune                  Delete all persistent job caches
+informant cache prune                  Delete keyed caches while preserving shared caches
+informant cache clear                  Delete all persistent job caches
 informant startup enable               Start the worker now and automatically at login
 informant startup disable              Stop and remove the automatic startup worker
 informant hook install                 Install the push-accelerating pre-push hook
@@ -27,7 +28,8 @@ informant builds                       List builds currently running on this mac
 informant builds --all                 List recent build history
 informant logs [<build-id>]             Tail a build's logs or select a running job
 informant update                        Update with Homebrew and restart a running worker
-informant doctor                       Verify host tools and GitHub auth
+informant storage                      Show Informant disk usage and available space
+informant doctor                       Verify host tools, GitHub auth, and disk space
 ```
 
 `informant setup` stores GitHub App credentials automatically. Environment variables are optional
@@ -44,6 +46,35 @@ The build list shows running jobs and links each build to its GitHub pull reques
 1 MiB of stdout and 1 MiB of stderr from each command. Run `informant logs` interactively to select
 and follow a currently running job, or pass a build ID to follow its combined log directly. Informant
 timestamps job lifecycle events while leaving command output unchanged.
+
+`informant storage` breaks down the data directory into caches, builds and logs, and other files. It
+also includes Informant-owned Tart VM images, counts prepared Apple Container images, reports free
+host capacity, and shows runtime-wide Apple Container image usage when that runtime is available.
+Container layers are shared, so their physical usage cannot be attributed to Informant alone; the
+command keeps that shared total separate and labels it runtime-wide. The report ends with cleanup
+commands and notes when a command can affect images outside Informant.
+
+The worker runs housekeeping at startup and whenever all builds become idle. It keeps at least the
+100 newest build records, removes additional records after 30 days, globally expires old keyed-cache
+versions, caps keyed caches at 20 GB, and removes caches and prepared images whose repository or job
+is no longer configured. Cleanup never runs while a build is active. Shared caches are retained unless
+the host is below its free-space target; under pressure, Informant removes old build history, keyed
+caches, and finally shared caches until the target is recovered.
+
+These environment variables tune the policy:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `INFORMANT_BUILD_RETENTION_DAYS` | `30` | Age after which build records beyond the history limit can be removed |
+| `INFORMANT_BUILD_HISTORY_LIMIT` | `100` | Build records kept during routine cleanup |
+| `INFORMANT_PRESSURE_BUILD_HISTORY_LIMIT` | `20` | Build records protected when disk space is low |
+| `INFORMANT_KEYED_CACHE_MAX_GB` | `20` | Maximum allocated size of persistent keyed caches |
+| `INFORMANT_MIN_FREE_SPACE_GB` | `25` | Minimum host free-space target |
+| `INFORMANT_MIN_FREE_SPACE_PERCENT` | `10` | Minimum host free-space percentage target |
+
+`informant doctor` uses the same configurable free-space target for warnings. It fails the disk-space
+check when less than 10 GB or 5% remains, since builds and runtime image preparation may no longer
+have enough working space.
 
 `informant startup enable` installs and immediately loads a per-user macOS LaunchAgent. The worker
 restarts if it exits and starts again when you log in. Its output is written to `worker.stdout.log`

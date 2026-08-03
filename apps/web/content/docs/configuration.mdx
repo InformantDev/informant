@@ -171,6 +171,10 @@ secrets by default. Changing the source image or preparation command creates a n
 Because preparation is part of the runtime table, different jobs can use different preparation
 commands.
 
+Informant tracks which configured repository jobs use each prepared Tart or Apple Container image.
+When the final reference moves to another image, or a repository or job is removed, idle housekeeping
+deletes the unreferenced image. `informant image prune` runs that cleanup immediately.
+
 Container runtimes can declare repository-relative files or glob patterns with `prepareInputs`.
 Informant copies matching files into the image's `/workspace`, exposes that path as
 `$INFORMANT_PREPARE_ROOT` during preparation, and includes their paths, modes, and contents in the
@@ -193,10 +197,11 @@ bun install --frozen-lockfile --ignore-scripts
 The corresponding job command should use the baked dependencies directly rather than running
 `bun install` again.
 
-Preparation is automatic. `informant image prepare`, `informant image list`, and `informant image
-prune` currently manage prepared Tart VM images. Container preparation is warmed automatically by the
-first job that uses it; inspect or remove those images with `container image`. Every worker prepares
-its own local copy, which keeps multi-machine setup automatic.
+Preparation is automatic. `informant image prepare` warms configured Tart VM images, while the first
+container job warms its prepared Apple Container image. `informant image list` lists prepared Tart
+images, and `informant image prune` removes unreferenced prepared images from both runtimes. Use
+`container image` to inspect the full Apple Container inventory. Every worker prepares its own local
+copy, which keeps multi-machine setup automatic.
 
 ## Persistent job caches
 
@@ -223,8 +228,11 @@ Without `shared`, each group associates one or more guest `paths` with its `key_
 restores those paths from persistent host storage before the job and saves them afterward, isolated
 by repository, job, and key-file contents in compressed archives. Missing key files do not fail the job. Use
 `informant cache path` to locate the cache root. Informant retains the current and most recent keyed
-version, removing older versions after seven days. `informant cache prune` removes keyed caches while
-preserving shared caches; `informant cache clear` removes everything.
+version, removing older versions after seven days. The worker applies that policy globally while idle,
+removes cache trees for repositories no longer assigned to it, and enforces its configured keyed-cache
+quota. `informant cache prune` removes keyed caches while preserving shared caches; `informant cache
+clear` removes everything. Shared caches are only removed automatically as a last resort when the host
+is below its configured free-space target.
 
 Prepared images and caches serve different purposes: put runtimes and system packages in
 `vm.prepare`; use `jobs.cache` for downloaded dependencies and compiler caches. Checkouts and all

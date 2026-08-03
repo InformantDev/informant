@@ -39,6 +39,7 @@ const config: InformantConfig = {
 
 test("starts Apple Container when the repository worker starts", async () => {
   let starts = 0;
+  let cleanups = 0;
   await serveRepositories([], {
     once: true,
     dependencies: {
@@ -46,10 +47,25 @@ test("starts Apple Container when the repository worker starts", async () => {
         starts++;
         return true;
       },
+      housekeeping: async () => {
+        cleanups++;
+        return {
+          skipped: false,
+          builds: 0,
+          cacheRepositories: 0,
+          cacheJobs: 0,
+          cacheVersions: 0,
+          sharedCaches: 0,
+          tartImages: 0,
+          containerImages: 0,
+          pressure: false,
+        };
+      },
     },
   });
 
   expect(starts).toBe(1);
+  expect(cleanups).toBe(1);
 });
 
 test("refreshes repository registrations without restarting the worker", async () => {
@@ -63,6 +79,17 @@ test("refreshes repository registrations without restarting the worker", async (
     signal: outer.signal,
     dependencies: {
       startAppleContainerSystem: async () => true,
+      housekeeping: async () => ({
+        skipped: false,
+        builds: 0,
+        cacheRepositories: 0,
+        cacheJobs: 0,
+        cacheVersions: 0,
+        sharedCaches: 0,
+        tartImages: 0,
+        containerImages: 0,
+        pressure: false,
+      }),
       sleep: async () => {},
       listRepositories: async () => {
         refreshes++;
@@ -135,9 +162,88 @@ function dependencies(
       state.pendingTags = [...next.pendingTags];
     },
     recoverInterruptedBuilds: async () => false,
+    reconcilePreparedImageReferences: async () => 0,
+    reconcilePreparedContainerImageReferences: async () => 0,
+    updateCacheConfiguration: async () => 0,
     sleep,
   };
 }
+
+test("serveRepositories preserves caller idle notifications after housekeeping", async () => {
+  const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+  const deps = dependencies(github({}), state, async () => undefined);
+  let cleanups = 0;
+  let idleNotifications = 0;
+  deps.startAppleContainerSystem = async () => true;
+  deps.housekeeping = async () => {
+    cleanups++;
+    return {
+      skipped: false,
+      builds: 0,
+      cacheRepositories: 0,
+      cacheJobs: 0,
+      cacheVersions: 0,
+      sharedCaches: 0,
+      tartImages: 0,
+      containerImages: 0,
+      pressure: false,
+    };
+  };
+  deps.reconcilePreparedImageReferences = async () => 1;
+
+  await serveRepositories([repository], {
+    once: true,
+    dependencies: deps,
+    onIdle: () => {
+      idleNotifications++;
+    },
+  });
+  while (idleNotifications === 0) await Bun.sleep(1);
+
+  expect(cleanups).toBe(2);
+  expect(idleNotifications).toBe(1);
+});
+
+test("serveRepositories reruns housekeeping requested while the current run settles", async () => {
+  const summary = {
+    skipped: false,
+    builds: 0,
+    cacheRepositories: 0,
+    cacheJobs: 0,
+    cacheVersions: 0,
+    sharedCaches: 0,
+    tartImages: 0,
+    containerImages: 0,
+    pressure: false,
+  };
+  const settling = deferred<typeof summary>();
+  let cleanups = 0;
+  let idle: (() => Promise<void> | void) | undefined;
+  const deps: ServerDependencies = {
+    startAppleContainerSystem: async () => true,
+    housekeeping: () => {
+      cleanups++;
+      return cleanups === 2 ? settling.promise : Promise.resolve(summary);
+    },
+    serveRepository: async (_repository, options) => {
+      idle = options?.onIdle;
+    },
+  };
+
+  await serveRepositories([repository], { once: true, dependencies: deps });
+  expect(cleanups).toBe(1);
+  if (!idle) throw new Error("expected an idle callback");
+
+  const first = Promise.resolve(idle());
+  while (cleanups < 2) await Bun.sleep(1);
+  settling.resolve(summary);
+  const late = new Promise<void>((resolve, reject) => {
+    queueMicrotask(() => Promise.resolve(idle?.()).then(() => resolve(), reject));
+  });
+  await Promise.all([first, late]);
+
+  expect(cleanups).toBe(3);
+});
 
 test("startup recovers old URL-only cancelled builds and leaves failures retryable", async () => {
   const recovered: number[] = [];
@@ -225,6 +331,56 @@ describe("serve polling orchestration", () => {
       triggers: [{ event: "commit", tag: { patterns: ["v*"] } }],
     })),
   };
+
+  test("reconciles only configured caches and prepared runtime jobs", async () => {
+    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const deps = dependencies(github({}), state, async () => undefined);
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected a job");
+    deps.repositoryConfig = async () => ({
+      ...config,
+      vm: { ...config.vm, prepare: "install vm tools" },
+      jobs: [
+        { ...baseJob, name: "vm" },
+        {
+          ...baseJob,
+          name: "container",
+          runtime: { type: "container", image: "base", prepare: "install container tools" },
+        },
+        {
+          ...baseJob,
+          name: "plain-container",
+          runtime: { type: "container", image: "base" },
+        },
+        {
+          ...baseJob,
+          name: "cached",
+          cache: [{ paths: ["~/.cache/test"], keyFiles: [], shared: false }],
+        },
+      ],
+    });
+    let vmJobs: string[] = [];
+    let containerJobs: string[] = [];
+    let cacheJobs: string[] = [];
+    deps.reconcilePreparedImageReferences = async (_repository, jobs) => {
+      vmJobs = jobs;
+      return 0;
+    };
+    deps.reconcilePreparedContainerImageReferences = async (_repository, jobs) => {
+      containerJobs = jobs;
+      return 0;
+    };
+    deps.updateCacheConfiguration = async (_repository, jobs) => {
+      cacheJobs = jobs;
+      return 0;
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(vmJobs).toEqual(["vm", "cached"]);
+    expect(containerJobs).toEqual(["container"]);
+    expect(cacheJobs).toEqual(["cached"]);
+  });
 
   test("baselines existing tags on the first poll without launching them", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };

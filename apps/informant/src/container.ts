@@ -1,4 +1,15 @@
-import { chmod, copyFile, lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+} from "node:fs/promises";
 import { availableParallelism, totalmem } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { command } from "./process.ts";
@@ -6,7 +17,7 @@ import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
 import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
 import { bunCopyfileBackend, raiseFileDescriptorLimit } from "./tart/layout.ts";
-import { shellQuote, withImageLock } from "./tart/vm.ts";
+import { digest, shellQuote, withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
 
 interface ContainerResources {
@@ -211,6 +222,199 @@ async function snapshotPreparedContainerInputs(
 export interface ContainerPreparationOperations {
   command?: typeof command;
   withImageLock?: typeof withImageLock;
+  reference?: string;
+  dataPath?: string;
+}
+
+type ContainerRunOperations = Pick<
+  ContainerPreparationOperations,
+  "command" | "withImageLock" | "dataPath"
+>;
+
+const preparedContainerReferencesDirectory = (dataPath = dataDirectory()) =>
+  join(dataPath, "prepared-container-image-references");
+
+const preparedContainerHistoryDirectory = (dataPath = dataDirectory()) =>
+  join(dataPath, "prepared-container-image-history");
+
+function preparedContainerHistoryPath(image: string, dataPath?: string): string {
+  return join(preparedContainerHistoryDirectory(dataPath), digest(image));
+}
+
+function preparedContainerReferencePath(reference: string, dataPath?: string): string {
+  const separator = reference.indexOf("\0");
+  if (separator < 0) return join(preparedContainerReferencesDirectory(dataPath), digest(reference));
+  return join(
+    preparedContainerReferencesDirectory(dataPath),
+    `${digest(reference.slice(0, separator))}.jobs`,
+    digest(reference.slice(separator + 1)),
+  );
+}
+
+async function preparedContainerReferenceValues(
+  excluded?: string,
+  directory = preparedContainerReferencesDirectory(),
+): Promise<string[]> {
+  let entries: Dirent<string>[];
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const values = await Promise.all(
+    entries.map(async (entry) => {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) return preparedContainerReferenceValues(excluded, path);
+      if (!entry.isFile() || path === excluded) return [];
+      return [(await readFile(path, "utf8")).trim()];
+    }),
+  );
+  return values.flat().filter(Boolean);
+}
+
+export async function listPreparedContainerImages(
+  runCommand: typeof command = command,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const result = await runCommand(["container", "image", "list", "--quiet"], { signal });
+  if (result.exitCode !== 0) throw containerCommandError("could not list container images", result);
+  return result.stdout
+    .split("\n")
+    .map((image) => image.trim())
+    .filter((image) => /^informant-prepared-container:[0-9a-f]{16}$/.test(image));
+}
+
+async function activatePreparedContainerImage(
+  reference: string | undefined,
+  prepared: string | undefined,
+  onMessage: (message: string) => Promise<void> | void,
+  runCommand: typeof command,
+  lock: typeof withImageLock,
+  signal?: AbortSignal,
+  dataPath?: string,
+): Promise<void> {
+  if (!reference) return;
+  await lock(
+    "prepared-container-image-references",
+    async () => {
+      const path = preparedContainerReferencePath(reference, dataPath);
+      const previous = (await readFile(path, "utf8").catch(() => "")).trim() || undefined;
+      if (prepared) {
+        await mkdir(preparedContainerHistoryDirectory(dataPath), { recursive: true });
+        await Bun.write(preparedContainerHistoryPath(prepared, dataPath), `${prepared}\n`);
+      }
+      if (previous === prepared) return;
+      if (previous) {
+        const referenced = await preparedContainerReferenceValues(
+          path,
+          preparedContainerReferencesDirectory(dataPath),
+        );
+        if (!referenced.includes(previous)) {
+          const result = await lock(
+            `container-${digest(previous).slice(0, 24)}`,
+            () => runCommand(["container", "image", "delete", previous], { signal }),
+            signal,
+          );
+          if (result.exitCode === 0) {
+            await rm(preparedContainerHistoryPath(previous, dataPath), { force: true });
+            await onMessage(`Deleted superseded container image ${previous}`);
+          } else
+            await onMessage(
+              `Could not delete superseded container image ${previous}; will retry later`,
+            );
+        }
+      }
+      await mkdir(dirname(path), { recursive: true });
+      if (prepared) await Bun.write(path, `${prepared}\n`);
+      else await rm(path, { force: true });
+    },
+    signal,
+  );
+}
+
+export async function reconcilePreparedContainerImageReferences(
+  repository: string,
+  containerJobs: string[],
+  signal?: AbortSignal,
+): Promise<number> {
+  return withImageLock(
+    "prepared-container-image-references",
+    async () => {
+      const directory = preparedContainerReferencesDirectory();
+      const jobDirectory = join(directory, `${digest(repository)}.jobs`);
+      const active = new Set(containerJobs.map(digest));
+      const entries = await readdir(jobDirectory, { withFileTypes: true }).catch(() => []);
+      const stale = entries.filter((entry) => entry.isFile() && !active.has(entry.name));
+      await Promise.all(stale.map((entry) => rm(join(jobDirectory, entry.name), { force: true })));
+      await rm(join(directory, digest(repository)), { force: true });
+      return stale.length;
+    },
+    signal,
+  );
+}
+
+export async function reconcilePreparedContainerImageRepositories(
+  repositories: string[],
+): Promise<number> {
+  return withImageLock("prepared-container-image-references", async () => {
+    const directory = preparedContainerReferencesDirectory();
+    const active = new Set(
+      repositories.flatMap((repository) => [digest(repository), `${digest(repository)}.jobs`]),
+    );
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+    const stale = entries.filter((entry) => !active.has(entry.name));
+    await Promise.all(
+      stale.map((entry) => rm(join(directory, entry.name), { recursive: true, force: true })),
+    );
+    return stale.length;
+  });
+}
+
+export async function prunePreparedContainerImages(
+  runCommand: typeof command = command,
+  dataPath = dataDirectory(),
+  lock: typeof withImageLock = withImageLock,
+  knownOnly = false,
+): Promise<number> {
+  return lock("prepared-container-image-references", async () => {
+    const referenced = new Set(
+      await preparedContainerReferenceValues(
+        undefined,
+        preparedContainerReferencesDirectory(dataPath),
+      ),
+    );
+    const known = knownOnly
+      ? new Set(
+          await preparedContainerReferenceValues(
+            undefined,
+            preparedContainerHistoryDirectory(dataPath),
+          ),
+        )
+      : undefined;
+    const images = (await listPreparedContainerImages(runCommand)).filter(
+      (image) => !referenced.has(image) && (!known || known.has(image)),
+    );
+    let removed = 0;
+    for (const image of images) {
+      const result = await lock(`container-${digest(image).slice(0, 24)}`, () =>
+        runCommand(["container", "image", "delete", image]),
+      );
+      if (result.exitCode === 0) {
+        await rm(preparedContainerHistoryPath(image, dataPath), { force: true });
+        removed++;
+      }
+    }
+    return removed;
+  });
+}
+
+export async function pruneKnownPreparedContainerImages(
+  runCommand: typeof command = command,
+  dataPath = dataDirectory(),
+  lock: typeof withImageLock = withImageLock,
+): Promise<number> {
+  return prunePreparedContainerImages(runCommand, dataPath, lock, true);
 }
 
 export async function ensurePreparedContainer(
@@ -220,11 +424,22 @@ export async function ensurePreparedContainer(
   signal?: AbortSignal,
   operations: ContainerPreparationOperations = {},
 ): Promise<string> {
-  const preparationCommand = runtime.prepare;
-  if (!preparationCommand) return runtime.image;
   const runCommand = operations.command ?? command;
   const lock = operations.withImageLock ?? withImageLock;
-  const contextRoot = join(dataDirectory(), "build-contexts");
+  const preparationCommand = runtime.prepare;
+  if (!preparationCommand) {
+    await activatePreparedContainerImage(
+      operations.reference,
+      undefined,
+      onMessage,
+      runCommand,
+      lock,
+      signal,
+      operations.dataPath,
+    );
+    return runtime.image;
+  }
+  const contextRoot = join(operations.dataPath ?? dataDirectory(), "build-contexts");
   await mkdir(contextRoot, { recursive: true });
   const context = await mkdtemp(join(contextRoot, "informant-container-build-"));
   try {
@@ -242,7 +457,7 @@ export async function ensurePreparedContainer(
       join(context, "Dockerfile"),
       `FROM ${runtime.image}\nUSER 0\nCOPY informant-prepare.sh /tmp/informant-prepare.sh\n${inputSetup}${preparationLayer}`,
     );
-    return await lock(
+    const image = await lock(
       "container-builder",
       async () => {
         const existing = await runCommand(["container", "image", "inspect", prepared], { signal });
@@ -275,6 +490,16 @@ export async function ensurePreparedContainer(
       },
       signal,
     );
+    await activatePreparedContainerImage(
+      operations.reference,
+      image,
+      onMessage,
+      runCommand,
+      lock,
+      signal,
+      operations.dataPath,
+    );
+    return image;
   } finally {
     await rm(context, { recursive: true, force: true });
   }
@@ -338,7 +563,7 @@ export async function runInContainer(
   started: () => Promise<void>,
   runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
-  operations: { command?: typeof command } = {},
+  operations: ContainerRunOperations = {},
 ): Promise<{ success: boolean; exitCode: number; timedOut: boolean }> {
   if (job.runtime?.type !== "container")
     throw new Error("container runner requires a container runtime");
@@ -395,6 +620,9 @@ export async function runInContainer(
     const wrapped = containerJobCommand(`${sourceSetup}${job.command}`, caches);
     const image = await ensurePreparedContainer(runtime, workspace, log, executionSignal, {
       command: runCommand,
+      withImageLock: operations.withImageLock ?? withImageLock,
+      reference: `${repository.fullName}\0${job.name}`,
+      dataPath: operations.dataPath,
     });
     const mounts = caches.mounts.map((mount) => ({
       source: mount.path,

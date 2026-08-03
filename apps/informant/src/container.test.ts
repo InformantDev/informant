@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,10 +8,29 @@ import {
   containerRunArguments,
   ensurePreparedContainer,
   preparedContainerImage,
+  pruneKnownPreparedContainerImages,
+  prunePreparedContainerImages,
   runInContainer,
 } from "./container.ts";
 import { shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
+
+const temporaryDataPaths: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDataPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
+});
+
+function temporaryContainerDataPath(): string {
+  const path = join(tmpdir(), `informant-container-data-${crypto.randomUUID()}`);
+  temporaryDataPaths.push(path);
+  return path;
+}
+
+const passthroughImageLock = async <T>(_image: string, callback: () => Promise<T>): Promise<T> =>
+  callback();
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -194,6 +213,87 @@ test("prepares and reuses a deterministic container image", async () => {
   expect(reused).toEqual([["container", "image", "inspect", prepared]]);
 });
 
+test("tracks prepared container image references and prunes images after their last user moves", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-container-references-"));
+  const dataPath = join(root, "data");
+  const firstRuntime = { type: "container" as const, image: "base", prepare: "install first" };
+  const secondRuntime = { type: "container" as const, image: "base", prepare: "install second" };
+  const first = preparedContainerImage(firstRuntime);
+  const second = preparedContainerImage(secondRuntime);
+  const orphan = "informant-prepared-container:aaaaaaaaaaaaaaaa";
+  if (!first || !second) throw new Error("expected prepared container image names");
+  const images = new Set([first, second, orphan]);
+  const deleted: string[] = [];
+  const command = async (args: string[]) => {
+    if (args[1] === "image" && args[2] === "inspect") {
+      return {
+        exitCode: images.has(args[3] ?? "") ? 0 : 1,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+      };
+    }
+    if (args[1] === "image" && args[2] === "list") {
+      return { exitCode: 0, stdout: [...images].join("\n"), stderr: "", timedOut: false };
+    }
+    if (args[1] === "image" && args[2] === "delete") {
+      const image = args.at(-1) ?? "";
+      images.delete(image);
+      deleted.push(image);
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+    }
+    return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+  };
+  const withImageLock = async <T>(_image: string, callback: () => Promise<T>) => callback();
+  try {
+    for (const reference of ["owner/one\0job", "owner/two\0job"])
+      await ensurePreparedContainer(firstRuntime, undefined, () => {}, undefined, {
+        command,
+        withImageLock,
+        reference,
+        dataPath,
+      });
+    await ensurePreparedContainer(secondRuntime, undefined, () => {}, undefined, {
+      command,
+      withImageLock,
+      reference: "owner/one\0job",
+      dataPath,
+    });
+    expect(deleted).toEqual([]);
+    await ensurePreparedContainer(secondRuntime, undefined, () => {}, undefined, {
+      command,
+      withImageLock,
+      reference: "owner/two\0job",
+      dataPath,
+    });
+    expect(deleted).toEqual([first]);
+    expect(await pruneKnownPreparedContainerImages(command, dataPath, withImageLock)).toBe(0);
+    expect(await prunePreparedContainerImages(command, dataPath, withImageLock)).toBe(1);
+    expect(deleted).toEqual([first, orphan]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("container image pruning fails safely when references cannot be enumerated", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  await Bun.write(join(dataPath, "prepared-container-image-references"), "not a directory\n");
+  let commands = 0;
+
+  await expect(
+    prunePreparedContainerImages(
+      async () => {
+        commands++;
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+      dataPath,
+      passthroughImageLock,
+    ),
+  ).rejects.toThrow();
+  expect(commands).toBe(0);
+});
+
 test("copies preparation inputs and includes their contents in the image identity", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "informant-prepare-inputs-"));
   await mkdir(join(workspace, "packages", "shared"), { recursive: true });
@@ -363,6 +463,7 @@ test("serializes preparation of different images through the shared Apple builde
 test("passes secrets through the client environment and always removes the container", async () => {
   const invocations: Array<{ args: string[]; environment?: Record<string, string> }> = [];
   const output: string[] = [];
+  const locks: string[] = [];
   const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const job: JobConfig = {
     name: "test",
@@ -389,6 +490,11 @@ test("passes secrets through the client environment and always removes the conta
     { TOKEN: "line one\nline two" },
     undefined,
     {
+      dataPath: temporaryContainerDataPath(),
+      withImageLock: async (image, callback) => {
+        locks.push(image);
+        return callback();
+      },
       command: async (args, options) => {
         invocations.push({ args, environment: options?.env });
         await options?.onOutput?.("line one\nline two");
@@ -412,6 +518,7 @@ test("passes secrets through the client environment and always removes the conta
   expect(args).toContain("CLICOLOR_FORCE=1");
   expect(invocations[0]?.environment?.TOKEN).toBe("line one\nline two");
   expect(invocations[1]?.args.slice(0, 3)).toEqual(["container", "delete", "--force"]);
+  expect(locks).toEqual(["prepared-container-image-references"]);
   expect(output.join("")).toStartWith("\n[test] $ bun test\n");
   expect(output.join("")).not.toContain("━━");
   expect(output.join("")).toContain("[REDACTED]");
@@ -454,6 +561,8 @@ test("prepared jobs copy source into the baked workspace before running", async 
       {},
       undefined,
       {
+        dataPath: temporaryContainerDataPath(),
+        withImageLock: passthroughImageLock,
         command: async (args) => {
           invocations.push(args);
           return result();
@@ -478,6 +587,7 @@ test("limits concurrent Apple containers across jobs", async () => {
   const waiting: string[] = [];
   const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
   const releases = new Map<string, ReturnType<typeof deferred<ReturnType<typeof result>>>>();
+  const dataPath = temporaryContainerDataPath();
   const run = (name: string) =>
     runInContainer(
       repository,
@@ -508,6 +618,8 @@ test("limits concurrent Apple containers across jobs", async () => {
       {},
       undefined,
       {
+        dataPath,
+        withImageLock: passthroughImageLock,
         command: async (args) => {
           if (args[1] === "run") {
             started.push(name);
@@ -539,6 +651,7 @@ test("cancelling a queued job does not invoke Apple Container", async () => {
   const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
   const release = deferred<ReturnType<typeof result>>();
   const invocations = new Map<string, string[][]>();
+  const dataPath = temporaryContainerDataPath();
   const run = (name: string, signal?: AbortSignal) =>
     runInContainer(
       repository,
@@ -567,6 +680,8 @@ test("cancelling a queued job does not invoke Apple Container", async () => {
       {},
       signal,
       {
+        dataPath,
+        withImageLock: passthroughImageLock,
         command: async (args) => {
           const calls = invocations.get(name) ?? [];
           calls.push(args);

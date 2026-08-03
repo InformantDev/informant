@@ -16,6 +16,7 @@ import {
   preparedImageName,
   prunePreparedImages,
   reconcilePreparedImageReferences,
+  reconcilePreparedImageRepositories,
   resolveJobSecrets,
   scheduleJobs,
   secretMount,
@@ -368,11 +369,17 @@ test("reconciles removed VM job references and the legacy repository reference",
     await Bun.write(removed, "removed-image\n");
     await Bun.write(legacy, "legacy-image\n");
 
-    await reconcilePreparedImageReferences(repository, ["active"]);
+    expect(await reconcilePreparedImageReferences(repository, ["active"])).toBe(1);
 
     expect(await Bun.file(active).text()).toBe("active-image\n");
     expect(await Bun.file(removed).exists()).toBe(false);
     expect(await Bun.file(legacy).exists()).toBe(false);
+
+    const orphaned = join(references, `${digest("owner/removed")}.jobs`);
+    await mkdir(orphaned, { recursive: true });
+    await Bun.write(join(orphaned, digest("job")), "old-image\n");
+    expect(await reconcilePreparedImageRepositories([repository])).toBe(1);
+    expect(await Bun.file(orphaned).exists()).toBe(false);
   } finally {
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
