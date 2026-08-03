@@ -284,6 +284,25 @@ function jobsForBuild(build: Build): NonNullable<Build["jobs"]> {
   return (build.runningJobs ?? []).map((name) => ({ name, status: "running" as const }));
 }
 
+function formatElapsedTime(startedAt: string, completedAt?: string): string {
+  const elapsedSeconds = Math.max(
+    0,
+    Math.floor(
+      ((completedAt ? Date.parse(completedAt) : Date.now()) - Date.parse(startedAt)) / 1_000,
+    ),
+  );
+  const hours = Math.floor(elapsedSeconds / 3_600);
+  const minutes = Math.floor((elapsedSeconds % 3_600) / 60);
+  const seconds = elapsedSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function buildTiming(build: Build): string {
+  return `started ${new Date(build.startedAt).toLocaleString()} · ${formatElapsedTime(build.startedAt, build.completedAt)} elapsed`;
+}
+
 function buildList(builds: Build[], includeHistory: boolean): string {
   if (builds.length === 0) return includeHistory ? "No local builds yet." : "No builds running.";
   return builds
@@ -291,7 +310,7 @@ function buildList(builds: Build[], includeHistory: boolean): string {
       const jobs = jobsForBuild(build);
       const lines = [
         `● ${build.repo} · ${build.branch}@${build.sha.slice(0, 7)} · ${build.status}`,
-        `  ${build.id} · ${build.startedAt} · ${build.machine}`,
+        `  ${build.id} · ${buildTiming(build)} · ${build.machine}`,
         `  ${githubUrl(build)}`,
       ];
       for (const [index, job] of jobs.entries()) {
@@ -375,7 +394,7 @@ function buildBrowserOptions(builds: Build[]): BrowserOption[] {
     {
       value: build.id,
       label: `${terminalColor.bold}${build.repo}${terminalColor.reset} · ${terminalColor.blue}${build.branch}@${build.sha.slice(0, 7)}${terminalColor.reset}`,
-      hint: `${coloredStatus(build.status)} · ${terminalColor.dim}${build.id}${terminalColor.reset}`,
+      hint: `${coloredStatus(build.status)} · ${buildTiming(build)} · ${terminalColor.dim}${build.id}${terminalColor.reset}`,
     },
     ...jobsForBuild(build).map((job) => ({
       value: `${build.id}\0${job.name}`,

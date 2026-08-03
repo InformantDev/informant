@@ -151,6 +151,10 @@ test("builds shows running jobs by default and recent history with --all", async
     expect(activeOutput).toContain("├─ test · running");
     expect(activeOutput).toContain("└─ lint · running");
     expect(activeOutput).toContain("https://github.com/owner/repo/pull/42");
+    expect(activeOutput).toContain(
+      `started ${new Date("2026-07-26T12:00:00.000Z").toLocaleString()}`,
+    );
+    expect(activeOutput).toContain(" elapsed");
     expect(activeOutput).not.toContain("finished-build");
 
     await main(["builds", "--all"]);
@@ -162,6 +166,9 @@ test("builds shows running jobs by default and recent history with --all", async
     );
     expect(historyOutput).toContain(
       "https://github.com/owner/repo/commit/3333333333333333333333333333333333333333",
+    );
+    expect(historyOutput).toContain(
+      `started ${new Date("2026-07-26T11:00:00.000Z").toLocaleString()} · 5m 0s elapsed`,
     );
     expect(historyOutput).not.toContain("https://github.com/owner/repo/pull/99");
 
