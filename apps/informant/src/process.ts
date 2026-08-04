@@ -41,6 +41,7 @@ export async function command(
   options: {
     cwd?: string;
     env?: Record<string, string>;
+    inheritEnv?: boolean;
     timeoutMs?: number;
     signal?: AbortSignal;
     onOutput?: (text: string) => Promise<void> | void;
@@ -51,7 +52,7 @@ export async function command(
     try {
       return Bun.spawn(argv, {
         cwd: options.cwd,
-        env: { ...Bun.env, ...options.env },
+        env: { ...(options.inheritEnv === false ? {} : Bun.env), ...options.env },
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -108,6 +109,7 @@ export async function requireCommand(
   options?: {
     cwd?: string;
     env?: Record<string, string>;
+    inheritEnv?: boolean;
     timeoutMs?: number;
     signal?: AbortSignal;
     onOutput?: (text: string) => Promise<void> | void;

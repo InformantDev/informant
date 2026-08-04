@@ -47,6 +47,7 @@ describe("configuration", () => {
         environment: {},
         secrets: [],
         needs: [],
+        runsOn: ["darwin", "arm64"],
         triggers: [{ event: "commit", branch: undefined, tag: undefined, pullRequest: undefined }],
         filters: [{ branch: { names: ["main"] } }],
         cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
@@ -227,6 +228,43 @@ describe("configuration", () => {
         source.replace('container = { image = "oven/bun:1", cpu = 1 }', "container = true"),
       ),
     ).toThrow("jobs[0].container must be a table");
+  });
+
+  test("parses native host jobs and runs-on capabilities", () => {
+    const source = configTemplate().replace(
+      'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+      'cache = []\nruns_on = ["linux", "x64"]\nhost = {}',
+    );
+    expect(parseConfig(source).jobs[0]).toMatchObject({
+      runsOn: ["linux", "x64"],
+      runtime: { type: "host" },
+    });
+    expect(() => parseConfig(source.replace("host = {}", 'host = { image = "bad" }'))).toThrow(
+      "jobs[0].host must be an empty table",
+    );
+    expect(() => parseConfig(source.replace('runs_on = ["linux", "x64"]\n', ""))).toThrow(
+      "jobs[0].runs_on is required for host jobs",
+    );
+    expect(() =>
+      parseConfig(
+        source.replace("cache = []", 'cache = [{ paths = ["~/.cache/tool"], shared = true }]'),
+      ),
+    ).toThrow("jobs[0].cache is not supported for host jobs");
+    expect(() =>
+      parseConfig(
+        configTemplate()
+          .replace(
+            '[container]\nimage = "oven/bun:1"',
+            'cache = [{ paths = ["~/.cache/tool"], shared = true }]\n[container]\nimage = "oven/bun:1"',
+          )
+          .replace('command = "bun install --frozen-lockfile && bun test"', 'command = "test"')
+          .replace('name = "test"', 'name = "host-test"')
+          .replace(
+            'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+            'runs_on = ["linux", "x64"]\nhost = {}',
+          ),
+      ),
+    ).toThrow("jobs[0].cache is not supported for host jobs");
   });
 
   test("container preparation can be inherited and overridden per job", () => {
@@ -502,6 +540,14 @@ filters = []
     expect(() => parseConfig(source.replace('needs = ["test"]', 'needs = ["build"]'))).toThrow(
       "dependency cycle",
     );
+    expect(() =>
+      parseConfig(
+        source.replace(
+          'needs = ["test"]',
+          'needs = ["test"]\nruns_on = ["linux", "x64"]\nhost = {}',
+        ),
+      ),
+    ).toThrow("job build and dependency test must use the same runs_on");
   });
 
   test("selects requested jobs and their transitive dependencies", () => {

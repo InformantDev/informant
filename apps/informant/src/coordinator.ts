@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
+import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
 import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
@@ -40,6 +41,18 @@ const defaultDependencies: CoordinatorDependencies = {
   runInTart,
   readLogTail,
 };
+
+export function aggregatePartitionResults(
+  results: Array<BuildRecord | false | undefined>,
+): BuildRecord | false | undefined {
+  if (results.includes(false)) return false;
+  const records = results.filter((result): result is BuildRecord => typeof result === "object");
+  return (
+    records.find((record) => record.status === "failure") ??
+    records.find((record) => record.status === "cancelled") ??
+    records[0]
+  );
+}
 
 export async function runLocalCommit(
   repository: Repository,
@@ -128,16 +141,71 @@ export async function runCommit(
   event?: RunEvent,
   signal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
+  const usesCapabilities = config.jobs.some(
+    (job) => (job.runsOn?.length ?? 0) > 0 || job.runtime?.type === "host",
+  );
+  if (!usesCapabilities) {
+    return runCommitPartition(github, repository, sha, branch, config, dependencies, event, signal);
+  }
+  const capable = selectCapableJobs(config, workerCapabilities());
+  const partitions = new Map<string, JobConfig[]>();
+  for (const job of capable.jobs) {
+    const labels = [...(job.runsOn ?? [])].sort();
+    const key = labels.join("\0");
+    const jobs = partitions.get(key) ?? [];
+    jobs.push(job);
+    partitions.set(key, jobs);
+  }
+  const results = await Promise.all(
+    [...partitions.entries()].map(([key, jobs]) =>
+      runCommitPartition(
+        github,
+        repository,
+        sha,
+        branch,
+        { ...capable, jobs },
+        dependencies,
+        event,
+        signal,
+        key.split("\0"),
+      ),
+    ),
+  );
+  return aggregatePartitionResults(results);
+}
+
+async function runCommitPartition(
+  github: GitHubClient,
+  repository: Repository,
+  sha: string,
+  branch: string,
+  config: InformantConfig,
+  dependencies: CoordinatorDependencies,
+  event?: RunEvent,
+  signal?: AbortSignal,
+  scopeLabels?: string[],
+): Promise<BuildRecord | false | undefined> {
+  if (config.jobs.length === 0) return undefined;
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
   const configuredVmJobs = config.jobs
-    .filter((job) => job.runtime?.type !== "container")
+    .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name);
+  const scopedEvent =
+    event && scopeLabels
+      ? {
+          ...event,
+          id: `${event.id}:jobs:${Buffer.from(scopeLabels.join("\0")).toString("base64url")}`,
+        }
+      : event;
   const claim = await github.claim(
     repository,
     sha,
     machine,
-    event ? { type: event.type, id: event.id, branch: event.branch, label: branch } : undefined,
+    scopedEvent
+      ? { type: scopedEvent.type, id: scopedEvent.id, branch: scopedEvent.branch, label: branch }
+      : undefined,
+    scopeLabels ? config.jobs.map((job) => job.name) : undefined,
   );
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;

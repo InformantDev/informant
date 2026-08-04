@@ -18,7 +18,11 @@ export interface ContainerRuntime {
   prepareInputs?: string[];
 }
 
-export type JobRuntime = VmRuntime | ContainerRuntime;
+export interface HostRuntime {
+  type: "host";
+}
+
+export type JobRuntime = VmRuntime | ContainerRuntime | HostRuntime;
 
 export interface JobFilter {
   branch: { names: string[] };
@@ -32,6 +36,7 @@ export interface JobConfig {
   environment: Record<string, string>;
   secrets: string[];
   needs: string[];
+  runsOn?: string[];
   runtime?: JobRuntime;
   triggers?: TriggerRule[];
   filters?: JobFilter[];

@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  aggregatePartitionResults,
   type CoordinatorDependencies,
   readLogTail,
   runCommit,
@@ -182,6 +183,123 @@ function harness(
 }
 
 describe("runCommit", () => {
+  test("partitions overlapping worker capabilities into non-overlapping claim scopes", async () => {
+    const claims: Array<{ event?: { type: string; id: string }; jobs?: string[] }> = [];
+    const github = {
+      claim: async (
+        _repository: Repository,
+        _sha: string,
+        _machine: string,
+        event?: { type: string; id: string },
+        jobs?: string[],
+      ) => {
+        claims.push({ event, jobs });
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const capabilityConfig: InformantConfig = {
+      ...config,
+      jobs: [
+        {
+          ...baseJob,
+          runsOn: [process.platform, process.arch],
+          runtime: { type: "host" },
+        },
+        {
+          ...baseJob,
+          name: "gpu-test",
+          runsOn: [process.platform, process.arch, "gpu"],
+          runtime: { type: "host" },
+        },
+      ],
+    };
+    const event = { type: "commit" as const, id: "branch:main:sha", branch: "main" };
+
+    delete Bun.env.INFORMANT_CAPABILITIES;
+    await runCommit(
+      github,
+      repository,
+      "sha",
+      "main",
+      capabilityConfig,
+      harness().dependencies,
+      event,
+    );
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      await runCommit(
+        github,
+        repository,
+        "sha",
+        "main",
+        capabilityConfig,
+        harness().dependencies,
+        event,
+      );
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
+
+    expect(claims).toHaveLength(3);
+    expect(claims[0]?.event?.id).toBe(claims[1]?.event?.id);
+    expect(claims[0]?.jobs).toEqual(["test"]);
+    expect(claims[1]?.jobs).toEqual(["test"]);
+    expect(claims[2]?.jobs).toEqual(["gpu-test"]);
+    expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
+  });
+
+  test("retries the event when any capability partition loses its claim", async () => {
+    let claims = 0;
+    const github = {
+      claim: async () => (++claims === 1 ? { retry: true } : undefined),
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      expect(
+        await runCommit(
+          github,
+          repository,
+          "sha",
+          "main",
+          {
+            ...config,
+            jobs: [
+              { ...baseJob, runsOn: [process.platform, process.arch] },
+              {
+                ...baseJob,
+                name: "gpu-test",
+                runsOn: [process.platform, process.arch, "gpu"],
+              },
+            ],
+          },
+          harness().dependencies,
+          { type: "commit", id: "branch:main:sha", branch: "main" },
+        ),
+      ).toBeFalse();
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
+  });
+
+  test("returns a failed record when any capability partition fails", () => {
+    const record = (status: BuildRecord["status"]): BuildRecord => ({
+      id: status,
+      repo: repository.fullName,
+      sha: "sha",
+      branch: "main",
+      machine: "worker",
+      startedAt: "2026-08-04T00:00:00Z",
+      status,
+      logPath: `/tmp/${status}.log`,
+    });
+    const result = aggregatePartitionResults([record("success"), record("failure")]);
+    expect(typeof result === "object" ? result.status : result).toBe("failure");
+  });
+
   test("keeps the complete VM job inventory when selecting one manually triggered job", async () => {
     const baseJob = config.jobs[0];
     if (!baseJob) throw new Error("expected test job");

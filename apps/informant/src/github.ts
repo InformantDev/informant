@@ -753,6 +753,7 @@ export class GitHubClient {
       type: "commit",
       id: sha,
     },
+    eligibleJobs?: string[],
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName);
@@ -777,6 +778,18 @@ export class GitHubClient {
           (context.label === undefined || context.label === event.label))
       );
     });
+    const requestedJobsFor = (check: CheckRun): string[] => {
+      const request = manualTriggerRequest(check);
+      if (request) return request.jobs;
+      const encoded = check.external_id?.split(":jobs:")[1];
+      if (!encoded) return [];
+      try {
+        const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+        return Array.isArray(value) ? value.map(String) : [];
+      } catch {
+        return [];
+      }
+    };
     const suiteRerun =
       event.type !== "comment" &&
       allRequestedChecks.length === 0 &&
@@ -788,7 +801,7 @@ export class GitHubClient {
           .sort((a, b) => b.id - a.id)[0]
       : undefined;
     const originalPullRequestMatch = previousAggregate?.external_id?.match(
-      /:event:commit:pr:(\d+):([^:]+)$/,
+      /:event:commit:pr:(\d+):([^:]+)(?::jobs:[^:]+)?$/,
     );
     const originalPullRequestNumber = Number(originalPullRequestMatch?.[1]);
     const originalPullRequest =
@@ -808,6 +821,20 @@ export class GitHubClient {
           ),
         ]
       : [];
+    const eligible = eligibleJobs ? new Set(eligibleJobs) : undefined;
+    const queuedJobRequests = requestedChecks.map(requestedJobsFor);
+    const targetedManualJobs = requestedChecks.length
+      ? queuedJobRequests.some((jobs) => jobs.length === 0)
+        ? []
+        : [...new Set(queuedJobRequests.flat())]
+      : failedRerunJobs;
+    if (
+      eligible &&
+      targetedManualJobs.length > 0 &&
+      !targetedManualJobs.some((job) => eligible.has(job))
+    ) {
+      return undefined;
+    }
     const manualTrigger = requestedChecks.length > 0 || suiteRerun;
     const requestedContext = requestedChecks
       .map(manualTriggerContext)
@@ -830,12 +857,15 @@ export class GitHubClient {
       context === undefined
         ? sha
         : `${sha}:context:${legacyManualRequest ? encodedManualTriggerContext(context) : contextKey}`;
+    const eligibleScope = eligibleJobs?.length
+      ? `:jobs:${Buffer.from([...eligibleJobs].sort().join("\0")).toString("base64url")}`
+      : "";
     const claimEvent = manualTrigger
       ? (suiteRerun &&
           originalPullRequest && {
             type: "commit" as const,
-            id: `pr:${originalPullRequest}:${sha}`,
-          }) || { type: "manual" as const, id: manualScope }
+            id: `pr:${originalPullRequest}:${sha}${eligibleScope}`,
+          }) || { type: "manual" as const, id: `${manualScope}${eligibleScope}` }
       : event;
     const name = claimEvent.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const scope = `${claimEvent.type}:${claimEvent.id}`;
@@ -947,18 +977,7 @@ export class GitHubClient {
         return legacyOrder || a.id - b.id;
       });
     if (!completed && contenders[0]?.id === candidate.id) {
-      const jobRequests = pendingRequests.map((check) => {
-        const request = manualTriggerRequest(check);
-        if (request) return request.jobs;
-        const encoded = check.external_id?.split(":jobs:")[1];
-        if (!encoded) return [];
-        try {
-          const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
-          return Array.isArray(value) ? value.map(String) : [];
-        } catch {
-          return [];
-        }
-      });
+      const jobRequests = pendingRequests.map(requestedJobsFor);
       const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
         ? []
         : [...new Set(jobRequests.flat())];
@@ -966,6 +985,10 @@ export class GitHubClient {
       // rerequested as "all" or "failed". Prefer retrying its unsuccessful and
       // incomplete jobs; explicit Informant requests still support all jobs.
       if (suiteRerun && failedRerunJobs.length > 0) requestedJobs.push(...failedRerunJobs);
+      if (eligible) {
+        const supported = requestedJobs.filter((job) => eligible.has(job));
+        requestedJobs.splice(0, requestedJobs.length, ...supported);
+      }
       await Promise.all(
         pendingRequests.map((check) =>
           this.updateCheck(repository, check.id, {

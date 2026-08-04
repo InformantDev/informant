@@ -1,6 +1,7 @@
 import { appendFile, chmod, mkdir, open, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { runInContainer } from "../container.ts";
+import { runOnHost } from "../host.ts";
 import { command, requireCommand } from "../process.ts";
 import { appendLog, claimBuildWorkspace, jobLogPath } from "../store.ts";
 import type { BuildRecord, InformantConfig, Repository } from "../types.ts";
@@ -473,11 +474,12 @@ export async function runInTart(
   signal?: AbortSignal,
   runtimeSecrets: RuntimeSecrets = {},
   configuredVmJobs = config.jobs
-    .filter((job) => job.runtime?.type !== "container")
+    .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name),
 ): Promise<boolean> {
   await reconcilePreparedImageReferences(repository.fullName, configuredVmJobs, signal);
-  if (config.jobs.some((job) => job.runtime?.type !== "container")) await cleanStaleVms();
+  if (config.jobs.some((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host"))
+    await cleanStaleVms();
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
   const workspaces = config.jobs.map((_, index) => join(root, `job-${index}`));
@@ -537,7 +539,15 @@ export async function runInTart(
     logHandle = await open(record.logPath, "a");
     await writeLog(`$ cloning ${repository.fullName} at ${sha}\n`);
     await requireCommand(
-      ["gh", "repo", "clone", repository.fullName, repositoryPath, "--", "--no-checkout"],
+      [
+        "gh",
+        "repo",
+        "clone",
+        `https://github.com/${repository.fullName}.git`,
+        repositoryPath,
+        "--",
+        "--no-checkout",
+      ],
       `could not clone ${repository.fullName}`,
       { signal },
     );
@@ -567,13 +577,12 @@ export async function runInTart(
         };
         const runtime = job.runtime ?? config.vm;
         const execution =
-          runtime.type === "container"
-            ? await runInContainer(
+          runtime.type === "host"
+            ? await runOnHost(
                 repository,
                 sha,
                 record.branch,
                 config.trustedSha ?? sha,
-                config.trustedSha === sha,
                 workspace,
                 job,
                 (text) => logJob(job, text),
@@ -581,25 +590,39 @@ export async function runInTart(
                 runtimeSecrets,
                 signal,
               )
-            : await runJob(
-                `informant-${record.id}-${index}`,
-                await ensurePreparedImage(
-                  { ...config, vm: runtime },
-                  async (message) => writeLog(`$ ${message}\n`),
-                  `${repository.fullName}\0${job.name}`,
+            : runtime.type === "container"
+              ? await runInContainer(
+                  repository,
+                  sha,
+                  record.branch,
+                  config.trustedSha ?? sha,
+                  config.trustedSha === sha,
+                  workspace,
+                  job,
+                  (text) => logJob(job, text),
+                  started,
+                  runtimeSecrets,
                   signal,
-                ),
-                repository,
-                sha,
-                record.branch,
-                workspace,
-                { ...config, vm: runtime },
-                job,
-                (text) => logJob(job, text),
-                started,
-                runtimeSecrets,
-                signal,
-              );
+                )
+              : await runJob(
+                  `informant-${record.id}-${index}`,
+                  await ensurePreparedImage(
+                    { ...config, vm: runtime },
+                    async (message) => writeLog(`$ ${message}\n`),
+                    `${repository.fullName}\0${job.name}`,
+                    signal,
+                  ),
+                  repository,
+                  sha,
+                  record.branch,
+                  workspace,
+                  { ...config, vm: runtime },
+                  job,
+                  (text) => logJob(job, text),
+                  started,
+                  runtimeSecrets,
+                  signal,
+                );
         const outcome = signal?.aborted ? "cancelled" : execution.success ? "success" : "failure";
         const detail = execution.timedOut
           ? `exit ${execution.exitCode}, timed out after ${job.timeoutMinutes}m`

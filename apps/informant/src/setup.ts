@@ -305,7 +305,7 @@ async function finishSetup(account: string): Promise<void> {
 
 export async function setup(): Promise<void> {
   intro("Informant setup");
-  await setupAppleContainer();
+  if (platform() === "darwin" && arch() === "arm64") await setupAppleContainer();
   const setupType = await select({
     message: "How should this machine be configured?",
     options: [

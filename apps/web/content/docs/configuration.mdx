@@ -37,13 +37,31 @@ provide their own preparation without repeating the image. For example:
 [[jobs]]
 name = "linux-e2e"
 command = "bun run test:e2e"
-container = { prepare = "apt-get update && apt-get install -y chromium" }
+runs_on = ["linux", "x64"]
+host = {}
 
 [[jobs]]
 name = "macos-e2e"
 command = "bun run test:e2e"
+runs_on = ["darwin", "arm64"]
 vm = { image = "ghcr.io/cirruslabs/macos-tahoe-base:latest", os = "macos", user = "admin", password = "admin", cpu = 4, memory_mb = 8192, prepare = "brew install playwright" }
 ```
+
+`runs_on` uses GitHub Actions-style AND matching: the worker must provide every listed capability.
+Every worker automatically provides `self-hosted`, its platform (`linux` or `darwin`), architecture
+(`x64` or `arm64`), and lowercase hostname. Add custom comma-separated labels with
+`INFORMANT_CAPABILITIES`, for example `INFORMANT_CAPABILITIES=gpu,large`.
+
+`host = {}` runs the command directly on the worker in a fresh detached checkout with an isolated
+home directory. It is intentionally explicit because repository code is not isolated from the host;
+use it only for trusted repositories. Persistent Informant caches are not supported for host jobs,
+and `runs_on` is required. Existing container and VM jobs without `runs_on` default to
+`["darwin", "arm64"]`, preserving their Apple Silicon worker behavior while preventing Linux workers
+from claiming them.
+
+Jobs with the same normalized `runs_on` labels share one claim election. Workers with additional
+capabilities still compete for shared jobs instead of executing them twice. A job and every job in its
+`needs` chain must use the same `runs_on` labels; cross-worker dependency chains are rejected.
 
 Container jobs require [Apple Container](https://github.com/apple/container) and run as UID 0 with the
 checkout mounted at `/workspace`. Cache directories use isolated host storage under `/home/root` in
