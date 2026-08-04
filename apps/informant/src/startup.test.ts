@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { CommandResult } from "./process.ts";
-import { renderStartupService, updateInformant } from "./startup.ts";
+import { parseStartupEnvironment, renderStartupService, updateInformant } from "./startup.ts";
 
 const result = (exitCode = 0, stderr = "", stdout = ""): CommandResult => ({
   exitCode,
@@ -10,6 +10,15 @@ const result = (exitCode = 0, stderr = "", stdout = ""): CommandResult => ({
 });
 
 describe("startup service", () => {
+  test("preserves the environment captured in an existing property list", () => {
+    expect(
+      parseStartupEnvironment(
+        JSON.stringify({ PATH: "/captured/bin", INFORMANT_SECRET_TOKEN: "captured-secret" }),
+      ),
+    ).toEqual({ PATH: "/captured/bin", INFORMANT_SECRET_TOKEN: "captured-secret" });
+    expect(() => parseStartupEnvironment("[]")).toThrow("invalid property list");
+  });
+
   test("renders a persistent LaunchAgent with escaped paths and environment", () => {
     const service = renderStartupService(
       "/Applications/Informant & tools/informant",

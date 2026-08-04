@@ -84,6 +84,24 @@ function servicePid(output: string): number | undefined {
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
+export function parseStartupEnvironment(output: string): Record<string, string> {
+  let value: unknown;
+  try {
+    value = JSON.parse(output);
+  } catch {
+    throw new Error("could not preserve Informant startup environment: invalid property list");
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.values(value).some((item) => typeof item !== "string")
+  ) {
+    throw new Error("could not preserve Informant startup environment: invalid property list");
+  }
+  return value as Record<string, string>;
+}
+
 function startupEnvironment(): Record<string, string> {
   const environment: Record<string, string> = {
     HOME: homedir(),
@@ -95,7 +113,7 @@ function startupEnvironment(): Record<string, string> {
   return environment;
 }
 
-async function writeStartupServiceDefinition(): Promise<string> {
+async function writeStartupServiceDefinition(environment = startupEnvironment()): Promise<string> {
   const executable = Bun.which("informant");
   if (!executable) {
     throw new Error("informant must be installed on PATH before enabling startup");
@@ -104,9 +122,28 @@ async function writeStartupServiceDefinition(): Promise<string> {
   const logs = dataDirectory();
   await mkdir(dirname(path), { recursive: true });
   await mkdir(logs, { recursive: true });
-  await Bun.write(path, renderStartupService(executable, startupEnvironment(), logs));
+  await Bun.write(path, renderStartupService(executable, environment, logs));
   await chmod(path, 0o600);
   return path;
+}
+
+async function migrateStartupServiceDefinition(): Promise<string> {
+  const path = startupServicePath();
+  const captured = await command([
+    "plutil",
+    "-extract",
+    "EnvironmentVariables",
+    "json",
+    "-o",
+    "-",
+    path,
+  ]);
+  if (captured.exitCode !== 0) {
+    throw new Error(
+      `could not preserve Informant startup environment: ${captured.stderr.trim() || `exit ${captured.exitCode}`}`,
+    );
+  }
+  return writeStartupServiceDefinition(parseStartupEnvironment(captured.stdout));
 }
 
 export async function enableStartup(): Promise<string> {
@@ -166,7 +203,7 @@ export async function updateInformant(
   if (!previousPid) {
     throw new Error("Informant was updated but its loaded startup service has no running worker");
   }
-  await (options.writeServiceDefinition ?? writeStartupServiceDefinition)();
+  await (options.writeServiceDefinition ?? migrateStartupServiceDefinition)();
   const restarted = await run(["kill", "-TERM", String(previousPid)]);
   if (restarted.exitCode !== 0) {
     throw new Error(
