@@ -79,7 +79,7 @@ test("matching roots include needs and PR filters are exact", () => {
   const rule = config.triggers?.[0];
   expect(rule && triggerMatches(rule, context)).toBe(true);
   expect(
-    selectTriggeredJobs(config, (rule) => triggerMatches(rule, context)).jobs.map(
+    selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), "pull/1").jobs.map(
       (job) => job.name,
     ),
   ).toEqual(["dependency", "root"]);
@@ -90,6 +90,37 @@ test("matching roots include needs and PR filters are exact", () => {
         pullRequest: { ...pr, sameRepository: false },
       }),
   ).toBe(false);
+});
+
+test("job filters constrain automatic roots before dependencies are selected", () => {
+  const config = parseConfig(
+    source('[{ event = "commit" }]', 'filters = [{ branch = { names = ["main", "release"] } }]'),
+  );
+  const context = { type: "commit" as const, branch: "feature" };
+  expect(
+    selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), "feature").jobs,
+  ).toEqual([]);
+  expect(
+    selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), context.branch).jobs.map(
+      (job) => job.name,
+    ),
+  ).toEqual([]);
+  const main = { ...context, branch: "main" };
+  expect(
+    selectTriggeredJobs(config, (rule) => triggerMatches(rule, main), main.branch).jobs.map(
+      (job) => job.name,
+    ),
+  ).toEqual(["dependency", "root"]);
+  for (const branch of [undefined, "pull/7"]) {
+    expect(selectTriggeredJobs(config, () => true, branch).jobs).toEqual([]);
+  }
+  const unfiltered = {
+    ...config,
+    jobs: config.jobs.map((job) => ({ ...job, filters: [] })),
+  };
+  expect(
+    selectTriggeredJobs(unfiltered, () => true, undefined).jobs.map((job) => job.name),
+  ).toEqual(["dependency", "root"]);
 });
 
 test("commit context is optional and PR state, draft, and base filters compose", () => {

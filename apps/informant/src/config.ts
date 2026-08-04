@@ -9,7 +9,8 @@ export const JOBS_DIRECTORY = `${CONFIG_DIRECTORY}/jobs`;
 
 const defaultDirectoryConfig = `version = 1
 timeout_minutes = 60
-triggers = [{ event = "commit", branch = { names = ["main"] } }]
+triggers = [{ event = "commit" }]
+filters = [{ branch = { names = ["main"] } }]
 
 [container]
 image = "oven/bun:1"
@@ -45,14 +46,76 @@ export function selectJobs(config: InformantConfig, requested: string[]): Inform
   return { ...config, jobs: config.jobs.filter((job) => selected.has(job.name)) };
 }
 
+function filtersMatch(job: JobConfig, branch: string | undefined): boolean {
+  return (job.filters ?? []).every(
+    (filter) => branch !== undefined && filter.branch.names.includes(branch),
+  );
+}
+
+export function selectManuallyTriggeredJobs(
+  config: InformantConfig,
+  requested: string[],
+  branch: string | undefined,
+): InformantConfig {
+  if (requested.length) selectJobs(config, requested);
+  const requestedNames = requested.length ? new Set(requested) : undefined;
+  const roots = config.jobs
+    .filter((job) => !requestedNames || requestedNames.has(job.name))
+    .filter((job) => filtersMatch(job, branch))
+    .filter((job) => {
+      const triggers = job.triggers ?? config.triggers ?? [];
+      return (
+        triggers.length === 0 ||
+        triggers.some(
+          (rule) => !rule.branch || (branch !== undefined && rule.branch.names.includes(branch)),
+        )
+      );
+    })
+    .map((job) => job.name);
+  return roots.length ? selectJobs(config, roots) : { ...config, jobs: [] };
+}
+
 export function selectTriggeredJobs(
   config: InformantConfig,
   matches: (rule: TriggerRule) => boolean,
+  branch: string | undefined,
 ) {
   const roots = config.jobs
+    .filter((job) => filtersMatch(job, branch))
     .filter((job) => (job.triggers ?? config.triggers ?? []).some(matches))
     .map((job) => job.name);
   return roots.length ? selectJobs(config, roots) : { ...config, jobs: [] };
+}
+
+function parseFilters(value: unknown, label: string): JobConfig["filters"] {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      throw new Error(`${label}[${index}] must be a table`);
+    const raw = item as Record<string, unknown>;
+    if (Object.keys(raw).length !== 1 || raw.branch === undefined)
+      throw new Error(`${label}[${index}] must contain only branch`);
+    return { branch: parseBranchFilter(raw.branch, `${label}[${index}].branch`) };
+  });
+}
+
+function parseBranchFilter(value: unknown, label: string): { names: string[] } {
+  const table = value as Record<string, unknown>;
+  if (
+    !table ||
+    typeof table !== "object" ||
+    Array.isArray(table) ||
+    Object.keys(table).some((key) => key !== "names")
+  )
+    throw new Error(`${label} must contain only names`);
+  if (
+    !Array.isArray(table.names) ||
+    table.names.length === 0 ||
+    table.names.some((name) => typeof name !== "string" || !name.trim())
+  )
+    throw new Error(`${label}.names must contain non-empty strings`);
+  return { names: table.names as string[] };
 }
 
 function parseTriggers(value: unknown, label: string): TriggerRule[] {
@@ -75,24 +138,10 @@ function parseTriggers(value: unknown, label: string): TriggerRule[] {
       throw new Error(`${label}[${index}] comment cannot use branch`);
     if (raw.tag !== undefined && raw.event !== "commit")
       throw new Error(`${label}[${index}] tag can only be used with commit`);
-    let branch: TriggerRule["branch"];
-    if (raw.branch !== undefined) {
-      const table = raw.branch as Record<string, unknown>;
-      if (
-        !table ||
-        typeof table !== "object" ||
-        Array.isArray(table) ||
-        Object.keys(table).some((key) => key !== "names")
-      )
-        throw new Error(`${label}[${index}].branch must contain only names`);
-      if (
-        !Array.isArray(table.names) ||
-        table.names.length === 0 ||
-        table.names.some((name) => typeof name !== "string" || !name.trim())
-      )
-        throw new Error(`${label}[${index}].branch.names must contain non-empty strings`);
-      branch = { names: table.names as string[] };
-    }
+    const branch =
+      raw.branch === undefined
+        ? undefined
+        : parseBranchFilter(raw.branch, `${label}[${index}].branch`);
     let tag: TriggerRule["tag"];
     if (raw.tag !== undefined) {
       const table = raw.tag as Record<string, unknown>;
@@ -387,6 +436,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
           [{ event: "commit", branch: { names: raw.branches ?? ["main"] } }],
           "triggers",
         );
+  const topFilters = parseFilters(raw.filters, "filters");
   if (!Array.isArray(rawJobs) || rawJobs.length === 0) {
     throw new Error(`${label} must contain at least one [[jobs]] entry`);
   }
@@ -482,6 +532,10 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         job.triggers === undefined
           ? topTriggers
           : parseTriggers(job.triggers, `jobs[${index}].triggers`),
+      filters:
+        job.filters === undefined
+          ? topFilters
+          : parseFilters(job.filters, `jobs[${index}].filters`),
       cache,
       runtime,
     };
@@ -521,6 +575,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     version: raw.version,
     pollIntervalSeconds: Math.max(5, pollIntervalSeconds),
     triggers: topTriggers,
+    filters: topFilters,
     vm: parsedVm,
     jobs,
   };

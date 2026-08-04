@@ -13,9 +13,10 @@ navigate and review.
 version = 1
 timeout_minutes = 60
 triggers = [
-  { event = "commit", branch = { names = ["main", "release"] } },
+  { event = "commit" },
   { event = "comment", pull_request = { state = "open", draft = false, base_branches = ["main"] } }
 ]
+filters = []
 
 [container]
 image = "oven/bun:1"
@@ -110,6 +111,8 @@ bun run build
 """
 timeout_minutes = 20
 needs = ["test", "lint"]
+triggers = [{ event = "commit" }]
+filters = [{ branch = { names = ["main"] } }]
 ```
 
 Top-level `timeout_minutes` is inherited by every job. Set `timeout_minutes` on an individual job only
@@ -177,7 +180,24 @@ closed PR. Fork PR heads are not executed.
 Jobs inherit top-level triggers. A job's own `triggers` replaces them; `triggers = []` makes it manual-
 or dependency-only. Matching rules are ORed, and dependencies of matching root jobs are always added.
 Legacy `branches` still becomes commit branch rules (default `main`), but cannot be combined with
-top-level `triggers`. Manual `informant run` ignores trigger eligibility.
+top-level `triggers`. Manual runs ignore trigger eligibility, except that branch constraints embedded
+in existing trigger rules remain enforced for compatibility. Prefer job filters for new configuration.
+
+Top-level `filters` are inherited by jobs. A job's own `filters` replaces them, and `filters = []`
+opts out. Filters constrain root-job eligibility independently of triggers. Use branch filters for jobs
+that must only run on exact branch names, including when manually requested:
+
+```toml
+triggers = [{ event = "commit" }]
+filters = [{ branch = { names = ["main", "release"] } }]
+```
+
+Every filter must match; names within a branch filter are ORed and matched exactly. A branch filter
+requires a real branch context, so tags, pull-request commits, and pull-request comments do not match
+one. Filters apply to automatic runs and GitHub manual triggers. Local `informant run --local`
+executions bypass filters and do not create GitHub checks. Dependencies of selected roots are still
+added even when their own filters do not match, just as their triggers are not independently
+evaluated.
 
 ## Prepared runtime images
 

@@ -36,6 +36,7 @@ describe("configuration", () => {
     const config = parseConfig(configTemplate());
     expect(directoryConfigTemplate()).not.toContain("poll_interval_seconds");
     expect(config.pollIntervalSeconds).toBe(30);
+    expect(config.filters).toEqual([{ branch: { names: ["main"] } }]);
     expect(config.vm).toMatchObject({ guestOs: "macos", user: "admin" });
     expect(config.jobs).toEqual([
       {
@@ -47,9 +48,8 @@ describe("configuration", () => {
         secrets: [],
         needs: [],
         runsOn: ["darwin", "arm64"],
-        triggers: [
-          { event: "commit", branch: { names: ["main"] }, tag: undefined, pullRequest: undefined },
-        ],
+        triggers: [{ event: "commit", branch: undefined, tag: undefined, pullRequest: undefined }],
+        filters: [{ branch: { names: ["main"] } }],
         cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
         runtime: {
           type: "container",
@@ -417,9 +417,32 @@ describe("configuration", () => {
     ).toThrow("also set in environment");
   });
 
+  test("parses and validates job filters", () => {
+    const configured = configTemplate().replace(
+      'command = "bun install --frozen-lockfile && bun test"',
+      'command = "bun install --frozen-lockfile && bun test"\nfilters = [{ branch = { names = ["main", "release"] } }]',
+    );
+    expect(parseConfig(configured).jobs[0]?.filters).toEqual([
+      { branch: { names: ["main", "release"] } },
+    ]);
+    expect(() => parseConfig(configured.replace('["main", "release"]', "[]"))).toThrow(
+      "filters[0].branch.names must contain non-empty strings",
+    );
+    expect(() =>
+      parseConfig(configured.replace("filters = [{ branch =", "filters = [{ tag =")),
+    ).toThrow("filters[0] must contain only branch");
+    const overridden = `${configured}
+[[jobs]]
+name = "unfiltered"
+command = "test"
+filters = []
+`;
+    expect(parseConfig(overridden).jobs[1]?.filters).toEqual([]);
+  });
+
   test("requires at least one non-empty legacy branch", () => {
     const legacy = configTemplate().replace(
-      'triggers = [{ event = "commit", branch = { names = ["main"] } }]',
+      'triggers = [{ event = "commit" }]',
       'branches = ["main"]',
     );
     expect(() => parseConfig(legacy.replace('branches = ["main"]', "branches = []"))).toThrow(

@@ -3,9 +3,12 @@ import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  branchNameFromSymbolicRef,
   cleanOrphanedBuildWorkspacesInBackground,
+  executionLabelFromRef,
   main,
   pruneRuntimeImages,
+  runInvocationType,
   runManualHousekeeping,
 } from "./cli.ts";
 import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
@@ -20,6 +23,32 @@ test("--version prints the package version without help", async () => {
   } finally {
     log.mockRestore();
   }
+});
+
+test("only local branch refs provide manual trigger branch context", () => {
+  expect(branchNameFromSymbolicRef("refs/heads/release")).toBe("release");
+  expect(branchNameFromSymbolicRef("refs/tags/v1")).toBeUndefined();
+  expect(branchNameFromSymbolicRef("abc123")).toBeUndefined();
+  expect(branchNameFromSymbolicRef("")).toBeUndefined();
+});
+
+test("execution labels follow the requested ref instead of the checked out branch", () => {
+  expect(executionLabelFromRef("release", "refs/heads/release")).toBe("release");
+  expect(executionLabelFromRef("v1", "refs/tags/v1")).toBe("v1");
+  expect(executionLabelFromRef("abc123", "")).toBe("abc123");
+  expect(executionLabelFromRef("HEAD", "refs/heads/main")).toBe("main");
+});
+
+test("run preserves reported triggers unless local execution is explicit", () => {
+  expect(runInvocationType(false)).toBe("trigger");
+  expect(runInvocationType(true)).toBe("local");
+});
+
+test("local and reported trigger flags cannot be mixed", async () => {
+  await expect(main(["run", "--local", "--wait-for-github"])).rejects.toThrow(
+    "--local cannot be combined with --wait-for-github",
+  );
+  await expect(main(["trigger", "--local"])).rejects.toThrow("trigger does not accept --local");
 });
 
 test("orphan cleanup does not block worker startup", async () => {
