@@ -539,7 +539,15 @@ export async function runInTart(
     logHandle = await open(record.logPath, "a");
     await writeLog(`$ cloning ${repository.fullName} at ${sha}\n`);
     await requireCommand(
-      ["gh", "repo", "clone", repository.fullName, repositoryPath, "--", "--no-checkout"],
+      [
+        "gh",
+        "repo",
+        "clone",
+        `https://github.com/${repository.fullName}.git`,
+        repositoryPath,
+        "--",
+        "--no-checkout",
+      ],
       `could not clone ${repository.fullName}`,
       { signal },
     );

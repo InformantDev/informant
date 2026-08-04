@@ -276,6 +276,47 @@ test("claim unions targeted requests unless an all-jobs request takes precedence
   expect((await run(true))?.requestedJobs).toEqual([]);
 });
 
+test("workers ignore manual requests for jobs outside their capabilities", async () => {
+  const run = async (eligibleJobs: string[]) => {
+    let posted = false;
+    const checks = [
+      {
+        id: 1,
+        name: "Informant CI",
+        status: "queued",
+        external_id: `request:jobs:${Buffer.from(JSON.stringify(["macos"])).toString("base64url")}`,
+      },
+    ];
+    const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        posted = true;
+        const body = JSON.parse(String(init.body));
+        const check = {
+          id: 2,
+          name: body.name,
+          status: body.status,
+          external_id: body.external_id,
+        };
+        checks.push(check);
+        return Response.json(check);
+      }
+      if (init?.method === "PATCH") return Response.json({});
+      return Response.json({ check_runs: checks });
+    }) as typeof globalThis.fetch;
+    const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+      { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+      "abc123",
+      "machine",
+      { type: "commit", id: "branch:main:abc123" },
+      eligibleJobs,
+    );
+    return { claim, posted };
+  };
+
+  expect(await run(["linux"])).toEqual({ claim: undefined, posted: false });
+  expect((await run(["macos"])).claim?.requestedJobs).toEqual(["macos"]);
+});
+
 test("claim replaces a stale claim after its accepted request was completed", async () => {
   let nextId = 100;
   const checks: Array<Record<string, unknown>> = [

@@ -79,6 +79,7 @@ export async function runCommit(
     sha,
     machine,
     scopedEvent ? { type: scopedEvent.type, id: scopedEvent.id } : undefined,
+    usesCapabilities ? config.jobs.map((job) => job.name) : undefined,
   );
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;

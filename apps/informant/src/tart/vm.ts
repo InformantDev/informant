@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { command, requireCommand } from "../process.ts";
 import { dataDirectory } from "../store.ts";
@@ -219,16 +219,42 @@ export async function withImageLock<T>(
   const directory = join(dataDirectory(), "locks");
   const path = join(directory, `${image}.lock`);
   await mkdir(directory, { recursive: true });
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   for (let attempt = 0; ; attempt++) {
     signal?.throwIfAborted();
-    const lock = await command(["shlock", "-f", path, "-p", String(process.pid)], { signal });
-    if (lock.exitCode === 0) break;
+    try {
+      handle = await open(path, "wx", 0o600);
+      await handle.writeFile(`${process.pid}\n`);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const owner = Number.parseInt(
+        await Bun.file(path)
+          .text()
+          .catch(() => ""),
+        10,
+      );
+      if (Number.isSafeInteger(owner) && owner > 0) {
+        try {
+          process.kill(owner, 0);
+        } catch (processError) {
+          if ((processError as NodeJS.ErrnoException).code === "ESRCH") {
+            await rm(path, { force: true });
+            continue;
+          }
+        }
+      } else if (attempt >= 5) {
+        await rm(path, { force: true });
+        continue;
+      }
+    }
     if (attempt >= 600) throw new Error(`timed out waiting for prepared image lock: ${image}`);
     await abortableSleep(1_000, signal);
   }
   try {
     return await callback();
   } finally {
+    await handle?.close();
     await rm(path, { force: true });
   }
 }

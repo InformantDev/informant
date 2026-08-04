@@ -23,6 +23,9 @@ export async function runOnHost(
   await mkdir(home, { recursive: true });
   const secrets = await resolveJobSecrets(job, runtimeSecrets);
   const environment = {
+    PATH: Bun.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    LANG: Bun.env.LANG ?? "C.UTF-8",
+    TERM: "xterm-256color",
     ...job.environment,
     ...secrets,
     INFORMANT_REPOSITORY: repository.fullName,
@@ -37,6 +40,7 @@ export async function runOnHost(
   const result = await command(["bash", "-lc", job.command], {
     cwd: workspace,
     env: environment,
+    inheritEnv: false,
     timeoutMs: job.timeoutMinutes * 60_000,
     signal,
     onOutput: redactor.write,

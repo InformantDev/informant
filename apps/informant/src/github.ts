@@ -625,6 +625,7 @@ export class GitHubClient {
     sha: string,
     machineId: string,
     event: { type: TriggerEvent | "manual"; id: string } = { type: "commit", id: sha },
+    eligibleJobs?: string[],
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName);
@@ -634,6 +635,17 @@ export class GitHubClient {
         : initialChecks.filter(
             (check) => check.status === "queued" && !check.external_id?.includes(":event:"),
           );
+    const decodeRequestedJobs = (check: CheckRun): string[] => {
+      const encoded = check.external_id?.split(":jobs:")[1];
+      if (!encoded) return [];
+      try {
+        const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+        return Array.isArray(value) ? value.map(String) : [];
+      } catch {
+        return [];
+      }
+    };
+    const queuedJobRequests = requestedChecks.map(decodeRequestedJobs);
     const suiteRerun =
       event.type !== "comment" &&
       requestedChecks.length === 0 &&
@@ -665,13 +677,29 @@ export class GitHubClient {
           ),
         ]
       : [];
+    const eligible = eligibleJobs ? new Set(eligibleJobs) : undefined;
+    const targetedManualJobs = requestedChecks.length
+      ? queuedJobRequests.some((jobs) => jobs.length === 0)
+        ? []
+        : [...new Set(queuedJobRequests.flat())]
+      : failedRerunJobs;
+    if (
+      eligible &&
+      targetedManualJobs.length > 0 &&
+      !targetedManualJobs.some((job) => eligible.has(job))
+    ) {
+      return undefined;
+    }
     const manualRequest = requestedChecks.length > 0 || suiteRerun;
+    const eligibleScope = eligibleJobs?.length
+      ? `:jobs:${Buffer.from([...eligibleJobs].sort().join("\0")).toString("base64url")}`
+      : "";
     const claimEvent = manualRequest
       ? (suiteRerun &&
           originalPullRequest && {
             type: "commit" as const,
-            id: `pr:${originalPullRequest}:${sha}`,
-          }) || { type: "manual" as const, id: sha }
+            id: `pr:${originalPullRequest}:${sha}${eligibleScope}`,
+          }) || { type: "manual" as const, id: `${sha}${eligibleScope}` }
       : event;
     const name = claimEvent.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const scope = `${claimEvent.type}:${claimEvent.id}`;
@@ -760,16 +788,7 @@ export class GitHubClient {
       .sort((a, b) => a.id - b.id);
     if (!completed && contenders[0]?.id === candidate.id) {
       const queued = existing.filter((check) => check.status === "queued");
-      const jobRequests = queued.map((check) => {
-        const encoded = check.external_id?.split(":jobs:")[1];
-        if (!encoded) return [];
-        try {
-          const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
-          return Array.isArray(value) ? value.map(String) : [];
-        } catch {
-          return [];
-        }
-      });
+      const jobRequests = queued.map(decodeRequestedJobs);
       const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
         ? []
         : [...new Set(jobRequests.flat())];
@@ -777,6 +796,10 @@ export class GitHubClient {
       // rerequested as "all" or "failed". Prefer retrying its unsuccessful and
       // incomplete jobs; explicit Informant requests still support all jobs.
       if (suiteRerun && failedRerunJobs.length > 0) requestedJobs.push(...failedRerunJobs);
+      if (eligible) {
+        const supported = requestedJobs.filter((job) => eligible.has(job));
+        requestedJobs.splice(0, requestedJobs.length, ...supported);
+      }
       await Promise.all(
         queued.map((check) =>
           this.updateCheck(repository, check.id, {
