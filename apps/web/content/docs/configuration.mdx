@@ -146,7 +146,8 @@ export INFORMANT_SECRET_AMP_API_KEY="sgamp_..."
 informant startup enable
 ```
 
-`startup enable` captures `INFORMANT_*` values in the mode-`600` LaunchAgent definition; rerun it
+`startup enable` captures `INFORMANT_*` values in the mode-`600` LaunchAgent or systemd user-service
+definition; rerun it
 after changing a secret. The prefix is required for foreground workers too, preventing a repository
 from requesting unrelated variables in the host environment. Secret names must be shell variable
 names and cannot also appear in `environment`. Values are written to a mode-`600` temporary file,

@@ -123,7 +123,8 @@ the environment file, then let Informant install its LaunchAgent:
 informant startup enable
 ```
 
-The startup command captures current `INFORMANT_*` overrides in a mode-`600` service definition. Run
+The startup command captures current `INFORMANT_*` overrides in a mode-`600` LaunchAgent or systemd
+user-service definition. Run
 it again after changing those variables. Use `informant startup disable` to unload and remove the
 service. The service user must be able to read the PEM, access the registered repositories, run `gh`,
 and run Tart.

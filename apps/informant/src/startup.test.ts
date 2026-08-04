@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { CommandResult } from "./process.ts";
-import { parseStartupEnvironment, renderStartupService, updateInformant } from "./startup.ts";
+import {
+  parseStartupEnvironment,
+  renderLinuxStartupService,
+  renderStartupService,
+  updateInformant,
+} from "./startup.ts";
 
 const result = (exitCode = 0, stderr = "", stdout = ""): CommandResult => ({
   exitCode,
@@ -37,6 +42,26 @@ describe("startup service", () => {
     );
     expect(service).toContain("<string>/opt/tools&amp;more/bin</string>");
     expect(service).toContain("<string>/tmp/informant logs/worker.stderr.log</string>");
+  });
+
+  test("renders a persistent systemd user service with escaped paths and environment", () => {
+    const service = renderLinuxStartupService(
+      "/opt/Informant tools/informant",
+      {
+        PATH: "/opt/tools/bin",
+        INFORMANT_CONFIG_FILE: '/tmp/config%file".json',
+      },
+      "/tmp/informant logs",
+    );
+
+    expect(service).toContain('ExecStart="/opt/Informant tools/informant" serve');
+    expect(service).toContain('Environment="INFORMANT_CONFIG_FILE=/tmp/config%%file\\".json"');
+    expect(service).toContain("Restart=always\nRestartSec=10");
+    expect(service).toContain("TimeoutStopSec=24h");
+    expect(service).toContain("LimitNOFILE=65536");
+    expect(service).toContain("StandardOutput=append:/tmp/informant logs/worker.stdout.log");
+    expect(service).toContain("StandardError=append:/tmp/informant logs/worker.stderr.log");
+    expect(service).toContain("WantedBy=default.target");
   });
 
   test("updates through Homebrew and restarts a loaded service", async () => {

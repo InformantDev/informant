@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { chmod, mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 
@@ -20,6 +20,10 @@ function escapeXml(value: string): string {
 
 export function startupServicePath(): string {
   return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
+}
+
+export function linuxStartupServicePath(): string {
+  return join(homedir(), ".config", "systemd", "user", "informant.service");
 }
 
 export function renderStartupService(
@@ -73,6 +77,40 @@ ${environmentXml}
 `;
 }
 
+function escapeSystemd(value: string): string {
+  return value.replaceAll("%", "%%").replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+export function renderLinuxStartupService(
+  executable: string,
+  environment: Record<string, string>,
+  logs = dataDirectory(),
+): string {
+  const environmentLines = Object.entries(environment)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `Environment="${key}=${escapeSystemd(value)}"`)
+    .join("\n");
+  return `[Unit]
+Description=Informant CI worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="${escapeSystemd(executable)}" serve
+${environmentLines}
+Restart=always
+RestartSec=10
+TimeoutStopSec=24h
+LimitNOFILE=65536
+StandardOutput=append:${escapeSystemd(join(logs, "worker.stdout.log"))}
+StandardError=append:${escapeSystemd(join(logs, "worker.stderr.log"))}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
 function launchDomain(configuredUid?: number): string {
   const uid = configuredUid ?? process.getuid?.();
   if (uid === undefined) throw new Error("could not determine the current user ID");
@@ -114,7 +152,9 @@ function startupEnvironment(): Record<string, string> {
 }
 
 async function writeStartupServiceDefinition(environment = startupEnvironment()): Promise<string> {
-  const executable = Bun.which("informant");
+  const executable =
+    Bun.which("informant") ??
+    (basename(process.execPath) === "informant" ? process.execPath : null);
   if (!executable) {
     throw new Error("informant must be installed on PATH before enabling startup");
   }
@@ -123,6 +163,24 @@ async function writeStartupServiceDefinition(environment = startupEnvironment())
   await mkdir(dirname(path), { recursive: true });
   await mkdir(logs, { recursive: true });
   await Bun.write(path, renderStartupService(executable, environment, logs));
+  await chmod(path, 0o600);
+  return path;
+}
+
+async function writeLinuxStartupServiceDefinition(
+  environment = startupEnvironment(),
+): Promise<string> {
+  const executable =
+    Bun.which("informant") ??
+    (basename(process.execPath) === "informant" ? process.execPath : null);
+  if (!executable) {
+    throw new Error("informant must be installed on PATH before enabling startup");
+  }
+  const path = linuxStartupServicePath();
+  const logs = dataDirectory();
+  await mkdir(dirname(path), { recursive: true });
+  await mkdir(logs, { recursive: true });
+  await Bun.write(path, renderLinuxStartupService(executable, environment, logs));
   await chmod(path, 0o600);
   return path;
 }
@@ -152,8 +210,22 @@ async function migrateStartupServiceDefinition(
 }
 
 export async function enableStartup(): Promise<string> {
-  if (process.platform !== "darwin")
-    throw new Error("startup services are supported only on macOS");
+  if (process.platform === "linux") {
+    const path = await writeLinuxStartupServiceDefinition();
+    const reloaded = await command(["systemctl", "--user", "daemon-reload"]);
+    if (reloaded.exitCode !== 0) {
+      await rm(path, { force: true });
+      throw new Error(
+        `could not enable Informant: Linux startup requires a running systemd user manager (${reloaded.stderr.trim() || "systemctl failed"})`,
+      );
+    }
+    const started = await command(["systemctl", "--user", "enable", "--now", "informant.service"]);
+    if (started.exitCode !== 0) {
+      throw new Error(`could not start Informant: ${started.stderr.trim() || "systemctl failed"}`);
+    }
+    return path;
+  }
+  if (process.platform !== "darwin") throw new Error("startup services are not supported here");
   const path = await writeStartupServiceDefinition();
 
   const domain = launchDomain();
@@ -167,8 +239,15 @@ export async function enableStartup(): Promise<string> {
 }
 
 export async function disableStartup(): Promise<{ path: string; disabled: boolean }> {
-  if (process.platform !== "darwin")
-    throw new Error("startup services are supported only on macOS");
+  if (process.platform === "linux") {
+    const path = linuxStartupServicePath();
+    const existed = existsSync(path);
+    const result = await command(["systemctl", "--user", "disable", "--now", "informant.service"]);
+    await rm(path, { force: true });
+    await command(["systemctl", "--user", "daemon-reload"]);
+    return { path, disabled: existed || result.exitCode === 0 };
+  }
+  if (process.platform !== "darwin") throw new Error("startup services are not supported here");
   const path = startupServicePath();
   const existed = existsSync(path);
   const result = await command(["launchctl", "bootout", launchDomain(), path]);
