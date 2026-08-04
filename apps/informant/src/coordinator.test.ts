@@ -173,6 +173,69 @@ function harness(
 }
 
 describe("runCommit", () => {
+  test("partitions overlapping worker capabilities into non-overlapping claim scopes", async () => {
+    const claims: Array<{ event?: { type: string; id: string }; jobs?: string[] }> = [];
+    const github = {
+      claim: async (
+        _repository: Repository,
+        _sha: string,
+        _machine: string,
+        event?: { type: string; id: string },
+        jobs?: string[],
+      ) => {
+        claims.push({ event, jobs });
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const capabilityConfig: InformantConfig = {
+      ...config,
+      jobs: [
+        { ...baseJob, runsOn: ["linux", "x64"], runtime: { type: "host" } },
+        {
+          ...baseJob,
+          name: "gpu-test",
+          runsOn: ["linux", "x64", "gpu"],
+          runtime: { type: "host" },
+        },
+      ],
+    };
+    const event = { type: "commit" as const, id: "branch:main:sha", branch: "main" };
+
+    delete Bun.env.INFORMANT_CAPABILITIES;
+    await runCommit(
+      github,
+      repository,
+      "sha",
+      "main",
+      capabilityConfig,
+      harness().dependencies,
+      event,
+    );
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      await runCommit(
+        github,
+        repository,
+        "sha",
+        "main",
+        capabilityConfig,
+        harness().dependencies,
+        event,
+      );
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
+
+    expect(claims).toHaveLength(3);
+    expect(claims[0]?.event?.id).toBe(claims[1]?.event?.id);
+    expect(claims[0]?.jobs).toEqual(["test"]);
+    expect(claims[1]?.jobs).toEqual(["test"]);
+    expect(claims[2]?.jobs).toEqual(["gpu-test"]);
+    expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
+  });
+
   test("keeps the complete VM job inventory when selecting one manual job", async () => {
     const baseJob = config.jobs[0];
     if (!baseJob) throw new Error("expected test job");

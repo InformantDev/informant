@@ -493,6 +493,13 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
       if (!jobNames.has(dependency)) {
         throw new Error(`job ${job.name} needs unknown job ${dependency}`);
       }
+      const required = jobs.find((candidate) => candidate.name === dependency);
+      if (
+        required &&
+        [...(job.runsOn ?? [])].sort().join("\0") !== [...(required.runsOn ?? [])].sort().join("\0")
+      ) {
+        throw new Error(`job ${job.name} and dependency ${dependency} must use the same runs_on`);
+      }
     }
   }
   const visiting = new Set<string>();

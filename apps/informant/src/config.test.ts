@@ -497,6 +497,14 @@ describe("configuration", () => {
     expect(() => parseConfig(source.replace('needs = ["test"]', 'needs = ["build"]'))).toThrow(
       "dependency cycle",
     );
+    expect(() =>
+      parseConfig(
+        source.replace(
+          'needs = ["test"]',
+          'needs = ["test"]\nruns_on = ["linux", "x64"]\nhost = {}',
+        ),
+      ),
+    ).toThrow("job build and dependency test must use the same runs_on");
   });
 
   test("selects requested jobs and their transitive dependencies", () => {

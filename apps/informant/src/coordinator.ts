@@ -55,7 +55,50 @@ export async function runCommit(
   const usesCapabilities = config.jobs.some(
     (job) => (job.runsOn?.length ?? 0) > 0 || job.runtime?.type === "host",
   );
-  if (usesCapabilities) config = selectCapableJobs(config, workerCapabilities());
+  if (!usesCapabilities) {
+    return runCommitPartition(github, repository, sha, branch, config, dependencies, event, signal);
+  }
+  const capable = selectCapableJobs(config, workerCapabilities());
+  const partitions = new Map<string, JobConfig[]>();
+  for (const job of capable.jobs) {
+    const labels = [...(job.runsOn ?? [])].sort();
+    const key = labels.join("\0");
+    const jobs = partitions.get(key) ?? [];
+    jobs.push(job);
+    partitions.set(key, jobs);
+  }
+  const results = await Promise.all(
+    [...partitions.entries()].map(([key, jobs]) =>
+      runCommitPartition(
+        github,
+        repository,
+        sha,
+        branch,
+        { ...capable, jobs },
+        dependencies,
+        event,
+        signal,
+        key.split("\0"),
+      ),
+    ),
+  );
+  return (
+    results.find((result): result is BuildRecord => typeof result === "object") ??
+    (results.includes(false) ? false : undefined)
+  );
+}
+
+async function runCommitPartition(
+  github: GitHubClient,
+  repository: Repository,
+  sha: string,
+  branch: string,
+  config: InformantConfig,
+  dependencies: CoordinatorDependencies,
+  event?: RunEvent,
+  signal?: AbortSignal,
+  scopeLabels?: string[],
+): Promise<BuildRecord | false | undefined> {
   if (config.jobs.length === 0) return undefined;
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
@@ -63,15 +106,10 @@ export async function runCommit(
     .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name);
   const scopedEvent =
-    event && usesCapabilities
+    event && scopeLabels
       ? {
           ...event,
-          id: `${event.id}:jobs:${Buffer.from(
-            config.jobs
-              .map((job) => job.name)
-              .sort()
-              .join("\0"),
-          ).toString("base64url")}`,
+          id: `${event.id}:jobs:${Buffer.from(scopeLabels.join("\0")).toString("base64url")}`,
         }
       : event;
   const claim = await github.claim(
@@ -79,7 +117,7 @@ export async function runCommit(
     sha,
     machine,
     scopedEvent ? { type: scopedEvent.type, id: scopedEvent.id } : undefined,
-    usesCapabilities ? config.jobs.map((job) => job.name) : undefined,
+    scopeLabels ? config.jobs.map((job) => job.name) : undefined,
   );
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;

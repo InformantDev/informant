@@ -58,6 +58,10 @@ and `runs_on` is required. Existing container and VM jobs without `runs_on` defa
 `["darwin", "arm64"]`, preserving their Apple Silicon worker behavior while preventing Linux workers
 from claiming them.
 
+Jobs with the same normalized `runs_on` labels share one claim election. Workers with additional
+capabilities still compete for shared jobs instead of executing them twice. A job and every job in its
+`needs` chain must use the same `runs_on` labels; cross-worker dependency chains are rejected.
+
 Container jobs require [Apple Container](https://github.com/apple/container) and run as UID 0 with the
 checkout mounted at `/workspace`. Cache directories use isolated host storage under `/home/root` in
 the container. Declared secrets are inherited by name from the Container client environment, never
