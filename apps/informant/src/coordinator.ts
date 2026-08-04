@@ -163,6 +163,7 @@ export async function runCommit(
       conclusion: "neutral",
       title: "No jobs matched",
       summary: `No jobs are configured for this ${event?.type ?? "manual"} event.`,
+      text: check.output?.text,
     });
     return undefined;
   }
@@ -318,13 +319,16 @@ export async function runCommit(
   };
 
   const completeAggregate = async (values: CheckUpdate) => {
+    const preservedValues = check.output?.text
+      ? { ...values, text: [values.text, check.output.text].filter(Boolean).join("\n") }
+      : values;
     try {
-      await github.updateCheck(repository, check.id, values);
+      await github.updateCheck(repository, check.id, preservedValues);
     } catch (firstError) {
       try {
         const remote = (await github.checks(repository, sha)).find((item) => item.id === check.id);
         if (remote?.status === "completed" && remote.conclusion === values.conclusion) return;
-        await github.updateCheck(repository, check.id, values);
+        await github.updateCheck(repository, check.id, preservedValues);
       } catch (retryError) {
         const first = firstError instanceof Error ? firstError : new Error(String(firstError));
         const retry = retryError instanceof Error ? retryError : new Error(String(retryError));

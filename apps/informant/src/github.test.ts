@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { GitHubApiError, GitHubClient } from "./github.ts";
+import { GitHubApiError, GitHubClient, MANUAL_TRIGGER_REQUEST_NAME } from "./github.ts";
+import type { CheckRun } from "./types.ts";
 
 test("job access tokens are freshly minted and downscoped to one repository", async () => {
   const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({
@@ -148,7 +149,7 @@ test("claim elects the oldest active check using the full check history", async 
 
   expect(claim?.check?.id).toBe(10);
   expect(claim?.requestedJobs).toEqual([]);
-  expect(urls.filter((url) => url.includes("check-runs"))).toHaveLength(3);
+  expect(urls.filter((url) => url.includes("check-runs"))).toHaveLength(4);
   expect(urls.some((url) => url.includes("filter=all") && url.includes("per_page=100"))).toBe(true);
 });
 
@@ -216,6 +217,64 @@ test("queued checks encode selected jobs in the request", async () => {
 
   const encoded = String(requestBody?.external_id).split(":jobs:")[1] ?? "";
   expect(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"))).toEqual(["test", "lint"]);
+});
+
+test("manual trigger context and jobs stay within GitHub's external ID limit", async () => {
+  let nextId = 1;
+  const checks: CheckRun[] = [];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("check-suites")) {
+      return Response.json({ check_suites: [{ status: "queued" }] });
+    }
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = { id: nextId++, ...body } as CheckRun;
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+  const github = new GitHubClient({ token: "installation-token", fetch });
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+  const branch = `release-${"x".repeat(240)}`;
+  const jobs = Array.from({ length: 20 }, (_, index) => `job-${index}`);
+
+  const request = await github.createManualTrigger(repository, "abc123", jobs, branch, branch);
+  expect(request.name).toBe(MANUAL_TRIGGER_REQUEST_NAME);
+  expect(request.status).toBe("in_progress");
+  expect(request.external_id?.length).toBeLessThanOrEqual(255);
+
+  const claim = await github.claim(repository, "abc123", "worker", {
+    type: "commit",
+    id: `branch:${branch}:abc123`,
+    branch,
+    label: branch,
+  });
+  expect(claim?.check?.external_id?.length).toBeLessThanOrEqual(255);
+  expect(claim?.manualTriggerBranch).toBe(branch);
+  expect(claim?.manualTriggerLabel).toBe(branch);
+  expect(claim?.requestedJobs).toEqual(jobs);
+
+  if (!claim?.check) throw new Error("expected the manual trigger to be claimed");
+  const completed = checks.find((check) => check.id === claim.check?.id);
+  if (!completed) throw new Error("expected the claimed check to be persisted");
+  completed.status = "completed";
+  completed.conclusion = "success";
+  const rerun = await github.claim(repository, "abc123", "worker", {
+    type: "commit",
+    id: "branch:main:abc123",
+    branch: "main",
+    label: "main",
+  });
+  expect(rerun?.manualTriggerBranch).toBe(branch);
+  expect(rerun?.manualTriggerLabel).toBe(branch);
+  expect(rerun?.check?.external_id?.length).toBeLessThanOrEqual(255);
 });
 
 test("job checks are separate queued runs correlated to the aggregate claim", async () => {
@@ -370,8 +429,9 @@ test("stale recovery leaves the aggregate active when a child cannot be cancelle
 
 test("interrupted build recovery cancels only correlated children before the aggregate", async () => {
   const updates: number[] = [];
+  const metadata = "<!-- informant-request:dGVzdA -->";
   const checks: Array<Record<string, unknown>> = [
-    { id: 2, name: "Informant CI", status: "in_progress" },
+    { id: 2, name: "Informant CI", status: "in_progress", output: { text: metadata } },
     {
       id: 3,
       name: "Informant / test",
@@ -402,6 +462,7 @@ test("interrupted build recovery cancels only correlated children before the agg
 
   expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(true);
   expect(updates).toEqual([3, 2]);
+  expect(checks[0]?.output).toMatchObject({ text: metadata });
   expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(false);
   expect(updates).toEqual([3, 2]);
 });
@@ -705,6 +766,87 @@ test("queued work elects in a canonical manual scope", async () => {
   expect(checks.find((check) => check.id === 3)?.status).toBe("queued");
 });
 
+test("compact claims do not race an active legacy manual claim", async () => {
+  let created = false;
+  const context = Buffer.from(JSON.stringify({ branch: "release", label: "release" })).toString(
+    "base64url",
+  );
+  const checks: CheckRun[] = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:context:${context}:jobs:${Buffer.from("[]").toString("base64url")}`,
+    },
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "in_progress",
+      started_at: new Date().toISOString(),
+      external_id: `legacy-worker:event:manual:abc123:context:${context}`,
+    },
+  ];
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") created = true;
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    { type: "commit", id: "branch:release:abc123", branch: "release", label: "release" },
+  );
+
+  expect(claim?.retry).toBe(true);
+  expect(created).toBe(false);
+});
+
+test("legacy manual requests keep a shared mixed-version election scope", async () => {
+  const context = Buffer.from(JSON.stringify({ branch: "release", label: "release" })).toString(
+    "base64url",
+  );
+  const checks: CheckRun[] = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:context:${context}:jobs:${Buffer.from("[]").toString("base64url")}`,
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const candidate = { id: 2, ...body } as CheckRun;
+      checks.push(candidate, {
+        id: 3,
+        name: "Informant CI",
+        status: "in_progress",
+        started_at: new Date().toISOString(),
+        external_id: `legacy-worker:event:manual:abc123:context:${context}`,
+      });
+      return Response.json(candidate);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(String(input).split("/").at(-1));
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    { type: "commit", id: "branch:release:abc123", branch: "release", label: "release" },
+  );
+
+  expect(claim?.check?.id).toBe(2);
+  expect(checks.find((check) => check.id === 3)?.status).toBe("in_progress");
+});
+
 test("an active event claim is retryable rather than terminal", async () => {
   const fetch = (async (_input: string | URL | Request) =>
     Response.json({
@@ -781,6 +923,7 @@ test("a repeated queued manual trigger can replace historical manual completion"
 });
 
 test("an event-scoped stale claim and its children are replaced", async () => {
+  const metadata = "<!-- informant-request:dGVzdA -->";
   const checks: Array<Record<string, unknown>> = [
     {
       id: 1,
@@ -788,6 +931,7 @@ test("an event-scoped stale claim and its children are replaced", async () => {
       status: "in_progress",
       started_at: "2000-01-01T00:00:00.000Z",
       external_id: "old-worker:event:commit:branch:main:abc123",
+      output: { text: metadata },
     },
     {
       id: 2,
@@ -828,6 +972,7 @@ test("an event-scoped stale claim and its children are replaced", async () => {
   expect(checks.find((check) => check.id === 1)).toMatchObject({
     status: "completed",
     conclusion: "cancelled",
+    output: { text: metadata },
   });
   expect(checks.find((check) => check.id === 2)).toMatchObject({
     status: "completed",
