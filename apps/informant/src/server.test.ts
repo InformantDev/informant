@@ -136,8 +136,12 @@ function github(options: {
     branches: options.branches ?? (async () => []),
     tags: options.tags ?? (async () => []),
     pullRequests: options.pullRequests ?? (async () => []),
-    hasPendingManualRequest: async (_repository: Repository, sha: string) =>
-      options.manual?.(sha) ?? false,
+    hasPendingManualTrigger: async (
+      _repository: Repository,
+      sha: string,
+      _branch?: string,
+      _label?: string,
+    ) => options.manual?.(sha) ?? false,
     latestPullRequestComments: async () => [],
     pullRequestComments: async () => [],
   } as unknown as GitHubClient;
@@ -332,6 +336,35 @@ describe("serve polling orchestration", () => {
     })),
   };
 
+  test("job filters prevent nonmatching automatic events from being claimed", async () => {
+    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const launched: string[] = [];
+    const deps = dependencies(
+      github({
+        branches: async () => [
+          { name: "main", sha: "main-sha" },
+          { name: "feature", sha: "feature-sha" },
+        ],
+      }),
+      state,
+      async (_github, _repository, _sha, branch) => {
+        launched.push(branch);
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async () => ({
+      ...config,
+      jobs: config.jobs.map((job) => ({
+        ...job,
+        filters: [{ branch: { names: ["main"] } }],
+      })),
+    });
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(launched).toEqual(["main"]);
+  });
+
   test("reconciles only configured caches and prepared runtime jobs", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
     const deps = dependencies(github({}), state, async () => undefined);
@@ -512,9 +545,28 @@ describe("serve polling orchestration", () => {
     }
   });
 
-  test("retains a tag when a manual request consumes its claim or it is cancelled", async () => {
+  test("a pending manual trigger is not discarded with a nonmatching tag", async () => {
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      tagRefs: [],
+      pendingTags: [{ name: "notes", sha: "sha" }],
+    };
+    let launches = 0;
+    const deps = dependencies(github({ manual: async () => true }), state, async () => {
+      launches++;
+      return { event: { type: "manual_trigger", id: "manual" }, status: "success" } as BuildRecord;
+    });
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(launches).toBe(1);
+    expect(state.pendingTags).toEqual([{ name: "notes", sha: "sha" }]);
+  });
+
+  test("retains a tag when a manual trigger consumes its claim or it is cancelled", async () => {
     for (const event of [
-      { type: "manual" as const, id: "manual" },
+      { type: "manual_trigger" as const, id: "manual" },
       { type: "commit" as const, id: "tag:v3:sha" },
     ]) {
       const state: PollState = {
@@ -526,7 +578,7 @@ describe("serve polling orchestration", () => {
       const deps = dependencies(github({}), state, async () => {
         return {
           event,
-          status: event.type === "manual" ? "success" : "cancelled",
+          status: event.type === "manual_trigger" ? "success" : "cancelled",
         } as BuildRecord;
       });
       deps.repositoryConfig = async () => tagConfig;

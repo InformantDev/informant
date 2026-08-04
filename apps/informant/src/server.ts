@@ -1,4 +1,4 @@
-import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles } from "./config.ts";
+import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles, selectTriggeredJobs } from "./config.ts";
 import {
   reconcilePreparedContainerImageReferences,
   startAppleContainerSystem,
@@ -14,7 +14,7 @@ import { listRepositories } from "./machine-config.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
 import { listActiveBuilds, listAllBuilds, saveBuild } from "./store.ts";
 import { reconcilePreparedImageReferences } from "./tart/images.ts";
-import { triggerMatches } from "./triggers.ts";
+import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
@@ -358,12 +358,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           automaticLanes.delete(lane);
         }
       }
-      const manualRequests = new Map<string, Promise<boolean>>();
-      const hasPendingManualRequest = (sha: string) => {
-        let pending = manualRequests.get(sha);
+      const manualTriggers = new Map<string, Promise<boolean>>();
+      const hasPendingManualTrigger = (sha: string, branch: string | undefined, label: string) => {
+        const key = `${sha}\0${branch ?? ""}\0${label}`;
+        let pending = manualTriggers.get(key);
         if (!pending) {
-          pending = github.hasPendingManualRequest(repository, sha);
-          manualRequests.set(sha, pending);
+          pending = github.hasPendingManualTrigger(repository, sha, branch, label);
+          manualTriggers.set(key, pending);
         }
         return pending;
       };
@@ -404,7 +405,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           automaticLanes.delete(target.lane);
         }
         if (inFlightRuns.has(target.eventId)) continue;
-        const context = {
+        const context: EventContext = {
           type: "commit" as const,
           branch: target.pullRequest || "tag" in target ? undefined : target.branch,
           tag: "tag" in target && typeof target.tag === "string" ? target.tag : undefined,
@@ -412,18 +413,19 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         };
         try {
           const config = applySecretPolicy(await configAt(target.sha), bootstrap, defaultSha);
-          const matches = config.jobs.some((job) =>
-            (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
-          );
+          const matches =
+            selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), context.branch)
+              .jobs.length > 0;
           if (!matches) {
-            if ("tag" in target) {
-              state.pendingTags = state.pendingTags.filter(
-                (item) => item.name !== target.tag || item.sha !== target.sha,
-              );
-              await persistPollState(repository.fullName, state);
+            if (!(await hasPendingManualTrigger(target.sha, context.branch, target.branch))) {
+              if ("tag" in target) {
+                state.pendingTags = state.pendingTags.filter(
+                  (item) => item.name !== target.tag || item.sha !== target.sha,
+                );
+                await persistPollState(repository.fullName, state);
+              }
               continue;
             }
-            if (!(await hasPendingManualRequest(target.sha))) continue;
           }
           if (options.signal?.aborted) {
             abortAutomaticRuns();
@@ -528,14 +530,14 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         if (inFlightRuns.has(eventId)) continue;
         try {
           const config = applySecretPolicy(await configAt(pending.sha), bootstrap, defaultSha);
-          const context = {
+          const context: EventContext & { id: string } = {
             type: "comment" as const,
             pullRequest: pending.pullRequest,
             id: eventId,
           };
-          const matches = config.jobs.some((job) =>
-            (job.triggers ?? config.triggers ?? []).some((rule) => triggerMatches(rule, context)),
-          );
+          const matches =
+            selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), context.branch)
+              .jobs.length > 0;
           if (!matches) {
             state.pending = state.pending.filter((item) => item.id !== pending.id);
             await persistPollState(repository.fullName, state);

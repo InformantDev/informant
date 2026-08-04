@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CoordinatorDependencies, readLogTail, runCommit } from "./coordinator.ts";
+import {
+  type CoordinatorDependencies,
+  readLogTail,
+  runCommit,
+  runLocalCommit,
+} from "./coordinator.ts";
 import type { GitHubClient } from "./github.ts";
 import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 
@@ -48,7 +53,9 @@ function harness(
     claim?: boolean;
     success?: boolean;
     error?: Error;
-    manualRequest?: boolean;
+    manualTrigger?: boolean;
+    manualTriggerBranch?: string | null;
+    manualTriggerLabel?: string;
     requestedJobs?: string[];
     originalPullRequest?: number;
   } = {},
@@ -86,7 +93,9 @@ function harness(
         : {
             check: aggregateCheck,
             requestedJobs: options.requestedJobs ?? [],
-            manualRequest: options.manualRequest ?? false,
+            manualTrigger: options.manualTrigger ?? false,
+            manualTriggerBranch: options.manualTriggerBranch,
+            manualTriggerLabel: options.manualTriggerLabel,
             originalPullRequest: options.originalPullRequest,
           },
     createJobCheck: async (
@@ -173,7 +182,7 @@ function harness(
 }
 
 describe("runCommit", () => {
-  test("keeps the complete VM job inventory when selecting one manual job", async () => {
+  test("keeps the complete VM job inventory when selecting one manually triggered job", async () => {
     const baseJob = config.jobs[0];
     if (!baseJob) throw new Error("expected test job");
     const selectedConfig: InformantConfig = {
@@ -191,7 +200,7 @@ describe("runCommit", () => {
         },
       ],
     };
-    const context = harness({ manualRequest: true, requestedJobs: ["test"] });
+    const context = harness({ manualTrigger: true, requestedJobs: ["test"] });
 
     await runCommit(
       context.github,
@@ -389,7 +398,7 @@ describe("runCommit", () => {
   test("preserves the pull request environment when its check is rerun", async () => {
     const initial = harness();
     const rerun = harness({
-      manualRequest: true,
+      manualTrigger: true,
       originalPullRequest: 7,
     });
     const pullRequestConfig: InformantConfig = {
@@ -542,8 +551,8 @@ describe("runCommit", () => {
     expect(context.updates.find((update) => update.id === 42)?.values.conclusion).toBe("success");
   });
 
-  test("an all-jobs manual request retains branch trigger filters", async () => {
-    const context = harness({ manualRequest: true });
+  test("an all-jobs manual trigger retains job filters", async () => {
+    const context = harness({ manualTrigger: true });
     const testJob = config.jobs[0];
     if (!testJob) throw new Error("expected a test job");
     const manualOnly = {
@@ -554,7 +563,8 @@ describe("runCommit", () => {
         {
           ...testJob,
           name: "deploy",
-          triggers: [{ event: "commit" as const, branch: { names: ["main"] } }],
+          triggers: [{ event: "commit" as const }],
+          filters: [{ branch: { names: ["main"] } }],
         },
       ],
     };
@@ -571,17 +581,22 @@ describe("runCommit", () => {
 
     if (!record) throw new Error("expected a build record");
     expect(record.status).toBe("success");
-    expect(record.event?.type).toBe("manual");
+    expect(record.event?.type).toBe("manual_trigger");
     expect(context.jobChecks).toEqual(["test"]);
   });
 
-  test("an explicitly requested manual job retains its branch trigger filter", async () => {
-    const context = harness({ manualRequest: true, requestedJobs: ["test"] });
+  test("an explicitly requested manual trigger retains job filters", async () => {
+    const context = harness({
+      manualTrigger: true,
+      manualTriggerBranch: null,
+      requestedJobs: ["test"],
+    });
     const branchFiltered = {
       ...config,
       jobs: config.jobs.map((job) => ({
         ...job,
-        triggers: [{ event: "commit" as const, branch: { names: ["main"] } }],
+        triggers: [{ event: "commit" as const }],
+        filters: [{ branch: { names: ["main"] } }],
       })),
     };
 
@@ -592,7 +607,7 @@ describe("runCommit", () => {
       "feature",
       branchFiltered,
       context.dependencies,
-      { type: "manual", id: "sha" },
+      { type: "commit", branch: "feature", id: "branch:feature:sha" },
     );
 
     expect(record).toBeUndefined();
@@ -601,6 +616,102 @@ describe("runCommit", () => {
       conclusion: "neutral",
       title: "No jobs matched",
     });
+  });
+
+  test("a manual trigger uses its encoded branch instead of the polling target", async () => {
+    const context = harness({
+      manualTrigger: true,
+      manualTriggerBranch: "release",
+      requestedJobs: ["test"],
+    });
+    const filtered = {
+      ...config,
+      jobs: config.jobs.map((job) => ({
+        ...job,
+        filters: [{ branch: { names: ["release"] } }],
+      })),
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      filtered,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("success");
+    expect(context.jobChecks).toEqual(["test"]);
+    expect(context.receivedBranches).toEqual(["release"]);
+  });
+
+  test("a pull request rerun discovered through a branch does not satisfy its filter", async () => {
+    const context = harness({ manualTrigger: true, originalPullRequest: 7 });
+    const filtered = {
+      ...config,
+      jobs: config.jobs.map((job) => ({
+        ...job,
+        filters: [{ branch: { names: ["feature"] } }],
+      })),
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "feature",
+      filtered,
+      context.dependencies,
+      { type: "commit", branch: "feature", id: "branch:feature:sha" },
+    );
+
+    expect(record).toBeUndefined();
+    expect(context.jobChecks).toEqual([]);
+  });
+
+  test("a tag suite rerun retains its execution label when discovered through a branch", async () => {
+    const context = harness({
+      manualTrigger: true,
+      manualTriggerBranch: null,
+      manualTriggerLabel: "v2",
+    });
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(context.receivedBranches).toEqual(["v2"]);
+  });
+
+  test("a local manual run bypasses job filters", async () => {
+    const context = harness();
+    const filtered = {
+      ...config,
+      jobs: config.jobs.map((job) => ({
+        ...job,
+        filters: [{ branch: { names: ["main"] } }],
+      })),
+    };
+
+    const record = await runLocalCommit(repository, "sha", "feature", filtered, {
+      requestedJobs: ["test"],
+      dependencies: context.dependencies,
+    });
+
+    expect(record.status).toBe("success");
+    expect(record.event?.type).toBe("manual_run");
+    expect(context.jobChecks).toEqual([]);
+    expect(context.updates).toEqual([]);
   });
 
   test("cancels created job checks when later check creation fails", async () => {
@@ -895,8 +1006,8 @@ describe("runCommit", () => {
     ).toBeDefined();
   });
 
-  test("does not cancel a manually requested build", async () => {
-    const context = harness({ manualRequest: true });
+  test("does not cancel a manually triggered build", async () => {
+    const context = harness({ manualTrigger: true });
     const controller = new AbortController();
     controller.abort("superseded");
 
@@ -913,6 +1024,6 @@ describe("runCommit", () => {
 
     if (!record) throw new Error("expected a build record");
     expect(record.status).toBe("success");
-    expect(record.event?.type).toBe("manual");
+    expect(record.event?.type).toBe("manual_trigger");
   });
 });

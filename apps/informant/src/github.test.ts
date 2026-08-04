@@ -490,7 +490,13 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
 
 test("claim falls back to all jobs when a queued suite has no failed job history", async () => {
   const checks: Array<Record<string, unknown>> = [
-    { id: 1, name: "Informant CI", status: "completed", conclusion: "success" },
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "success",
+      external_id: "worker:event:commit:branch:release:abc123",
+    },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
@@ -510,11 +516,48 @@ test("claim falls back to all jobs when a queued suite has no failed job history
     { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
     "abc123",
     "machine",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
   );
 
   expect(claim?.requestedJobs).toEqual([]);
   expect(claim?.originalPullRequest).toBeUndefined();
-  expect(checks.at(-1)?.external_id).toBe("machine:event:manual:abc123");
+  expect(claim?.manualTriggerBranch).toBe("release");
+  expect(checks.at(-1)?.external_id).toContain("machine:event:manual:abc123:context:");
+});
+
+test("a tag suite rerun recovers its branchless context and execution label", async () => {
+  const checks: Array<Record<string, unknown>> = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "success",
+      external_id: "worker:event:commit:tag:v2:abc123",
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = { id: 2, name: body.name, status: body.status, external_id: body.external_id };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (url.includes("check-suites"))
+      return Response.json({ check_suites: [{ status: "queued" }] });
+    if (!new URL(url).searchParams.has("check_name")) return Response.json({ check_runs: [] });
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "machine",
+    { type: "commit", id: "branch:main:abc123", branch: "main", label: "main" },
+  );
+
+  expect(claim?.manualTriggerBranch).toBeNull();
+  expect(claim?.manualTriggerLabel).toBe("v2");
 });
 
 test("claim does not repeat a completed check suite", async () => {
@@ -615,12 +658,20 @@ test("event scopes match exactly and legacy checks do not suppress PR commits", 
 
 test("queued work elects in a canonical manual scope", async () => {
   let createdExternalId = "";
+  const context = Buffer.from(JSON.stringify({ branch: "release" })).toString("base64url");
+  const otherContext = Buffer.from(JSON.stringify({ branch: "main" })).toString("base64url");
   const checks: Array<Record<string, unknown>> = [
     {
       id: 1,
       name: "Informant CI",
       status: "queued",
-      external_id: `request:jobs:${Buffer.from("[]").toString("base64url")}`,
+      external_id: `request:context:${context}:jobs:${Buffer.from("[]").toString("base64url")}`,
+    },
+    {
+      id: 3,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:context:${otherContext}:jobs:${Buffer.from("[]").toString("base64url")}`,
     },
   ];
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
@@ -631,7 +682,12 @@ test("queued work elects in a canonical manual scope", async () => {
       checks.push(check);
       return Response.json(check);
     }
-    if (init?.method === "PATCH") return Response.json({});
+    if (init?.method === "PATCH") {
+      const id = Number(String(_input).split("/").at(-1));
+      const check = checks.find((item) => item.id === id);
+      if (check) Object.assign(check, JSON.parse(String(init.body)));
+      return Response.json(check ?? {});
+    }
     return Response.json({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
@@ -639,11 +695,14 @@ test("queued work elects in a canonical manual scope", async () => {
     { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
     "abc123",
     "worker",
-    { type: "commit", id: "branch:main:abc123" },
+    { type: "commit", id: "branch:release:abc123", branch: "release" },
   );
 
-  expect(createdExternalId.endsWith(":event:manual:abc123")).toBe(true);
-  expect(claim?.manualRequest).toBe(true);
+  expect(createdExternalId).toContain(":event:manual:abc123:context:");
+  expect(claim?.manualTrigger).toBe(true);
+  expect(claim?.manualTriggerBranch).toBe("release");
+  expect(checks.find((check) => check.id === 1)?.status).toBe("completed");
+  expect(checks.find((check) => check.id === 3)?.status).toBe("queued");
 });
 
 test("an active event claim is retryable rather than terminal", async () => {
@@ -670,7 +729,7 @@ test("an active event claim is retryable rather than terminal", async () => {
   expect(claim?.retry).toBe(true);
 });
 
-test("a repeated queued manual request can replace historical manual completion", async () => {
+test("a repeated queued manual trigger can replace historical manual completion", async () => {
   const checks: Array<Record<string, unknown>> = [
     {
       id: 1,
@@ -714,7 +773,7 @@ test("a repeated queued manual request can replace historical manual completion"
   );
 
   expect(claim?.check?.id).toBe(3);
-  expect(claim?.manualRequest).toBe(true);
+  expect(claim?.manualTrigger).toBe(true);
   expect(checks.find((check) => check.id === 2)).toMatchObject({
     status: "completed",
     conclusion: "neutral",

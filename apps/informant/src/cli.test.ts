@@ -3,9 +3,11 @@ import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  branchNameFromSymbolicRef,
   cleanOrphanedBuildWorkspacesInBackground,
   main,
   pruneRuntimeImages,
+  runInvocationType,
   runManualHousekeeping,
 } from "./cli.ts";
 import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
@@ -20,6 +22,18 @@ test("--version prints the package version without help", async () => {
   } finally {
     log.mockRestore();
   }
+});
+
+test("only local branch refs provide manual trigger branch context", () => {
+  expect(branchNameFromSymbolicRef("refs/heads/release")).toBe("release");
+  expect(branchNameFromSymbolicRef("refs/tags/v1")).toBeUndefined();
+  expect(branchNameFromSymbolicRef("abc123")).toBeUndefined();
+  expect(branchNameFromSymbolicRef("")).toBeUndefined();
+});
+
+test("the previous hook invocation remains a reported trigger", () => {
+  expect(runInvocationType(true)).toBe("trigger");
+  expect(runInvocationType(false)).toBe("local");
 });
 
 test("orphan cleanup does not block worker startup", async () => {

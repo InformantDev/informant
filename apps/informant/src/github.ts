@@ -30,9 +30,56 @@ const RETRYABLE_CHECK_CONCLUSIONS = new Set([
 export interface ClaimResult {
   check?: CheckRun;
   requestedJobs: string[];
-  manualRequest: boolean;
+  manualTrigger: boolean;
+  manualTriggerBranch?: string | null;
+  manualTriggerLabel?: string;
   originalPullRequest?: number;
   retry?: boolean;
+}
+
+interface ManualTriggerContext {
+  branch: string | null;
+  label?: string;
+}
+
+function manualTriggerContext(check: CheckRun): ManualTriggerContext | undefined {
+  const encoded = check.external_id?.match(/:context:([^:]+)(?::jobs:|$)/)?.[1];
+  if (!encoded) return undefined;
+  try {
+    const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
+      branch?: unknown;
+      label?: unknown;
+    };
+    return {
+      branch: typeof value.branch === "string" ? value.branch : null,
+      label: typeof value.label === "string" ? value.label : undefined,
+    };
+  } catch {
+    return { branch: null };
+  }
+}
+
+function encodedManualTriggerContext(context: ManualTriggerContext): string {
+  return Buffer.from(JSON.stringify(context)).toString("base64url");
+}
+
+function previousTriggerContext(
+  check: CheckRun | undefined,
+  sha: string,
+): ManualTriggerContext | undefined {
+  if (!check?.external_id) return undefined;
+  const manualContext = check.external_id.match(/:event:manual:[^:]+:context:([^:]+)$/)?.[1];
+  if (manualContext) {
+    return manualTriggerContext({ ...check, external_id: `request:context:${manualContext}` });
+  }
+  const branch = check.external_id.match(/:event:commit:branch:([^:]+):([^:]+)$/);
+  if (branch?.[1] && branch[2] === sha) return { branch: branch[1], label: branch[1] };
+  const pullRequest = check.external_id.match(/:event:commit:pr:(\d+):([^:]+)$/);
+  if (pullRequest?.[1] && pullRequest[2] === sha)
+    return { branch: null, label: `pull/${pullRequest[1]}` };
+  const tag = check.external_id.match(/:event:commit:tag:([^:]+):([^:]+)$/);
+  if (tag?.[1] && tag[2] === sha) return { branch: null, label: tag[1] };
+  return undefined;
 }
 
 export class GitHubApiError extends Error {
@@ -497,10 +544,23 @@ export class GitHubClient {
     return result.check_suites[0]?.status ?? undefined;
   }
 
-  async hasPendingManualRequest(repository: Repository, sha: string): Promise<boolean> {
+  async hasPendingManualTrigger(
+    repository: Repository,
+    sha: string,
+    branch?: string,
+    label?: string,
+  ): Promise<boolean> {
     const checks = await this.checks(repository, sha, CLAIM_NAME);
     if (
-      checks.some((check) => check.status === "queued" && !check.external_id?.includes(":event:"))
+      checks.some(
+        (check) =>
+          check.status === "queued" &&
+          !check.external_id?.includes(":event:") &&
+          (manualTriggerContext(check) === undefined ||
+            (manualTriggerContext(check)?.branch === (branch ?? null) &&
+              (manualTriggerContext(check)?.label === undefined ||
+                manualTriggerContext(check)?.label === label))),
+      )
     ) {
       return true;
     }
@@ -572,6 +632,23 @@ export class GitHubClient {
     });
   }
 
+  async createManualTrigger(
+    repository: Repository,
+    sha: string,
+    requestedJobs: string[],
+    branch: string | undefined,
+    label: string,
+  ): Promise<CheckRun> {
+    const context = encodedManualTriggerContext({ branch: branch ?? null, label });
+    return this.createCheck(
+      repository,
+      sha,
+      `manual:${crypto.randomUUID()}:context:${context}`,
+      "queued",
+      requestedJobs,
+    );
+  }
+
   async createJobCheck(
     repository: Repository,
     sha: string,
@@ -624,19 +701,30 @@ export class GitHubClient {
     repository: Repository,
     sha: string,
     machineId: string,
-    event: { type: TriggerEvent | "manual"; id: string } = { type: "commit", id: sha },
+    event: { type: TriggerEvent | "manual"; id: string; branch?: string; label?: string } = {
+      type: "commit",
+      id: sha,
+    },
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName);
-    const requestedChecks =
+    const allRequestedChecks =
       event.type === "comment"
         ? []
         : initialChecks.filter(
             (check) => check.status === "queued" && !check.external_id?.includes(":event:"),
           );
+    const requestedChecks = allRequestedChecks.filter((check) => {
+      const context = manualTriggerContext(check);
+      return (
+        context === undefined ||
+        (context.branch === (event.branch ?? null) &&
+          (context.label === undefined || context.label === event.label))
+      );
+    });
     const suiteRerun =
       event.type !== "comment" &&
-      requestedChecks.length === 0 &&
+      allRequestedChecks.length === 0 &&
       initialChecks.some((check) => check.status === "completed") &&
       (await this.checkSuiteStatus(repository, sha, initialName)) === "queued";
     const previousAggregate = suiteRerun
@@ -665,13 +753,22 @@ export class GitHubClient {
           ),
         ]
       : [];
-    const manualRequest = requestedChecks.length > 0 || suiteRerun;
-    const claimEvent = manualRequest
+    const manualTrigger = requestedChecks.length > 0 || suiteRerun;
+    const requestedContext = requestedChecks
+      .map(manualTriggerContext)
+      .find((context) => context !== undefined);
+    const recoveredContext = suiteRerun
+      ? previousTriggerContext(previousAggregate, sha)
+      : undefined;
+    const context = requestedContext ?? recoveredContext;
+    const manualScope =
+      context === undefined ? sha : `${sha}:context:${encodedManualTriggerContext(context)}`;
+    const claimEvent = manualTrigger
       ? (suiteRerun &&
           originalPullRequest && {
             type: "commit" as const,
             id: `pr:${originalPullRequest}:${sha}`,
-          }) || { type: "manual" as const, id: sha }
+          }) || { type: "manual" as const, id: manualScope }
       : event;
     const name = claimEvent.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const scope = `${claimEvent.type}:${claimEvent.id}`;
@@ -682,7 +779,9 @@ export class GitHubClient {
       (check) =>
         check.external_id?.endsWith(`:event:${scope}`) ||
         requestedChecks.some((request) => request.id === check.id) ||
-        (acceptsLegacyCommit && !check.external_id?.includes(":event:")),
+        (acceptsLegacyCommit &&
+          !check.external_id?.includes(":event:") &&
+          manualTriggerContext(check) === undefined),
     );
     const historicalCompleted = new Set(
       existing.filter((check) => check.status === "completed").map((check) => check.id),
@@ -721,7 +820,7 @@ export class GitHubClient {
         });
       }),
     );
-    if (active.length > stale.length) return { requestedJobs: [], manualRequest, retry: true };
+    if (active.length > stale.length) return { requestedJobs: [], manualTrigger, retry: true };
     const requested = suiteRerun || existing.some((check) => check.status === "queued");
     if (
       !requested &&
@@ -790,7 +889,9 @@ export class GitHubClient {
       return {
         check: candidate,
         requestedJobs,
-        manualRequest,
+        manualTrigger,
+        manualTriggerBranch: context?.branch,
+        manualTriggerLabel: context?.label,
         originalPullRequest,
       };
     }
@@ -801,6 +902,6 @@ export class GitHubClient {
       title: "Claim lost",
       summary: "Another Informant machine claimed this commit first.",
     });
-    return completed ? undefined : { requestedJobs: [], manualRequest, retry: true };
+    return completed ? undefined : { requestedJobs: [], manualTrigger, retry: true };
   }
 }
