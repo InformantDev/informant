@@ -49,6 +49,9 @@ describe("startup service", () => {
       uid: 501,
       command: async (argv) => {
         invocations.push(argv);
+        if (argv[0] === "plutil") {
+          return result(0, "", JSON.stringify({ PATH: "/captured/bin" }));
+        }
         if (argv[1] === "print") {
           serviceChecks++;
           return result(0, "", `pid = ${serviceChecks < 5 ? 100 : 200}`);
@@ -59,7 +62,8 @@ describe("startup service", () => {
         sleeps++;
       },
       restartTimeoutMs: 5_000,
-      writeServiceDefinition: async () => {
+      writeStartupService: async (environment) => {
+        expect(environment).toEqual({ PATH: "/captured/bin" });
         definitions++;
       },
     });
@@ -71,6 +75,7 @@ describe("startup service", () => {
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["brew", "upgrade", "informant-ci/tap/informant"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
+      ["plutil", "-extract", "EnvironmentVariables", "json", "-o", "-", expect.any(String)],
       ["kill", "-TERM", "100"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
@@ -101,10 +106,15 @@ describe("startup service", () => {
       updateInformant({
         platform: "darwin",
         uid: 501,
-        command: async (argv) => (argv[1] === "print" ? result(0, "", "pid = 100") : result()),
+        command: async (argv) =>
+          argv[0] === "plutil"
+            ? result(0, "", "{}")
+            : argv[1] === "print"
+              ? result(0, "", "pid = 100")
+              : result(),
         sleep: async () => {},
         restartTimeoutMs: 2_000,
-        writeServiceDefinition: async () => {},
+        writeStartupService: async () => {},
       }),
     ).rejects.toThrow("graceful restart did not complete within 2 seconds");
   });
@@ -124,8 +134,12 @@ describe("startup service", () => {
         platform: "darwin",
         uid: 501,
         command: async (argv) =>
-          argv[0] === "kill" ? result(1, "service unavailable") : result(0, "", "pid = 100"),
-        writeServiceDefinition: async () => {},
+          argv[0] === "plutil"
+            ? result(0, "", "{}")
+            : argv[0] === "kill"
+              ? result(1, "service unavailable")
+              : result(0, "", "pid = 100"),
+        writeStartupService: async () => {},
       }),
     ).rejects.toThrow(
       "Informant was updated but its service could not be restarted: service unavailable",

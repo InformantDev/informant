@@ -127,9 +127,14 @@ async function writeStartupServiceDefinition(environment = startupEnvironment())
   return path;
 }
 
-async function migrateStartupServiceDefinition(): Promise<string> {
+async function migrateStartupServiceDefinition(
+  runCommand = command,
+  writeDefinition: (
+    environment: Record<string, string>,
+  ) => Promise<unknown> = writeStartupServiceDefinition,
+): Promise<unknown> {
   const path = startupServicePath();
-  const captured = await command([
+  const captured = await runCommand([
     "plutil",
     "-extract",
     "EnvironmentVariables",
@@ -143,7 +148,7 @@ async function migrateStartupServiceDefinition(): Promise<string> {
       `could not preserve Informant startup environment: ${captured.stderr.trim() || `exit ${captured.exitCode}`}`,
     );
   }
-  return writeStartupServiceDefinition(parseStartupEnvironment(captured.stdout));
+  return writeDefinition(parseStartupEnvironment(captured.stdout));
 }
 
 export async function enableStartup(): Promise<string> {
@@ -179,7 +184,7 @@ export async function updateInformant(
     onOutput?: (text: string) => Promise<void> | void;
     sleep?: (milliseconds: number) => Promise<unknown>;
     restartTimeoutMs?: number;
-    writeServiceDefinition?: () => Promise<unknown>;
+    writeStartupService?: (environment: Record<string, string>) => Promise<unknown>;
   } = {},
 ): Promise<{ restarted: boolean }> {
   if ((options.platform ?? process.platform) !== "darwin")
@@ -203,7 +208,7 @@ export async function updateInformant(
   if (!previousPid) {
     throw new Error("Informant was updated but its loaded startup service has no running worker");
   }
-  await (options.writeServiceDefinition ?? migrateStartupServiceDefinition)();
+  await migrateStartupServiceDefinition(run, options.writeStartupService);
   const restarted = await run(["kill", "-TERM", String(previousPid)]);
   if (restarted.exitCode !== 0) {
     throw new Error(
