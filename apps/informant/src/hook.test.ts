@@ -17,6 +17,7 @@ describe("hook uninstall", () => {
     expect(await Bun.file(hookPath).text()).toContain(
       'case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac',
     );
+    expect(await Bun.file(hookPath).text()).toContain("informant trigger --ref");
     expect((await stat(hookPath)).mode & 0o111).not.toBe(0);
 
     expect(await uninstallPostPushHook(repo)).toEqual({ path: hookPath, removed: true });
@@ -72,6 +73,7 @@ fi
     const upgraded = await Bun.file(hookPath).text();
     expect(upgraded.match(/# informant push accelerator/g)).toHaveLength(1);
     expect(upgraded).toContain('case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac');
+    expect(upgraded).toContain("informant trigger --ref");
   });
 
   test("removes only the managed section", () => {

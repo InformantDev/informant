@@ -11,9 +11,12 @@ informant repo list                    List repositories handled by this machine
 informant repo remove [owner/repo]     Stop handling a repository
 informant serve                        Poll every registered repository continuously
 informant serve --once                 Poll every registered repository once
-informant run --ref HEAD               Manually run every job for a commit
-informant run --job test               Run one job and the jobs it needs
-informant run --job test --job lint    Run multiple selected jobs
+informant run --local --ref HEAD       Locally run every job for a commit
+informant run --local --job test       Locally run one job and the jobs it needs
+informant run --local --job test --job lint
+                                       Locally run multiple selected jobs
+informant trigger --ref HEAD           Trigger jobs and report them to the commit
+informant trigger --job test           Trigger one reported job and its dependencies
 informant image prepare                Prepare configured Tart VM job images
 informant image list                   List Informant-prepared Tart images
 informant image prune                  Delete unused prepared runtime images
@@ -85,8 +88,16 @@ changing any `INFORMANT_*` environment-variable overrides so the service capture
 already loaded, the command restarts it after the upgrade without rewriting its captured environment.
 It does not start a worker that was stopped or never enabled.
 
-`informant run` accepts repeatable `--job` flags as well as comma-separated job names. Only selected
-jobs and their transitive `needs` dependencies run. Omit `--job` to run the complete job graph.
+`informant run --local` accepts repeatable `--job` flags as well as comma-separated job names. Only
+selected jobs and their transitive `needs` dependencies run. Omit `--job` to run the complete job
+graph. Local runs bypass job filters and write only local build history and logs; they do not create
+GitHub checks.
+
+`informant trigger` accepts the same selection flags, applies job filters, and reports the build and
+job checks on the selected commit. The push-acceleration hook uses this path. During migration,
+`informant run` retains its previous reported-trigger behavior, including the optional
+`--wait-for-github` flag used by previously installed hooks. New scripts should use either
+`informant trigger` or `informant run --local` explicitly.
 
 Completed builds can also be re-run from GitHub. Open the commit or pull request checks, select the
 Informant check, and click **Re-run**. GitHub marks the Check Suite as queued, and the next Informant

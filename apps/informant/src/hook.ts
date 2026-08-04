@@ -9,11 +9,16 @@ const HOOK_BODY = `if command -v informant >/dev/null 2>&1; then
     case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
     case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac
     branch="\${remote_ref#refs/heads/}"
-    nohup informant run --ref "$local_sha" --branch "$branch" --wait-for-github </dev/null >>/tmp/informant-post-push.log 2>&1 &
+    nohup informant trigger --ref "$local_sha" --branch "$branch" --wait-for-github </dev/null >>/tmp/informant-post-push.log 2>&1 &
   done
 fi
 `;
+const PREVIOUS_HOOK_BODY = HOOK_BODY.replace("informant trigger", "informant run");
 const LEGACY_HOOK_BODY = HOOK_BODY.replace(
+  '    case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac\n',
+  "",
+);
+const PREVIOUS_LEGACY_HOOK_BODY = PREVIOUS_HOOK_BODY.replace(
   '    case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac\n',
   "",
 );
@@ -28,7 +33,7 @@ export function removeInformantHook(source: string): { source: string; removed: 
     const followingNewline = source.indexOf("\n", markedEnd + END_MARKER.length);
     end = followingNewline === -1 ? source.length : followingNewline + 1;
   } else {
-    const legacyBlock = [HOOK_BODY, LEGACY_HOOK_BODY]
+    const legacyBlock = [HOOK_BODY, PREVIOUS_HOOK_BODY, LEGACY_HOOK_BODY, PREVIOUS_LEGACY_HOOK_BODY]
       .map((body) => `${START_MARKER}\n${body}`)
       .find((block) => source.startsWith(block, start));
     if (!legacyBlock) {

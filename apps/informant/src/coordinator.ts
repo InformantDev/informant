@@ -1,6 +1,6 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { selectJobs, selectTriggeredJobs } from "./config.ts";
+import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
@@ -8,7 +8,7 @@ import { withImageLock } from "./tart/vm.ts";
 import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, CheckRun, InformantConfig, JobConfig, Repository } from "./types.ts";
 
-type RunEvent = (EventContext | { type: "manual" }) & { id: string };
+type RunEvent = EventContext & { id: string };
 
 export interface CoordinatorDependencies {
   createBuild: typeof createBuild;
@@ -41,6 +41,83 @@ const defaultDependencies: CoordinatorDependencies = {
   readLogTail,
 };
 
+export async function runLocalCommit(
+  repository: Repository,
+  sha: string,
+  branch: string,
+  unselectedConfig: InformantConfig,
+  options: {
+    requestedJobs?: string[];
+    runtimeSecrets?: RuntimeSecrets;
+    dependencies?: CoordinatorDependencies;
+  } = {},
+): Promise<BuildRecord> {
+  const dependencies = options.dependencies ?? defaultDependencies;
+  const configuredVmJobs = unselectedConfig.jobs
+    .filter((job) => job.runtime?.type !== "container")
+    .map((job) => job.name);
+  const config = selectJobs(unselectedConfig, options.requestedJobs ?? []);
+  const id = crypto.randomUUID().slice(0, 12);
+  const record: BuildRecord = {
+    id,
+    repo: repository.fullName,
+    sha,
+    branch,
+    machine: hostname(),
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: [],
+    jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
+    owner: currentProcessOwner(),
+    logPath: join(dataDirectory(), "builds", id, "build.log"),
+    event: { type: "manual_run", id },
+  };
+
+  try {
+    await (
+      dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
+    )(() => dependencies.createBuild(record));
+    const success = await dependencies.runInTart(
+      repository,
+      sha,
+      config,
+      record,
+      {
+        started: async (job) => {
+          record.runningJobs?.push(job.name);
+          record.jobs = record.jobs?.map((item) =>
+            item.name === job.name ? { ...item, status: "running" } : item,
+          );
+          await dependencies.saveBuild(record).catch(() => undefined);
+        },
+        completed: async (job, result) => {
+          record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
+          record.jobs = record.jobs?.map((item) =>
+            item.name === job.name ? { ...item, status: result.outcome } : item,
+          );
+          await dependencies.saveBuild(record).catch(() => undefined);
+        },
+      },
+      undefined,
+      options.runtimeSecrets,
+      configuredVmJobs,
+    );
+    record.status = success ? "success" : "failure";
+    record.completedAt = new Date().toISOString();
+    await dependencies.saveBuild(record);
+    return record;
+  } catch (error) {
+    record.status = "failure";
+    record.runningJobs = [];
+    record.jobs = record.jobs?.map((job) =>
+      job.status === "queued" || job.status === "running" ? { ...job, status: "failure" } : job,
+    );
+    record.completedAt = new Date().toISOString();
+    await dependencies.saveBuild(record).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function runCommit(
   github: GitHubClient,
   repository: Repository,
@@ -60,18 +137,25 @@ export async function runCommit(
     repository,
     sha,
     machine,
-    event ? { type: event.type, id: event.id } : undefined,
+    event ? { type: event.type, id: event.id, branch: event.branch, label: branch } : undefined,
   );
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;
   const { check } = claim;
   const rerunPullRequest = claim.originalPullRequest;
   if (rerunPullRequest !== undefined) branch = `pull/${rerunPullRequest}`;
-  const executionSignal = claim.manualRequest ? undefined : signal;
-  config = claim.manualRequest
-    ? selectJobs(config, claim.requestedJobs)
-    : event && event.type !== "manual"
-      ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event))
+  else if (claim.manualTrigger && claim.manualTriggerLabel) branch = claim.manualTriggerLabel;
+  else if (claim.manualTrigger && typeof claim.manualTriggerBranch === "string")
+    branch = claim.manualTriggerBranch;
+  const executionSignal = claim.manualTrigger ? undefined : signal;
+  const selectionBranch =
+    rerunPullRequest !== undefined || claim.manualTriggerBranch === null
+      ? undefined
+      : (claim.manualTriggerBranch ?? event?.branch);
+  config = claim.manualTrigger
+    ? selectManuallyTriggeredJobs(config, claim.requestedJobs, selectionBranch)
+    : event
+      ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
       : config;
   if (config.jobs.length === 0) {
     await github.updateCheck(repository, check.id, {
@@ -79,6 +163,7 @@ export async function runCommit(
       conclusion: "neutral",
       title: "No jobs matched",
       summary: `No jobs are configured for this ${event?.type ?? "manual"} event.`,
+      text: check.output?.text,
     });
     return undefined;
   }
@@ -107,13 +192,12 @@ export async function runCommit(
     runningJobs: [],
     jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
     owner: currentProcessOwner(),
-    pullRequest:
-      rerunPullRequest ?? (event?.type === "manual" ? undefined : event?.pullRequest?.number),
+    pullRequest: rerunPullRequest ?? event?.pullRequest?.number,
     logPath: join(dataDirectory(), "builds", id, "build.log"),
     checkId: check.id,
     checkUrl: check.html_url,
-    event: claim.manualRequest
-      ? { type: "manual", id: check.id.toString() }
+    event: claim.manualTrigger
+      ? { type: "manual_trigger", id: check.id.toString() }
       : event
         ? { type: event.type, id: event.id }
         : { type: "manual", id: check.id.toString() },
@@ -235,13 +319,16 @@ export async function runCommit(
   };
 
   const completeAggregate = async (values: CheckUpdate) => {
+    const preservedValues = check.output?.text
+      ? { ...values, text: [values.text, check.output.text].filter(Boolean).join("\n") }
+      : values;
     try {
-      await github.updateCheck(repository, check.id, values);
+      await github.updateCheck(repository, check.id, preservedValues);
     } catch (firstError) {
       try {
         const remote = (await github.checks(repository, sha)).find((item) => item.id === check.id);
         if (remote?.status === "completed" && remote.conclusion === values.conclusion) return;
-        await github.updateCheck(repository, check.id, values);
+        await github.updateCheck(repository, check.id, preservedValues);
       } catch (retryError) {
         const first = firstError instanceof Error ? firstError : new Error(String(firstError));
         const retry = retryError instanceof Error ? retryError : new Error(String(retryError));

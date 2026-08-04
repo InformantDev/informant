@@ -20,6 +20,10 @@ export interface ContainerRuntime {
 
 export type JobRuntime = VmRuntime | ContainerRuntime;
 
+export interface JobFilter {
+  branch: { names: string[] };
+}
+
 export interface JobConfig {
   name: string;
   command: string;
@@ -30,6 +34,7 @@ export interface JobConfig {
   needs: string[];
   runtime?: JobRuntime;
   triggers?: TriggerRule[];
+  filters?: JobFilter[];
   cache?: Array<{
     paths: string[];
     keyFiles: string[];
@@ -72,6 +77,7 @@ export interface InformantConfig {
   /** Default-branch commit that authorized secret-bearing jobs. */
   trustedSha?: string;
   triggers?: TriggerRule[];
+  filters?: JobFilter[];
   /** Legacy input compatibility; normalized configs omit this field. */
   branches?: string[];
   vm: VmRuntime;
@@ -115,5 +121,5 @@ export interface BuildRecord {
   checkId?: number;
   checkUrl?: string;
   checksCompletedAt?: string;
-  event?: { type: TriggerEvent | "manual"; id: string };
+  event?: { type: TriggerEvent | "manual" | "manual_trigger" | "manual_run"; id: string };
 }

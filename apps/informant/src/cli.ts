@@ -17,7 +17,7 @@ import {
   selectJobs,
 } from "./config.ts";
 import { prunePreparedContainerImages } from "./container.ts";
-import { runCommit } from "./coordinator.ts";
+import { runCommit, runLocalCommit } from "./coordinator.ts";
 import { GitHubClient } from "./github.ts";
 import { installPostPushHook, uninstallPostPushHook } from "./hook.ts";
 import { formatHousekeepingSummary, runHousekeeping } from "./housekeeping.ts";
@@ -59,8 +59,10 @@ Usage:
   informant repo list                     List registered repositories
   informant repo remove [owner/repo]      Stop handling a repository
   informant serve [--once]                Poll all registered repositories
-  informant run [--ref <ref>] [--job <name>]
-                                        Manually request all or selected jobs
+  informant run --local [--ref <ref>] [--job <name>]
+                                        Run all or selected jobs locally
+  informant trigger [--ref <ref>] [--job <name>]
+                                        Trigger reported jobs for a commit
   informant image prepare                Prepare this repository's configured VM job images
   informant image list                   List Informant-prepared VM images
   informant image prune                  Delete unused prepared runtime images
@@ -226,7 +228,47 @@ export async function runManualHousekeeping(
   }
 }
 
-async function manualRun(
+async function localRun(ref: string, branchOverride?: string, jobs: string[] = []): Promise<void> {
+  if (branchOverride?.startsWith("refs/tags/")) {
+    throw new Error("tag pushes are handled by the Informant service");
+  }
+  const repository = await repositoryFromGit();
+  const sha = await requireCommand(["git", "rev-parse", ref]);
+  const symbolicRef = await requireCommand(["git", "rev-parse", "--symbolic-full-name", ref]);
+  const github = new GitHubClient({ repository });
+  const config = await configAtGitRef(sha);
+  selectJobs(config, jobs);
+  const progress = spinner();
+  progress.start(`Running ${repository.fullName}@${sha.slice(0, 7)}`);
+  const clean = () => runManualHousekeeping(repository);
+  const build = await runLocalCommit(
+    repository,
+    sha,
+    branchOverride || executionLabelFromRef(ref, symbolicRef.trim()),
+    config,
+    {
+      requestedJobs: jobs,
+      runtimeSecrets: { GITHUB_TOKEN: () => github.createJobAccessToken(repository) },
+    },
+  );
+  progress.stop(`${build.status}: ${build.id}`);
+  await clean();
+  if (build.status !== "success") process.exitCode = 1;
+}
+
+export function branchNameFromSymbolicRef(ref: string): string | undefined {
+  return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
+}
+
+export function executionLabelFromRef(ref: string, symbolicRef: string): string {
+  return branchNameFromSymbolicRef(symbolicRef) || ref;
+}
+
+export function runInvocationType(local: boolean): "local" | "trigger" {
+  return local ? "local" : "trigger";
+}
+
+async function manualTrigger(
   ref: string,
   branchOverride?: string,
   waitForGitHub = false,
@@ -237,24 +279,22 @@ async function manualRun(
   }
   const repository = await repositoryFromGit();
   const sha = await requireCommand(["git", "rev-parse", ref]);
-  const branch = await command(["git", "branch", "--show-current"]);
+  const symbolicRef = await requireCommand(["git", "rev-parse", "--symbolic-full-name", ref]);
+  const contextBranch = branchOverride || branchNameFromSymbolicRef(symbolicRef.trim());
+  const displayBranch = branchOverride || executionLabelFromRef(ref, symbolicRef.trim());
   const github = new GitHubClient({ repository });
   if (waitForGitHub) await github.waitForCommit(repository, sha);
   const config = await configAtGitRef(sha);
   selectJobs(config, jobs);
-  await github.createCheck(repository, sha, `manual:${crypto.randomUUID()}`, "queued", jobs);
+  await github.createManualTrigger(repository, sha, jobs, contextBranch, displayBranch);
   const progress = spinner();
-  progress.start(`Claiming ${repository.fullName}@${sha.slice(0, 7)}`);
+  progress.start(`Triggering ${repository.fullName}@${sha.slice(0, 7)}`);
   const clean = () => runManualHousekeeping(repository);
-  const build = await runCommit(
-    github,
-    repository,
-    sha,
-    branchOverride || branch.stdout.trim() || ref,
-    config,
-    undefined,
-    { type: "manual", id: sha },
-  );
+  const build = await runCommit(github, repository, sha, displayBranch, config, undefined, {
+    type: "commit",
+    branch: contextBranch,
+    id: contextBranch ? `branch:${contextBranch}:${sha}` : `ref:${sha}`,
+  });
   if (!build) {
     progress.stop("Another machine is already running this commit.");
     await clean();
@@ -899,7 +939,31 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     }
   }
   if (subcommand === "run") {
-    return manualRun(
+    if (runInvocationType(flags.local === true) === "local") {
+      if (flags["wait-for-github"] === true) {
+        throw new Error("--local cannot be combined with --wait-for-github");
+      }
+      return localRun(
+        typeof flags.ref === "string" ? flags.ref : "HEAD",
+        typeof flags.branch === "string" ? flags.branch : undefined,
+        requestedJobs(flags.job),
+      );
+    }
+    if (flags["wait-for-github"] !== true) {
+      console.warn(
+        "informant run reports GitHub checks for compatibility; use informant trigger, or pass --local for an unreported local run",
+      );
+    }
+    return manualTrigger(
+      typeof flags.ref === "string" ? flags.ref : "HEAD",
+      typeof flags.branch === "string" ? flags.branch : undefined,
+      flags["wait-for-github"] === true,
+      requestedJobs(flags.job),
+    );
+  }
+  if (subcommand === "trigger") {
+    if (flags.local === true) throw new Error("trigger does not accept --local");
+    return manualTrigger(
       typeof flags.ref === "string" ? flags.ref : "HEAD",
       typeof flags.branch === "string" ? flags.branch : undefined,
       flags["wait-for-github"] === true,
