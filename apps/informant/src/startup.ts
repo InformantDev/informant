@@ -95,9 +95,7 @@ function startupEnvironment(): Record<string, string> {
   return environment;
 }
 
-export async function enableStartup(): Promise<string> {
-  if (process.platform !== "darwin")
-    throw new Error("startup services are supported only on macOS");
+async function writeStartupServiceDefinition(): Promise<string> {
   const executable = Bun.which("informant");
   if (!executable) {
     throw new Error("informant must be installed on PATH before enabling startup");
@@ -108,6 +106,13 @@ export async function enableStartup(): Promise<string> {
   await mkdir(logs, { recursive: true });
   await Bun.write(path, renderStartupService(executable, startupEnvironment(), logs));
   await chmod(path, 0o600);
+  return path;
+}
+
+export async function enableStartup(): Promise<string> {
+  if (process.platform !== "darwin")
+    throw new Error("startup services are supported only on macOS");
+  const path = await writeStartupServiceDefinition();
 
   const domain = launchDomain();
   await command(["launchctl", "bootout", domain, path]);
@@ -137,6 +142,7 @@ export async function updateInformant(
     onOutput?: (text: string) => Promise<void> | void;
     sleep?: (milliseconds: number) => Promise<unknown>;
     restartTimeoutMs?: number;
+    writeServiceDefinition?: () => Promise<unknown>;
   } = {},
 ): Promise<{ restarted: boolean }> {
   if ((options.platform ?? process.platform) !== "darwin")
@@ -156,7 +162,11 @@ export async function updateInformant(
     );
   }
   if (!loaded) return { restarted: false };
-  const restarted = await run(["launchctl", "kill", "SIGTERM", service]);
+  if (!previousPid) {
+    throw new Error("Informant was updated but its loaded startup service has no running worker");
+  }
+  await (options.writeServiceDefinition ?? writeStartupServiceDefinition)();
+  const restarted = await run(["kill", "-TERM", String(previousPid)]);
   if (restarted.exitCode !== 0) {
     throw new Error(
       `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,

@@ -34,6 +34,7 @@ describe("startup service", () => {
     const invocations: string[][] = [];
     let serviceChecks = 0;
     let sleeps = 0;
+    let definitions = 0;
     const updated = await updateInformant({
       platform: "darwin",
       uid: 501,
@@ -49,14 +50,18 @@ describe("startup service", () => {
         sleeps++;
       },
       restartTimeoutMs: 5_000,
+      writeServiceDefinition: async () => {
+        definitions++;
+      },
     });
 
     expect(updated).toEqual({ restarted: true });
     expect(sleeps).toBe(2);
+    expect(definitions).toBe(1);
     expect(invocations).toEqual([
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["brew", "upgrade", "informant-ci/tap/informant"],
-      ["launchctl", "kill", "SIGTERM", "gui/501/dev.informant.worker"],
+      ["kill", "-TERM", "100"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
@@ -89,6 +94,7 @@ describe("startup service", () => {
         command: async (argv) => (argv[1] === "print" ? result(0, "", "pid = 100") : result()),
         sleep: async () => {},
         restartTimeoutMs: 2_000,
+        writeServiceDefinition: async () => {},
       }),
     ).rejects.toThrow("graceful restart did not complete within 2 seconds");
   });
@@ -108,7 +114,8 @@ describe("startup service", () => {
         platform: "darwin",
         uid: 501,
         command: async (argv) =>
-          argv[1] === "kill" ? result(1, "service unavailable") : result(0, "", "pid = 100"),
+          argv[0] === "kill" ? result(1, "service unavailable") : result(0, "", "pid = 100"),
+        writeServiceDefinition: async () => {},
       }),
     ).rejects.toThrow(
       "Informant was updated but its service could not be restarted: service unavailable",
