@@ -584,6 +584,7 @@ test("prepared jobs copy source into the baked workspace before running", async 
 test("limits concurrent Apple containers across jobs", async () => {
   const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const started: string[] = [];
+  const reportedStarted: string[] = [];
   const waiting: string[] = [];
   const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
   const releases = new Map<string, ReturnType<typeof deferred<ReturnType<typeof result>>>>();
@@ -614,7 +615,9 @@ test("limits concurrent Apple containers across jobs", async () => {
       async (text) => {
         if (text.includes("waiting for")) waiting.push(name);
       },
-      async () => {},
+      async () => {
+        reportedStarted.push(name);
+      },
       {},
       undefined,
       {
@@ -636,12 +639,14 @@ test("limits concurrent Apple containers across jobs", async () => {
   const jobs = names.map(run);
   while (started.length < 1) await Bun.sleep(1);
   expect(started).toHaveLength(1);
+  expect(reportedStarted).toEqual(started);
   expect(waiting).toHaveLength(1);
   expect(new Set([...started, ...waiting])).toEqual(new Set(names));
 
   releases.get(started[0] ?? "")?.resolve(result());
   while (started.length < names.length) await Bun.sleep(1);
   expect(new Set(started)).toEqual(new Set(names));
+  expect(new Set(reportedStarted)).toEqual(new Set(names));
   for (const release of releases.values()) release.resolve(result());
   await Promise.all(jobs);
 });

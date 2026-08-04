@@ -186,6 +186,7 @@ async function runJob(
   config: InformantConfig,
   job: InformantConfig["jobs"][number],
   log: (text: string) => Promise<void>,
+  started: () => Promise<void>,
   runtimeSecrets: RuntimeSecrets,
   signal?: AbortSignal,
 ): Promise<{ success: boolean; exitCode: number; timedOut: boolean }> {
@@ -275,6 +276,7 @@ async function runJob(
         secretValues: secrets.values,
       };
     }, executionSignal);
+    await started();
     await log(`\n[${job.name}] $ ${job.command}\n`);
     const environment = {
       TERM: "xterm-256color",
@@ -559,8 +561,10 @@ export async function runInTart(
       async (job, index) => {
         const workspace = workspaces[index];
         if (!workspace) throw new Error(`workspace missing for job ${job.name}`);
-        await logJob(job, jobEventLine(job.name, "started"));
-        await notify(() => observer.started?.(job));
+        const started = async () => {
+          await logJob(job, jobEventLine(job.name, "started"));
+          await notify(() => observer.started?.(job));
+        };
         const runtime = job.runtime ?? config.vm;
         const execution =
           runtime.type === "container"
@@ -573,7 +577,7 @@ export async function runInTart(
                 workspace,
                 job,
                 (text) => logJob(job, text),
-                async () => {},
+                started,
                 runtimeSecrets,
                 signal,
               )
@@ -592,6 +596,7 @@ export async function runInTart(
                 { ...config, vm: runtime },
                 job,
                 (text) => logJob(job, text),
+                started,
                 runtimeSecrets,
                 signal,
               );
