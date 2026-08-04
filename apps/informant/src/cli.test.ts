@@ -39,9 +39,16 @@ test("execution labels follow the requested ref instead of the checked out branc
   expect(executionLabelFromRef("HEAD", "refs/heads/main")).toBe("main");
 });
 
-test("the previous hook invocation remains a reported trigger", () => {
-  expect(runInvocationType(true)).toBe("trigger");
-  expect(runInvocationType(false)).toBe("local");
+test("run preserves reported triggers unless local execution is explicit", () => {
+  expect(runInvocationType(false)).toBe("trigger");
+  expect(runInvocationType(true)).toBe("local");
+});
+
+test("local and reported trigger flags cannot be mixed", async () => {
+  await expect(main(["run", "--local", "--wait-for-github"])).rejects.toThrow(
+    "--local cannot be combined with --wait-for-github",
+  );
+  await expect(main(["trigger", "--local"])).rejects.toThrow("trigger does not accept --local");
 });
 
 test("orphan cleanup does not block worker startup", async () => {

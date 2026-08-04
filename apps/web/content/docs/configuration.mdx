@@ -176,9 +176,10 @@ filters = [{ branch = { names = ["main", "release"] } }]
 
 Every filter must match; names within a branch filter are ORed and matched exactly. A branch filter
 requires a real branch context, so tags, pull-request commits, and pull-request comments do not match
-one. Filters apply to automatic runs and GitHub manual triggers. Local `informant run` executions
-bypass filters and do not create GitHub checks. Dependencies of selected roots are still added even
-when their own filters do not match, just as their triggers are not independently evaluated.
+one. Filters apply to automatic runs and GitHub manual triggers. Local `informant run --local`
+executions bypass filters and do not create GitHub checks. Dependencies of selected roots are still
+added even when their own filters do not match, just as their triggers are not independently
+evaluated.
 
 ## Prepared runtime images
 

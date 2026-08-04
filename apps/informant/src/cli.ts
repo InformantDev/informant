@@ -59,7 +59,7 @@ Usage:
   informant repo list                     List registered repositories
   informant repo remove [owner/repo]      Stop handling a repository
   informant serve [--once]                Poll all registered repositories
-  informant run [--ref <ref>] [--job <name>]
+  informant run --local [--ref <ref>] [--job <name>]
                                         Run all or selected jobs locally
   informant trigger [--ref <ref>] [--job <name>]
                                         Trigger reported jobs for a commit
@@ -264,8 +264,8 @@ export function executionLabelFromRef(ref: string, symbolicRef: string): string 
   return branchNameFromSymbolicRef(symbolicRef) || ref;
 }
 
-export function runInvocationType(waitForGitHub: boolean): "local" | "trigger" {
-  return waitForGitHub ? "trigger" : "local";
+export function runInvocationType(local: boolean): "local" | "trigger" {
+  return local ? "local" : "trigger";
 }
 
 async function manualTrigger(
@@ -939,21 +939,30 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     }
   }
   if (subcommand === "run") {
-    if (runInvocationType(flags["wait-for-github"] === true) === "trigger") {
-      return manualTrigger(
+    if (runInvocationType(flags.local === true) === "local") {
+      if (flags["wait-for-github"] === true) {
+        throw new Error("--local cannot be combined with --wait-for-github");
+      }
+      return localRun(
         typeof flags.ref === "string" ? flags.ref : "HEAD",
         typeof flags.branch === "string" ? flags.branch : undefined,
-        true,
         requestedJobs(flags.job),
       );
     }
-    return localRun(
+    if (flags["wait-for-github"] !== true) {
+      console.warn(
+        "informant run reports GitHub checks for compatibility; use informant trigger, or pass --local for an unreported local run",
+      );
+    }
+    return manualTrigger(
       typeof flags.ref === "string" ? flags.ref : "HEAD",
       typeof flags.branch === "string" ? flags.branch : undefined,
+      flags["wait-for-github"] === true,
       requestedJobs(flags.job),
     );
   }
   if (subcommand === "trigger") {
+    if (flags.local === true) throw new Error("trigger does not accept --local");
     return manualTrigger(
       typeof flags.ref === "string" ? flags.ref : "HEAD",
       typeof flags.branch === "string" ? flags.branch : undefined,
