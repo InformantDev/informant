@@ -645,7 +645,7 @@ export class GitHubClient {
           .sort((a, b) => b.id - a.id)[0]
       : undefined;
     const originalPullRequestMatch = previousAggregate?.external_id?.match(
-      /:event:commit:pr:(\d+):([^:]+)$/,
+      /:event:commit:pr:(\d+):([^:]+)(?::jobs:[^:]+)?$/,
     );
     const originalPullRequestNumber = Number(originalPullRequestMatch?.[1]);
     const originalPullRequest =

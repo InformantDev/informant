@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
+import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
 import { selectJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
@@ -51,16 +52,33 @@ export async function runCommit(
   event?: RunEvent,
   signal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
+  const usesCapabilities = config.jobs.some(
+    (job) => (job.runsOn?.length ?? 0) > 0 || job.runtime?.type === "host",
+  );
+  if (usesCapabilities) config = selectCapableJobs(config, workerCapabilities());
+  if (config.jobs.length === 0) return undefined;
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
   const configuredVmJobs = config.jobs
-    .filter((job) => job.runtime?.type !== "container")
+    .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name);
+  const scopedEvent =
+    event && usesCapabilities
+      ? {
+          ...event,
+          id: `${event.id}:jobs:${Buffer.from(
+            config.jobs
+              .map((job) => job.name)
+              .sort()
+              .join("\0"),
+          ).toString("base64url")}`,
+        }
+      : event;
   const claim = await github.claim(
     repository,
     sha,
     machine,
-    event ? { type: event.type, id: event.id } : undefined,
+    scopedEvent ? { type: scopedEvent.type, id: scopedEvent.id } : undefined,
   );
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;

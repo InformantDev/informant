@@ -803,6 +803,7 @@ async function doctor(): Promise<void> {
   const tartHost = process.platform === "darwin" && process.arch === "arm64";
   const containerReady = container.exitCode === 0;
   const tartReady = tart.exitCode === 0 && sshpass.exitCode === 0 && tartHost;
+  const hostReady = process.platform === "linux" || process.platform === "darwin";
   console.log(
     `${containerReady ? "✓" : "○"} Apple Container${containerReady ? "" : ` — ${container.stderr.trim() || "not found or not running"}`}`,
   );
@@ -815,7 +816,8 @@ async function doctor(): Promise<void> {
   console.log(
     `${tartHost ? "✓" : "○"} ${tartHost ? "macOS on Apple Silicon" : "host — Tart requires macOS on Apple Silicon"}`,
   );
-  if (!containerReady && !tartReady) {
+  console.log(`${hostReady ? "✓" : "○"} native host jobs — ${process.platform}/${process.arch}`);
+  if (!containerReady && !tartReady && !hostReady) {
     console.log(
       "✗ runtime — install and start Apple Container for container jobs or Tart and sshpass for VM jobs",
     );

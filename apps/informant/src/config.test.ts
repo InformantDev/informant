@@ -46,6 +46,7 @@ describe("configuration", () => {
         environment: {},
         secrets: [],
         needs: [],
+        runsOn: ["darwin", "arm64"],
         triggers: [
           { event: "commit", branch: { names: ["main"] }, tag: undefined, pullRequest: undefined },
         ],
@@ -227,6 +228,23 @@ describe("configuration", () => {
         source.replace('container = { image = "oven/bun:1", cpu = 1 }', "container = true"),
       ),
     ).toThrow("jobs[0].container must be a table");
+  });
+
+  test("parses native host jobs and runs-on capabilities", () => {
+    const source = configTemplate().replace(
+      'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+      'cache = []\nruns_on = ["linux", "x64"]\nhost = {}',
+    );
+    expect(parseConfig(source).jobs[0]).toMatchObject({
+      runsOn: ["linux", "x64"],
+      runtime: { type: "host" },
+    });
+    expect(() => parseConfig(source.replace("host = {}", 'host = { image = "bad" }'))).toThrow(
+      "jobs[0].host must be an empty table",
+    );
+    expect(() => parseConfig(source.replace('runs_on = ["linux", "x64"]\n', ""))).toThrow(
+      "jobs[0].runs_on is required for host jobs",
+    );
   });
 
   test("container preparation can be inherited and overridden per job", () => {

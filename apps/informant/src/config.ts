@@ -359,6 +359,12 @@ function parseContainer(
   };
 }
 
+function parseHost(value: unknown, label: string): JobRuntime {
+  const host = runtimeTable(value, label);
+  if (Object.keys(host).length > 0) throw new Error(`${label} must be an empty table`);
+  return { type: "host" };
+}
+
 export function parseConfig(source: string, label = CONFIG_FILE): InformantConfig {
   const raw = Bun.TOML.parse(source) as Record<string, unknown>;
   if (raw.version !== 1) {
@@ -428,18 +434,35 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     }
     const cache =
       job.cache === undefined ? defaultCache : parseCaches(job.cache, `jobs[${index}].cache`, true);
-    if (job.vm !== undefined && job.container !== undefined)
+    const configuredRuntimes = [job.vm, job.container, job.host].filter(
+      (value) => value !== undefined,
+    );
+    if (configuredRuntimes.length > 1)
       throw new Error(`jobs[${index}] must configure only one runtime`);
     const runtime =
-      job.container !== undefined
-        ? parseContainer(
-            runtimeTable(job.container, `jobs[${index}].container`),
-            `jobs[${index}].container`,
-            container,
-          )
-        : job.vm !== undefined
-          ? parseVm(runtimeTable(job.vm, `jobs[${index}].vm`), `jobs[${index}].vm`, vm)
-          : defaultRuntime;
+      job.host !== undefined
+        ? parseHost(job.host, `jobs[${index}].host`)
+        : job.container !== undefined
+          ? parseContainer(
+              runtimeTable(job.container, `jobs[${index}].container`),
+              `jobs[${index}].container`,
+              container,
+            )
+          : job.vm !== undefined
+            ? parseVm(runtimeTable(job.vm, `jobs[${index}].vm`), `jobs[${index}].vm`, vm)
+            : defaultRuntime;
+    const runsOn = job.runs_on ?? (runtime.type === "host" ? undefined : ["darwin", "arm64"]);
+    if (runtime.type === "host" && runsOn === undefined) {
+      throw new Error(`jobs[${index}].runs_on is required for host jobs`);
+    }
+    if (
+      runsOn !== undefined &&
+      (!Array.isArray(runsOn) ||
+        runsOn.length === 0 ||
+        runsOn.some((label) => typeof label !== "string" || !label.trim()))
+    ) {
+      throw new Error(`jobs[${index}].runs_on must contain non-empty strings`);
+    }
     return {
       name: job.name,
       command: job.command.trim(),
@@ -450,6 +473,9 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         : job.needs === undefined
           ? []
           : [String(job.needs)],
+      runsOn: runsOn
+        ? [...new Set((runsOn as string[]).map((label) => label.trim().toLowerCase()))]
+        : undefined,
       environment,
       secrets,
       triggers:

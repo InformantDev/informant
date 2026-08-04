@@ -4,12 +4,17 @@ description: How GitHub Checks act as a decentralized work queue.
 ---
 
 ```text
-GitHub branch/PR/comment ──poll──▶ Mac A ─┐
-                      Mac B ─┼──▶ oldest Check Run wins ──▶ Tart VM
-                      Mac C ─┘                                  │
-                           ▲                                    ▼
-                           └──────── GitHub Checks ◀──── job conclusions + separate logs
+GitHub branch/PR/comment ──poll──▶ Linux worker ──▶ native checkout
+                                  macOS worker ──▶ Apple Container / Tart VM
+                                        │
+                                        ▼
+                                  GitHub Checks
 ```
+
+Workers advertise `self-hosted`, their operating system, architecture, hostname, and optional custom
+capabilities. A worker filters jobs before entering the claim election, and the eligible job set is
+part of the claim scope. Linux and macOS workers can therefore claim different jobs for the same
+commit without stealing work from each other.
 
 ## Claim safety
 

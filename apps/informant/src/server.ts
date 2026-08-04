@@ -297,6 +297,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             .filter(
               (job) =>
                 job.runtime?.type !== "container" &&
+                job.runtime?.type !== "host" &&
                 (job.runtime?.type === "vm" ? job.runtime.prepare : bootstrap.vm.prepare),
             )
             .map((job) => job.name),
