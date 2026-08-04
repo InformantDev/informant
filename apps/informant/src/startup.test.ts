@@ -22,6 +22,7 @@ describe("startup service", () => {
     expect(service).toContain("<string>serve</string>");
     expect(service).toContain("<key>RunAtLoad</key>\n  <true/>");
     expect(service).toContain("<key>KeepAlive</key>\n  <true/>");
+    expect(service).toContain("<key>ExitTimeOut</key>\n  <integer>86400</integer>");
     expect(service).toContain(
       "<key>SoftResourceLimits</key>\n  <dict>\n    <key>NumberOfFiles</key>\n    <integer>65536</integer>",
     );
@@ -44,7 +45,7 @@ describe("startup service", () => {
     expect(invocations).toEqual([
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["brew", "upgrade", "informant-ci/tap/informant"],
-      ["launchctl", "kickstart", "-k", "gui/501/dev.informant.worker"],
+      ["launchctl", "kill", "SIGTERM", "gui/501/dev.informant.worker"],
     ]);
   });
 
@@ -80,8 +81,7 @@ describe("startup service", () => {
       updateInformant({
         platform: "darwin",
         uid: 501,
-        command: async (argv) =>
-          argv[1] === "kickstart" ? result(1, "service unavailable") : result(),
+        command: async (argv) => (argv[1] === "kill" ? result(1, "service unavailable") : result()),
       }),
     ).rejects.toThrow(
       "Informant was updated but its service could not be restarted: service unavailable",

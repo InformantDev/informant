@@ -53,6 +53,8 @@ ${environmentXml}
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>86400</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>SoftResourceLimits</key>
@@ -143,7 +145,7 @@ export async function updateInformant(
     );
   }
   if (!loaded) return { restarted: false };
-  const restarted = await run(["launchctl", "kickstart", "-k", service]);
+  const restarted = await run(["launchctl", "kill", "SIGTERM", service]);
   if (restarted.exitCode !== 0) {
     throw new Error(
       `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,

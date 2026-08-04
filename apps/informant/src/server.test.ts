@@ -676,8 +676,7 @@ describe("serve polling orchestration", () => {
     });
 
     await server;
-    expect(signals[1]?.aborted).toBe(true);
-    expect(signals[1]?.reason).toBe("Server shutdown requested.");
+    expect(signals[1]?.aborted).toBe(false);
   });
 
   test("cancels an automatic build when its pull request is no longer open", async () => {
@@ -742,8 +741,9 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal?.aborted).toBe(true);
   });
 
-  test("aborts automatic runs before draining during shutdown", async () => {
+  test("drains automatic runs without cancelling them during shutdown", async () => {
     const outer = new AbortController();
+    const run = deferred<BuildRecord | false | undefined>();
     let receivedSignal: AbortSignal | undefined;
     const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
 
@@ -754,19 +754,21 @@ describe("serve polling orchestration", () => {
         { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
-          return new Promise((resolve) => {
-            signal?.addEventListener("abort", () => resolve(undefined), { once: true });
-          });
+          return run.promise;
         },
-        async () => outer.abort(),
+        async () => {
+          outer.abort();
+          await Promise.resolve();
+          expect(receivedSignal?.aborted).toBe(false);
+          run.resolve(undefined);
+        },
       ),
     });
 
-    expect(receivedSignal?.aborted).toBe(true);
-    expect(receivedSignal?.reason).toBe("Server shutdown requested.");
+    expect(receivedSignal?.aborted).toBe(false);
   });
 
-  test("interrupts the polling interval to abort automatic runs on shutdown", async () => {
+  test("interrupts the polling interval and drains automatic runs on shutdown", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;
     let releaseSleep!: () => void;
@@ -781,7 +783,6 @@ describe("serve polling orchestration", () => {
         { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
-          signal?.addEventListener("abort", () => runSettled.resolve(undefined), { once: true });
           return runSettled.promise;
         },
         async () => sleepStarted,
@@ -791,11 +792,13 @@ describe("serve polling orchestration", () => {
     await Promise.resolve();
     while (!receivedSignal) await Promise.resolve();
     outer.abort();
+    await Promise.resolve();
+    expect(receivedSignal.aborted).toBe(false);
+    runSettled.resolve(undefined);
     await server;
     releaseSleep();
 
-    expect(receivedSignal.aborted).toBe(true);
-    expect(receivedSignal.reason).toBe("Server shutdown requested.");
+    expect(receivedSignal.aborted).toBe(false);
   });
 
   test("does not claim automatic work when shutdown arrives during config loading", async () => {

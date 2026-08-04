@@ -214,12 +214,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     return error instanceof Error ? error.message : String(error);
   };
-  const abortAutomaticRuns = () => {
-    for (const { controller } of automaticLanes.values()) {
-      controller.abort("Server shutdown requested.");
-    }
-    automaticLanes.clear();
-  };
   const waitForDelay = async (milliseconds: number) => {
     if (options.signal?.aborted) return false;
     if (!options.signal) {
@@ -263,7 +257,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       }
     }
     if (rateLimitUntil > Date.now() && !(await waitForDelay(rateLimitUntil - Date.now()))) {
-      abortAutomaticRuns();
       await drainRuns();
       return;
     }
@@ -394,7 +387,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         })),
       ]) {
         if (options.signal?.aborted) {
-          abortAutomaticRuns();
           await drainRuns();
           return;
         }
@@ -426,7 +418,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             if (!(await hasPendingManualRequest(target.sha))) continue;
           }
           if (options.signal?.aborted) {
-            abortAutomaticRuns();
             await drainRuns();
             return;
           }
@@ -542,7 +533,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             continue;
           }
           if (options.signal?.aborted) {
-            abortAutomaticRuns();
             await drainRuns();
             return;
           }
@@ -587,12 +577,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       return;
     }
     if (!(await waitForDelay(intervalSeconds * 1_000))) {
-      abortAutomaticRuns();
       await drainRuns();
       return;
     }
   } while (!options.signal?.aborted);
-  abortAutomaticRuns();
   await drainRuns();
 }
 
