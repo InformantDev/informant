@@ -556,7 +556,8 @@ describe("serve polling orchestration", () => {
     deps.repositoryConfig = async () => tagConfig;
     await serve(repository, { once: true, dependencies: deps });
     expect(events).toEqual(["tag:v4:old", "tag:v4:new"]);
-    expect(signals).toEqual([undefined, undefined]);
+    expect(signals).toHaveLength(2);
+    expect(signals.every((signal) => signal?.aborted === false)).toBe(true);
     expect(state.pendingTags).toEqual([]);
   });
 
@@ -676,8 +677,7 @@ describe("serve polling orchestration", () => {
     });
 
     await server;
-    expect(signals[1]?.aborted).toBe(true);
-    expect(signals[1]?.reason).toBe("Server shutdown requested.");
+    expect(signals[1]?.aborted).toBe(false);
   });
 
   test("cancels an automatic build when its pull request is no longer open", async () => {
@@ -742,8 +742,9 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal?.aborted).toBe(true);
   });
 
-  test("aborts automatic runs before draining during shutdown", async () => {
+  test("drains automatic runs without cancelling them during shutdown", async () => {
     const outer = new AbortController();
+    const run = deferred<BuildRecord | false | undefined>();
     let receivedSignal: AbortSignal | undefined;
     const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
 
@@ -754,19 +755,46 @@ describe("serve polling orchestration", () => {
         { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
-          return new Promise((resolve) => {
-            signal?.addEventListener("abort", () => resolve(undefined), { once: true });
-          });
+          return run.promise;
+        },
+        async () => {
+          outer.abort();
+          await Promise.resolve();
+          expect(receivedSignal?.aborted).toBe(false);
+          run.resolve(undefined);
+        },
+      ),
+    });
+
+    expect(receivedSignal?.aborted).toBe(false);
+  });
+
+  test("cancels automatic runs that exceed the graceful shutdown deadline", async () => {
+    const outer = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
+
+    await serve(repository, {
+      signal: outer.signal,
+      shutdownTimeoutMs: 0,
+      dependencies: dependencies(
+        client,
+        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
+          receivedSignal = signal;
+          return new Promise((resolve) =>
+            signal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+          );
         },
         async () => outer.abort(),
       ),
     });
 
     expect(receivedSignal?.aborted).toBe(true);
-    expect(receivedSignal?.reason).toBe("Server shutdown requested.");
+    expect(receivedSignal?.reason).toBe("Graceful worker shutdown timed out.");
   });
 
-  test("interrupts the polling interval to abort automatic runs on shutdown", async () => {
+  test("interrupts the polling interval and drains automatic runs on shutdown", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;
     let releaseSleep!: () => void;
@@ -781,7 +809,6 @@ describe("serve polling orchestration", () => {
         { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
-          signal?.addEventListener("abort", () => runSettled.resolve(undefined), { once: true });
           return runSettled.promise;
         },
         async () => sleepStarted,
@@ -791,11 +818,13 @@ describe("serve polling orchestration", () => {
     await Promise.resolve();
     while (!receivedSignal) await Promise.resolve();
     outer.abort();
+    await Promise.resolve();
+    expect(receivedSignal.aborted).toBe(false);
+    runSettled.resolve(undefined);
     await server;
     releaseSleep();
 
-    expect(receivedSignal.aborted).toBe(true);
-    expect(receivedSignal.reason).toBe("Server shutdown requested.");
+    expect(receivedSignal.aborted).toBe(false);
   });
 
   test("does not claim automatic work when shutdown arrives during config loading", async () => {
@@ -865,7 +894,7 @@ describe("serve polling orchestration", () => {
     expect(launches).toBe(0);
   });
 
-  test("does not pass an automatic-lane signal to comment runs", async () => {
+  test("does not cancel comment runs during normal draining", async () => {
     const state: PollState = {
       cursor: "2026-01-01T00:00:00.000Z",
       pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
@@ -881,8 +910,38 @@ describe("serve polling orchestration", () => {
       }),
     });
 
-    expect(receivedSignal).toBeUndefined();
+    expect(receivedSignal?.aborted).toBe(false);
     expect(state.pending).toEqual([]);
+  });
+
+  test("cancels comment runs that exceed the graceful shutdown deadline", async () => {
+    const outer = new AbortController();
+    const state: PollState = {
+      cursor: "2026-01-01T00:00:00.000Z",
+      pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
+      seenCommentIds: [42],
+      pendingTags: [],
+    };
+    let receivedSignal: AbortSignal | undefined;
+
+    await serve(repository, {
+      signal: outer.signal,
+      shutdownTimeoutMs: 0,
+      dependencies: dependencies(
+        github({}),
+        state,
+        async (...args) => {
+          receivedSignal = args[7];
+          return new Promise((resolve) =>
+            receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+          );
+        },
+        async () => outer.abort(),
+      ),
+    });
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(receivedSignal?.reason).toBe("Graceful worker shutdown timed out.");
   });
 
   test("retains retryable comments and removes successful comments after draining", async () => {

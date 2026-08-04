@@ -6,6 +6,8 @@ import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 
 const LABEL = "dev.informant.worker";
+const GRACEFUL_RESTART_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const RESTART_POLL_INTERVAL_MS = 1_000;
 
 function escapeXml(value: string): string {
   return value
@@ -53,6 +55,8 @@ ${environmentXml}
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>86400</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>SoftResourceLimits</key>
@@ -75,6 +79,29 @@ function launchDomain(configuredUid?: number): string {
   return `gui/${uid}`;
 }
 
+function servicePid(output: string): number | undefined {
+  const pid = Number(output.match(/\bpid = (\d+)/)?.[1]);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+export function parseStartupEnvironment(output: string): Record<string, string> {
+  let value: unknown;
+  try {
+    value = JSON.parse(output);
+  } catch {
+    throw new Error("could not preserve Informant startup environment: invalid property list");
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.values(value).some((item) => typeof item !== "string")
+  ) {
+    throw new Error("could not preserve Informant startup environment: invalid property list");
+  }
+  return value as Record<string, string>;
+}
+
 function startupEnvironment(): Record<string, string> {
   const environment: Record<string, string> = {
     HOME: homedir(),
@@ -86,9 +113,7 @@ function startupEnvironment(): Record<string, string> {
   return environment;
 }
 
-export async function enableStartup(): Promise<string> {
-  if (process.platform !== "darwin")
-    throw new Error("startup services are supported only on macOS");
+async function writeStartupServiceDefinition(environment = startupEnvironment()): Promise<string> {
   const executable = Bun.which("informant");
   if (!executable) {
     throw new Error("informant must be installed on PATH before enabling startup");
@@ -97,8 +122,39 @@ export async function enableStartup(): Promise<string> {
   const logs = dataDirectory();
   await mkdir(dirname(path), { recursive: true });
   await mkdir(logs, { recursive: true });
-  await Bun.write(path, renderStartupService(executable, startupEnvironment(), logs));
+  await Bun.write(path, renderStartupService(executable, environment, logs));
   await chmod(path, 0o600);
+  return path;
+}
+
+async function migrateStartupServiceDefinition(
+  runCommand = command,
+  writeDefinition: (
+    environment: Record<string, string>,
+  ) => Promise<unknown> = writeStartupServiceDefinition,
+): Promise<unknown> {
+  const path = startupServicePath();
+  const captured = await runCommand([
+    "plutil",
+    "-extract",
+    "EnvironmentVariables",
+    "json",
+    "-o",
+    "-",
+    path,
+  ]);
+  if (captured.exitCode !== 0) {
+    throw new Error(
+      `could not preserve Informant startup environment: ${captured.stderr.trim() || `exit ${captured.exitCode}`}`,
+    );
+  }
+  return writeDefinition(parseStartupEnvironment(captured.stdout));
+}
+
+export async function enableStartup(): Promise<string> {
+  if (process.platform !== "darwin")
+    throw new Error("startup services are supported only on macOS");
+  const path = await writeStartupServiceDefinition();
 
   const domain = launchDomain();
   await command(["launchctl", "bootout", domain, path]);
@@ -126,6 +182,9 @@ export async function updateInformant(
     platform?: string;
     uid?: number;
     onOutput?: (text: string) => Promise<void> | void;
+    sleep?: (milliseconds: number) => Promise<unknown>;
+    restartTimeoutMs?: number;
+    writeStartupService?: (environment: Record<string, string>) => Promise<unknown>;
   } = {},
 ): Promise<{ restarted: boolean }> {
   if ((options.platform ?? process.platform) !== "darwin")
@@ -133,7 +192,8 @@ export async function updateInformant(
   const run = options.command ?? command;
   const domain = launchDomain(options.uid);
   const service = `${domain}/${LABEL}`;
-  const loaded = (await run(["launchctl", "print", service])).exitCode === 0;
+  const initialService = await run(["launchctl", "print", service]);
+  const loaded = initialService.exitCode === 0;
   const upgraded = await run(["brew", "upgrade", "informant-ci/tap/informant"], {
     onOutput: options.onOutput,
   });
@@ -143,11 +203,32 @@ export async function updateInformant(
     );
   }
   if (!loaded) return { restarted: false };
-  const restarted = await run(["launchctl", "kickstart", "-k", service]);
+  const currentService = await run(["launchctl", "print", service]);
+  const previousPid = currentService.exitCode === 0 ? servicePid(currentService.stdout) : undefined;
+  await migrateStartupServiceDefinition(run, options.writeStartupService);
+  const restartCommand = previousPid
+    ? ["kill", "-TERM", String(previousPid)]
+    : ["launchctl", "kickstart", service];
+  const restarted = await run(restartCommand);
   if (restarted.exitCode !== 0) {
     throw new Error(
       `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,
     );
   }
-  return { restarted: true };
+  const timeoutMs = options.restartTimeoutMs ?? GRACEFUL_RESTART_TIMEOUT_MS;
+  const sleep = options.sleep ?? Bun.sleep;
+  let elapsed = 0;
+  while (true) {
+    const current = await run(["launchctl", "print", service]);
+    const currentPid = current.exitCode === 0 ? servicePid(current.stdout) : undefined;
+    if (currentPid && (!previousPid || currentPid !== previousPid)) return { restarted: true };
+    if (elapsed >= timeoutMs) break;
+    const delay = Math.min(RESTART_POLL_INTERVAL_MS, timeoutMs - elapsed);
+    await sleep(delay);
+    elapsed += delay;
+  }
+  if (previousPid) await run(["kill", "-KILL", String(previousPid)]);
+  throw new Error(
+    `Informant was updated but its graceful restart did not complete within ${Math.ceil(timeoutMs / 1_000)} seconds`,
+  );
 }

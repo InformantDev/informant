@@ -21,6 +21,7 @@ const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
 const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 24 * 60 * 60_000;
 
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
@@ -42,6 +43,7 @@ export interface ServerOptions {
   signal?: AbortSignal;
   onMessage?: (message: string) => void;
   onIdle?: () => Promise<void> | void;
+  shutdownTimeoutMs?: number;
   dependencies?: ServerDependencies;
 }
 
@@ -187,6 +189,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const configs = new Map<string, ReturnType<typeof repositoryConfig>>();
   const inFlightRuns = new Map<string, Promise<void>>();
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
+  const shutdownControllers = new Set<AbortController>();
   const completedComments = new Set<number>();
   const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
@@ -214,10 +217,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     return error instanceof Error ? error.message : String(error);
   };
-  const abortAutomaticRuns = () => {
-    for (const { controller } of automaticLanes.values()) {
-      controller.abort("Server shutdown requested.");
+  const abortInFlightRuns = () => {
+    for (const controller of shutdownControllers) {
+      controller.abort("Graceful worker shutdown timed out.");
     }
+    shutdownControllers.clear();
     automaticLanes.clear();
   };
   const waitForDelay = async (milliseconds: number) => {
@@ -252,6 +256,22 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       for (const id of completedTagEvents) completedTags.delete(id);
     }
   };
+  const drainForShutdown = async () => {
+    const draining = drainRuns();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<false>((resolve) => {
+      timeout = setTimeout(
+        () => resolve(false),
+        options.shutdownTimeoutMs ?? GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+      );
+    });
+    if ((await Promise.race([draining.then(() => true as const), expired])) === true) {
+      if (timeout) clearTimeout(timeout);
+      return;
+    }
+    abortInFlightRuns();
+    await draining;
+  };
   do {
     if (recoveryPending) {
       try {
@@ -263,8 +283,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       }
     }
     if (rateLimitUntil > Date.now() && !(await waitForDelay(rateLimitUntil - Date.now()))) {
-      abortAutomaticRuns();
-      await drainRuns();
+      await drainForShutdown();
       return;
     }
     try {
@@ -394,8 +413,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         })),
       ]) {
         if (options.signal?.aborted) {
-          abortAutomaticRuns();
-          await drainRuns();
+          await drainForShutdown();
           return;
         }
         const previous = automaticLanes.get(target.lane);
@@ -426,15 +444,14 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             if (!(await hasPendingManualRequest(target.sha))) continue;
           }
           if (options.signal?.aborted) {
-            abortAutomaticRuns();
-            await drainRuns();
+            await drainForShutdown();
             return;
           }
           const controller = new AbortController();
           if (!("tag" in target)) {
             automaticLanes.set(target.lane, { sha: target.sha, controller });
           }
-          const run = executeCommit(
+          const result = executeCommit(
             github,
             repository,
             target.sha,
@@ -445,8 +462,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               ...context,
               id: target.eventId,
             },
-            "tag" in target ? undefined : controller.signal,
-          )
+            controller.signal,
+          );
+          shutdownControllers.add(controller);
+          const run = result
             .then((build) => {
               if (build)
                 message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
@@ -463,6 +482,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(target.eventId);
+              shutdownControllers.delete(controller);
               if (
                 !("tag" in target) &&
                 automaticLanes.get(target.lane)?.controller === controller
@@ -542,11 +562,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             continue;
           }
           if (options.signal?.aborted) {
-            abortAutomaticRuns();
-            await drainRuns();
+            await drainForShutdown();
             return;
           }
-          const run = executeCommit(
+          const controller = new AbortController();
+          const result = executeCommit(
             github,
             repository,
             pending.sha,
@@ -554,7 +574,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             config,
             undefined,
             context,
-          )
+            controller.signal,
+          );
+          shutdownControllers.add(controller);
+          const run = result
             .then((result) => {
               if (result !== false) completedComments.add(pending.id);
             })
@@ -563,6 +586,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(eventId);
+              shutdownControllers.delete(controller);
               idle();
             });
           inFlightRuns.set(eventId, run);
@@ -587,13 +611,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       return;
     }
     if (!(await waitForDelay(intervalSeconds * 1_000))) {
-      abortAutomaticRuns();
-      await drainRuns();
+      await drainForShutdown();
       return;
     }
   } while (!options.signal?.aborted);
-  abortAutomaticRuns();
-  await drainRuns();
+  await drainForShutdown();
 }
 
 export async function serveRepositories(
