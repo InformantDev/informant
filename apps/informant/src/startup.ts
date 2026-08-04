@@ -152,7 +152,6 @@ export async function updateInformant(
   const service = `${domain}/${LABEL}`;
   const initialService = await run(["launchctl", "print", service]);
   const loaded = initialService.exitCode === 0;
-  const previousPid = servicePid(initialService.stdout);
   const upgraded = await run(["brew", "upgrade", "informant-ci/tap/informant"], {
     onOutput: options.onOutput,
   });
@@ -162,6 +161,8 @@ export async function updateInformant(
     );
   }
   if (!loaded) return { restarted: false };
+  const currentService = await run(["launchctl", "print", service]);
+  const previousPid = currentService.exitCode === 0 ? servicePid(currentService.stdout) : undefined;
   if (!previousPid) {
     throw new Error("Informant was updated but its loaded startup service has no running worker");
   }

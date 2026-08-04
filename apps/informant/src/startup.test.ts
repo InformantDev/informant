@@ -42,7 +42,7 @@ describe("startup service", () => {
         invocations.push(argv);
         if (argv[1] === "print") {
           serviceChecks++;
-          return result(0, "", `pid = ${serviceChecks < 4 ? 100 : 200}`);
+          return result(0, "", `pid = ${serviceChecks < 5 ? 100 : 200}`);
         }
         return result();
       },
@@ -61,6 +61,7 @@ describe("startup service", () => {
     expect(invocations).toEqual([
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["brew", "upgrade", "informant-ci/tap/informant"],
+      ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["kill", "-TERM", "100"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
