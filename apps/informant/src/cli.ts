@@ -234,7 +234,7 @@ async function localRun(ref: string, branchOverride?: string, jobs: string[] = [
   }
   const repository = await repositoryFromGit();
   const sha = await requireCommand(["git", "rev-parse", ref]);
-  const branch = await command(["git", "branch", "--show-current"]);
+  const symbolicRef = await requireCommand(["git", "rev-parse", "--symbolic-full-name", ref]);
   const github = new GitHubClient({ repository });
   const config = await configAtGitRef(sha);
   selectJobs(config, jobs);
@@ -244,7 +244,7 @@ async function localRun(ref: string, branchOverride?: string, jobs: string[] = [
   const build = await runLocalCommit(
     repository,
     sha,
-    branchOverride || branch.stdout.trim() || ref,
+    branchOverride || executionLabelFromRef(ref, symbolicRef.trim()),
     config,
     {
       requestedJobs: jobs,
@@ -258,6 +258,10 @@ async function localRun(ref: string, branchOverride?: string, jobs: string[] = [
 
 export function branchNameFromSymbolicRef(ref: string): string | undefined {
   return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
+}
+
+export function executionLabelFromRef(ref: string, symbolicRef: string): string {
+  return branchNameFromSymbolicRef(symbolicRef) || ref;
 }
 
 export function runInvocationType(waitForGitHub: boolean): "local" | "trigger" {
@@ -277,7 +281,7 @@ async function manualTrigger(
   const sha = await requireCommand(["git", "rev-parse", ref]);
   const symbolicRef = await requireCommand(["git", "rev-parse", "--symbolic-full-name", ref]);
   const contextBranch = branchOverride || branchNameFromSymbolicRef(symbolicRef.trim());
-  const displayBranch = contextBranch || ref;
+  const displayBranch = branchOverride || executionLabelFromRef(ref, symbolicRef.trim());
   const github = new GitHubClient({ repository });
   if (waitForGitHub) await github.waitForCommit(repository, sha);
   const config = await configAtGitRef(sha);

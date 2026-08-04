@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   branchNameFromSymbolicRef,
   cleanOrphanedBuildWorkspacesInBackground,
+  executionLabelFromRef,
   main,
   pruneRuntimeImages,
   runInvocationType,
@@ -29,6 +30,13 @@ test("only local branch refs provide manual trigger branch context", () => {
   expect(branchNameFromSymbolicRef("refs/tags/v1")).toBeUndefined();
   expect(branchNameFromSymbolicRef("abc123")).toBeUndefined();
   expect(branchNameFromSymbolicRef("")).toBeUndefined();
+});
+
+test("execution labels follow the requested ref instead of the checked out branch", () => {
+  expect(executionLabelFromRef("release", "refs/heads/release")).toBe("release");
+  expect(executionLabelFromRef("v1", "refs/tags/v1")).toBe("v1");
+  expect(executionLabelFromRef("abc123", "")).toBe("abc123");
+  expect(executionLabelFromRef("HEAD", "refs/heads/main")).toBe("main");
 });
 
 test("the previous hook invocation remains a reported trigger", () => {
