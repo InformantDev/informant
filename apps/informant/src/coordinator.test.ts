@@ -192,11 +192,15 @@ describe("runCommit", () => {
     const capabilityConfig: InformantConfig = {
       ...config,
       jobs: [
-        { ...baseJob, runsOn: ["linux", "x64"], runtime: { type: "host" } },
+        {
+          ...baseJob,
+          runsOn: [process.platform, process.arch],
+          runtime: { type: "host" },
+        },
         {
           ...baseJob,
           name: "gpu-test",
-          runsOn: ["linux", "x64", "gpu"],
+          runsOn: [process.platform, process.arch, "gpu"],
           runtime: { type: "host" },
         },
       ],
