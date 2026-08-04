@@ -219,32 +219,46 @@ export async function withImageLock<T>(
   const directory = join(dataDirectory(), "locks");
   const path = join(directory, `${image}.lock`);
   await mkdir(directory, { recursive: true });
+  const token = `${process.pid}:${crypto.randomUUID()}`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   for (let attempt = 0; ; attempt++) {
     signal?.throwIfAborted();
     try {
       handle = await open(path, "wx", 0o600);
-      await handle.writeFile(`${process.pid}\n`);
+      await handle.writeFile(`${token}\n`);
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const owner = Number.parseInt(
-        await Bun.file(path)
-          .text()
-          .catch(() => ""),
-        10,
-      );
+      const observed = await Bun.file(path)
+        .text()
+        .catch(() => "");
+      const owner = Number.parseInt(observed, 10);
+      let stale = false;
       if (Number.isSafeInteger(owner) && owner > 0) {
         try {
           process.kill(owner, 0);
         } catch (processError) {
-          if ((processError as NodeJS.ErrnoException).code === "ESRCH") {
-            await rm(path, { force: true });
-            continue;
-          }
+          stale = (processError as NodeJS.ErrnoException).code === "ESRCH";
         }
-      } else if (attempt >= 5) {
-        await rm(path, { force: true });
+      } else stale = attempt >= 5;
+      if (stale) {
+        const reclaimPath = `${path}.reclaim-${digest(observed)}`;
+        let reclaim: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          reclaim = await open(reclaimPath, "wx", 0o600);
+          if (
+            (await Bun.file(path)
+              .text()
+              .catch(() => "")) === observed
+          ) {
+            await rm(path, { force: true });
+          }
+        } catch (reclaimError) {
+          if ((reclaimError as NodeJS.ErrnoException).code !== "EEXIST") throw reclaimError;
+        } finally {
+          await reclaim?.close();
+          if (reclaim) await rm(reclaimPath, { force: true });
+        }
         continue;
       }
     }
@@ -255,7 +269,15 @@ export async function withImageLock<T>(
     return await callback();
   } finally {
     await handle?.close();
-    await rm(path, { force: true });
+    if (
+      (
+        await Bun.file(path)
+          .text()
+          .catch(() => "")
+      ).trim() === token
+    ) {
+      await rm(path, { force: true });
+    }
   }
 }
 

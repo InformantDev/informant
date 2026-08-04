@@ -30,7 +30,7 @@ import {
   linuxWorkspaceCopyCommand,
   raiseFileDescriptorLimit,
 } from "./tart/layout.ts";
-import { digest, sshCommand } from "./tart/vm.ts";
+import { digest, sshCommand, withImageLock } from "./tart/vm.ts";
 import type { InformantConfig } from "./types.ts";
 
 const job = (
@@ -735,6 +735,31 @@ test("job event lines timestamp lifecycle changes without changing command outpu
   expect(jobEventLine("test", "finished (success)", timestamp, "exit 0")).toBe(
     "[2026-07-26T12:34:56.789Z] [test] finished (success, exit 0)\n",
   );
+});
+
+test("stale image lock reclamation cannot admit concurrent successors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-lock-"));
+  const previous = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = root;
+  await mkdir(join(root, "locks"), { recursive: true });
+  await Bun.write(join(root, "locks", "shared.lock"), "999999999:stale\n");
+  let active = 0;
+  let maximum = 0;
+  const enter = () =>
+    withImageLock("shared", async () => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await Bun.sleep(20);
+      active--;
+    });
+  try {
+    await Promise.all([enter(), enter()]);
+    expect(maximum).toBe(1);
+  } finally {
+    if (previous === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = previous;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 describe("job scheduler", () => {

@@ -240,6 +240,41 @@ describe("runCommit", () => {
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
   });
 
+  test("retries the event when any capability partition loses its claim", async () => {
+    let claims = 0;
+    const github = {
+      claim: async () => (++claims === 1 ? { retry: true } : undefined),
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      expect(
+        await runCommit(
+          github,
+          repository,
+          "sha",
+          "main",
+          {
+            ...config,
+            jobs: [
+              { ...baseJob, runsOn: [process.platform, process.arch] },
+              {
+                ...baseJob,
+                name: "gpu-test",
+                runsOn: [process.platform, process.arch, "gpu"],
+              },
+            ],
+          },
+          harness().dependencies,
+          { type: "commit", id: "branch:main:sha", branch: "main" },
+        ),
+      ).toBeFalse();
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
+  });
+
   test("keeps the complete VM job inventory when selecting one manual job", async () => {
     const baseJob = config.jobs[0];
     if (!baseJob) throw new Error("expected test job");

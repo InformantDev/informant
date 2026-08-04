@@ -82,10 +82,8 @@ export async function runCommit(
       ),
     ),
   );
-  return (
-    results.find((result): result is BuildRecord => typeof result === "object") ??
-    (results.includes(false) ? false : undefined)
-  );
+  if (results.includes(false)) return false;
+  return results.find((result): result is BuildRecord => typeof result === "object");
 }
 
 async function runCommitPartition(
