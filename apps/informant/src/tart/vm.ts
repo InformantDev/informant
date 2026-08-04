@@ -244,8 +244,10 @@ export async function withImageLock<T>(
       if (stale) {
         const reclaimPath = `${path}.reclaim`;
         let reclaim: Awaited<ReturnType<typeof open>> | undefined;
+        let reclaimed = false;
         try {
           reclaim = await open(reclaimPath, "wx", 0o600);
+          await reclaim.writeFile(`${token}\n`);
           if (
             (await Bun.file(path)
               .text()
@@ -258,14 +260,33 @@ export async function withImageLock<T>(
               if ((renameError as NodeJS.ErrnoException).code !== "ENOENT") throw renameError;
             }
             await rm(stalePath, { force: true });
+            reclaimed = true;
           }
         } catch (reclaimError) {
           if ((reclaimError as NodeJS.ErrnoException).code !== "EEXIST") throw reclaimError;
+          const observedReclaim = await Bun.file(reclaimPath)
+            .text()
+            .catch(() => "");
+          const reclaimOwner = Number.parseInt(observedReclaim, 10);
+          if (Number.isSafeInteger(reclaimOwner) && reclaimOwner > 0) {
+            try {
+              process.kill(reclaimOwner, 0);
+            } catch (ownerError) {
+              if (
+                (ownerError as NodeJS.ErrnoException).code === "ESRCH" &&
+                (await Bun.file(reclaimPath)
+                  .text()
+                  .catch(() => "")) === observedReclaim
+              ) {
+                await rm(reclaimPath, { force: true });
+              }
+            }
+          }
         } finally {
           await reclaim?.close();
           if (reclaim) await rm(reclaimPath, { force: true });
         }
-        continue;
+        if (reclaimed) continue;
       }
     }
     if (attempt >= 600) throw new Error(`timed out waiting for prepared image lock: ${image}`);

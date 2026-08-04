@@ -772,6 +772,26 @@ test("stale image lock reclamation cannot admit concurrent successors", async ()
   }
 });
 
+test("stale image lock reclamation recovers an orphaned reclaim lease", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-lock-"));
+  const previous = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = root;
+  await mkdir(join(root, "locks"), { recursive: true });
+  await Bun.write(join(root, "locks", "shared.lock"), "999999999:stale\n");
+  await Bun.write(join(root, "locks", "shared.lock.reclaim"), "999999998:orphaned\n");
+  let entered = false;
+  try {
+    await withImageLock("shared", async () => {
+      entered = true;
+    });
+    expect(entered).toBeTrue();
+  } finally {
+    if (previous === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 describe("job scheduler", () => {
   test("starts independent jobs in parallel", async () => {
     const started: string[] = [];
