@@ -1,6 +1,6 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { selectJobs, selectTriggeredJobs } from "./config.ts";
+import { selectManualJobs, selectTriggeredJobs } from "./config.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
@@ -69,7 +69,7 @@ export async function runCommit(
   if (rerunPullRequest !== undefined) branch = `pull/${rerunPullRequest}`;
   const executionSignal = claim.manualRequest ? undefined : signal;
   config = claim.manualRequest
-    ? selectJobs(config, claim.requestedJobs)
+    ? selectManualJobs(config, claim.requestedJobs, branch)
     : event && event.type !== "manual"
       ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event))
       : config;

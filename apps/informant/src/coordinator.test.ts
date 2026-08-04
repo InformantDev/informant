@@ -542,28 +542,65 @@ describe("runCommit", () => {
     expect(context.updates.find((update) => update.id === 42)?.values.conclusion).toBe("success");
   });
 
-  test("an all-jobs manual request bypasses automatic trigger filters", async () => {
+  test("an all-jobs manual request retains branch trigger filters", async () => {
     const context = harness({ manualRequest: true });
+    const testJob = config.jobs[0];
+    if (!testJob) throw new Error("expected a test job");
     const manualOnly = {
       ...config,
       triggers: [{ event: "commit" as const }],
-      jobs: config.jobs.map((job) => ({ ...job, triggers: [] })),
+      jobs: [
+        ...config.jobs.map((job) => ({ ...job, triggers: [] })),
+        {
+          ...testJob,
+          name: "deploy",
+          triggers: [{ event: "commit" as const, branch: { names: ["main"] } }],
+        },
+      ],
     };
 
     const record = await runCommit(
       context.github,
       repository,
       "sha",
-      "main",
+      "feature",
       manualOnly,
       context.dependencies,
-      { type: "commit", branch: "main", id: "branch:main:sha" },
+      { type: "commit", branch: "feature", id: "branch:feature:sha" },
     );
 
     if (!record) throw new Error("expected a build record");
     expect(record.status).toBe("success");
     expect(record.event?.type).toBe("manual");
     expect(context.jobChecks).toEqual(["test"]);
+  });
+
+  test("an explicitly requested manual job retains its branch trigger filter", async () => {
+    const context = harness({ manualRequest: true, requestedJobs: ["test"] });
+    const branchFiltered = {
+      ...config,
+      jobs: config.jobs.map((job) => ({
+        ...job,
+        triggers: [{ event: "commit" as const, branch: { names: ["main"] } }],
+      })),
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "feature",
+      branchFiltered,
+      context.dependencies,
+      { type: "manual", id: "sha" },
+    );
+
+    expect(record).toBeUndefined();
+    expect(context.jobChecks).toEqual([]);
+    expect(context.updates.at(-1)?.values).toMatchObject({
+      conclusion: "neutral",
+      title: "No jobs matched",
+    });
   });
 
   test("cancels created job checks when later check creation fails", async () => {

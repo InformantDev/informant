@@ -45,6 +45,26 @@ export function selectJobs(config: InformantConfig, requested: string[]): Inform
   return { ...config, jobs: config.jobs.filter((job) => selected.has(job.name)) };
 }
 
+export function selectManualJobs(
+  config: InformantConfig,
+  requested: string[],
+  branch: string,
+): InformantConfig {
+  if (requested.length) selectJobs(config, requested);
+  const requestedNames = requested.length ? new Set(requested) : undefined;
+  const roots = config.jobs
+    .filter((job) => !requestedNames || requestedNames.has(job.name))
+    .filter((job) => {
+      const triggers = job.triggers ?? config.triggers ?? [];
+      return (
+        triggers.length === 0 ||
+        triggers.some((rule) => !rule.branch || rule.branch.names.includes(branch))
+      );
+    })
+    .map((job) => job.name);
+  return roots.length ? selectJobs(config, roots) : { ...config, jobs: [] };
+}
+
 export function selectTriggeredJobs(
   config: InformantConfig,
   matches: (rule: TriggerRule) => boolean,

@@ -159,7 +159,9 @@ closed PR. Fork PR heads are not executed.
 Jobs inherit top-level triggers. A job's own `triggers` replaces them; `triggers = []` makes it manual-
 or dependency-only. Matching rules are ORed, and dependencies of matching root jobs are always added.
 Legacy `branches` still becomes commit branch rules (default `main`), but cannot be combined with
-top-level `triggers`. Manual `informant run` ignores trigger eligibility.
+top-level `triggers`. Manual runs ignore event eligibility, but branch filters still apply when
+selecting root jobs; a manual run on another branch cannot select a branch-restricted job as a root.
+Dependencies of selected roots are still added.
 
 ## Prepared runtime images
 
