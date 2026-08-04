@@ -778,6 +778,18 @@ export class GitHubClient {
           (context.label === undefined || context.label === event.label))
       );
     });
+    const requestedJobsFor = (check: CheckRun): string[] => {
+      const request = manualTriggerRequest(check);
+      if (request) return request.jobs;
+      const encoded = check.external_id?.split(":jobs:")[1];
+      if (!encoded) return [];
+      try {
+        const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+        return Array.isArray(value) ? value.map(String) : [];
+      } catch {
+        return [];
+      }
+    };
     const suiteRerun =
       event.type !== "comment" &&
       allRequestedChecks.length === 0 &&
@@ -810,9 +822,7 @@ export class GitHubClient {
         ]
       : [];
     const eligible = eligibleJobs ? new Set(eligibleJobs) : undefined;
-    const queuedJobRequests = requestedChecks.map(
-      (check) => manualTriggerRequest(check)?.jobs ?? [],
-    );
+    const queuedJobRequests = requestedChecks.map(requestedJobsFor);
     const targetedManualJobs = requestedChecks.length
       ? queuedJobRequests.some((jobs) => jobs.length === 0)
         ? []
@@ -967,18 +977,7 @@ export class GitHubClient {
         return legacyOrder || a.id - b.id;
       });
     if (!completed && contenders[0]?.id === candidate.id) {
-      const jobRequests = pendingRequests.map((check) => {
-        const request = manualTriggerRequest(check);
-        if (request) return request.jobs;
-        const encoded = check.external_id?.split(":jobs:")[1];
-        if (!encoded) return [];
-        try {
-          const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
-          return Array.isArray(value) ? value.map(String) : [];
-        } catch {
-          return [];
-        }
-      });
+      const jobRequests = pendingRequests.map(requestedJobsFor);
       const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
         ? []
         : [...new Set(jobRequests.flat())];
