@@ -50,12 +50,17 @@ describe("startup service", () => {
       {
         PATH: "/opt/tools/bin",
         INFORMANT_CONFIG_FILE: '/tmp/config%file".json',
+        INFORMANT_GITHUB_PRIVATE_KEY:
+          "-----BEGIN PRIVATE KEY-----\nline\tvalue\r\n-----END PRIVATE KEY-----",
       },
       "/tmp/informant logs",
     );
 
     expect(service).toContain('ExecStart="/opt/Informant tools/informant" serve');
     expect(service).toContain('Environment="INFORMANT_CONFIG_FILE=/tmp/config%%file\\".json"');
+    expect(service).toContain(
+      'Environment="INFORMANT_GITHUB_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\\nline\\tvalue\\r\\n-----END PRIVATE KEY-----"',
+    );
     expect(service).toContain("Restart=always\nRestartSec=10");
     expect(service).toContain("TimeoutStopSec=24h");
     expect(service).toContain("LimitNOFILE=65536");
