@@ -101,22 +101,46 @@ describe("startup service", () => {
     ]);
   });
 
+  test("starts and verifies a loaded service that temporarily has no worker PID", async () => {
+    const invocations: string[][] = [];
+    let serviceChecks = 0;
+    const updated = await updateInformant({
+      platform: "darwin",
+      uid: 501,
+      command: async (argv) => {
+        invocations.push(argv);
+        if (argv[0] === "plutil") return result(0, "", "{}");
+        if (argv[1] !== "print") return result();
+        serviceChecks++;
+        return result(0, "", serviceChecks === 2 ? "" : `pid = ${serviceChecks === 1 ? 100 : 200}`);
+      },
+      writeStartupService: async () => {},
+    });
+
+    expect(updated).toEqual({ restarted: true });
+    expect(invocations).toContainEqual(["launchctl", "kickstart", "gui/501/dev.informant.worker"]);
+  });
+
   test("fails when the replacement worker does not start before the graceful restart deadline", async () => {
+    const invocations: string[][] = [];
     await expect(
       updateInformant({
         platform: "darwin",
         uid: 501,
-        command: async (argv) =>
-          argv[0] === "plutil"
+        command: async (argv) => {
+          invocations.push(argv);
+          return argv[0] === "plutil"
             ? result(0, "", "{}")
             : argv[1] === "print"
               ? result(0, "", "pid = 100")
-              : result(),
+              : result();
+        },
         sleep: async () => {},
         restartTimeoutMs: 2_000,
         writeStartupService: async () => {},
       }),
     ).rejects.toThrow("graceful restart did not complete within 2 seconds");
+    expect(invocations).toContainEqual(["kill", "-KILL", "100"]);
   });
 
   test("reports Homebrew and service restart failures separately", async () => {

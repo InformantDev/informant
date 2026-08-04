@@ -768,6 +768,31 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal?.aborted).toBe(false);
   });
 
+  test("cancels automatic runs that exceed the graceful shutdown deadline", async () => {
+    const outer = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
+
+    await serve(repository, {
+      signal: outer.signal,
+      shutdownTimeoutMs: 0,
+      dependencies: dependencies(
+        client,
+        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
+          receivedSignal = signal;
+          return new Promise((resolve) =>
+            signal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+          );
+        },
+        async () => outer.abort(),
+      ),
+    });
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(receivedSignal?.reason).toBe("Graceful worker shutdown timed out.");
+  });
+
   test("interrupts the polling interval and drains automatic runs on shutdown", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;

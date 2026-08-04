@@ -21,6 +21,7 @@ const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
 const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 24 * 60 * 60_000;
 
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
@@ -42,6 +43,7 @@ export interface ServerOptions {
   signal?: AbortSignal;
   onMessage?: (message: string) => void;
   onIdle?: () => Promise<void> | void;
+  shutdownTimeoutMs?: number;
   dependencies?: ServerDependencies;
 }
 
@@ -214,6 +216,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     return error instanceof Error ? error.message : String(error);
   };
+  const abortAutomaticRuns = () => {
+    for (const { controller } of automaticLanes.values()) {
+      controller.abort("Graceful worker shutdown timed out.");
+    }
+    automaticLanes.clear();
+  };
   const waitForDelay = async (milliseconds: number) => {
     if (options.signal?.aborted) return false;
     if (!options.signal) {
@@ -246,6 +254,22 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       for (const id of completedTagEvents) completedTags.delete(id);
     }
   };
+  const drainForShutdown = async () => {
+    const draining = drainRuns();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<false>((resolve) => {
+      timeout = setTimeout(
+        () => resolve(false),
+        options.shutdownTimeoutMs ?? GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+      );
+    });
+    if ((await Promise.race([draining.then(() => true as const), expired])) === true) {
+      if (timeout) clearTimeout(timeout);
+      return;
+    }
+    abortAutomaticRuns();
+    await draining;
+  };
   do {
     if (recoveryPending) {
       try {
@@ -257,7 +281,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       }
     }
     if (rateLimitUntil > Date.now() && !(await waitForDelay(rateLimitUntil - Date.now()))) {
-      await drainRuns();
+      await drainForShutdown();
       return;
     }
     try {
@@ -387,7 +411,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         })),
       ]) {
         if (options.signal?.aborted) {
-          await drainRuns();
+          await drainForShutdown();
           return;
         }
         const previous = automaticLanes.get(target.lane);
@@ -418,7 +442,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             if (!(await hasPendingManualRequest(target.sha))) continue;
           }
           if (options.signal?.aborted) {
-            await drainRuns();
+            await drainForShutdown();
             return;
           }
           const controller = new AbortController();
@@ -533,7 +557,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             continue;
           }
           if (options.signal?.aborted) {
-            await drainRuns();
+            await drainForShutdown();
             return;
           }
           const run = executeCommit(
@@ -577,11 +601,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       return;
     }
     if (!(await waitForDelay(intervalSeconds * 1_000))) {
-      await drainRuns();
+      await drainForShutdown();
       return;
     }
   } while (!options.signal?.aborted);
-  await drainRuns();
+  await drainForShutdown();
 }
 
 export async function serveRepositories(

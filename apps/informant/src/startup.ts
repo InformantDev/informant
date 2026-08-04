@@ -205,11 +205,11 @@ export async function updateInformant(
   if (!loaded) return { restarted: false };
   const currentService = await run(["launchctl", "print", service]);
   const previousPid = currentService.exitCode === 0 ? servicePid(currentService.stdout) : undefined;
-  if (!previousPid) {
-    throw new Error("Informant was updated but its loaded startup service has no running worker");
-  }
   await migrateStartupServiceDefinition(run, options.writeStartupService);
-  const restarted = await run(["kill", "-TERM", String(previousPid)]);
+  const restartCommand = previousPid
+    ? ["kill", "-TERM", String(previousPid)]
+    : ["launchctl", "kickstart", service];
+  const restarted = await run(restartCommand);
   if (restarted.exitCode !== 0) {
     throw new Error(
       `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,
@@ -221,12 +221,13 @@ export async function updateInformant(
   while (true) {
     const current = await run(["launchctl", "print", service]);
     const currentPid = current.exitCode === 0 ? servicePid(current.stdout) : undefined;
-    if (currentPid && currentPid !== previousPid) return { restarted: true };
+    if (currentPid && (!previousPid || currentPid !== previousPid)) return { restarted: true };
     if (elapsed >= timeoutMs) break;
     const delay = Math.min(RESTART_POLL_INTERVAL_MS, timeoutMs - elapsed);
     await sleep(delay);
     elapsed += delay;
   }
+  if (previousPid) await run(["kill", "-KILL", String(previousPid)]);
   throw new Error(
     `Informant was updated but its graceful restart did not complete within ${Math.ceil(timeoutMs / 1_000)} seconds`,
   );
