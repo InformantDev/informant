@@ -189,6 +189,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const configs = new Map<string, ReturnType<typeof repositoryConfig>>();
   const inFlightRuns = new Map<string, Promise<void>>();
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
+  const shutdownControllers = new Set<AbortController>();
   const completedComments = new Set<number>();
   const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
@@ -216,10 +217,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     return error instanceof Error ? error.message : String(error);
   };
-  const abortAutomaticRuns = () => {
-    for (const { controller } of automaticLanes.values()) {
+  const abortInFlightRuns = () => {
+    for (const controller of shutdownControllers) {
       controller.abort("Graceful worker shutdown timed out.");
     }
+    shutdownControllers.clear();
     automaticLanes.clear();
   };
   const waitForDelay = async (milliseconds: number) => {
@@ -267,7 +269,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       if (timeout) clearTimeout(timeout);
       return;
     }
-    abortAutomaticRuns();
+    abortInFlightRuns();
     await draining;
   };
   do {
@@ -449,7 +451,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           if (!("tag" in target)) {
             automaticLanes.set(target.lane, { sha: target.sha, controller });
           }
-          const run = executeCommit(
+          const result = executeCommit(
             github,
             repository,
             target.sha,
@@ -460,8 +462,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               ...context,
               id: target.eventId,
             },
-            "tag" in target ? undefined : controller.signal,
-          )
+            controller.signal,
+          );
+          shutdownControllers.add(controller);
+          const run = result
             .then((build) => {
               if (build)
                 message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
@@ -478,6 +482,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(target.eventId);
+              shutdownControllers.delete(controller);
               if (
                 !("tag" in target) &&
                 automaticLanes.get(target.lane)?.controller === controller
@@ -560,7 +565,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             await drainForShutdown();
             return;
           }
-          const run = executeCommit(
+          const controller = new AbortController();
+          const result = executeCommit(
             github,
             repository,
             pending.sha,
@@ -568,7 +574,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             config,
             undefined,
             context,
-          )
+            controller.signal,
+          );
+          shutdownControllers.add(controller);
+          const run = result
             .then((result) => {
               if (result !== false) completedComments.add(pending.id);
             })
@@ -577,6 +586,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(eventId);
+              shutdownControllers.delete(controller);
               idle();
             });
           inFlightRuns.set(eventId, run);

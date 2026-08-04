@@ -556,7 +556,8 @@ describe("serve polling orchestration", () => {
     deps.repositoryConfig = async () => tagConfig;
     await serve(repository, { once: true, dependencies: deps });
     expect(events).toEqual(["tag:v4:old", "tag:v4:new"]);
-    expect(signals).toEqual([undefined, undefined]);
+    expect(signals).toHaveLength(2);
+    expect(signals.every((signal) => signal?.aborted === false)).toBe(true);
     expect(state.pendingTags).toEqual([]);
   });
 
@@ -893,7 +894,7 @@ describe("serve polling orchestration", () => {
     expect(launches).toBe(0);
   });
 
-  test("does not pass an automatic-lane signal to comment runs", async () => {
+  test("does not cancel comment runs during normal draining", async () => {
     const state: PollState = {
       cursor: "2026-01-01T00:00:00.000Z",
       pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
@@ -909,8 +910,38 @@ describe("serve polling orchestration", () => {
       }),
     });
 
-    expect(receivedSignal).toBeUndefined();
+    expect(receivedSignal?.aborted).toBe(false);
     expect(state.pending).toEqual([]);
+  });
+
+  test("cancels comment runs that exceed the graceful shutdown deadline", async () => {
+    const outer = new AbortController();
+    const state: PollState = {
+      cursor: "2026-01-01T00:00:00.000Z",
+      pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
+      seenCommentIds: [42],
+      pendingTags: [],
+    };
+    let receivedSignal: AbortSignal | undefined;
+
+    await serve(repository, {
+      signal: outer.signal,
+      shutdownTimeoutMs: 0,
+      dependencies: dependencies(
+        github({}),
+        state,
+        async (...args) => {
+          receivedSignal = args[7];
+          return new Promise((resolve) =>
+            receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+          );
+        },
+        async () => outer.abort(),
+      ),
+    });
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(receivedSignal?.reason).toBe("Graceful worker shutdown timed out.");
   });
 
   test("retains retryable comments and removes successful comments after draining", async () => {
