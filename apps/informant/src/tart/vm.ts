@@ -1,4 +1,4 @@
-import { mkdir, open, rm } from "node:fs/promises";
+import { mkdir, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { command, requireCommand } from "../process.ts";
 import { dataDirectory } from "../store.ts";
@@ -242,7 +242,7 @@ export async function withImageLock<T>(
         }
       } else stale = attempt >= 5;
       if (stale) {
-        const reclaimPath = `${path}.reclaim-${digest(observed)}`;
+        const reclaimPath = `${path}.reclaim`;
         let reclaim: Awaited<ReturnType<typeof open>> | undefined;
         try {
           reclaim = await open(reclaimPath, "wx", 0o600);
@@ -251,7 +251,13 @@ export async function withImageLock<T>(
               .text()
               .catch(() => "")) === observed
           ) {
-            await rm(path, { force: true });
+            const stalePath = `${path}.stale-${crypto.randomUUID()}`;
+            try {
+              await rename(path, stalePath);
+            } catch (renameError) {
+              if ((renameError as NodeJS.ErrnoException).code !== "ENOENT") throw renameError;
+            }
+            await rm(stalePath, { force: true });
           }
         } catch (reclaimError) {
           if ((reclaimError as NodeJS.ErrnoException).code !== "EEXIST") throw reclaimError;

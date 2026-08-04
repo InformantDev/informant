@@ -745,17 +745,27 @@ test("stale image lock reclamation cannot admit concurrent successors", async ()
   await Bun.write(join(root, "locks", "shared.lock"), "999999999:stale\n");
   let active = 0;
   let maximum = 0;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   const enter = () =>
     withImageLock("shared", async () => {
       active++;
       maximum = Math.max(maximum, active);
-      await Bun.sleep(20);
+      if (active === 1) await blocked;
       active--;
     });
   try {
-    await Promise.all([enter(), enter()]);
+    const successors = [enter(), enter(), enter(), enter()];
+    while (active === 0) await Bun.sleep(10);
+    await Bun.sleep(1_100);
+    expect(maximum).toBe(1);
+    release();
+    await Promise.all(successors);
     expect(maximum).toBe(1);
   } finally {
+    release?.();
     if (previous === undefined) delete Bun.env.INFORMANT_DATA_DIR;
     else Bun.env.INFORMANT_DATA_DIR = previous;
     await rm(root, { recursive: true, force: true });
