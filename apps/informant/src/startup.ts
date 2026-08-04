@@ -6,6 +6,8 @@ import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 
 const LABEL = "dev.informant.worker";
+const GRACEFUL_RESTART_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const RESTART_POLL_INTERVAL_MS = 1_000;
 
 function escapeXml(value: string): string {
   return value
@@ -77,6 +79,11 @@ function launchDomain(configuredUid?: number): string {
   return `gui/${uid}`;
 }
 
+function servicePid(output: string): number | undefined {
+  const pid = Number(output.match(/\bpid = (\d+)/)?.[1]);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
 function startupEnvironment(): Record<string, string> {
   const environment: Record<string, string> = {
     HOME: homedir(),
@@ -128,6 +135,8 @@ export async function updateInformant(
     platform?: string;
     uid?: number;
     onOutput?: (text: string) => Promise<void> | void;
+    sleep?: (milliseconds: number) => Promise<unknown>;
+    restartTimeoutMs?: number;
   } = {},
 ): Promise<{ restarted: boolean }> {
   if ((options.platform ?? process.platform) !== "darwin")
@@ -135,7 +144,9 @@ export async function updateInformant(
   const run = options.command ?? command;
   const domain = launchDomain(options.uid);
   const service = `${domain}/${LABEL}`;
-  const loaded = (await run(["launchctl", "print", service])).exitCode === 0;
+  const initialService = await run(["launchctl", "print", service]);
+  const loaded = initialService.exitCode === 0;
+  const previousPid = servicePid(initialService.stdout);
   const upgraded = await run(["brew", "upgrade", "informant-ci/tap/informant"], {
     onOutput: options.onOutput,
   });
@@ -151,5 +162,19 @@ export async function updateInformant(
       `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,
     );
   }
-  return { restarted: true };
+  const timeoutMs = options.restartTimeoutMs ?? GRACEFUL_RESTART_TIMEOUT_MS;
+  const sleep = options.sleep ?? Bun.sleep;
+  let elapsed = 0;
+  while (true) {
+    const current = await run(["launchctl", "print", service]);
+    const currentPid = current.exitCode === 0 ? servicePid(current.stdout) : undefined;
+    if (currentPid && currentPid !== previousPid) return { restarted: true };
+    if (elapsed >= timeoutMs) break;
+    const delay = Math.min(RESTART_POLL_INTERVAL_MS, timeoutMs - elapsed);
+    await sleep(delay);
+    elapsed += delay;
+  }
+  throw new Error(
+    `Informant was updated but its graceful restart did not complete within ${Math.ceil(timeoutMs / 1_000)} seconds`,
+  );
 }

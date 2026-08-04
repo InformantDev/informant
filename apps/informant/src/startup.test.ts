@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import type { CommandResult } from "./process.ts";
 import { renderStartupService, updateInformant } from "./startup.ts";
 
-const result = (exitCode = 0, stderr = ""): CommandResult => ({
+const result = (exitCode = 0, stderr = "", stdout = ""): CommandResult => ({
   exitCode,
-  stdout: "",
+  stdout,
   stderr,
   timedOut: false,
 });
@@ -32,20 +32,34 @@ describe("startup service", () => {
 
   test("updates through Homebrew and restarts a loaded service", async () => {
     const invocations: string[][] = [];
+    let serviceChecks = 0;
+    let sleeps = 0;
     const updated = await updateInformant({
       platform: "darwin",
       uid: 501,
       command: async (argv) => {
         invocations.push(argv);
+        if (argv[1] === "print") {
+          serviceChecks++;
+          return result(0, "", `pid = ${serviceChecks < 4 ? 100 : 200}`);
+        }
         return result();
       },
+      sleep: async () => {
+        sleeps++;
+      },
+      restartTimeoutMs: 5_000,
     });
 
     expect(updated).toEqual({ restarted: true });
+    expect(sleeps).toBe(2);
     expect(invocations).toEqual([
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["brew", "upgrade", "informant-ci/tap/informant"],
       ["launchctl", "kill", "SIGTERM", "gui/501/dev.informant.worker"],
+      ["launchctl", "print", "gui/501/dev.informant.worker"],
+      ["launchctl", "print", "gui/501/dev.informant.worker"],
+      ["launchctl", "print", "gui/501/dev.informant.worker"],
     ]);
   });
 
@@ -67,13 +81,25 @@ describe("startup service", () => {
     ]);
   });
 
+  test("fails when the replacement worker does not start before the graceful restart deadline", async () => {
+    await expect(
+      updateInformant({
+        platform: "darwin",
+        uid: 501,
+        command: async (argv) => (argv[1] === "print" ? result(0, "", "pid = 100") : result()),
+        sleep: async () => {},
+        restartTimeoutMs: 2_000,
+      }),
+    ).rejects.toThrow("graceful restart did not complete within 2 seconds");
+  });
+
   test("reports Homebrew and service restart failures separately", async () => {
     await expect(
       updateInformant({
         platform: "darwin",
         uid: 501,
         command: async (argv) =>
-          argv[0] === "brew" ? result(1, "formula is not installed") : result(),
+          argv[0] === "brew" ? result(1, "formula is not installed") : result(0, "", "pid = 100"),
       }),
     ).rejects.toThrow("could not update Informant with Homebrew: formula is not installed");
 
@@ -81,7 +107,8 @@ describe("startup service", () => {
       updateInformant({
         platform: "darwin",
         uid: 501,
-        command: async (argv) => (argv[1] === "kill" ? result(1, "service unavailable") : result()),
+        command: async (argv) =>
+          argv[1] === "kill" ? result(1, "service unavailable") : result(0, "", "pid = 100"),
       }),
     ).rejects.toThrow(
       "Informant was updated but its service could not be restarted: service unavailable",
