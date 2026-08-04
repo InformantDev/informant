@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  aggregatePartitionResults,
   type CoordinatorDependencies,
   readLogTail,
   runCommit,
@@ -282,6 +283,21 @@ describe("runCommit", () => {
     } finally {
       delete Bun.env.INFORMANT_CAPABILITIES;
     }
+  });
+
+  test("returns a failed record when any capability partition fails", () => {
+    const record = (status: BuildRecord["status"]): BuildRecord => ({
+      id: status,
+      repo: repository.fullName,
+      sha: "sha",
+      branch: "main",
+      machine: "worker",
+      startedAt: "2026-08-04T00:00:00Z",
+      status,
+      logPath: `/tmp/${status}.log`,
+    });
+    const result = aggregatePartitionResults([record("success"), record("failure")]);
+    expect(typeof result === "object" ? result.status : result).toBe("failure");
   });
 
   test("keeps the complete VM job inventory when selecting one manually triggered job", async () => {

@@ -42,6 +42,18 @@ const defaultDependencies: CoordinatorDependencies = {
   readLogTail,
 };
 
+export function aggregatePartitionResults(
+  results: Array<BuildRecord | false | undefined>,
+): BuildRecord | false | undefined {
+  if (results.includes(false)) return false;
+  const records = results.filter((result): result is BuildRecord => typeof result === "object");
+  return (
+    records.find((record) => record.status === "failure") ??
+    records.find((record) => record.status === "cancelled") ??
+    records[0]
+  );
+}
+
 export async function runLocalCommit(
   repository: Repository,
   sha: string,
@@ -159,8 +171,7 @@ export async function runCommit(
       ),
     ),
   );
-  if (results.includes(false)) return false;
-  return results.find((result): result is BuildRecord => typeof result === "object");
+  return aggregatePartitionResults(results);
 }
 
 async function runCommitPartition(

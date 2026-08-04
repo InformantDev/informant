@@ -245,6 +245,26 @@ describe("configuration", () => {
     expect(() => parseConfig(source.replace('runs_on = ["linux", "x64"]\n', ""))).toThrow(
       "jobs[0].runs_on is required for host jobs",
     );
+    expect(() =>
+      parseConfig(
+        source.replace("cache = []", 'cache = [{ paths = ["~/.cache/tool"], shared = true }]'),
+      ),
+    ).toThrow("jobs[0].cache is not supported for host jobs");
+    expect(() =>
+      parseConfig(
+        configTemplate()
+          .replace(
+            '[container]\nimage = "oven/bun:1"',
+            'cache = [{ paths = ["~/.cache/tool"], shared = true }]\n[container]\nimage = "oven/bun:1"',
+          )
+          .replace('command = "bun install --frozen-lockfile && bun test"', 'command = "test"')
+          .replace('name = "test"', 'name = "host-test"')
+          .replace(
+            'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
+            'runs_on = ["linux", "x64"]\nhost = {}',
+          ),
+      ),
+    ).toThrow("jobs[0].cache is not supported for host jobs");
   });
 
   test("container preparation can be inherited and overridden per job", () => {

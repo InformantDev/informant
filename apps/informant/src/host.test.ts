@@ -40,3 +40,35 @@ test("runs a host job in its disposable checkout with an isolated home", async (
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+test("rejects untrusted commits before executing a host job", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-host-"));
+  try {
+    await expect(
+      runOnHost(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "untrusted",
+        "feature",
+        "trusted",
+        workspace,
+        {
+          name: "test",
+          command: "touch executed",
+          optional: false,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          needs: [],
+          runsOn: ["linux"],
+          runtime: { type: "host" },
+        },
+        async () => {},
+        async () => {},
+        {},
+      ),
+    ).rejects.toThrow("host jobs require a trusted commit");
+    expect(await Bun.file(join(workspace, "executed")).exists()).toBeFalse();
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});

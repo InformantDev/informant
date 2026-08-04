@@ -17,6 +17,7 @@ export async function runOnHost(
   signal?: AbortSignal,
 ) {
   if (job.runtime?.type !== "host") throw new Error("host runner requires a host runtime");
+  if (sha !== trustedSha) throw new Error("host jobs require a trusted commit");
   if ((job.cache?.length ?? 0) > 0)
     throw new Error("persistent caches are not supported by the host runtime");
   const home = join(workspace, ".informant-home");

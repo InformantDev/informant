@@ -501,6 +501,9 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
           : job.vm !== undefined
             ? parseVm(runtimeTable(job.vm, `jobs[${index}].vm`), `jobs[${index}].vm`, vm)
             : defaultRuntime;
+    if (runtime.type === "host" && (cache?.length ?? 0) > 0) {
+      throw new Error(`jobs[${index}].cache is not supported for host jobs`);
+    }
     const runsOn = job.runs_on ?? (runtime.type === "host" ? undefined : ["darwin", "arm64"]);
     if (runtime.type === "host" && runsOn === undefined) {
       throw new Error(`jobs[${index}].runs_on is required for host jobs`);
