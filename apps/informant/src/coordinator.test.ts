@@ -88,6 +88,7 @@ function harness(
   };
   let nextCheckId = 100;
   const github = {
+    hasPendingManualTrigger: async () => options.manualTrigger ?? false,
     claim: async () =>
       options.claim === false
         ? undefined
@@ -182,7 +183,161 @@ function harness(
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe("runCommit", () => {
+  test("does not claim another suite until the worker has an available run slot", async () => {
+    const first = harness();
+    const second = harness();
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const firstRun = first.dependencies.runInTart;
+    first.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return firstRun(...args);
+    };
+    let secondClaims = 0;
+    const secondClaim = second.github.claim.bind(second.github);
+    second.github.claim = async (...args) => {
+      secondClaims++;
+      return secondClaim(...args);
+    };
+
+    const firstBuild = runCommit(
+      first.github,
+      repository,
+      "first-sha",
+      "main",
+      config,
+      first.dependencies,
+    );
+    await entered.promise;
+    const secondBuild = runCommit(
+      second.github,
+      repository,
+      "second-sha",
+      "feature",
+      config,
+      second.dependencies,
+    );
+    await Bun.sleep(0);
+
+    expect(secondClaims).toBe(0);
+    expect(second.jobChecks).toEqual([]);
+
+    blocked.resolve();
+    await firstBuild;
+    await secondBuild;
+    expect(secondClaims).toBe(1);
+    expect(second.jobChecks).toEqual(["test"]);
+  });
+
+  test("drops superseded automatic suites while they wait for a run slot", async () => {
+    const first = harness();
+    const superseded = harness();
+    const current = harness();
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const firstRun = first.dependencies.runInTart;
+    first.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return firstRun(...args);
+    };
+    let supersededClaims = 0;
+    const supersededClaim = superseded.github.claim.bind(superseded.github);
+    superseded.github.claim = async (...args) => {
+      supersededClaims++;
+      return supersededClaim(...args);
+    };
+    const controller = new AbortController();
+
+    const firstBuild = runCommit(
+      first.github,
+      repository,
+      "first-sha",
+      "main",
+      config,
+      first.dependencies,
+    );
+    await entered.promise;
+    const oldBuild = runCommit(
+      superseded.github,
+      repository,
+      "old-sha",
+      "feature",
+      config,
+      superseded.dependencies,
+      { type: "commit", id: "branch:feature:old-sha", branch: "feature" },
+      controller.signal,
+    );
+    const currentBuild = runCommit(
+      current.github,
+      repository,
+      "current-sha",
+      "feature",
+      config,
+      current.dependencies,
+    );
+    controller.abort("Superseded by feature@current-sha.");
+
+    expect(await oldBuild).toBeFalse();
+    expect(supersededClaims).toBe(0);
+    blocked.resolve();
+    await Promise.all([firstBuild, currentBuild]);
+    expect(current.jobChecks).toEqual(["test"]);
+  });
+
+  test("preserves a manually triggered suite when it is superseded while waiting", async () => {
+    const first = harness();
+    const manual = harness({ manualTrigger: true });
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const firstRun = first.dependencies.runInTart;
+    first.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return firstRun(...args);
+    };
+    const controller = new AbortController();
+
+    const firstBuild = runCommit(
+      first.github,
+      repository,
+      "first-sha",
+      "main",
+      config,
+      first.dependencies,
+    );
+    await entered.promise;
+    const manualBuild = runCommit(
+      manual.github,
+      repository,
+      "manual-sha",
+      "feature",
+      config,
+      manual.dependencies,
+      { type: "commit", id: "branch:feature:manual-sha", branch: "feature" },
+      controller.signal,
+    );
+    controller.abort("superseded");
+    await Bun.sleep(0);
+    expect(manual.jobChecks).toEqual([]);
+
+    blocked.resolve();
+    await firstBuild;
+    const result = await manualBuild;
+    expect(typeof result === "object" ? result.status : result).toBe("success");
+    expect(manual.jobChecks).toEqual(["test"]);
+  });
+
   test("partitions overlapping worker capabilities into non-overlapping claim scopes", async () => {
     const claims: Array<{ event?: { type: string; id: string }; jobs?: string[] }> = [];
     const github = {

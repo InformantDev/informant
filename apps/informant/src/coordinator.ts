@@ -23,6 +23,64 @@ const CHECK_LOG_CHARACTERS = 55_000;
 const CHECK_LOG_BYTES = CHECK_LOG_CHARACTERS * 4;
 const CHECK_LOG_UPDATE_INTERVAL_MS = 10_000;
 
+interface RunSlotWaiter {
+  signal?: AbortSignal;
+  resolve: (release: (() => void) | undefined) => void;
+  abort?: () => void;
+  checkingAbort: boolean;
+}
+
+let runSlotHeld = false;
+const runSlotWaiters: RunSlotWaiter[] = [];
+
+function dispatchRunSlot(): void {
+  if (runSlotHeld) return;
+  const waiter = runSlotWaiters[0];
+  if (!waiter) {
+    return;
+  }
+  if (waiter.checkingAbort) return;
+  runSlotWaiters.shift();
+  if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
+  runSlotHeld = true;
+  waiter.resolve(releaseRunSlot);
+}
+
+function releaseRunSlot(): void {
+  runSlotHeld = false;
+  dispatchRunSlot();
+}
+
+async function acquireRunSlot(
+  signal?: AbortSignal,
+  preserveOnAbort?: () => Promise<boolean>,
+): Promise<(() => void) | undefined> {
+  if (!runSlotHeld && runSlotWaiters.length === 0) {
+    runSlotHeld = true;
+    return releaseRunSlot;
+  }
+  return new Promise((resolve) => {
+    const waiter: RunSlotWaiter = { signal, resolve, checkingAbort: false };
+    waiter.abort = () => {
+      waiter.checkingAbort = true;
+      void Promise.resolve(preserveOnAbort?.() ?? false)
+        .catch(() => true)
+        .then((preserve) => {
+          waiter.checkingAbort = false;
+          const index = runSlotWaiters.indexOf(waiter);
+          if (index !== -1 && !preserve) {
+            runSlotWaiters.splice(index, 1);
+            resolve(undefined);
+          }
+          dispatchRunSlot();
+        });
+    };
+    signal?.addEventListener("abort", waiter.abort, { once: true });
+    runSlotWaiters.push(waiter);
+    if (signal?.aborted) waiter.abort();
+  });
+}
+
 export async function readLogTail(path: string): Promise<string> {
   const file = Bun.file(path);
   const bytes = new Uint8Array(
@@ -138,6 +196,37 @@ export async function runCommit(
   branch: string,
   config: InformantConfig,
   dependencies: CoordinatorDependencies = defaultDependencies,
+  event?: RunEvent,
+  signal?: AbortSignal,
+): Promise<BuildRecord | false | undefined> {
+  const release = await acquireRunSlot(
+    signal,
+    event ? () => github.hasPendingManualTrigger(repository, sha, event.branch, branch) : undefined,
+  );
+  if (!release) return false;
+  try {
+    return await runCommitWithSlot(
+      github,
+      repository,
+      sha,
+      branch,
+      config,
+      dependencies,
+      event,
+      signal,
+    );
+  } finally {
+    release();
+  }
+}
+
+async function runCommitWithSlot(
+  github: GitHubClient,
+  repository: Repository,
+  sha: string,
+  branch: string,
+  config: InformantConfig,
+  dependencies: CoordinatorDependencies,
   event?: RunEvent,
   signal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
