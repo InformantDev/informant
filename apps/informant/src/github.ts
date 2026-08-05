@@ -517,7 +517,10 @@ export class GitHubClient {
     return checks.filter((check) => check.name === name);
   }
 
-  async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
+  private async jobChecksByClaim(
+    repository: Repository,
+    sha: string,
+  ): Promise<Map<number, CheckRun[]>> {
     await this.authenticate();
     const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
     const checks: CheckRun[] = [];
@@ -528,10 +531,21 @@ export class GitHubClient {
       checks.push(...result.check_runs);
       if (result.check_runs.length < 100) break;
     }
-    const prefix = `informant-job:${claimId}:`;
-    return checks.filter(
-      (check) => check.name.startsWith(JOB_CHECK_PREFIX) && check.external_id?.startsWith(prefix),
-    );
+    const checksByClaim = new Map<number, CheckRun[]>();
+    for (const check of checks) {
+      if (!check.name.startsWith(JOB_CHECK_PREFIX)) continue;
+      const match = check.external_id?.match(/^informant-job:(\d+):/);
+      const claimId = Number(match?.[1]);
+      if (!Number.isSafeInteger(claimId)) continue;
+      const claimChecks = checksByClaim.get(claimId) ?? [];
+      claimChecks.push(check);
+      checksByClaim.set(claimId, claimChecks);
+    }
+    return checksByClaim;
+  }
+
+  async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
+    return (await this.jobChecksByClaim(repository, sha)).get(claimId) ?? [];
   }
 
   async recoverInterruptedCheck(
@@ -828,10 +842,11 @@ export class GitHubClient {
         ? originalPullRequestNumber
         : undefined;
     const latestRerunJobs = new Map<string, CheckRun>();
-    for (const checks of await Promise.all(
-      rerunAggregates.map((aggregate) => this.jobChecks(repository, sha, aggregate.id)),
-    )) {
-      for (const check of checks) {
+    const rerunChecksByClaim = rerunAggregates.length
+      ? await this.jobChecksByClaim(repository, sha)
+      : new Map<number, CheckRun[]>();
+    for (const aggregate of rerunAggregates) {
+      for (const check of rerunChecksByClaim.get(aggregate.id) ?? []) {
         const name = check.name.slice(JOB_CHECK_PREFIX.length);
         if (!latestRerunJobs.has(name)) latestRerunJobs.set(name, check);
       }

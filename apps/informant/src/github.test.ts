@@ -586,6 +586,7 @@ test("interrupted build recovery cancels only correlated children before the agg
 });
 
 test("claim treats a queued failed check suite as a failed-jobs re-run request", async () => {
+  let jobCheckReads = 0;
   const checks: Array<Record<string, unknown>> = [
     {
       id: 0,
@@ -633,6 +634,7 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
       return Response.json({ check_suites: [{ status: "queued" }] });
     }
     if (!new URL(url).searchParams.has("check_name")) {
+      jobCheckReads++;
       return Response.json({
         check_runs: [
           {
@@ -686,6 +688,7 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
   expect(claim?.requestedJobs).toEqual(["deploy", "cleanup", "lint"]);
   expect(claim?.originalPullRequest).toBe(43);
   expect(checks.at(-1)?.external_id).toBe("machine:event:commit:pr:43:abc123");
+  expect(jobCheckReads).toBe(1);
 });
 
 test("claim falls back to all jobs when a queued suite has no failed job history", async () => {
