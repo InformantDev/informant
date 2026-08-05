@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   aggregatePartitionResults,
   type CoordinatorDependencies,
+  partitionJobGraphs,
   readLogTail,
   runCommit,
   runLocalCommit,
@@ -192,6 +193,65 @@ function deferred<T>() {
 }
 
 describe("runCommit", () => {
+  test("partitions independent jobs while keeping dependency graphs together", () => {
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const jobs = [
+      base,
+      { ...base, name: "unit" },
+      { ...base, name: "package", needs: ["unit"] },
+      { ...base, name: "publish", needs: ["package"] },
+    ];
+
+    expect(partitionJobGraphs(jobs).map((partition) => partition.map((job) => job.name))).toEqual([
+      ["test"],
+      ["unit", "package", "publish"],
+    ]);
+  });
+
+  test("claims independent jobs from one suite only as worker capacity becomes available", async () => {
+    const context = harness();
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const runInTart = context.dependencies.runInTart;
+    let executions = 0;
+    context.dependencies.runInTart = async (...args) => {
+      if (++executions === 1) {
+        entered.resolve();
+        await blocked.promise;
+      }
+      return runInTart(...args);
+    };
+    let claims = 0;
+    const claim = context.github.claim.bind(context.github);
+    context.github.claim = async (...args) => {
+      claims++;
+      return claim(...args);
+    };
+    const build = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      { ...config, jobs: [base, { ...base, name: "lint" }] },
+      context.dependencies,
+    );
+
+    await entered.promise;
+    try {
+      await Bun.sleep(0);
+      expect(claims).toBe(1);
+      expect(context.jobChecks).toEqual(["test"]);
+    } finally {
+      blocked.resolve();
+    }
+    await build;
+    expect(claims).toBe(2);
+    expect(context.jobChecks).toEqual(["test", "lint"]);
+  });
+
   test("does not claim another suite until the worker has an available run slot", async () => {
     const first = harness();
     const second = harness();
@@ -295,7 +355,7 @@ describe("runCommit", () => {
     expect(current.jobChecks).toEqual(["test"]);
   });
 
-  test("preserves a manually triggered suite when it is superseded while waiting", async () => {
+  test("manual suites retain their existing claim behavior while automatic work is running", async () => {
     const first = harness();
     const manual = harness({ manualTrigger: true });
     const entered = deferred<void>();
@@ -328,19 +388,18 @@ describe("runCommit", () => {
       controller.signal,
     );
     controller.abort("superseded");
-    await Bun.sleep(0);
-    expect(manual.jobChecks).toEqual([]);
-
-    blocked.resolve();
-    await firstBuild;
     const result = await manualBuild;
     expect(typeof result === "object" ? result.status : result).toBe("success");
     expect(manual.jobChecks).toEqual(["test"]);
+
+    blocked.resolve();
+    await firstBuild;
   });
 
   test("partitions overlapping worker capabilities into non-overlapping claim scopes", async () => {
     const claims: Array<{ event?: { type: string; id: string }; jobs?: string[] }> = [];
     const github = {
+      hasPendingManualTrigger: async () => false,
       claim: async (
         _repository: Repository,
         _sha: string,
@@ -408,6 +467,7 @@ describe("runCommit", () => {
   test("retries the event when any capability partition loses its claim", async () => {
     let claims = 0;
     const github = {
+      hasPendingManualTrigger: async () => false,
       claim: async () => (++claims === 1 ? { retry: true } : undefined),
     } as unknown as GitHubClient;
     const baseJob = config.jobs[0];
@@ -1011,7 +1071,7 @@ describe("runCommit", () => {
           timeoutMinutes: 1,
           environment: {},
           secrets: [],
-          needs: [],
+          needs: ["test"],
         },
       ],
     };

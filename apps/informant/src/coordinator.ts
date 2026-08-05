@@ -27,7 +27,6 @@ interface RunSlotWaiter {
   signal?: AbortSignal;
   resolve: (release: (() => void) | undefined) => void;
   abort?: () => void;
-  checkingAbort: boolean;
 }
 
 let runSlotHeld = false;
@@ -35,12 +34,8 @@ const runSlotWaiters: RunSlotWaiter[] = [];
 
 function dispatchRunSlot(): void {
   if (runSlotHeld) return;
-  const waiter = runSlotWaiters[0];
-  if (!waiter) {
-    return;
-  }
-  if (waiter.checkingAbort) return;
-  runSlotWaiters.shift();
+  const waiter = runSlotWaiters.shift();
+  if (!waiter) return;
   if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
   runSlotHeld = true;
   waiter.resolve(releaseRunSlot);
@@ -51,29 +46,18 @@ function releaseRunSlot(): void {
   dispatchRunSlot();
 }
 
-async function acquireRunSlot(
-  signal?: AbortSignal,
-  preserveOnAbort?: () => Promise<boolean>,
-): Promise<(() => void) | undefined> {
+async function acquireRunSlot(signal?: AbortSignal): Promise<(() => void) | undefined> {
+  if (signal?.aborted) return undefined;
   if (!runSlotHeld && runSlotWaiters.length === 0) {
     runSlotHeld = true;
     return releaseRunSlot;
   }
   return new Promise((resolve) => {
-    const waiter: RunSlotWaiter = { signal, resolve, checkingAbort: false };
+    const waiter: RunSlotWaiter = { signal, resolve };
     waiter.abort = () => {
-      waiter.checkingAbort = true;
-      void Promise.resolve(preserveOnAbort?.() ?? false)
-        .catch(() => true)
-        .then((preserve) => {
-          waiter.checkingAbort = false;
-          const index = runSlotWaiters.indexOf(waiter);
-          if (index !== -1 && !preserve) {
-            runSlotWaiters.splice(index, 1);
-            resolve(undefined);
-          }
-          dispatchRunSlot();
-        });
+      const index = runSlotWaiters.indexOf(waiter);
+      if (index !== -1) runSlotWaiters.splice(index, 1);
+      resolve(undefined);
     };
     signal?.addEventListener("abort", waiter.abort, { once: true });
     runSlotWaiters.push(waiter);
@@ -110,6 +94,34 @@ export function aggregatePartitionResults(
     records.find((record) => record.status === "cancelled") ??
     records[0]
   );
+}
+
+export function partitionJobGraphs(jobs: JobConfig[]): JobConfig[][] {
+  const byName = new Map(jobs.map((job) => [job.name, job]));
+  const neighbors = new Map(jobs.map((job) => [job.name, new Set<string>()]));
+  for (const job of jobs) {
+    for (const dependency of job.needs) {
+      if (!byName.has(dependency)) continue;
+      neighbors.get(job.name)?.add(dependency);
+      neighbors.get(dependency)?.add(job.name);
+    }
+  }
+  const visited = new Set<string>();
+  const partitions: JobConfig[][] = [];
+  for (const job of jobs) {
+    if (visited.has(job.name)) continue;
+    const pending = [job.name];
+    const names = new Set<string>();
+    while (pending.length > 0) {
+      const name = pending.pop();
+      if (!name || visited.has(name)) continue;
+      visited.add(name);
+      names.add(name);
+      pending.push(...(neighbors.get(name) ?? []));
+    }
+    partitions.push(jobs.filter((candidate) => names.has(candidate.name)));
+  }
+  return partitions;
 }
 
 export async function runLocalCommit(
@@ -199,55 +211,62 @@ export async function runCommit(
   event?: RunEvent,
   signal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
-  const release = await acquireRunSlot(
-    signal,
-    event ? () => github.hasPendingManualTrigger(repository, sha, event.branch, branch) : undefined,
-  );
-  if (!release) return false;
-  try {
-    return await runCommitWithSlot(
-      github,
-      repository,
-      sha,
-      branch,
-      config,
-      dependencies,
-      event,
-      signal,
-    );
-  } finally {
-    release();
-  }
-}
-
-async function runCommitWithSlot(
-  github: GitHubClient,
-  repository: Repository,
-  sha: string,
-  branch: string,
-  config: InformantConfig,
-  dependencies: CoordinatorDependencies,
-  event?: RunEvent,
-  signal?: AbortSignal,
-): Promise<BuildRecord | false | undefined> {
   const usesCapabilities = config.jobs.some(
     (job) => (job.runsOn?.length ?? 0) > 0 || job.runtime?.type === "host",
   );
-  if (!usesCapabilities) {
-    return runCommitPartition(github, repository, sha, branch, config, dependencies, event, signal);
+  const manualTrigger =
+    event?.type === "comment"
+      ? false
+      : await github.hasPendingManualTrigger(repository, sha, event?.branch, branch);
+  const hasTriggers =
+    (config.triggers?.length ?? 0) > 0 || config.jobs.some((job) => job.triggers !== undefined);
+  const selected =
+    !manualTrigger && event && hasTriggers
+      ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
+      : config;
+  const capable = usesCapabilities ? selectCapableJobs(selected, workerCapabilities()) : selected;
+  let partitions: JobConfig[][];
+  if (manualTrigger && usesCapabilities) {
+    const byLabels = new Map<string, JobConfig[]>();
+    for (const job of capable.jobs) {
+      const key = [...(job.runsOn ?? [])].sort().join("\0");
+      const jobs = byLabels.get(key) ?? [];
+      jobs.push(job);
+      byLabels.set(key, jobs);
+    }
+    partitions = [...byLabels.values()];
+  } else {
+    partitions = manualTrigger ? [capable.jobs] : partitionJobGraphs(capable.jobs);
   }
-  const capable = selectCapableJobs(config, workerCapabilities());
-  const partitions = new Map<string, JobConfig[]>();
+  const jobsByLabels = new Map<string, JobConfig[]>();
   for (const job of capable.jobs) {
-    const labels = [...(job.runsOn ?? [])].sort();
-    const key = labels.join("\0");
-    const jobs = partitions.get(key) ?? [];
+    const key = [...(job.runsOn ?? [])].sort().join("\0");
+    const jobs = jobsByLabels.get(key) ?? [];
     jobs.push(job);
-    partitions.set(key, jobs);
+    jobsByLabels.set(key, jobs);
   }
   const results = await Promise.all(
-    [...partitions.entries()].map(([key, jobs]) =>
-      runCommitPartition(
+    partitions.map((jobs) => {
+      const labels = [...(jobs[0]?.runsOn ?? [])].sort();
+      const previousJobs = jobsByLabels.get(labels.join("\0")) ?? jobs;
+      const baseScope = `${event?.type ?? "commit"}:${event?.id ?? sha}`;
+      const previousScope =
+        usesCapabilities && event
+          ? `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from(
+              previousJobs
+                .map((job) => job.name)
+                .sort()
+                .join("\0"),
+            ).toString("base64url")}`
+          : usesCapabilities
+            ? `${baseScope}:jobs:${Buffer.from(
+                previousJobs
+                  .map((job) => job.name)
+                  .sort()
+                  .join("\0"),
+              ).toString("base64url")}`
+            : baseScope;
+      return runCommitPartition(
         github,
         repository,
         sha,
@@ -256,9 +275,11 @@ async function runCommitWithSlot(
         dependencies,
         event,
         signal,
-        key.split("\0"),
-      ),
-    ),
+        jobs.map((job) => job.name),
+        !manualTrigger,
+        manualTrigger ? [] : [previousScope],
+      );
+    }),
   );
   return aggregatePartitionResults(results);
 }
@@ -272,19 +293,55 @@ async function runCommitPartition(
   dependencies: CoordinatorDependencies,
   event?: RunEvent,
   signal?: AbortSignal,
-  scopeLabels?: string[],
+  scopeJobs?: string[],
+  requireRunSlot = false,
+  legacyScopes: string[] = [],
 ): Promise<BuildRecord | false | undefined> {
   if (config.jobs.length === 0) return undefined;
+  const release = requireRunSlot ? await acquireRunSlot(signal) : undefined;
+  if (requireRunSlot && !release) return false;
+  try {
+    return await runCommitPartitionWithSlot(
+      github,
+      repository,
+      sha,
+      branch,
+      config,
+      dependencies,
+      event,
+      signal,
+      scopeJobs,
+      !requireRunSlot,
+      legacyScopes,
+    );
+  } finally {
+    release?.();
+  }
+}
+
+async function runCommitPartitionWithSlot(
+  github: GitHubClient,
+  repository: Repository,
+  sha: string,
+  branch: string,
+  config: InformantConfig,
+  dependencies: CoordinatorDependencies,
+  event?: RunEvent,
+  signal?: AbortSignal,
+  scopeJobs?: string[],
+  acceptManualTrigger = true,
+  legacyScopes: string[] = [],
+): Promise<BuildRecord | false | undefined> {
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
   const configuredVmJobs = config.jobs
     .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name);
   const scopedEvent =
-    event && scopeLabels
+    event && scopeJobs
       ? {
           ...event,
-          id: `${event.id}:jobs:${Buffer.from(scopeLabels.join("\0")).toString("base64url")}`,
+          id: `${event.id}:jobs:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
         }
       : event;
   const claim = await github.claim(
@@ -294,7 +351,9 @@ async function runCommitPartition(
     scopedEvent
       ? { type: scopedEvent.type, id: scopedEvent.id, branch: scopedEvent.branch, label: branch }
       : undefined,
-    scopeLabels ? config.jobs.map((job) => job.name) : undefined,
+    scopeJobs,
+    acceptManualTrigger,
+    legacyScopes,
   );
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;
