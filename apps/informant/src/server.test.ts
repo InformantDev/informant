@@ -164,7 +164,7 @@ function dependencies(
       state.seenCommentIds = [...next.seenCommentIds];
       state.tagRefs = next.tagRefs ? [...next.tagRefs] : undefined;
       state.pendingTags = [...next.pendingTags];
-      state.missingConfigShas = [...(next.missingConfigShas ?? [])];
+      state.missingConfigs = (next.missingConfigs ?? []).map((entry) => ({ ...entry }));
     },
     recoverInterruptedBuilds: async () => false,
     reconcilePreparedImageReferences: async () => 0,
@@ -345,7 +345,7 @@ describe("serve polling orchestration", () => {
       pending: [],
       seenCommentIds: [],
       pendingTags: [],
-      missingConfigShas: [],
+      missingConfigs: [],
     };
     const deps = dependencies(
       github({
@@ -371,7 +371,32 @@ describe("serve polling orchestration", () => {
 
     expect(missingConfigReads).toBe(1);
     expect(launches).toBe(2);
-    expect(state.missingConfigShas).toEqual(["legacy-sha"]);
+    expect(state.missingConfigs?.map((entry) => entry.sha)).toEqual(["legacy-sha"]);
+  });
+
+  test("rechecks expired missing configurations", async () => {
+    let missingConfigReads = 0;
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      missingConfigs: [{ sha: "legacy-sha", checkedAt: "2020-01-01T00:00:00.000Z" }],
+    };
+    const deps = dependencies(
+      github({ branches: async () => [{ name: "legacy", sha: "legacy-sha" }] }),
+      state,
+      async () => undefined,
+    );
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      missingConfigReads++;
+      return config;
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(missingConfigReads).toBe(1);
+    expect(state.missingConfigs).toEqual([]);
   });
 
   test("job filters prevent nonmatching automatic events from being claimed", async () => {

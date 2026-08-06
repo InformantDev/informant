@@ -22,6 +22,8 @@ const SEEN_COMMENT_LIMIT = 1_000;
 const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 24 * 60 * 60_000;
+const MISSING_CONFIG_TTL_MS = 24 * 60 * 60_000;
+const MISSING_CONFIG_LIMIT = 256;
 
 class MissingRepositoryConfigError extends Error {}
 
@@ -203,21 +205,33 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   };
   let recoveryPending = true;
   const configAt = (sha: string, state: Awaited<ReturnType<typeof readPollState>>) => {
-    if (state.missingConfigShas?.includes(sha)) return Promise.resolve(undefined);
+    const now = Date.now();
+    state.missingConfigs = (state.missingConfigs ?? [])
+      .filter((entry) => now - Date.parse(entry.checkedAt) < MISSING_CONFIG_TTL_MS)
+      .slice(-MISSING_CONFIG_LIMIT);
+    if (state.missingConfigs.some((entry) => entry.sha === sha)) return Promise.resolve(undefined);
     const cached = configs.get(sha);
     if (cached) return cached;
     const pending = loadRepositoryConfig(github, repository, sha).catch(async (error) => {
       if (error instanceof GitHubApiError && error.status === 404) {
-        state.missingConfigShas = [...(state.missingConfigShas ?? []), sha];
+        state.missingConfigs = [
+          ...(state.missingConfigs ?? []).filter((entry) => entry.sha !== sha),
+          { sha, checkedAt: new Date(now).toISOString() },
+        ].slice(-MISSING_CONFIG_LIMIT);
         await persistPollState(repository.fullName, state);
         return undefined;
       }
       throw error;
     });
     configs.set(sha, pending);
-    void pending.catch(() => {
-      if (configs.get(sha) === pending) configs.delete(sha);
-    });
+    void pending.then(
+      (config) => {
+        if (!config && configs.get(sha) === pending) configs.delete(sha);
+      },
+      () => {
+        if (configs.get(sha) === pending) configs.delete(sha);
+      },
+    );
     return pending;
   };
   const errorDetail = (error: unknown) => {
