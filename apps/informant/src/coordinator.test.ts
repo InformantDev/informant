@@ -396,6 +396,37 @@ describe("runCommit", () => {
     await firstBuild;
   });
 
+  test("does not execute automatic fallback after a preflight manual request is consumed", async () => {
+    let requireManualTrigger: unknown;
+    let executed = false;
+    const github = {
+      hasPendingManualTrigger: async () => true,
+      claim: async (...args: unknown[]) => {
+        requireManualTrigger = args[7];
+        return {
+          check: { id: 42 },
+          requestedJobs: [],
+          manualTrigger: false,
+        };
+      },
+    } as unknown as GitHubClient;
+    const dependencies = harness().dependencies;
+    dependencies.runInTart = async () => {
+      executed = true;
+      return true;
+    };
+
+    const result = await runCommit(github, repository, "sha", "main", config, dependencies, {
+      type: "commit",
+      id: "branch:main:sha",
+      branch: "main",
+    });
+
+    expect(result).toBeFalse();
+    expect(requireManualTrigger).toBeTrue();
+    expect(executed).toBeFalse();
+  });
+
   test("partitions overlapping worker capabilities into non-overlapping claim scopes", async () => {
     const claims: Array<{ event?: { type: string; id: string }; jobs?: string[] }> = [];
     const github = {
@@ -462,6 +493,51 @@ describe("runCommit", () => {
     expect(claims[1]?.jobs).toEqual(["test"]);
     expect(claims[2]?.jobs).toEqual(["gpu-test"]);
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
+  });
+
+  test("legacy capability scopes include jobs omitted by trigger selection", async () => {
+    const claims: Array<{ jobs?: string[]; legacyScopes?: string[] }> = [];
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async (...args: unknown[]) => {
+        claims.push({ jobs: args[4] as string[], legacyScopes: args[6] as string[] });
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const labels = [process.platform, process.arch].sort();
+    const event = { type: "commit" as const, id: "branch:main:sha", branch: "main" };
+
+    await runCommit(
+      github,
+      repository,
+      "sha",
+      "main",
+      {
+        ...config,
+        jobs: [
+          {
+            ...baseJob,
+            runsOn: labels,
+            runtime: { type: "host" },
+            triggers: [{ event: "commit" }],
+          },
+          {
+            ...baseJob,
+            name: "lint",
+            runsOn: labels,
+            runtime: { type: "host" },
+            triggers: [{ event: "comment" }],
+          },
+        ],
+      },
+      harness().dependencies,
+      event,
+    );
+
+    const legacyScope = `commit:${event.id}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from("lint\0test").toString("base64url")}`;
+    expect(claims).toEqual([{ jobs: ["test"], legacyScopes: [legacyScope] }]);
   });
 
   test("retries the event when any capability partition loses its claim", async () => {

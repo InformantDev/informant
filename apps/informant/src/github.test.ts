@@ -277,6 +277,28 @@ test("manual trigger context and jobs stay within GitHub's external ID limit", a
   expect(rerun?.check?.external_id?.length).toBeLessThanOrEqual(255);
 });
 
+test("claim does not fall back to automatic work when manual mode is required", async () => {
+  let posts = 0;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") posts++;
+    return Response.json({ check_runs: [] });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+    undefined,
+    true,
+    [],
+    true,
+  );
+
+  expect(claim).toEqual({ requestedJobs: [], manualTrigger: false, retry: true });
+  expect(posts).toBe(0);
+});
+
 test("job checks are separate queued runs correlated to the aggregate claim", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {

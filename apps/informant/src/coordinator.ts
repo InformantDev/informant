@@ -224,7 +224,9 @@ export async function runCommit(
     !manualTrigger && event && hasTriggers
       ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
       : config;
-  const capable = usesCapabilities ? selectCapableJobs(selected, workerCapabilities()) : selected;
+  const capabilities = usesCapabilities ? workerCapabilities() : [];
+  const untriggeredCapable = usesCapabilities ? selectCapableJobs(config, capabilities) : config;
+  const capable = usesCapabilities ? selectCapableJobs(selected, capabilities) : selected;
   let partitions: JobConfig[][];
   if (manualTrigger && usesCapabilities) {
     const byLabels = new Map<string, JobConfig[]>();
@@ -239,7 +241,7 @@ export async function runCommit(
     partitions = manualTrigger ? [capable.jobs] : partitionJobGraphs(capable.jobs);
   }
   const jobsByLabels = new Map<string, JobConfig[]>();
-  for (const job of capable.jobs) {
+  for (const job of untriggeredCapable.jobs) {
     const key = [...(job.runsOn ?? [])].sort().join("\0");
     const jobs = jobsByLabels.get(key) ?? [];
     jobs.push(job);
@@ -354,7 +356,9 @@ async function runCommitPartitionWithSlot(
     scopeJobs,
     acceptManualTrigger,
     legacyScopes,
+    acceptManualTrigger,
   );
+  if (acceptManualTrigger && claim && !claim.manualTrigger) return false;
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;
   const { check } = claim;

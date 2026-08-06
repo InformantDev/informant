@@ -777,6 +777,7 @@ export class GitHubClient {
     eligibleJobs?: string[],
     acceptManualTrigger = true,
     legacyScopes: string[] = [],
+    requireManualTrigger = false,
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName);
@@ -871,6 +872,9 @@ export class GitHubClient {
       return undefined;
     }
     const manualTrigger = requestedChecks.length > 0 || suiteRerun;
+    if (requireManualTrigger && !manualTrigger) {
+      return { requestedJobs: [], manualTrigger: false, retry: true };
+    }
     const requestedContext = requestedChecks
       .map(manualTriggerContext)
       .find((context) => context !== undefined);
