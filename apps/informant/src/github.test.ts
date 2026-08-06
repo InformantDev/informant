@@ -398,6 +398,176 @@ test("workers ignore manual requests for jobs outside their capabilities", async
   expect((await run(["macos"])).claim?.requestedJobs).toEqual(["macos"]);
 });
 
+test("manual claims defer to an active old-worker eligible-job scope", async () => {
+  let posts = 0;
+  const encodedJobs = Buffer.from(JSON.stringify(["gpu"])).toString("base64url");
+  const encodedScope = Buffer.from("gpu").toString("base64url");
+  const checks: CheckRun[] = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:jobs:${encodedJobs}`,
+    },
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "in_progress",
+      started_at: new Date().toISOString(),
+      external_id: `old-worker:event:manual:abc123:jobs:${encodedScope}`,
+    },
+  ];
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") posts++;
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    undefined,
+    ["gpu"],
+  );
+
+  expect(claim).toEqual({ requestedJobs: [], manualTrigger: true, retry: true });
+  expect(posts).toBe(0);
+});
+
+test("suite reruns defer to an active old-worker eligible-job scope", async () => {
+  let posts = 0;
+  const encodedScope = Buffer.from("gpu").toString("base64url");
+  const aggregates: CheckRun[] = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "failure",
+      external_id: "original-worker:event:commit:pr:43:abc123",
+    },
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "in_progress",
+      started_at: new Date().toISOString(),
+      external_id: `old-worker:event:commit:pr:43:abc123:jobs:${encodedScope}`,
+    },
+  ];
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "POST") posts++;
+    if (url.includes("check-suites"))
+      return Response.json({ check_suites: [{ status: "queued" }] });
+    const checkName = new URL(url).searchParams.get("check_name");
+    if (checkName === MANUAL_TRIGGER_REQUEST_NAME) return Response.json({ check_runs: [] });
+    if (checkName) return Response.json({ check_runs: aggregates });
+    return Response.json({
+      check_runs: [
+        {
+          id: 10,
+          name: "Informant / gpu",
+          status: "completed",
+          conclusion: "failure",
+          external_id: "informant-job:1:Z3B1",
+        },
+      ],
+    });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    undefined,
+    ["gpu"],
+  );
+
+  expect(claim).toEqual({ requestedJobs: [], manualTrigger: true, retry: true });
+  expect(posts).toBe(0);
+});
+
+test("completed old-worker eligible-job scopes suppress election duplicates", async () => {
+  let reads = 0;
+  const updates: Array<{ id: number; conclusion?: string }> = [];
+  const encodedJobs = Buffer.from(JSON.stringify(["gpu"])).toString("base64url");
+  const encodedScope = Buffer.from("gpu").toString("base64url");
+  const request: CheckRun = {
+    id: 1,
+    name: "Informant CI",
+    status: "queued",
+    external_id: `request:jobs:${encodedJobs}`,
+  };
+  let candidate: CheckRun | undefined;
+  const historical: CheckRun = {
+    id: 2,
+    name: "Informant CI",
+    status: "completed",
+    conclusion: "success",
+    external_id: `old-worker:event:manual:abc123:jobs:${encodedScope}`,
+  };
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      candidate = { id: 3, ...body } as CheckRun;
+      return Response.json(candidate);
+    }
+    if (init?.method === "PATCH") {
+      updates.push({
+        id: Number(String(input).split("/").at(-1)),
+        conclusion: JSON.parse(String(init.body)).conclusion,
+      });
+      return Response.json({});
+    }
+    reads++;
+    return Response.json({
+      check_runs: reads >= 3 ? [request, historical, ...(candidate ? [candidate] : [])] : [request],
+    });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    undefined,
+    ["gpu"],
+  );
+
+  expect(claim).toBeUndefined();
+  expect(updates).toContainEqual({ id: 3, conclusion: "cancelled" });
+});
+
+test("manual eligible-job claim IDs retain the historical jobs namespace", async () => {
+  const encodedJobs = Buffer.from(JSON.stringify(["gpu"])).toString("base64url");
+  const checks: CheckRun[] = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:jobs:${encodedJobs}`,
+    },
+  ];
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = { id: 2, ...body } as CheckRun;
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") return Response.json({});
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "new-worker",
+    undefined,
+    ["gpu"],
+  );
+
+  expect(claim?.check?.external_id).toBe("new-worker:event:manual:abc123:jobs:Z3B1");
+});
+
 test("automatic job claims do not consume a manual suite request", async () => {
   const updates: number[] = [];
   const checks = [
@@ -704,12 +874,17 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
     { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
     "abc123",
     "machine",
+    undefined,
+    ["cleanup", "deploy", "lint"],
   );
 
   expect(claim?.check?.id).toBe(4);
   expect(claim?.requestedJobs).toEqual(["deploy", "cleanup", "lint"]);
   expect(claim?.originalPullRequest).toBe(43);
-  expect(checks.at(-1)?.external_id).toBe("machine:event:commit:pr:43:abc123");
+  const eligibleScope = Buffer.from("cleanup\0deploy\0lint").toString("base64url");
+  expect(checks.at(-1)?.external_id).toBe(
+    `machine:event:commit:pr:43:abc123:jobs:${eligibleScope}`,
+  );
   expect(jobCheckReads).toBe(1);
 });
 
@@ -757,7 +932,7 @@ test("a tag suite rerun recovers its branchless context and execution label", as
       name: "Informant CI",
       status: "completed",
       conclusion: "success",
-      external_id: "worker:event:commit:tag:v2:abc123:jobs:dGVzdA:jobs:dGVzdA",
+      external_id: "worker:event:commit:tag:v2:abc123:job-set:dGVzdA:jobs:dGVzdA",
     },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -890,7 +1065,7 @@ test("queued work elects in a canonical manual scope", async () => {
       id: 1,
       name: "Informant CI",
       status: "queued",
-      external_id: `request:context:${context}:jobs:${Buffer.from("[]").toString("base64url")}`,
+      external_id: `request:context:${context}:job-set:${Buffer.from("[]").toString("base64url")}`,
     },
     {
       id: 3,

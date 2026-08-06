@@ -18,11 +18,20 @@ export function executionCapacity(
   };
 }
 
-function runtimeResources(runtime: JobRuntime): ExecutionResources {
+function runtimeResources(runtime: JobRuntime, capacity: ExecutionResources): ExecutionResources {
   return {
-    cpu: runtime.type === "host" ? 1 : (runtime.cpu ?? DEFAULT_EXECUTION_RESOURCES.cpu),
+    cpu:
+      runtime.type === "host"
+        ? 1
+        : runtime.type === "vm"
+          ? (runtime.cpu ?? capacity.cpu)
+          : (runtime.cpu ?? DEFAULT_EXECUTION_RESOURCES.cpu),
     memoryMb:
-      runtime.type === "host" ? 1024 : (runtime.memoryMb ?? DEFAULT_EXECUTION_RESOURCES.memoryMb),
+      runtime.type === "host"
+        ? 1024
+        : runtime.type === "vm"
+          ? (runtime.memoryMb ?? capacity.memoryMb)
+          : (runtime.memoryMb ?? DEFAULT_EXECUTION_RESOURCES.memoryMb),
   };
 }
 
@@ -35,6 +44,7 @@ function runtimeResources(runtime: JobRuntime): ExecutionResources {
 export function claimExecutionResources(
   config: InformantConfig,
   jobs: JobConfig[] = config.jobs,
+  capacity: ExecutionResources = executionCapacity(),
 ): ExecutionResources {
   const byName = new Map(jobs.map((job) => [job.name, job]));
   const ordered: JobConfig[] = [];
@@ -69,7 +79,7 @@ export function claimExecutionResources(
   // request is a safe bound without charging sequential jobs cumulatively.
   const chains: Array<{ last: JobConfig; cpu: number; memoryMb: number }> = [];
   for (const job of ordered) {
-    const resources = runtimeResources(job.runtime ?? config.vm);
+    const resources = runtimeResources(job.runtime ?? config.vm, capacity);
     const chain = chains.find((candidate) => dependsOn(job, candidate.last.name));
     if (chain) {
       chain.last = job;
@@ -142,7 +152,7 @@ export function createExecutionSlotAcquirer(
 
   return async (config, signal) => {
     if (signal?.aborted) return undefined;
-    const resources = claimExecutionResources(config);
+    const resources = claimExecutionResources(config, config.jobs, capacity);
     if ((hasCapacity(resources) || active.cpu === 0) && waiters.length === 0) {
       return reserve(resources);
     }

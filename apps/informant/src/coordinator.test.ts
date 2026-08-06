@@ -238,7 +238,11 @@ describe("runCommit", () => {
       repository,
       "sha",
       "main",
-      { ...config, jobs: [base, { ...base, name: "lint" }] },
+      {
+        ...config,
+        vm: { ...config.vm, cpu: 1, memoryMb: 1024 },
+        jobs: [base, { ...base, name: "lint" }],
+      },
       context.dependencies,
     );
 
@@ -600,6 +604,63 @@ describe("runCommit", () => {
       `${baseScope}:jobs:${Buffer.from(gpuLabels.join("\0")).toString("base64url")}:jobs:${Buffer.from("gpu-test").toString("base64url")}`,
     ];
     expect(claims).toEqual([{ jobs: ["test", "gpu-test"], legacyScopes }]);
+  });
+
+  test("job component scopes cannot collide with legacy runs-on label scopes", async () => {
+    const claims: Array<{
+      event?: { type: string; id: string; branch?: string; label?: string };
+      legacyScopes?: string[];
+    }> = [];
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async (...args: unknown[]) => {
+        claims.push({
+          event: args[3] as { type: string; id: string; branch?: string; label?: string },
+          legacyScopes: args[6] as string[],
+        });
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const event = { type: "commit" as const, id: "branch:main:sha", branch: "main" };
+    const encodedGpu = Buffer.from("gpu").toString("base64url");
+
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      await runCommit(
+        github,
+        repository,
+        "sha",
+        "main",
+        {
+          ...config,
+          jobs: [
+            {
+              ...baseJob,
+              name: "gpu",
+              runsOn: ["gpu"],
+              runtime: { type: "host" },
+              triggers: [{ event: "commit" }],
+            },
+          ],
+        },
+        harness().dependencies,
+        event,
+      );
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
+
+    const currentScope = `commit:${event.id}:job-set:${encodedGpu}`;
+    const legacyLabelScope = `commit:${event.id}:jobs:${encodedGpu}`;
+    expect(claims).toEqual([
+      {
+        event: { ...event, id: `${event.id}:job-set:${encodedGpu}`, label: "main" },
+        legacyScopes: [legacyLabelScope, `${legacyLabelScope}:jobs:${encodedGpu}`],
+      },
+    ]);
+    expect(currentScope).not.toBe(legacyLabelScope);
   });
 
   test("retries the event when any capability partition loses its claim", async () => {

@@ -312,7 +312,7 @@ async function runCommitPartitionWithSlot(
     event && scopeJobs
       ? {
           ...event,
-          id: `${event.id}:jobs:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
+          id: `${event.id}:job-set:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
         }
       : event;
   const claim = await github.claim(

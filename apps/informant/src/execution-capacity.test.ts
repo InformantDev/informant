@@ -24,6 +24,19 @@ const config = (jobs: JobConfig[]): InformantConfig => ({
   jobs,
 });
 
+const vmJob = (name: string, cpu?: number, memoryMb?: number): JobConfig => ({
+  ...job(name, 1, 1024),
+  runtime: {
+    type: "vm",
+    image: "image",
+    guestOs: "macos",
+    user: "user",
+    password: "password",
+    cpu,
+    memoryMb,
+  },
+});
+
 describe("execution capacity", () => {
   test("derives capacity while retaining a minimum runnable slot", () => {
     expect(executionCapacity(16, 49_152)).toEqual({ cpu: 14, memoryMb: 36_864 });
@@ -81,5 +94,43 @@ describe("execution capacity", () => {
     expect(releaseThird).toBeFunction();
     second?.();
     releaseThird?.();
+  });
+
+  test("an unspecified VM reserves full capacity until release", async () => {
+    const capacity = { cpu: 8, memoryMb: 16_384 };
+    const vm = config([vmJob("test")]);
+    expect(claimExecutionResources(vm, vm.jobs, capacity)).toEqual(capacity);
+
+    const acquire = createExecutionSlotAcquirer(capacity);
+    const first = await acquire(vm);
+    let secondEntered = false;
+    const second = acquire(vm).then((release) => {
+      secondEntered = true;
+      return release;
+    });
+
+    await Bun.sleep(0);
+    expect(first).toBeFunction();
+    expect(secondEntered).toBeFalse();
+
+    first?.();
+    const releaseSecond = await second;
+    expect(releaseSecond).toBeFunction();
+    releaseSecond?.();
+  });
+
+  test("partially specified VMs use explicit values and conservative fallbacks", () => {
+    const capacity = { cpu: 8, memoryMb: 16_384 };
+    const cpuConfigured = config([vmJob("cpu", 4)]);
+    const memoryConfigured = config([vmJob("memory", undefined, 8192)]);
+
+    expect(claimExecutionResources(cpuConfigured, cpuConfigured.jobs, capacity)).toEqual({
+      cpu: 4,
+      memoryMb: capacity.memoryMb,
+    });
+    expect(claimExecutionResources(memoryConfigured, memoryConfigured.jobs, capacity)).toEqual({
+      cpu: capacity.cpu,
+      memoryMb: 8192,
+    });
   });
 });
