@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { CommandResult } from "./process.ts";
 import {
+  linuxStartupServicePath,
   parseStartupEnvironment,
   renderLinuxStartupService,
   renderStartupService,
+  startupEnvironment,
   updateInformant,
 } from "./startup.ts";
 
@@ -22,6 +24,28 @@ describe("startup service", () => {
       ),
     ).toEqual({ PATH: "/captured/bin", INFORMANT_SECRET_TOKEN: "captured-secret" });
     expect(() => parseStartupEnvironment("[]")).toThrow("invalid property list");
+  });
+
+  test("preserves the Linux machine configuration location", () => {
+    expect(
+      startupEnvironment(
+        {
+          PATH: "/usr/local/bin:/usr/bin",
+          XDG_CONFIG_HOME: "/srv/informant/config",
+          INFORMANT_CAPABILITIES: "linux-builder",
+          UNRELATED: "ignored",
+        },
+        "/home/worker",
+      ),
+    ).toEqual({
+      HOME: "/home/worker",
+      PATH: "/usr/local/bin:/usr/bin",
+      XDG_CONFIG_HOME: "/srv/informant/config",
+      INFORMANT_CAPABILITIES: "linux-builder",
+    });
+    expect(
+      linuxStartupServicePath({ XDG_CONFIG_HOME: "/srv/informant/config" }, "/home/worker"),
+    ).toBe("/srv/informant/config/systemd/user/informant.service");
   });
 
   test("renders a persistent LaunchAgent with escaped paths and environment", () => {

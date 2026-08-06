@@ -10,6 +10,7 @@ import {
   runCommit,
   runLocalCommit,
 } from "./coordinator.ts";
+import { createExecutionSlotAcquirer } from "./execution-capacity.ts";
 import type { GitHubClient } from "./github.ts";
 import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 
@@ -209,7 +210,7 @@ describe("runCommit", () => {
     ]);
   });
 
-  test("claims independent jobs from one suite only as worker capacity becomes available", async () => {
+  test("claims independent jobs concurrently while worker capacity is available", async () => {
     const context = harness();
     const base = config.jobs[0];
     if (!base) throw new Error("expected test job");
@@ -218,12 +219,14 @@ describe("runCommit", () => {
     const runInTart = context.dependencies.runInTart;
     let executions = 0;
     context.dependencies.runInTart = async (...args) => {
-      if (++executions === 1) {
-        entered.resolve();
-        await blocked.promise;
-      }
+      if (++executions === 2) entered.resolve();
+      await blocked.promise;
       return runInTart(...args);
     };
+    context.dependencies.acquireExecutionSlot = createExecutionSlotAcquirer({
+      cpu: 2,
+      memoryMb: 2048,
+    });
     let claims = 0;
     const claim = context.github.claim.bind(context.github);
     context.github.claim = async (...args) => {
@@ -235,21 +238,24 @@ describe("runCommit", () => {
       repository,
       "sha",
       "main",
-      { ...config, jobs: [base, { ...base, name: "lint" }] },
+      {
+        ...config,
+        vm: { ...config.vm, cpu: 1, memoryMb: 1024 },
+        jobs: [base, { ...base, name: "lint" }],
+      },
       context.dependencies,
     );
 
     await entered.promise;
     try {
       await Bun.sleep(0);
-      expect(claims).toBe(1);
-      expect(context.jobChecks).toEqual(["test"]);
+      expect(claims).toBe(2);
+      expect(context.jobChecks.sort()).toEqual(["lint", "test"]);
     } finally {
       blocked.resolve();
     }
     await build;
     expect(claims).toBe(2);
-    expect(context.jobChecks).toEqual(["test", "lint"]);
   });
 
   test("does not claim another suite until the worker has an available run slot", async () => {
@@ -258,6 +264,9 @@ describe("runCommit", () => {
     const entered = deferred<void>();
     const blocked = deferred<void>();
     const firstRun = first.dependencies.runInTart;
+    const acquireExecutionSlot = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 });
+    first.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    second.dependencies.acquireExecutionSlot = acquireExecutionSlot;
     first.dependencies.runInTart = async (...args) => {
       entered.resolve();
       await blocked.promise;
@@ -306,6 +315,10 @@ describe("runCommit", () => {
     const entered = deferred<void>();
     const blocked = deferred<void>();
     const firstRun = first.dependencies.runInTart;
+    const acquireExecutionSlot = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 });
+    first.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    superseded.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    current.dependencies.acquireExecutionSlot = acquireExecutionSlot;
     first.dependencies.runInTart = async (...args) => {
       entered.resolve();
       await blocked.promise;
@@ -353,6 +366,39 @@ describe("runCommit", () => {
     blocked.resolve();
     await Promise.all([firstBuild, currentBuild]);
     expect(current.jobChecks).toEqual(["test"]);
+  });
+
+  test("does not claim work cancelled as an execution slot is granted", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    let claims = 0;
+    let releases = 0;
+    const claim = context.github.claim.bind(context.github);
+    context.github.claim = async (...args) => {
+      claims++;
+      return claim(...args);
+    };
+    context.dependencies.acquireExecutionSlot = async () => {
+      controller.abort("superseded");
+      return () => {
+        releases++;
+      };
+    };
+
+    expect(
+      await runCommit(
+        context.github,
+        repository,
+        "sha",
+        "main",
+        config,
+        context.dependencies,
+        { type: "commit", id: "branch:main:sha", branch: "main" },
+        controller.signal,
+      ),
+    ).toBeFalse();
+    expect(claims).toBe(0);
+    expect(releases).toBe(1);
   });
 
   test("manual suites retain their existing claim behavior while automatic work is running", async () => {
@@ -552,10 +598,69 @@ describe("runCommit", () => {
 
     const baseScope = `commit:${event.id}`;
     const legacyScopes = [
+      `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}`,
       `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from("lint\0test").toString("base64url")}`,
+      `${baseScope}:jobs:${Buffer.from(gpuLabels.join("\0")).toString("base64url")}`,
       `${baseScope}:jobs:${Buffer.from(gpuLabels.join("\0")).toString("base64url")}:jobs:${Buffer.from("gpu-test").toString("base64url")}`,
     ];
     expect(claims).toEqual([{ jobs: ["test", "gpu-test"], legacyScopes }]);
+  });
+
+  test("job component scopes cannot collide with legacy runs-on label scopes", async () => {
+    const claims: Array<{
+      event?: { type: string; id: string; branch?: string; label?: string };
+      legacyScopes?: string[];
+    }> = [];
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async (...args: unknown[]) => {
+        claims.push({
+          event: args[3] as { type: string; id: string; branch?: string; label?: string },
+          legacyScopes: args[6] as string[],
+        });
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const event = { type: "commit" as const, id: "branch:main:sha", branch: "main" };
+    const encodedGpu = Buffer.from("gpu").toString("base64url");
+
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      await runCommit(
+        github,
+        repository,
+        "sha",
+        "main",
+        {
+          ...config,
+          jobs: [
+            {
+              ...baseJob,
+              name: "gpu",
+              runsOn: ["gpu"],
+              runtime: { type: "host" },
+              triggers: [{ event: "commit" }],
+            },
+          ],
+        },
+        harness().dependencies,
+        event,
+      );
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
+
+    const currentScope = `commit:${event.id}:job-set:${encodedGpu}`;
+    const legacyLabelScope = `commit:${event.id}:jobs:${encodedGpu}`;
+    expect(claims).toEqual([
+      {
+        event: { ...event, id: `${event.id}:job-set:${encodedGpu}`, label: "main" },
+        legacyScopes: [legacyLabelScope, `${legacyLabelScope}:jobs:${encodedGpu}`],
+      },
+    ]);
+    expect(currentScope).not.toBe(legacyLabelScope);
   });
 
   test("retries the event when any capability partition loses its claim", async () => {
