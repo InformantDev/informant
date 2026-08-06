@@ -105,18 +105,25 @@ function previousTriggerContext(
   if (!check?.external_id) return undefined;
   const persistedContext = manualTriggerContext(check);
   if (persistedContext) return persistedContext;
-  const manualContext = check.external_id.match(/:event:manual:[^:]+:context:([^:]+)$/)?.[1];
+  const manualContext = check.external_id.match(
+    /:event:manual:[^:]+:context:([^:]+)(?::jobs:[^:]+)*$/,
+  )?.[1];
   if (manualContext) {
     return manualTriggerContext({ ...check, external_id: `request:context:${manualContext}` });
   }
-  const branch = check.external_id.match(/:event:commit:branch:([^:]+):([^:]+)$/);
+  const branch = check.external_id.match(/:event:commit:branch:([^:]+):([^:]+)(?::jobs:[^:]+)*$/);
   if (branch?.[1] && branch[2] === sha) return { branch: branch[1], label: branch[1] };
-  const pullRequest = check.external_id.match(/:event:commit:pr:(\d+):([^:]+)$/);
+  const pullRequest = check.external_id.match(/:event:commit:pr:(\d+):([^:]+)(?::jobs:[^:]+)*$/);
   if (pullRequest?.[1] && pullRequest[2] === sha)
     return { branch: null, label: `pull/${pullRequest[1]}` };
-  const tag = check.external_id.match(/:event:commit:tag:([^:]+):([^:]+)$/);
+  const tag = check.external_id.match(/:event:commit:tag:([^:]+):([^:]+)(?::jobs:[^:]+)*$/);
   if (tag?.[1] && tag[2] === sha) return { branch: null, label: tag[1] };
   return undefined;
+}
+
+function baseEventScope(check: CheckRun): string | undefined {
+  const scope = check.external_id?.split(":event:")[1];
+  return scope?.replace(/(?::jobs:[^:]+)+$/, "");
 }
 
 export class GitHubApiError extends Error {
@@ -510,7 +517,10 @@ export class GitHubClient {
     return checks.filter((check) => check.name === name);
   }
 
-  async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
+  private async jobChecksByClaim(
+    repository: Repository,
+    sha: string,
+  ): Promise<Map<number, CheckRun[]>> {
     await this.authenticate();
     const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
     const checks: CheckRun[] = [];
@@ -521,10 +531,21 @@ export class GitHubClient {
       checks.push(...result.check_runs);
       if (result.check_runs.length < 100) break;
     }
-    const prefix = `informant-job:${claimId}:`;
-    return checks.filter(
-      (check) => check.name.startsWith(JOB_CHECK_PREFIX) && check.external_id?.startsWith(prefix),
-    );
+    const checksByClaim = new Map<number, CheckRun[]>();
+    for (const check of checks) {
+      if (!check.name.startsWith(JOB_CHECK_PREFIX)) continue;
+      const match = check.external_id?.match(/^informant-job:(\d+):/);
+      const claimId = Number(match?.[1]);
+      if (!Number.isSafeInteger(claimId)) continue;
+      const claimChecks = checksByClaim.get(claimId) ?? [];
+      claimChecks.push(check);
+      checksByClaim.set(claimId, claimChecks);
+    }
+    return checksByClaim;
+  }
+
+  async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
+    return (await this.jobChecksByClaim(repository, sha)).get(claimId) ?? [];
   }
 
   async recoverInterruptedCheck(
@@ -754,15 +775,18 @@ export class GitHubClient {
       id: sha,
     },
     eligibleJobs?: string[],
+    acceptManualTrigger = true,
+    legacyScopes: string[] = [],
+    requireManualTrigger = false,
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName);
     const manualRequestChecks =
-      event.type === "comment"
+      event.type === "comment" || !acceptManualTrigger
         ? []
         : await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME);
     const allRequestedChecks =
-      event.type === "comment"
+      event.type === "comment" || !acceptManualTrigger
         ? []
         : [...initialChecks, ...manualRequestChecks].filter(
             (check) =>
@@ -791,17 +815,25 @@ export class GitHubClient {
       }
     };
     const suiteRerun =
+      acceptManualTrigger &&
       event.type !== "comment" &&
       allRequestedChecks.length === 0 &&
       initialChecks.some((check) => check.status === "completed") &&
       (await this.checkSuiteStatus(repository, sha, initialName)) === "queued";
-    const previousAggregate = suiteRerun
+    const previousAggregates = suiteRerun
       ? initialChecks
           .filter((check) => check.status === "completed" && check.conclusion !== "neutral")
-          .sort((a, b) => b.id - a.id)[0]
-      : undefined;
+          .sort((a, b) => b.id - a.id)
+      : [];
+    const previousAggregate = previousAggregates[0];
+    const previousScope = previousAggregate ? baseEventScope(previousAggregate) : undefined;
+    const rerunAggregates = previousScope
+      ? previousAggregates.filter((check) => baseEventScope(check) === previousScope)
+      : previousAggregate
+        ? [previousAggregate]
+        : [];
     const originalPullRequestMatch = previousAggregate?.external_id?.match(
-      /:event:commit:pr:(\d+):([^:]+)(?::jobs:[^:]+)?$/,
+      /:event:commit:pr:(\d+):([^:]+)(?::jobs:[^:]+)*$/,
     );
     const originalPullRequestNumber = Number(originalPullRequestMatch?.[1]);
     const originalPullRequest =
@@ -810,17 +842,21 @@ export class GitHubClient {
       originalPullRequestMatch?.[2] === sha
         ? originalPullRequestNumber
         : undefined;
-    const failedRerunJobs = previousAggregate
-      ? [
-          ...new Set(
-            (await this.jobChecks(repository, sha, previousAggregate.id))
-              .filter((check) =>
-                check.conclusion ? RETRYABLE_CHECK_CONCLUSIONS.has(check.conclusion) : false,
-              )
-              .map((check) => check.name.slice(JOB_CHECK_PREFIX.length)),
-          ),
-        ]
-      : [];
+    const latestRerunJobs = new Map<string, CheckRun>();
+    const rerunChecksByClaim = rerunAggregates.length
+      ? await this.jobChecksByClaim(repository, sha)
+      : new Map<number, CheckRun[]>();
+    for (const aggregate of rerunAggregates) {
+      for (const check of rerunChecksByClaim.get(aggregate.id) ?? []) {
+        const name = check.name.slice(JOB_CHECK_PREFIX.length);
+        if (!latestRerunJobs.has(name)) latestRerunJobs.set(name, check);
+      }
+    }
+    const failedRerunJobs = [...latestRerunJobs]
+      .filter(([, check]) =>
+        check.conclusion ? RETRYABLE_CHECK_CONCLUSIONS.has(check.conclusion) : false,
+      )
+      .map(([name]) => name);
     const eligible = eligibleJobs ? new Set(eligibleJobs) : undefined;
     const queuedJobRequests = requestedChecks.map(requestedJobsFor);
     const targetedManualJobs = requestedChecks.length
@@ -836,6 +872,9 @@ export class GitHubClient {
       return undefined;
     }
     const manualTrigger = requestedChecks.length > 0 || suiteRerun;
+    if (requireManualTrigger && !manualTrigger) {
+      return { requestedJobs: [], manualTrigger: false, retry: true };
+    }
     const requestedContext = requestedChecks
       .map(manualTriggerContext)
       .find((context) => context !== undefined);
@@ -877,8 +916,11 @@ export class GitHubClient {
       legacyManualScope !== undefined &&
       check.external_id?.endsWith(`:event:${legacyManualScope}`) === true;
     const matchesScope = (check: CheckRun) =>
-      check.external_id?.endsWith(`:event:${scope}`) === true || matchesLegacyManualScope(check);
+      check.external_id?.endsWith(`:event:${scope}`) === true ||
+      legacyScopes.some((legacyScope) => check.external_id?.endsWith(`:event:${legacyScope}`)) ||
+      matchesLegacyManualScope(check);
     const acceptsLegacyCommit =
+      acceptManualTrigger &&
       claimEvent.type === "commit" &&
       (claimEvent.id === sha || claimEvent.id.startsWith("branch:"));
     const availableChecks = [

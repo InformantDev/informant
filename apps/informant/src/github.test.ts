@@ -277,6 +277,28 @@ test("manual trigger context and jobs stay within GitHub's external ID limit", a
   expect(rerun?.check?.external_id?.length).toBeLessThanOrEqual(255);
 });
 
+test("claim does not fall back to automatic work when manual mode is required", async () => {
+  let posts = 0;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") posts++;
+    return Response.json({ check_runs: [] });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+    undefined,
+    true,
+    [],
+    true,
+  );
+
+  expect(claim).toEqual({ requestedJobs: [], manualTrigger: false, retry: true });
+  expect(posts).toBe(0);
+});
+
 test("job checks are separate queued runs correlated to the aggregate claim", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
@@ -374,6 +396,83 @@ test("workers ignore manual requests for jobs outside their capabilities", async
 
   expect(await run(["linux"])).toEqual({ claim: undefined, posted: false });
   expect((await run(["macos"])).claim?.requestedJobs).toEqual(["macos"]);
+});
+
+test("automatic job claims do not consume a manual suite request", async () => {
+  const updates: number[] = [];
+  const checks = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `request:jobs:${Buffer.from(JSON.stringify([])).toString("base64url")}`,
+    },
+  ];
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = {
+        id: 2,
+        name: body.name,
+        status: body.status,
+        external_id: body.external_id,
+      };
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(String(_input).match(/check-runs\/(\d+)/)?.[1]);
+      updates.push(id);
+      return Response.json({});
+    }
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "machine",
+    { type: "commit", id: "branch:main:abc123:jobs:dGVzdA" },
+    ["test"],
+    false,
+  );
+
+  expect(claim?.manualTrigger).toBeFalse();
+  expect(claim?.requestedJobs).toEqual([]);
+  expect(updates).not.toContain(1);
+});
+
+test("component claims honor completed and active legacy suite scopes", async () => {
+  const run = async (status: "completed" | "in_progress") => {
+    let posted = false;
+    const checks = [
+      {
+        id: 1,
+        name: "Informant CI",
+        status,
+        conclusion: status === "completed" ? "success" : undefined,
+        started_at: new Date().toISOString(),
+        external_id: "old-worker:event:commit:branch:main:abc123",
+      },
+    ];
+    const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") posted = true;
+      return Response.json({ check_runs: checks });
+    }) as typeof globalThis.fetch;
+    const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+      { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+      "abc123",
+      "machine",
+      { type: "commit", id: "branch:main:abc123:jobs:dGVzdA" },
+      ["test"],
+      false,
+      ["commit:branch:main:abc123"],
+    );
+    return { claim, posted };
+  };
+
+  expect(await run("completed")).toEqual({ claim: undefined, posted: false });
+  expect((await run("in_progress")).claim?.retry).toBeTrue();
 });
 
 test("claim replaces a stale claim after its accepted request was completed", async () => {
@@ -509,6 +608,7 @@ test("interrupted build recovery cancels only correlated children before the agg
 });
 
 test("claim treats a queued failed check suite as a failed-jobs re-run request", async () => {
+  let jobCheckReads = 0;
   const checks: Array<Record<string, unknown>> = [
     {
       id: 0,
@@ -522,7 +622,21 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
       name: "Informant CI",
       status: "completed",
       conclusion: "failure",
-      external_id: "original-worker:event:commit:pr:43:abc123",
+      external_id: "original-worker:event:commit:pr:43:abc123:jobs:dHlwZWNoZWNr",
+    },
+    {
+      id: 2,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "failure",
+      external_id: "second-worker:event:commit:pr:43:abc123:jobs:ZGVwbG95",
+    },
+    {
+      id: 3,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "success",
+      external_id: "retry-worker:event:commit:pr:43:abc123:jobs:dHlwZWNoZWNr",
     },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -530,7 +644,7 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       const check = {
-        id: 2,
+        id: 4,
         name: body.name,
         status: body.status,
         external_id: body.external_id,
@@ -542,13 +656,14 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
       return Response.json({ check_suites: [{ status: "queued" }] });
     }
     if (!new URL(url).searchParams.has("check_name")) {
+      jobCheckReads++;
       return Response.json({
         check_runs: [
           {
             id: 10,
             name: "Informant / lint",
             status: "completed",
-            conclusion: "success",
+            conclusion: "failure",
             external_id: "informant-job:1:bGludA",
           },
           {
@@ -563,14 +678,21 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
             name: "Informant / deploy",
             status: "completed",
             conclusion: "skipped",
-            external_id: "informant-job:1:ZGVwbG95",
+            external_id: "informant-job:2:ZGVwbG95",
           },
           {
             id: 13,
             name: "Informant / cleanup",
             status: "completed",
             conclusion: "cancelled",
-            external_id: "informant-job:1:Y2xlYW51cA",
+            external_id: "informant-job:2:Y2xlYW51cA",
+          },
+          {
+            id: 14,
+            name: "Informant / typecheck",
+            status: "completed",
+            conclusion: "success",
+            external_id: "informant-job:3:dHlwZWNoZWNr",
           },
         ],
       });
@@ -584,10 +706,11 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
     "machine",
   );
 
-  expect(claim?.check?.id).toBe(2);
-  expect(claim?.requestedJobs).toEqual(["typecheck", "deploy", "cleanup"]);
+  expect(claim?.check?.id).toBe(4);
+  expect(claim?.requestedJobs).toEqual(["deploy", "cleanup", "lint"]);
   expect(claim?.originalPullRequest).toBe(43);
   expect(checks.at(-1)?.external_id).toBe("machine:event:commit:pr:43:abc123");
+  expect(jobCheckReads).toBe(1);
 });
 
 test("claim falls back to all jobs when a queued suite has no failed job history", async () => {
@@ -634,7 +757,7 @@ test("a tag suite rerun recovers its branchless context and execution label", as
       name: "Informant CI",
       status: "completed",
       conclusion: "success",
-      external_id: "worker:event:commit:tag:v2:abc123",
+      external_id: "worker:event:commit:tag:v2:abc123:jobs:dGVzdA:jobs:dGVzdA",
     },
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {

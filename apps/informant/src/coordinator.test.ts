@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   aggregatePartitionResults,
   type CoordinatorDependencies,
+  partitionJobGraphs,
   readLogTail,
   runCommit,
   runLocalCommit,
@@ -88,6 +89,7 @@ function harness(
   };
   let nextCheckId = 100;
   const github = {
+    hasPendingManualTrigger: async () => options.manualTrigger ?? false,
     claim: async () =>
       options.claim === false
         ? undefined
@@ -182,10 +184,253 @@ function harness(
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe("runCommit", () => {
+  test("partitions independent jobs while keeping dependency graphs together", () => {
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const jobs = [
+      base,
+      { ...base, name: "unit" },
+      { ...base, name: "package", needs: ["unit"] },
+      { ...base, name: "publish", needs: ["package"] },
+    ];
+
+    expect(partitionJobGraphs(jobs).map((partition) => partition.map((job) => job.name))).toEqual([
+      ["test"],
+      ["unit", "package", "publish"],
+    ]);
+  });
+
+  test("claims independent jobs from one suite only as worker capacity becomes available", async () => {
+    const context = harness();
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const runInTart = context.dependencies.runInTart;
+    let executions = 0;
+    context.dependencies.runInTart = async (...args) => {
+      if (++executions === 1) {
+        entered.resolve();
+        await blocked.promise;
+      }
+      return runInTart(...args);
+    };
+    let claims = 0;
+    const claim = context.github.claim.bind(context.github);
+    context.github.claim = async (...args) => {
+      claims++;
+      return claim(...args);
+    };
+    const build = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      { ...config, jobs: [base, { ...base, name: "lint" }] },
+      context.dependencies,
+    );
+
+    await entered.promise;
+    try {
+      await Bun.sleep(0);
+      expect(claims).toBe(1);
+      expect(context.jobChecks).toEqual(["test"]);
+    } finally {
+      blocked.resolve();
+    }
+    await build;
+    expect(claims).toBe(2);
+    expect(context.jobChecks).toEqual(["test", "lint"]);
+  });
+
+  test("does not claim another suite until the worker has an available run slot", async () => {
+    const first = harness();
+    const second = harness();
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const firstRun = first.dependencies.runInTart;
+    first.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return firstRun(...args);
+    };
+    let secondClaims = 0;
+    const secondClaim = second.github.claim.bind(second.github);
+    second.github.claim = async (...args) => {
+      secondClaims++;
+      return secondClaim(...args);
+    };
+
+    const firstBuild = runCommit(
+      first.github,
+      repository,
+      "first-sha",
+      "main",
+      config,
+      first.dependencies,
+    );
+    await entered.promise;
+    const secondBuild = runCommit(
+      second.github,
+      repository,
+      "second-sha",
+      "feature",
+      config,
+      second.dependencies,
+    );
+    await Bun.sleep(0);
+
+    expect(secondClaims).toBe(0);
+    expect(second.jobChecks).toEqual([]);
+
+    blocked.resolve();
+    await firstBuild;
+    await secondBuild;
+    expect(secondClaims).toBe(1);
+    expect(second.jobChecks).toEqual(["test"]);
+  });
+
+  test("drops superseded automatic suites while they wait for a run slot", async () => {
+    const first = harness();
+    const superseded = harness();
+    const current = harness();
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const firstRun = first.dependencies.runInTart;
+    first.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return firstRun(...args);
+    };
+    let supersededClaims = 0;
+    const supersededClaim = superseded.github.claim.bind(superseded.github);
+    superseded.github.claim = async (...args) => {
+      supersededClaims++;
+      return supersededClaim(...args);
+    };
+    const controller = new AbortController();
+
+    const firstBuild = runCommit(
+      first.github,
+      repository,
+      "first-sha",
+      "main",
+      config,
+      first.dependencies,
+    );
+    await entered.promise;
+    const oldBuild = runCommit(
+      superseded.github,
+      repository,
+      "old-sha",
+      "feature",
+      config,
+      superseded.dependencies,
+      { type: "commit", id: "branch:feature:old-sha", branch: "feature" },
+      controller.signal,
+    );
+    const currentBuild = runCommit(
+      current.github,
+      repository,
+      "current-sha",
+      "feature",
+      config,
+      current.dependencies,
+    );
+    controller.abort("Superseded by feature@current-sha.");
+
+    expect(await oldBuild).toBeFalse();
+    expect(supersededClaims).toBe(0);
+    blocked.resolve();
+    await Promise.all([firstBuild, currentBuild]);
+    expect(current.jobChecks).toEqual(["test"]);
+  });
+
+  test("manual suites retain their existing claim behavior while automatic work is running", async () => {
+    const first = harness();
+    const manual = harness({ manualTrigger: true });
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const firstRun = first.dependencies.runInTart;
+    first.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return firstRun(...args);
+    };
+    const controller = new AbortController();
+
+    const firstBuild = runCommit(
+      first.github,
+      repository,
+      "first-sha",
+      "main",
+      config,
+      first.dependencies,
+    );
+    await entered.promise;
+    const manualBuild = runCommit(
+      manual.github,
+      repository,
+      "manual-sha",
+      "feature",
+      config,
+      manual.dependencies,
+      { type: "commit", id: "branch:feature:manual-sha", branch: "feature" },
+      controller.signal,
+    );
+    controller.abort("superseded");
+    const result = await manualBuild;
+    expect(typeof result === "object" ? result.status : result).toBe("success");
+    expect(manual.jobChecks).toEqual(["test"]);
+
+    blocked.resolve();
+    await firstBuild;
+  });
+
+  test("does not execute automatic fallback after a preflight manual request is consumed", async () => {
+    let requireManualTrigger: unknown;
+    let executed = false;
+    const github = {
+      hasPendingManualTrigger: async () => true,
+      claim: async (...args: unknown[]) => {
+        requireManualTrigger = args[7];
+        return {
+          check: { id: 42 },
+          requestedJobs: [],
+          manualTrigger: false,
+        };
+      },
+    } as unknown as GitHubClient;
+    const dependencies = harness().dependencies;
+    dependencies.runInTart = async () => {
+      executed = true;
+      return true;
+    };
+
+    const result = await runCommit(github, repository, "sha", "main", config, dependencies, {
+      type: "commit",
+      id: "branch:main:sha",
+      branch: "main",
+    });
+
+    expect(result).toBeFalse();
+    expect(requireManualTrigger).toBeTrue();
+    expect(executed).toBeFalse();
+  });
+
   test("partitions overlapping worker capabilities into non-overlapping claim scopes", async () => {
     const claims: Array<{ event?: { type: string; id: string }; jobs?: string[] }> = [];
     const github = {
+      hasPendingManualTrigger: async () => false,
       claim: async (
         _repository: Repository,
         _sha: string,
@@ -250,9 +495,73 @@ describe("runCommit", () => {
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
   });
 
+  test("legacy capability scopes cover every label group before trigger selection", async () => {
+    const claims: Array<{ jobs?: string[]; legacyScopes?: string[] }> = [];
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async (...args: unknown[]) => {
+        claims.push({ jobs: args[4] as string[], legacyScopes: args[6] as string[] });
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const labels = [process.platform, process.arch].sort();
+    const gpuLabels = [...labels, "gpu"].sort();
+    const event = { type: "commit" as const, id: "branch:main:sha", branch: "main" };
+
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      await runCommit(
+        github,
+        repository,
+        "sha",
+        "main",
+        {
+          ...config,
+          jobs: [
+            {
+              ...baseJob,
+              runsOn: labels,
+              runtime: { type: "host" },
+              triggers: [{ event: "commit" }],
+            },
+            {
+              ...baseJob,
+              name: "lint",
+              runsOn: labels,
+              runtime: { type: "host" },
+              triggers: [{ event: "comment" }],
+            },
+            {
+              ...baseJob,
+              name: "gpu-test",
+              needs: ["test"],
+              runsOn: gpuLabels,
+              runtime: { type: "host" },
+              triggers: [{ event: "commit" }],
+            },
+          ],
+        },
+        harness().dependencies,
+        event,
+      );
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
+
+    const baseScope = `commit:${event.id}`;
+    const legacyScopes = [
+      `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from("lint\0test").toString("base64url")}`,
+      `${baseScope}:jobs:${Buffer.from(gpuLabels.join("\0")).toString("base64url")}:jobs:${Buffer.from("gpu-test").toString("base64url")}`,
+    ];
+    expect(claims).toEqual([{ jobs: ["test", "gpu-test"], legacyScopes }]);
+  });
+
   test("retries the event when any capability partition loses its claim", async () => {
     let claims = 0;
     const github = {
+      hasPendingManualTrigger: async () => false,
       claim: async () => (++claims === 1 ? { retry: true } : undefined),
     } as unknown as GitHubClient;
     const baseJob = config.jobs[0];
@@ -856,7 +1165,7 @@ describe("runCommit", () => {
           timeoutMinutes: 1,
           environment: {},
           secrets: [],
-          needs: [],
+          needs: ["test"],
         },
       ],
     };
