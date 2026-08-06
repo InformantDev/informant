@@ -22,8 +22,12 @@ export function startupServicePath(): string {
   return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 }
 
-export function linuxStartupServicePath(): string {
-  return join(homedir(), ".config", "systemd", "user", "informant.service");
+export function linuxStartupServicePath(
+  environment: Record<string, string | undefined> = Bun.env,
+  home = homedir(),
+): string {
+  const configHome = environment.XDG_CONFIG_HOME ?? join(home, ".config");
+  return join(configHome, "systemd", "user", "informant.service");
 }
 
 export function renderStartupService(
@@ -146,12 +150,16 @@ export function parseStartupEnvironment(output: string): Record<string, string> 
   return value as Record<string, string>;
 }
 
-function startupEnvironment(): Record<string, string> {
+export function startupEnvironment(
+  source: Record<string, string | undefined> = Bun.env,
+  home = homedir(),
+): Record<string, string> {
   const environment: Record<string, string> = {
-    HOME: homedir(),
-    PATH: Bun.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    HOME: home,
+    PATH: source.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
   };
-  for (const [key, value] of Object.entries(Bun.env)) {
+  if (source.XDG_CONFIG_HOME) environment.XDG_CONFIG_HOME = source.XDG_CONFIG_HOME;
+  for (const [key, value] of Object.entries(source)) {
     if (key.startsWith("INFORMANT_") && value !== undefined) environment[key] = value;
   }
   return environment;
