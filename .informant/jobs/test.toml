@@ -1,10 +1,11 @@
 name = "test"
+runs_on = ["container"]
 command = """
 set -eu
 bun run test
 """
 timeout_minutes = 15
-container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = """
+container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update

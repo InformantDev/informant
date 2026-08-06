@@ -1,8 +1,9 @@
 name = "build"
+runs_on = ["container"]
 command = """
 set -eu
 bun run build
 """
 environment = { NEXT_TELEMETRY_DISABLED = "1" }
 needs = ["test", "lint", "typecheck"]
-container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = "bun install --frozen-lockfile --ignore-scripts" }
+container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = "bun install --frozen-lockfile --ignore-scripts" }
