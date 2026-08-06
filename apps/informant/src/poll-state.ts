@@ -17,6 +17,7 @@ export interface PollState {
   tagRefs?: Array<{ name: string; sha: string }>;
   tagsPolledAt?: string;
   pendingTags: Array<{ name: string; sha: string }>;
+  missingConfigShas?: string[];
 }
 
 function path(repo: string) {
@@ -24,7 +25,8 @@ function path(repo: string) {
 }
 export async function readPollState(repo: string): Promise<PollState> {
   const file = Bun.file(path(repo));
-  if (!(await file.exists())) return { pending: [], seenCommentIds: [], pendingTags: [] };
+  if (!(await file.exists()))
+    return { pending: [], seenCommentIds: [], pendingTags: [], missingConfigShas: [] };
   const state = (await file.json()) as Partial<PollState>;
   return {
     cursor: state.cursor,
@@ -33,6 +35,9 @@ export async function readPollState(repo: string): Promise<PollState> {
     tagRefs: state.tagRefs,
     tagsPolledAt: state.tagsPolledAt,
     pendingTags: state.pendingTags ?? [],
+    missingConfigShas: (state.missingConfigShas ?? []).filter(
+      (sha): sha is string => typeof sha === "string",
+    ),
   };
 }
 export async function savePollState(repo: string, state: PollState): Promise<void> {

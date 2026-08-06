@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { GitHubClient } from "./github.ts";
+import { GitHubApiError, type GitHubClient } from "./github.ts";
 import type { PollState } from "./poll-state.ts";
 import {
   applySecretPolicy,
@@ -164,6 +164,7 @@ function dependencies(
       state.seenCommentIds = [...next.seenCommentIds];
       state.tagRefs = next.tagRefs ? [...next.tagRefs] : undefined;
       state.pendingTags = [...next.pendingTags];
+      state.missingConfigShas = [...(next.missingConfigShas ?? [])];
     },
     recoverInterruptedBuilds: async () => false,
     reconcilePreparedImageReferences: async () => 0,
@@ -335,6 +336,43 @@ describe("serve polling orchestration", () => {
       triggers: [{ event: "commit", tag: { patterns: ["v*"] } }],
     })),
   };
+
+  test("persists missing config for unchanged branch commits across restarts", async () => {
+    let missingConfigReads = 0;
+    let launches = 0;
+    const state: PollState = {
+      cursor: "2026-01-01T00:00:00.000Z",
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      missingConfigShas: [],
+    };
+    const deps = dependencies(
+      github({
+        branches: async () => [
+          { name: "main", sha: "default-sha" },
+          { name: "legacy", sha: "legacy-sha" },
+        ],
+      }),
+      state,
+      async () => {
+        launches++;
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      missingConfigReads++;
+      throw new GitHubApiError(404, '{"message":"Not Found"}');
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(missingConfigReads).toBe(1);
+    expect(launches).toBe(2);
+    expect(state.missingConfigShas).toEqual(["legacy-sha"]);
+  });
 
   test("job filters prevent nonmatching automatic events from being claimed", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };

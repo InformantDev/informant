@@ -23,6 +23,8 @@ const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 24 * 60 * 60_000;
 
+class MissingRepositoryConfigError extends Error {}
+
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
   const paths = await github.directoryFiles(repository, sha, JOBS_DIRECTORY);
@@ -186,7 +188,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   let intervalSeconds = 30;
   let lastPollError: string | undefined;
   let rateLimitUntil = 0;
-  const configs = new Map<string, ReturnType<typeof repositoryConfig>>();
+  const configs = new Map<string, Promise<InformantConfig | undefined>>();
   const inFlightRuns = new Map<string, Promise<void>>();
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
   const shutdownControllers = new Set<AbortController>();
@@ -200,10 +202,18 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     });
   };
   let recoveryPending = true;
-  const configAt = (sha: string) => {
+  const configAt = (sha: string, state: Awaited<ReturnType<typeof readPollState>>) => {
+    if (state.missingConfigShas?.includes(sha)) return Promise.resolve(undefined);
     const cached = configs.get(sha);
     if (cached) return cached;
-    const pending = loadRepositoryConfig(github, repository, sha);
+    const pending = loadRepositoryConfig(github, repository, sha).catch(async (error) => {
+      if (error instanceof GitHubApiError && error.status === 404) {
+        state.missingConfigShas = [...(state.missingConfigShas ?? []), sha];
+        await persistPollState(repository.fullName, state);
+        return undefined;
+      }
+      throw error;
+    });
     configs.set(sha, pending);
     void pending.catch(() => {
       if (configs.get(sha) === pending) configs.delete(sha);
@@ -287,9 +297,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       return;
     }
     try {
+      const state = await loadPollState(repository.fullName);
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
-      const bootstrap = await configAt(defaultSha);
+      const bootstrap = await configAt(defaultSha, state);
+      if (!bootstrap) throw new MissingRepositoryConfigError();
       const storageReferences = await Promise.allSettled([
         (dependencies.reconcilePreparedImageReferences ?? reconcilePreparedImageReferences)(
           repository.fullName,
@@ -331,7 +343,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       }
       if (removedStorageReferences > 0) idle();
       intervalSeconds = bootstrap.pollIntervalSeconds;
-      const state = await loadPollState(repository.fullName);
       const hasTagTriggers = bootstrap.jobs.some((job) =>
         (job.triggers ?? bootstrap.triggers ?? []).some((rule) => rule.tag !== undefined),
       );
@@ -431,7 +442,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           pullRequest: target.pullRequest,
         };
         try {
-          const config = applySecretPolicy(await configAt(target.sha), bootstrap, defaultSha);
+          const targetConfig = await configAt(target.sha, state);
+          if (!targetConfig) continue;
+          const config = applySecretPolicy(targetConfig, bootstrap, defaultSha);
           const matches =
             selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), context.branch)
               .jobs.length > 0;
@@ -550,7 +563,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
         if (inFlightRuns.has(eventId)) continue;
         try {
-          const config = applySecretPolicy(await configAt(pending.sha), bootstrap, defaultSha);
+          const pendingConfig = await configAt(pending.sha, state);
+          if (!pendingConfig) continue;
+          const config = applySecretPolicy(pendingConfig, bootstrap, defaultSha);
           const context: EventContext & { id: string } = {
             type: "comment" as const,
             pullRequest: pending.pullRequest,
@@ -601,7 +616,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     } catch (error) {
       const detail = errorDetail(error);
       const pollError =
-        detail.startsWith("GitHub 404:") && detail.includes("rest/repos/contents")
+        error instanceof MissingRepositoryConfigError ||
+        (detail.startsWith("GitHub 404:") && detail.includes("rest/repos/contents"))
           ? `waiting for ${CONFIG_FILE}`
           : detail.startsWith("GitHub 409:") && detail.includes("rest/git/refs")
             ? "waiting for the repository's first commit"
