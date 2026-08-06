@@ -68,6 +68,38 @@ test("starts Apple Container when the repository worker starts", async () => {
   expect(cleanups).toBe(1);
 });
 
+test("continues serving host jobs when container backend initialization fails", async () => {
+  let served = false;
+  let readinessSignal: AbortSignal | undefined;
+  const controller = new AbortController();
+  await serveRepositories([repository], {
+    once: true,
+    signal: controller.signal,
+    dependencies: {
+      initializeContainerBackend: async (signal) => {
+        readinessSignal = signal;
+        return false;
+      },
+      housekeeping: async () => ({
+        skipped: false,
+        builds: 0,
+        cacheRepositories: 0,
+        cacheJobs: 0,
+        cacheVersions: 0,
+        sharedCaches: 0,
+        tartImages: 0,
+        containerImages: 0,
+        pressure: false,
+      }),
+      serveRepository: async () => {
+        served = true;
+      },
+    },
+  });
+  expect(served).toBe(true);
+  expect(readinessSignal).toBe(controller.signal);
+});
+
 test("refreshes repository registrations without restarting the worker", async () => {
   const outer = new AbortController();
   const added: Repository = { owner: "owner", repo: "added", fullName: "owner/added" };

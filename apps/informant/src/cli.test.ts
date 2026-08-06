@@ -96,7 +96,7 @@ test("image prune reports partial runtime failures and preserves the successful 
       },
     }),
   ).rejects.toThrow(
-    "Deleted 2 unused prepared images, but failed to prune Apple Container images: runtime unavailable",
+    "Deleted 2 unused prepared images, but failed to prune rootless Podman images: runtime unavailable",
   );
 });
 

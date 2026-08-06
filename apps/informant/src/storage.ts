@@ -1,6 +1,11 @@
 import { existsSync } from "node:fs";
 import { readdir, statfs } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import {
+  appleContainerBackend,
+  type ContainerBackend,
+  selectContainerBackend,
+} from "./container-backend.ts";
 import { type CommandResult, command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { tartImages } from "./tart/vm.ts";
@@ -30,6 +35,9 @@ export interface StorageReport {
     error?: string;
   };
   container: {
+    backend?: string;
+    storageDescription?: string;
+    globalPruneCommand?: string;
     available: boolean;
     preparedCount?: number;
     imageBytes?: number;
@@ -45,6 +53,7 @@ interface StorageOperations {
   fileSystemSpace?: (path: string) => Promise<FileSystemSpace>;
   listTartImages?: typeof tartImages;
   runCommand?: (argv: string[]) => Promise<CommandResult>;
+  containerBackend?: ContainerBackend;
 }
 
 function errorMessage(error: unknown): string {
@@ -152,16 +161,49 @@ function appleContainerDiskUsage(source: string): {
   };
 }
 
+function podmanDiskUsage(source: string): {
+  imageBytes?: number;
+  reclaimableImageBytes?: number;
+} {
+  const records = JSON.parse(source) as Array<Record<string, unknown>>;
+  if (!Array.isArray(records)) return {};
+  const images = records.find((record) => String(record.Type).toLowerCase() === "images");
+  if (!images) return {};
+  const numeric = (keys: string[]) => {
+    for (const key of keys) {
+      const value = images[key];
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())) {
+        return Number(value);
+      }
+    }
+    return undefined;
+  };
+  return {
+    imageBytes: numeric(["RawSize", "rawSize", "Size", "size"]),
+    reclaimableImageBytes: numeric([
+      "RawReclaimable",
+      "rawReclaimable",
+      "Reclaimable",
+      "reclaimable",
+    ]),
+  };
+}
+
 async function containerStorage(
   runCommand: (argv: string[]) => Promise<CommandResult>,
+  backend: ContainerBackend,
 ): Promise<StorageReport["container"]> {
   const [images, usage] = await Promise.all([
-    runCommand(["container", "image", "list", "--quiet"]),
-    runCommand(["container", "system", "df", "--format", "json"]),
+    runCommand(backend.listImagesArguments()),
+    runCommand(backend.systemDfArguments()),
   ]);
   if (images.exitCode !== 0 && usage.exitCode !== 0) {
     return {
       available: false,
+      backend: backend.name,
+      storageDescription: backend.sharedStorageDescription,
+      globalPruneCommand: backend.globalPruneCommand,
       preparedCount: 0,
       error: errorMessage(images.stderr || usage.stderr || "not available"),
     };
@@ -170,16 +212,34 @@ async function containerStorage(
     images.exitCode === 0
       ? images.stdout
           .split("\n")
-          .filter((name) => /^informant-prepared-container:[0-9a-f]{16}$/.test(name.trim())).length
+          .filter((name) =>
+            /^informant-prepared-container:[0-9a-f]{16}$/.test(
+              backend.normalizeImageName(name.trim()),
+            ),
+          ).length
       : undefined;
   try {
     return {
       available: true,
+      backend: backend.name,
+      storageDescription: backend.sharedStorageDescription,
+      globalPruneCommand: backend.globalPruneCommand,
       preparedCount,
-      ...(usage.exitCode === 0 ? appleContainerDiskUsage(usage.stdout) : {}),
+      ...(usage.exitCode === 0
+        ? backend.kind === "apple"
+          ? appleContainerDiskUsage(usage.stdout)
+          : podmanDiskUsage(usage.stdout)
+        : {}),
     };
   } catch (error) {
-    return { available: true, preparedCount, error: errorMessage(error) };
+    return {
+      available: true,
+      backend: backend.name,
+      storageDescription: backend.sharedStorageDescription,
+      globalPruneCommand: backend.globalPruneCommand,
+      preparedCount,
+      error: errorMessage(error),
+    };
   }
 }
 
@@ -201,11 +261,15 @@ export async function collectStorageReport(
   const measureFileSystem = operations.fileSystemSpace ?? fileSystemSpace;
   const listImages = operations.listTartImages ?? tartImages;
   const runCommand = operations.runCommand ?? command;
+  const containerBackend =
+    operations.containerBackend ??
+    (operations.runCommand ? appleContainerBackend : selectContainerBackend()) ??
+    appleContainerBackend;
   const dataPaths = (await listDataEntries(path)).map((entry) => join(path, entry));
   const [dataSizes, tart, container, disk] = await Promise.all([
     measure(dataPaths),
     tartStorage(listImages),
-    containerStorage(runCommand),
+    containerStorage(runCommand, containerBackend),
     measureFileSystem(path),
   ]);
   const cacheBytes = dataSizes.get(join(path, "caches")) ?? 0;
@@ -321,7 +385,10 @@ export function formatStorageReport(report: StorageReport): string {
         ? "prepared image count unavailable"
         : `${report.container.preparedCount} prepared`;
     lines.push(
-      row("Container images", `${prepared} · stored in the shared Apple Container runtime`),
+      row(
+        "Container images",
+        `${prepared} · stored in ${report.container.storageDescription ?? "the selected runtime"}`,
+      ),
     );
   } else {
     lines.push(
@@ -347,7 +414,7 @@ export function formatStorageReport(report: StorageReport): string {
         : ` · ${formatBytes(report.container.reclaimableImageBytes)} reclaimable`;
     lines.push(
       row(
-        "Apple Container images",
+        `${report.container.backend ?? "Container"} images`,
         `${formatBytes(report.container.imageBytes)}${reclaimable} · runtime-wide`,
       ),
     );
@@ -367,10 +434,14 @@ export function formatStorageReport(report: StorageReport): string {
     row("informant cache prune", "Remove keyed caches; keep shared caches"),
     row("informant cache clear", "Remove all persistent job caches"),
     row("informant image prune", "Remove unused prepared runtime images"),
-    row(
-      "container image prune --all",
-      "Remove unused runtime images, including non-Informant images",
-    ),
   );
+  if (report.container.globalPruneCommand) {
+    lines.push(
+      row(
+        report.container.globalPruneCommand,
+        "Remove unused runtime images, including non-Informant images",
+      ),
+    );
+  }
   return lines.join("\n");
 }

@@ -1,4 +1,5 @@
 import { arch, hostname, platform } from "node:os";
+import { containerBackendReadiness } from "./container-backend.ts";
 import type { InformantConfig } from "./types.ts";
 
 const architectureLabel = (value: string) =>
@@ -8,13 +9,14 @@ export function workerCapabilities(environment = Bun.env): string[] {
   const configured = (environment.INFORMANT_CAPABILITIES ?? "")
     .split(",")
     .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
+    .filter((value) => Boolean(value) && value !== "container");
   return [
     ...new Set([
       "self-hosted",
       platform(),
       architectureLabel(arch()),
       hostname().toLowerCase(),
+      ...(containerBackendReadiness()?.ready ? ["container"] : []),
       ...configured,
     ]),
   ];
@@ -27,7 +29,11 @@ export function selectCapableJobs(
   const available = new Set(capabilities.map((value) => value.toLowerCase()));
   const selected = new Set(
     config.jobs
-      .filter((job) => (job.runsOn ?? []).every((label) => available.has(label.toLowerCase())))
+      .filter(
+        (job) =>
+          (job.runtime?.type !== "container" || available.has("container")) &&
+          (job.runsOn ?? []).every((label) => available.has(label.toLowerCase())),
+      )
       .map((job) => job.name),
   );
   let changed = true;

@@ -139,6 +139,7 @@ function harness(
   const dependencies: CoordinatorDependencies = {
     createBuild: async () => {},
     housekeepingBarrier: async (callback) => callback(),
+    refreshContainerBackend: async () => true,
     saveBuild: async (record) => {
       saved.push({ ...record });
     },
@@ -493,6 +494,179 @@ describe("runCommit", () => {
     expect(claims[1]?.jobs).toEqual(["test"]);
     expect(claims[2]?.jobs).toEqual(["gpu-test"]);
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
+  });
+
+  test("returns retryable before claiming selected portable container work when unavailable", async () => {
+    let claims = 0;
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async () => {
+        claims++;
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const containerConfig: InformantConfig = {
+      ...config,
+      jobs: [
+        {
+          ...baseJob,
+          runsOn: ["container"],
+          runtime: { type: "container", image: "docker.io/oven/bun:1" },
+          triggers: [{ event: "comment" }],
+        },
+      ],
+    };
+    const dependencies = harness().dependencies;
+    let ready = false;
+    let refreshes = 0;
+    const signals: Array<AbortSignal | undefined> = [];
+    dependencies.refreshContainerBackend = async (signal) => {
+      refreshes++;
+      signals.push(signal);
+      return ready;
+    };
+    const event = { type: "comment" as const, id: "pr:1:comment:7" };
+
+    expect(
+      await runCommit(github, repository, "sha", "main", containerConfig, dependencies, event),
+    ).toBeFalse();
+    expect(refreshes).toBe(1);
+    expect(claims).toBe(0);
+
+    ready = true;
+    const controller = new AbortController();
+    await runCommit(
+      github,
+      repository,
+      "sha",
+      "main",
+      containerConfig,
+      dependencies,
+      event,
+      controller.signal,
+    );
+    expect(refreshes).toBe(2);
+    expect(claims).toBe(1);
+    expect(signals).toEqual([undefined, controller.signal]);
+  });
+
+  test("does not execute a partial host subset when selected container work is unavailable", async () => {
+    let claims = 0;
+    let executions = 0;
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async () => {
+        claims++;
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const dependencies = harness().dependencies;
+    dependencies.workerCapabilities = () => ["self-hosted", "linux", "x64"];
+    dependencies.refreshContainerBackend = async () => false;
+    dependencies.runInTart = async () => {
+      executions++;
+      return true;
+    };
+    const result = await runCommit(
+      github,
+      repository,
+      "sha",
+      "main",
+      {
+        ...config,
+        jobs: [
+          { ...baseJob, runsOn: ["linux", "x64"], runtime: { type: "host" } },
+          {
+            ...baseJob,
+            name: "container",
+            runsOn: ["linux", "x64"],
+            runtime: { type: "container", image: "docker.io/oven/bun:1" },
+          },
+        ],
+      },
+      dependencies,
+    );
+    expect(result).toBeFalse();
+    expect(claims).toBe(0);
+    expect(executions).toBe(0);
+  });
+
+  test("does not retry incompatible Darwin-only container work on a Linux worker", async () => {
+    let claims = 0;
+    let refreshes = 0;
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async () => {
+        claims++;
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const dependencies = harness().dependencies;
+    dependencies.workerCapabilities = () => ["self-hosted", "linux", "x64"];
+    dependencies.refreshContainerBackend = async () => {
+      refreshes++;
+      return false;
+    };
+    const result = await runCommit(
+      github,
+      repository,
+      "sha",
+      "main",
+      {
+        ...config,
+        jobs: [
+          {
+            ...baseJob,
+            runsOn: ["darwin", "arm64"],
+            runtime: { type: "container", image: "docker.io/oven/bun:1" },
+          },
+        ],
+      },
+      dependencies,
+    );
+    expect(result).toBeUndefined();
+    expect(refreshes).toBe(0);
+    expect(claims).toBe(0);
+  });
+
+  test("does not probe container readiness for VM or host-only configs", async () => {
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async () => undefined,
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const dependencies = harness().dependencies;
+    let refreshes = 0;
+    dependencies.refreshContainerBackend = async () => {
+      refreshes++;
+      return true;
+    };
+    await runCommit(github, repository, "vm", "main", config, dependencies);
+    await runCommit(
+      github,
+      repository,
+      "host",
+      "main",
+      {
+        ...config,
+        jobs: [
+          {
+            ...baseJob,
+            runsOn: [process.platform, process.arch],
+            runtime: { type: "host" },
+          },
+        ],
+      },
+      dependencies,
+    );
+    expect(refreshes).toBe(0);
   });
 
   test("legacy capability scopes cover every label group before trigger selection", async () => {

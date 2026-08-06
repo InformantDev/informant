@@ -13,13 +13,14 @@ triggers = [{ event = "commit" }]
 filters = [{ branch = { names = ["main"] } }]
 
 [container]
-image = "oven/bun:1"
+image = "docker.io/oven/bun:1"
 `;
 
 const defaultJob = `name = "test"
 command = """
 bun install --frozen-lockfile && bun test
 """
+runs_on = ["container"]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 `;
 

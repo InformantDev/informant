@@ -1,16 +1,17 @@
 ---
 title: Quickstart
-description: Put one Mac on CI duty in a few minutes.
+description: Put a Linux or macOS machine on CI duty in a few minutes.
 ---
 
 ## Requirements
 
-- macOS 13 or newer on Apple Silicon; container jobs require macOS 26 or newer
-- Homebrew, Git, and GitHub CLI
+- Apple Silicon macOS 13 or newer; Apple Container jobs require macOS 26 or newer
+- Or Debian/Ubuntu/Fedora/RHEL Linux with rootless Podman and cgroups v2
+- Git and GitHub CLI; Homebrew for the documented macOS installation
 
 ## Install Informant
 
-Install the standalone Informant binary from its Homebrew tap and GitHub CLI:
+On macOS, install the standalone Informant binary from its Homebrew tap and GitHub CLI:
 
 ```bash
 brew install informant-ci/tap/informant
@@ -18,6 +19,20 @@ brew install gh
 gh auth login
 informant --version
 ```
+
+On Linux, install Informant separately before running setup. The repository currently provides a
+standalone binary build path from a source checkout with Bun installed:
+
+```bash
+bun install
+bun run --cwd apps/informant build:binary
+sudo install -m 0755 apps/informant/dist/informant /usr/local/bin/informant
+informant --version
+```
+
+`informant setup` can install the Podman packages described below; it does not install Informant.
+Install GitHub CLI through the distribution's package instructions and authenticate with
+`gh auth login`.
 
 ## Create the GitHub App
 
@@ -29,8 +44,11 @@ informant setup
 
 Informant will:
 
-1. Offer to install Apple's signed Container package, start its services, and verify the default job
-   image. The installation requires an administrator password.
+1. Configure and verify the host container backend. On Apple Silicon this installs Apple's signed
+   Container package. On Linux, setup offers to install Podman with `apt-get` or `dnf`, verifies that
+   it is rootless with cgroups v2, and smoke tests the default image with production CPU, memory,
+   security, and writable bind-mount constraints. Podman is daemonless; Informant does not start a
+   service and does not require systemd.
 2. Ask whether your account or an organization should own the App.
 3. Open GitHub with **Checks: read/write**, **Contents: read**, **Pull requests: read/write**, and
    webhooks disabled.
@@ -68,14 +86,17 @@ informant hook install # supported pre-push hook; waits until the push is visibl
 `.informant/jobs/test.toml`, detects `owner/repository` from the `origin` Git remote, and registers it
 with this machine automatically.
 
-Start the worker now and automatically whenever you log in:
+On macOS, or Linux with a working systemd user manager, start the worker now and automatically when
+you log in:
 
 ```bash
 informant startup enable
 ```
 
-Use `informant startup disable` to stop the worker and remove it from login startup. Run
-`informant serve` instead when you want a foreground worker for debugging.
+Use `informant startup disable` to stop the worker and remove it from login startup. Linux hosts
+without a systemd user manager must not use `startup enable`; run `informant serve` in the foreground
+or configure that command in the host's existing process supervisor. Podman itself remains daemonless
+in either arrangement.
 
 Register more repositories with `informant repo add owner/repository`. Run the same registration and
-serve commands on another Mac to add capacity. There is no shared database to configure.
+serve commands on another machine to add capacity. There is no shared database to configure.
