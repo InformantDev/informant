@@ -249,25 +249,26 @@ export async function runCommit(
   }
   const results = await Promise.all(
     partitions.map((jobs) => {
-      const labels = [...(jobs[0]?.runsOn ?? [])].sort();
-      const previousJobs = jobsByLabels.get(labels.join("\0")) ?? jobs;
       const baseScope = `${event?.type ?? "commit"}:${event?.id ?? sha}`;
-      const previousScope =
-        usesCapabilities && event
-          ? `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from(
-              previousJobs
-                .map((job) => job.name)
-                .sort()
-                .join("\0"),
-            ).toString("base64url")}`
-          : usesCapabilities
-            ? `${baseScope}:jobs:${Buffer.from(
-                previousJobs
-                  .map((job) => job.name)
-                  .sort()
-                  .join("\0"),
-              ).toString("base64url")}`
-            : baseScope;
+      const labelKeys = new Set<string>();
+      for (const job of jobs) {
+        labelKeys.add([...(job.runsOn ?? [])].sort().join("\0"));
+      }
+      const previousScopes = [...labelKeys].map((key) => {
+        const previousJobs =
+          jobsByLabels.get(key) ??
+          jobs.filter((job) => [...(job.runsOn ?? [])].sort().join("\0") === key);
+        if (!usesCapabilities) return baseScope;
+        const jobsScope = Buffer.from(
+          previousJobs
+            .map((job) => job.name)
+            .sort()
+            .join("\0"),
+        ).toString("base64url");
+        return event
+          ? `${baseScope}:jobs:${Buffer.from(key).toString("base64url")}:jobs:${jobsScope}`
+          : `${baseScope}:jobs:${jobsScope}`;
+      });
       return runCommitPartition(
         github,
         repository,
@@ -279,7 +280,7 @@ export async function runCommit(
         signal,
         jobs.map((job) => job.name),
         !manualTrigger,
-        manualTrigger ? [] : [previousScope],
+        manualTrigger ? [] : previousScopes,
       );
     }),
   );

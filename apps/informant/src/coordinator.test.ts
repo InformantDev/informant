@@ -495,7 +495,7 @@ describe("runCommit", () => {
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
   });
 
-  test("legacy capability scopes include jobs omitted by trigger selection", async () => {
+  test("legacy capability scopes cover every label group before trigger selection", async () => {
     const claims: Array<{ jobs?: string[]; legacyScopes?: string[] }> = [];
     const github = {
       hasPendingManualTrigger: async () => false,
@@ -507,37 +507,55 @@ describe("runCommit", () => {
     const baseJob = config.jobs[0];
     if (!baseJob) throw new Error("expected test job");
     const labels = [process.platform, process.arch].sort();
+    const gpuLabels = [...labels, "gpu"].sort();
     const event = { type: "commit" as const, id: "branch:main:sha", branch: "main" };
 
-    await runCommit(
-      github,
-      repository,
-      "sha",
-      "main",
-      {
-        ...config,
-        jobs: [
-          {
-            ...baseJob,
-            runsOn: labels,
-            runtime: { type: "host" },
-            triggers: [{ event: "commit" }],
-          },
-          {
-            ...baseJob,
-            name: "lint",
-            runsOn: labels,
-            runtime: { type: "host" },
-            triggers: [{ event: "comment" }],
-          },
-        ],
-      },
-      harness().dependencies,
-      event,
-    );
+    Bun.env.INFORMANT_CAPABILITIES = "gpu";
+    try {
+      await runCommit(
+        github,
+        repository,
+        "sha",
+        "main",
+        {
+          ...config,
+          jobs: [
+            {
+              ...baseJob,
+              runsOn: labels,
+              runtime: { type: "host" },
+              triggers: [{ event: "commit" }],
+            },
+            {
+              ...baseJob,
+              name: "lint",
+              runsOn: labels,
+              runtime: { type: "host" },
+              triggers: [{ event: "comment" }],
+            },
+            {
+              ...baseJob,
+              name: "gpu-test",
+              needs: ["test"],
+              runsOn: gpuLabels,
+              runtime: { type: "host" },
+              triggers: [{ event: "commit" }],
+            },
+          ],
+        },
+        harness().dependencies,
+        event,
+      );
+    } finally {
+      delete Bun.env.INFORMANT_CAPABILITIES;
+    }
 
-    const legacyScope = `commit:${event.id}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from("lint\0test").toString("base64url")}`;
-    expect(claims).toEqual([{ jobs: ["test"], legacyScopes: [legacyScope] }]);
+    const baseScope = `commit:${event.id}`;
+    const legacyScopes = [
+      `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from("lint\0test").toString("base64url")}`,
+      `${baseScope}:jobs:${Buffer.from(gpuLabels.join("\0")).toString("base64url")}:jobs:${Buffer.from("gpu-test").toString("base64url")}`,
+    ];
+    expect(claims).toEqual([{ jobs: ["test", "gpu-test"], legacyScopes }]);
   });
 
   test("retries the event when any capability partition loses its claim", async () => {
