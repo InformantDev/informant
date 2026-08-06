@@ -7,17 +7,25 @@ import {
   containerJobCommand,
   containerRunArguments,
   ensurePreparedContainer,
+  listPreparedContainerImages,
   preparedContainerImage,
   pruneKnownPreparedContainerImages,
   prunePreparedContainerImages,
   runInContainer,
 } from "./container.ts";
+import {
+  appleContainerBackend,
+  initializeContainerBackend,
+  podmanContainerBackend,
+  resetContainerBackendReadiness,
+} from "./container-backend.ts";
 import { shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
 const temporaryDataPaths: string[] = [];
 
 afterEach(async () => {
+  resetContainerBackendReadiness();
   await Promise.all(
     temporaryDataPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -147,6 +155,75 @@ test("preserves commas in Apple Container volume paths", () => {
   ).toContain("/tmp/workspace,one:/workspace");
 });
 
+test("normalizes Podman localhost prepared image names", async () => {
+  const commands: string[][] = [];
+  const images = await listPreparedContainerImages(
+    async (argv) => {
+      commands.push(argv);
+      return {
+        exitCode: 0,
+        stdout: "localhost/informant-prepared-container:0123456789abcdef\ndocker.io/oven/bun:1\n",
+        stderr: "",
+        timedOut: false,
+      };
+    },
+    undefined,
+    podmanContainerBackend,
+  );
+  expect(commands).toEqual([podmanContainerBackend.listImagesArguments()]);
+  expect(images).toEqual(["informant-prepared-container:0123456789abcdef"]);
+});
+
+test("executes and force-removes jobs with rootless Podman", async () => {
+  const invocations: string[][] = [];
+  const runCommand = async (args: string[]) => {
+    invocations.push(args);
+    return {
+      exitCode: 0,
+      stdout:
+        args[1] === "info"
+          ? JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } })
+          : "",
+      stderr: "",
+      timedOut: false,
+    };
+  };
+  await initializeContainerBackend(podmanContainerBackend, runCommand);
+  const result = await runInContainer(
+    { owner: "owner", repo: "repo", fullName: "owner/repo" },
+    "sha",
+    "main",
+    "trusted",
+    false,
+    process.cwd(),
+    {
+      name: "podman",
+      command: "true",
+      optional: false,
+      timeoutMinutes: 1,
+      environment: {},
+      secrets: [],
+      needs: [],
+      runtime: { type: "container", image: "docker.io/oven/bun:1" },
+    },
+    async () => {},
+    async () => {},
+    {},
+    undefined,
+    {
+      backend: podmanContainerBackend,
+      command: runCommand,
+      dataPath: temporaryContainerDataPath(),
+    },
+  );
+  expect(result.success).toBe(true);
+  const run = invocations.find((args) => args[1] === "run");
+  expect(run).toContain("no-new-privileges");
+  expect(run).toContain("--cpus");
+  expect(run).toContain("--memory");
+  expect(invocations.at(-1)?.slice(0, 3)).toEqual(["podman", "rm", "--force"]);
+});
+
 test("prepares and reuses a deterministic container image", async () => {
   const runtime = {
     type: "container" as const,
@@ -267,8 +344,23 @@ test("tracks prepared container image references and prunes images after their l
       dataPath,
     });
     expect(deleted).toEqual([first]);
-    expect(await pruneKnownPreparedContainerImages(command, dataPath, withImageLock)).toBe(0);
-    expect(await prunePreparedContainerImages(command, dataPath, withImageLock)).toBe(1);
+    expect(
+      await pruneKnownPreparedContainerImages(
+        command,
+        dataPath,
+        withImageLock,
+        appleContainerBackend,
+      ),
+    ).toBe(0);
+    expect(
+      await prunePreparedContainerImages(
+        command,
+        dataPath,
+        withImageLock,
+        false,
+        appleContainerBackend,
+      ),
+    ).toBe(1);
     expect(deleted).toEqual([first, orphan]);
   } finally {
     await rm(root, { recursive: true, force: true });

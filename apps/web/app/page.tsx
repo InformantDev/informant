@@ -18,8 +18,8 @@ export default function HomePage() {
           Your machines.<em>On CI duty.</em>
         </h1>
         <p className="hero-copy">
-          Informant turns idle Macs into a private CI fleet. GitHub is the queue. Tart is the
-          isolation. Nothing needs a public endpoint.
+          Informant turns Linux and macOS machines into a private CI fleet. GitHub is the queue.
+          Containers and VMs isolate the work. Nothing needs a public endpoint.
         </p>
         <div className="actions">
           <Link className="button" href="/docs/quickstart">
@@ -31,7 +31,7 @@ export default function HomePage() {
         </div>
         <div className="terminal" role="log" aria-label="Example Informant terminal output">
           <div className="terminal-head">
-            <span>INFORMANT / MAC-MINI-03</span>
+            <span>INFORMANT / WORKER-03</span>
             <span>LIVE</span>
           </div>
           <pre>
@@ -50,11 +50,11 @@ export default function HomePage() {
             rule, or public server.
           </div>
           <div className="feature">
-            <strong>02 / Disposable</strong>Every commit runs in a fresh Tart VM built from your
-            chosen macOS image.
+            <strong>02 / Disposable</strong>Every job runs in a fresh container, VM, or isolated
+            native checkout selected by its configuration.
           </div>
           <div className="feature">
-            <strong>03 / Distributed</strong>Add another Mac. Checks coordinate claims; the fleet
+            <strong>03 / Distributed</strong>Add another worker. Checks coordinate claims; the fleet
             balances itself.
           </div>
         </div>
