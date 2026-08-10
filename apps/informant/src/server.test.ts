@@ -417,6 +417,12 @@ describe("serve polling orchestration", () => {
       state,
       async () => undefined,
     );
+    let pollStateWrites = 0;
+    const savePollState = deps.savePollState;
+    deps.savePollState = async (...args) => {
+      pollStateWrites++;
+      await savePollState?.(...args);
+    };
     deps.repositoryConfig = async (_github, _repository, sha) => {
       if (sha === "default-sha") return config;
       missingConfigReads++;
@@ -428,6 +434,7 @@ describe("serve polling orchestration", () => {
 
     expect(missingConfigReads).toBe(branches.length);
     expect(state.missingConfigs).toHaveLength(branches.length);
+    expect(pollStateWrites).toBe(5);
   });
 
   test("job filters prevent nonmatching automatic events from being claimed", async () => {

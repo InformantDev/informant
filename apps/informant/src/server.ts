@@ -230,6 +230,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     sha: string,
     state: Awaited<ReturnType<typeof readPollState>>,
     missingConfigShas: Set<string>,
+    onMissingConfig: () => Promise<void> | void,
   ) => {
     const now = Date.now();
     if (missingConfigShas.has(sha)) return Promise.resolve(undefined);
@@ -242,7 +243,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           { sha, checkedAt: new Date(now).toISOString() },
         ];
         missingConfigShas.add(sha);
-        await persistPollState(repository.fullName, state);
+        await onMissingConfig();
         return undefined;
       }
       throw error;
@@ -338,9 +339,23 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       const state = await loadPollState(repository.fullName);
       state.missingConfigs = unexpiredMissingConfigs(state.missingConfigs ?? []);
       const missingConfigShas = new Set(state.missingConfigs.map((entry) => entry.sha));
+      let missingConfigsDirty = false;
+      const persistState = async () => {
+        await persistPollState(repository.fullName, state);
+        missingConfigsDirty = false;
+      };
+      const flushMissingConfigs = async () => {
+        if (missingConfigsDirty) await persistState();
+      };
+      const markMissingConfig = async (persistImmediately = false) => {
+        missingConfigsDirty = true;
+        if (persistImmediately) await persistState();
+      };
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
-      const bootstrap = await configAt(defaultSha, state, missingConfigShas);
+      const bootstrap = await configAt(defaultSha, state, missingConfigShas, () =>
+        markMissingConfig(true),
+      );
       if (!bootstrap) throw new MissingRepositoryConfigError();
       const storageReferences = await Promise.allSettled([
         (dependencies.reconcilePreparedImageReferences ?? reconcilePreparedImageReferences)(
@@ -426,7 +441,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         state.tagRefs = tags;
         state.tagsPolledAt = new Date().toISOString();
       }
-      await persistPollState(repository.fullName, state);
+      await persistState();
       for (const id of completedTagEvents) completedTags.delete(id);
       const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
       const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
@@ -476,6 +491,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         })),
       ]) {
         if (options.signal?.aborted) {
+          await flushMissingConfigs();
           await drainForShutdown();
           return;
         }
@@ -492,7 +508,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           pullRequest: target.pullRequest,
         };
         try {
-          const targetConfig = await configAt(target.sha, state, missingConfigShas);
+          const targetConfig = await configAt(
+            target.sha,
+            state,
+            missingConfigShas,
+            markMissingConfig,
+          );
           if (!targetConfig) continue;
           const config = applySecretPolicy(targetConfig, bootstrap, defaultSha);
           const matches =
@@ -504,12 +525,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
                 state.pendingTags = state.pendingTags.filter(
                   (item) => item.name !== target.tag || item.sha !== target.sha,
                 );
-                await persistPollState(repository.fullName, state);
+                await persistState();
               }
               continue;
             }
           }
           if (options.signal?.aborted) {
+            await flushMissingConfigs();
             await drainForShutdown();
             return;
           }
@@ -562,11 +584,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           message(`${target.branch}@${target.sha.slice(0, 7)} failed: ${errorDetail(error)}`);
         }
       }
+      await flushMissingConfigs();
 
       if (completedComments.size > 0) {
         const completed = new Set(completedComments);
         state.pending = state.pending.filter((item) => !completed.has(item.id));
-        await persistPollState(repository.fullName, state);
+        await persistState();
         for (const id of completed) completedComments.delete(id);
       }
       if (!state.cursor) {
@@ -576,7 +599,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           new Date(0).toISOString(),
         );
         state.seenCommentIds = latest.map((comment) => comment.id);
-        await persistPollState(repository.fullName, state);
+        await persistState();
       } else {
         const previousCursor = state.cursor;
         const overlap = new Date(
@@ -607,13 +630,18 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             });
         }
         state.seenCommentIds = state.seenCommentIds.slice(-SEEN_COMMENT_LIMIT);
-        await persistPollState(repository.fullName, state);
+        await persistState();
       }
       for (const pending of [...state.pending]) {
         const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
         if (inFlightRuns.has(eventId)) continue;
         try {
-          const pendingConfig = await configAt(pending.sha, state, missingConfigShas);
+          const pendingConfig = await configAt(
+            pending.sha,
+            state,
+            missingConfigShas,
+            markMissingConfig,
+          );
           if (!pendingConfig) continue;
           const config = applySecretPolicy(pendingConfig, bootstrap, defaultSha);
           const context: EventContext & { id: string } = {
@@ -626,10 +654,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               .jobs.length > 0;
           if (!matches) {
             state.pending = state.pending.filter((item) => item.id !== pending.id);
-            await persistPollState(repository.fullName, state);
+            await persistState();
             continue;
           }
           if (options.signal?.aborted) {
+            await flushMissingConfigs();
             await drainForShutdown();
             return;
           }
@@ -662,6 +691,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           message(`comment ${pending.id} failed: ${errorDetail(error)}`);
         }
       }
+      await flushMissingConfigs();
       lastPollError = undefined;
     } catch (error) {
       const detail = errorDetail(error);
