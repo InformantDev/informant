@@ -399,6 +399,37 @@ describe("serve polling orchestration", () => {
     expect(state.missingConfigs).toEqual([]);
   });
 
+  test("retains all reachable missing configurations when the bounded cache is full", async () => {
+    const branches = Array.from({ length: 257 }, (_, index) => ({
+      name: `legacy-${index}`,
+      sha: `legacy-sha-${index}`,
+    }));
+    let missingConfigReads = 0;
+    const state: PollState = {
+      cursor: "2026-01-01T00:00:00.000Z",
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      missingConfigs: [],
+    };
+    const deps = dependencies(
+      github({ branches: async () => branches }),
+      state,
+      async () => undefined,
+    );
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      missingConfigReads++;
+      throw new GitHubApiError(404, '{"message":"Not Found"}');
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(missingConfigReads).toBe(branches.length);
+    expect(state.missingConfigs).toHaveLength(branches.length);
+  });
+
   test("job filters prevent nonmatching automatic events from being claimed", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
     const launched: string[] = [];

@@ -28,7 +28,6 @@ export async function readPollState(repo: string): Promise<PollState> {
   if (!(await file.exists()))
     return { pending: [], seenCommentIds: [], pendingTags: [], missingConfigs: [] };
   const state = (await file.json()) as Partial<PollState> & { missingConfigShas?: unknown[] };
-  const checkedAt = new Date().toISOString();
   return {
     cursor: state.cursor,
     pending: state.pending ?? [],
@@ -43,7 +42,7 @@ export async function readPollState(repo: string): Promise<PollState> {
       ),
       ...(state.missingConfigShas ?? [])
         .filter((sha): sha is string => typeof sha === "string")
-        .map((sha) => ({ sha, checkedAt })),
+        .map((sha) => ({ sha, checkedAt: new Date(0).toISOString() })),
     ],
   };
 }

@@ -27,6 +27,28 @@ const MISSING_CONFIG_LIMIT = 256;
 
 class MissingRepositoryConfigError extends Error {}
 
+function unexpiredMissingConfigs(
+  entries: Array<{ sha: string; checkedAt: string }>,
+  now = Date.now(),
+) {
+  return entries.filter((entry) => {
+    const checkedAt = Date.parse(entry.checkedAt);
+    return Number.isFinite(checkedAt) && now - checkedAt < MISSING_CONFIG_TTL_MS;
+  });
+}
+
+function boundMissingConfigs(
+  entries: Array<{ sha: string; checkedAt: string }>,
+  retainedShas: ReadonlySet<string>,
+) {
+  const retained: typeof entries = [];
+  const stale: typeof entries = [];
+  for (const entry of entries) {
+    (retainedShas.has(entry.sha) ? retained : stale).push(entry);
+  }
+  return [...stale.slice(-MISSING_CONFIG_LIMIT), ...retained];
+}
+
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
   const paths = await github.directoryFiles(repository, sha, JOBS_DIRECTORY);
@@ -204,12 +226,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     });
   };
   let recoveryPending = true;
-  const configAt = (sha: string, state: Awaited<ReturnType<typeof readPollState>>) => {
+  const configAt = (
+    sha: string,
+    state: Awaited<ReturnType<typeof readPollState>>,
+    missingConfigShas: Set<string>,
+  ) => {
     const now = Date.now();
-    state.missingConfigs = (state.missingConfigs ?? [])
-      .filter((entry) => now - Date.parse(entry.checkedAt) < MISSING_CONFIG_TTL_MS)
-      .slice(-MISSING_CONFIG_LIMIT);
-    if (state.missingConfigs.some((entry) => entry.sha === sha)) return Promise.resolve(undefined);
+    if (missingConfigShas.has(sha)) return Promise.resolve(undefined);
     const cached = configs.get(sha);
     if (cached) return cached;
     const pending = loadRepositoryConfig(github, repository, sha).catch(async (error) => {
@@ -217,7 +240,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         state.missingConfigs = [
           ...(state.missingConfigs ?? []).filter((entry) => entry.sha !== sha),
           { sha, checkedAt: new Date(now).toISOString() },
-        ].slice(-MISSING_CONFIG_LIMIT);
+        ];
+        missingConfigShas.add(sha);
         await persistPollState(repository.fullName, state);
         return undefined;
       }
@@ -312,9 +336,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     try {
       const state = await loadPollState(repository.fullName);
+      state.missingConfigs = unexpiredMissingConfigs(state.missingConfigs ?? []);
+      const missingConfigShas = new Set(state.missingConfigs.map((entry) => entry.sha));
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
-      const bootstrap = await configAt(defaultSha, state);
+      const bootstrap = await configAt(defaultSha, state, missingConfigShas);
       if (!bootstrap) throw new MissingRepositoryConfigError();
       const storageReferences = await Promise.allSettled([
         (dependencies.reconcilePreparedImageReferences ?? reconcilePreparedImageReferences)(
@@ -369,6 +395,16 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         shouldPollTags ? github.tags(repository) : undefined,
         github.pullRequests(repository),
       ]);
+      const retainedConfigShas = new Set([
+        defaultSha,
+        ...branches.map((branch) => branch.sha),
+        ...prs.filter((pr) => pr.sameRepository).map((pr) => pr.headSha),
+        ...state.pendingTags.map((tag) => tag.sha),
+        ...state.pending.map((comment) => comment.sha),
+      ]);
+      state.missingConfigs = boundMissingConfigs(state.missingConfigs, retainedConfigShas);
+      missingConfigShas.clear();
+      for (const entry of state.missingConfigs) missingConfigShas.add(entry.sha);
       const completedTagEvents = new Set(completedTags);
       if (completedTagEvents.size > 0) {
         state.pendingTags = state.pendingTags.filter(
@@ -456,7 +492,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           pullRequest: target.pullRequest,
         };
         try {
-          const targetConfig = await configAt(target.sha, state);
+          const targetConfig = await configAt(target.sha, state, missingConfigShas);
           if (!targetConfig) continue;
           const config = applySecretPolicy(targetConfig, bootstrap, defaultSha);
           const matches =
@@ -577,7 +613,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
         if (inFlightRuns.has(eventId)) continue;
         try {
-          const pendingConfig = await configAt(pending.sha, state);
+          const pendingConfig = await configAt(pending.sha, state, missingConfigShas);
           if (!pendingConfig) continue;
           const config = applySecretPolicy(pendingConfig, bootstrap, defaultSha);
           const context: EventContext & { id: string } = {
