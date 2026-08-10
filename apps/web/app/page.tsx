@@ -25,7 +25,7 @@ export default function HomePage() {
           <Link className="button" href="/docs/quickstart">
             Start reporting
           </Link>
-          <a className="button secondary" href="https://github.com/informant-ci/informant">
+          <a className="button secondary" href="https://github.com/InformantDev/informant">
             View source
           </a>
         </div>
