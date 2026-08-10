@@ -15,7 +15,12 @@
     "test": "bun test src",
     "typecheck": "tsc --noEmit",
     "build": "bun build src/cli.ts --target=bun --outfile=dist/informant.js",
-    "build:binary": "bun build src/cli.ts --compile --outfile=dist/informant"
+    "build:binary": "bun build src/cli.ts --compile --outfile=dist/informant",
+    "build:binary:darwin-arm64": "bun build src/cli.ts --compile --minify --target=bun-darwin-arm64 --outfile=dist/informant-darwin-arm64",
+    "build:binary:darwin-x64": "bun build src/cli.ts --compile --minify --target=bun-darwin-x64 --outfile=dist/informant-darwin-x64",
+    "build:binary:linux-x64": "bun build src/cli.ts --compile --minify --target=bun-linux-x64 --outfile=dist/informant-linux-x64",
+    "build:binary:linux-arm64": "bun build src/cli.ts --compile --minify --target=bun-linux-arm64 --outfile=dist/informant-linux-arm64",
+    "build:all": "bun run build:binary:darwin-arm64 && bun run build:binary:darwin-x64 && bun run build:binary:linux-x64 && bun run build:binary:linux-arm64"
   },
   "dependencies": {
     "@clack/core": "1.4.3",
