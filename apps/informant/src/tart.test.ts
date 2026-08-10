@@ -878,4 +878,23 @@ describe("job scheduler", () => {
     expect(failed).toEqual(["review"]);
     expect(skipped).toEqual(["publish"]);
   });
+
+  test("cancelled optional jobs still block dependent jobs", async () => {
+    const executed: string[] = [];
+    const skipped: string[] = [];
+    expect(
+      await scheduleJobs(
+        [job("review", [], true), job("publish", ["review"])],
+        async (current) => {
+          executed.push(current.name);
+          return "cancelled";
+        },
+        async (current) => {
+          skipped.push(current.name);
+        },
+      ),
+    ).toBe(false);
+    expect(executed).toEqual(["review"]);
+    expect(skipped).toEqual(["publish"]);
+  });
 });

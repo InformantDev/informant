@@ -173,6 +173,29 @@ test("cancellation requests target a running build or one active job", async () 
   await expect(requestBuildCancellation(record.id)).rejects.toThrow("build is not running");
 });
 
+test("cancellation reconciles a build whose owning worker exited", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "dead-cancellation",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    owner: { pid: 2_147_483_647, startedAt: "dead" },
+    logPath: join(root, "builds", "dead-cancellation", "build.log"),
+  };
+  await createBuild(record);
+
+  await expect(requestBuildCancellation(record.id)).rejects.toThrow("build is not running");
+  expect((await getBuild(record.id))?.status).toBe("cancelled");
+  expect(await listActiveBuilds()).toEqual([]);
+});
+
 afterEach(async () => {
   if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
   else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;

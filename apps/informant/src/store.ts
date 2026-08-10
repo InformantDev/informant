@@ -196,8 +196,9 @@ export async function listActiveBuilds(): Promise<BuildRecord[]> {
 }
 
 export async function requestBuildCancellation(id: string, job?: string): Promise<BuildRecord> {
-  const build = await getBuild(id);
+  let build = await getBuild(id);
   if (!build) throw new Error(`build not found: ${id}`);
+  if (build.status === "running") build = await reconcileBuildLiveness(build);
   if (build.status !== "running") throw new Error(`build is not running: ${id}`);
   if (job) {
     const state = build.jobs?.find((item) => item.name === job);

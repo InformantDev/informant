@@ -11,6 +11,7 @@ import {
   runLocalCommit,
 } from "./coordinator.ts";
 import type { GitHubClient } from "./github.ts";
+import { scheduleJobs } from "./tart/index.ts";
 import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 
 const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
@@ -60,8 +61,6 @@ function harness(
     manualTriggerLabel?: string;
     requestedJobs?: string[];
     originalPullRequest?: number;
-    cancelBuild?: boolean;
-    cancelJob?: string;
   } = {},
 ) {
   const updates: Array<{ id: number; values: Record<string, unknown> }> = [];
@@ -147,12 +146,6 @@ function harness(
     monitorBuildCancellation: (_id, jobs) => {
       const build = new AbortController();
       const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
-      if (options.cancelBuild) build.abort("Cancellation requested from informant builds.");
-      if (options.cancelJob) {
-        jobControllers
-          .get(options.cancelJob)
-          ?.abort(`Cancellation requested for ${options.cancelJob} from informant builds.`);
-      }
       return {
         signal: build.signal,
         jobSignal: (job) => jobControllers.get(job)?.signal,
@@ -1409,31 +1402,132 @@ describe("runCommit", () => {
     });
   });
 
-  test("cancels one requested job and completes the aggregate as cancelled", async () => {
-    const context = harness({ cancelJob: "test" });
+  test("cancels a running job, skips its dependent, and completes independent work", async () => {
+    const context = harness({ manualTrigger: true });
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multiJobConfig = {
+      ...config,
+      jobs: [base, { ...base, name: "deploy", needs: [base.name] }, { ...base, name: "lint" }],
+    };
+    const targetStarted = deferred<void>();
+    const releaseTarget = deferred<void>();
+    const started: string[] = [];
+    let cancelTarget: (() => void) | undefined;
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      cancelTarget = () =>
+        jobControllers
+          .get(base.name)
+          ?.abort(`Cancellation requested for ${base.name} from informant builds.`);
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+      _signal,
+      _runtimeSecrets,
+      _configuredVmJobs,
+      jobSignal,
+    ) =>
+      scheduleJobs(
+        selectedConfig.jobs,
+        async (job) => {
+          started.push(job.name);
+          await observer?.started?.(job);
+          if (job.name === base.name) {
+            targetStarted.resolve();
+            await releaseTarget.promise;
+          }
+          const outcome = jobSignal?.(job.name)?.aborted ? "cancelled" : "success";
+          await observer?.completed?.(job, { outcome, log: `${job.name} output` });
+          return outcome === "cancelled" ? "cancelled" : true;
+        },
+        async (job) => {
+          await observer?.completed?.(job, { outcome: "skipped", log: "" });
+        },
+      );
 
-    const record = await runCommit(
+    const running = runCommit(
       context.github,
       repository,
       "sha",
       "main",
-      config,
+      multiJobConfig,
       context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
     );
+    await targetStarted.promise;
+    if (!cancelTarget) throw new Error("expected a job cancellation controller");
+    cancelTarget();
+    releaseTarget.resolve();
+    const record = await running;
 
     if (!record) throw new Error("expected a build record");
     expect(record.status).toBe("cancelled");
-    expect(record.jobs).toEqual([{ name: "test", status: "cancelled" }]);
+    expect(record.jobs).toEqual([
+      { name: "test", status: "cancelled" },
+      { name: "deploy", status: "skipped" },
+      { name: "lint", status: "success" },
+    ]);
+    expect(new Set(started)).toEqual(new Set(["test", "lint"]));
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "cancelled" });
+    expect(
+      context.updates.find((update) => update.id === 101 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "skipped" });
+    expect(
+      context.updates.find((update) => update.id === 102 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "success" });
     expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
       conclusion: "cancelled",
       title: "1 job cancelled",
     });
   });
 
-  test("explicit cancellation also stops manually triggered builds", async () => {
-    const context = harness({ manualTrigger: true, cancelBuild: true });
+  test("keeps a cancelled build active until runtime cleanup finishes", async () => {
+    const context = harness({ manualTrigger: true });
+    const started = deferred<void>();
+    const cleanup = deferred<void>();
+    const buildController = new AbortController();
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      return {
+        signal: buildController.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+      signal,
+    ) => {
+      const job = selectedConfig.jobs[0];
+      if (!job || !signal) throw new Error("expected an abortable job");
+      await observer?.started?.(job);
+      started.resolve();
+      await cleanup.promise;
+      await observer?.completed?.(job, { outcome: "cancelled", log: "cancelled output" });
+      return false;
+    };
 
-    const record = await runCommit(
+    const running = runCommit(
       context.github,
       repository,
       "sha",
@@ -1442,6 +1536,12 @@ describe("runCommit", () => {
       context.dependencies,
       { type: "commit", branch: "main", id: "branch:main:sha" },
     );
+    await started.promise;
+    buildController.abort("Cancellation requested from informant builds.");
+    await Bun.sleep(0);
+    expect(context.saved.at(-1)?.status).toBe("running");
+    cleanup.resolve();
+    const record = await running;
 
     if (!record) throw new Error("expected a build record");
     expect(record.status).toBe("cancelled");

@@ -431,7 +431,10 @@ export function appendUtf8Tail(
 
 export async function scheduleJobs(
   jobs: InformantConfig["jobs"],
-  executeJob: (job: InformantConfig["jobs"][number], index: number) => Promise<boolean>,
+  executeJob: (
+    job: InformantConfig["jobs"][number],
+    index: number,
+  ) => Promise<boolean | "cancelled">,
   skipJob: (job: InformantConfig["jobs"][number]) => Promise<void> = async () => {},
   failJob: (job: InformantConfig["jobs"][number], error: unknown) => Promise<void> = async () => {},
 ): Promise<boolean> {
@@ -452,7 +455,8 @@ export async function scheduleJobs(
           await skipJob(job);
           return false;
         }
-        return (await executeJob(job, index)) || job.optional;
+        const result = await executeJob(job, index);
+        return result === "cancelled" ? false : result || job.optional;
       })
       .catch(async (error: unknown) => {
         await failJob(job, error);
@@ -655,7 +659,7 @@ export async function runInTart(
             log: decoder.decode(jobLogs.get(job.name)),
           }),
         );
-        return execution.success;
+        return outcome === "cancelled" ? "cancelled" : execution.success;
       },
       async (job) => {
         const cancelled = signalForJob(job)?.aborted;

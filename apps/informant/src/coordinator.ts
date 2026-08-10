@@ -173,21 +173,6 @@ export async function runLocalCommit(
       record.id,
       config.jobs.map((job) => job.name),
     );
-    cancellation.signal.addEventListener(
-      "abort",
-      () => {
-        record.status = "cancelled";
-        record.runningJobs = [];
-        record.jobs = record.jobs?.map((job) =>
-          job.status === "queued" || job.status === "running"
-            ? { ...job, status: "cancelled" }
-            : job,
-        );
-        record.completedAt = new Date().toISOString();
-        void dependencies.saveBuild(record).catch(() => undefined);
-      },
-      { once: true },
-    );
     const success = await dependencies.runInTart(
       repository,
       sha,
@@ -602,6 +587,7 @@ async function runCommitPartitionWithSlot(
 
   let childrenReconciled = false;
   let executionFinished = false;
+  let executionActive = false;
   let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
   try {
     await (
@@ -617,6 +603,7 @@ async function runCommitPartitionWithSlot(
     cancellation.signal.addEventListener(
       "abort",
       () => {
+        if (executionActive) return;
         record.status = "cancelled";
         record.runningJobs = [];
         record.jobs = record.jobs?.map((job) =>
@@ -647,46 +634,51 @@ async function runCommitPartitionWithSlot(
       )
         ? { GITHUB_TOKEN: () => github.createJobAccessToken(repository) }
         : {};
-      success = await dependencies.runInTart(
-        repository,
-        sha,
-        config,
-        record,
-        {
-          started: async (job) => {
-            const state = jobChecks.get(job.name);
-            if (!state) return;
-            record.runningJobs?.push(job.name);
-            record.jobs = record.jobs?.map((item) =>
-              item.name === job.name ? { ...item, status: "running" } : item,
-            );
-            await dependencies.saveBuild(record).catch(() => undefined);
-            await updateJob(state, {
-              status: "in_progress",
-              title: `${job.name} is running`,
-              summary: `Running on ${record.machine}.`,
-            });
+      executionActive = true;
+      try {
+        success = await dependencies.runInTart(
+          repository,
+          sha,
+          config,
+          record,
+          {
+            started: async (job) => {
+              const state = jobChecks.get(job.name);
+              if (!state) return;
+              record.runningJobs?.push(job.name);
+              record.jobs = record.jobs?.map((item) =>
+                item.name === job.name ? { ...item, status: "running" } : item,
+              );
+              await dependencies.saveBuild(record).catch(() => undefined);
+              await updateJob(state, {
+                status: "in_progress",
+                title: `${job.name} is running`,
+                summary: `Running on ${record.machine}.`,
+              });
+            },
+            progress: (job, log) => {
+              const state = jobChecks.get(job.name);
+              if (state) queueProgress(state, log);
+            },
+            completed: async (job, result) => {
+              const state = jobChecks.get(job.name);
+              if (!state) return;
+              record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
+              record.jobs = record.jobs?.map((item) =>
+                item.name === job.name ? { ...item, status: result.outcome } : item,
+              );
+              await dependencies.saveBuild(record).catch(() => undefined);
+              await updateJob(state, completedValues(job, result.outcome, result.log), true);
+            },
           },
-          progress: (job, log) => {
-            const state = jobChecks.get(job.name);
-            if (state) queueProgress(state, log);
-          },
-          completed: async (job, result) => {
-            const state = jobChecks.get(job.name);
-            if (!state) return;
-            record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
-            record.jobs = record.jobs?.map((item) =>
-              item.name === job.name ? { ...item, status: result.outcome } : item,
-            );
-            await dependencies.saveBuild(record).catch(() => undefined);
-            await updateJob(state, completedValues(job, result.outcome, result.log), true);
-          },
-        },
-        executionSignal,
-        runtimeSecrets,
-        configuredVmJobs,
-        cancellation.jobSignal,
-      );
+          executionSignal,
+          runtimeSecrets,
+          configuredVmJobs,
+          cancellation.jobSignal,
+        );
+      } finally {
+        executionActive = false;
+      }
     } catch (error) {
       executionError = error;
     }
