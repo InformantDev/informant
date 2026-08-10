@@ -50,23 +50,9 @@ apt-get install -y --no-install-recommends ca-certificates curl git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
 mkdir -p "$HOME/.bun/install/global"
-case "$(uname -m)" in
-  aarch64|arm64)
-    amp_package="@ampcode/cli-linux-arm64"
-    staff_asset="staff-linux-arm64"
-    ;;
-  x86_64)
-    amp_package="@ampcode/cli-linux-x64"
-    staff_asset="staff-linux-x64"
-    ;;
-  *)
-    echo "unsupported architecture for Staff Review: $(uname -m)" >&2
-    exit 1
-    ;;
-esac
-bun add --global "$amp_package@0.0.1784917055-ge644b2"
-ln -sf "$HOME/.bun/install/global/node_modules/$amp_package/amp" /usr/local/bin/amp
-curl -fsSL "https://github.com/staffreview/staffreview/releases/download/v1.10.2/$staff_asset" \
+bun add --global @ampcode/cli-linux-arm64@0.0.1784917055-ge644b2
+ln -sf "$HOME/.bun/install/global/node_modules/@ampcode/cli-linux-arm64/amp" /usr/local/bin/amp
+curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.10.3/staff-linux-arm64 \
   -o /usr/local/bin/staff
 chmod +x /usr/local/bin/staff
 """ }
