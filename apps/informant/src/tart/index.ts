@@ -476,6 +476,7 @@ export async function runInTart(
   configuredVmJobs = config.jobs
     .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name),
+  jobSignal?: (job: string) => AbortSignal | undefined,
 ): Promise<boolean> {
   await reconcilePreparedImageReferences(repository.fullName, configuredVmJobs, signal);
   if (config.jobs.some((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host"))
@@ -527,6 +528,16 @@ export async function runInTart(
   };
   const eventSeparator = (job: InformantConfig["jobs"][number]) =>
     jobLogs.get(job.name)?.at(-1) === 0x0a ? "\n" : "\n\n";
+  const executionSignals = new Map<string, AbortSignal>();
+  const signalForJob = (job: InformantConfig["jobs"][number]): AbortSignal | undefined => {
+    const existing = executionSignals.get(job.name);
+    if (existing) return existing;
+    const requested = jobSignal?.(job.name);
+    const executionSignal =
+      signal && requested ? AbortSignal.any([signal, requested]) : (signal ?? requested);
+    if (executionSignal) executionSignals.set(job.name, executionSignal);
+    return executionSignal;
+  };
 
   let runFailed = false;
   let runError: unknown;
@@ -569,6 +580,7 @@ export async function runInTart(
     result = await scheduleJobs(
       config.jobs,
       async (job, index) => {
+        const executionSignal = signalForJob(job);
         const workspace = workspaces[index];
         if (!workspace) throw new Error(`workspace missing for job ${job.name}`);
         const started = async () => {
@@ -588,7 +600,7 @@ export async function runInTart(
                 (text) => logJob(job, text),
                 started,
                 runtimeSecrets,
-                signal,
+                executionSignal,
               )
             : runtime.type === "container"
               ? await runInContainer(
@@ -602,7 +614,7 @@ export async function runInTart(
                   (text) => logJob(job, text),
                   started,
                   runtimeSecrets,
-                  signal,
+                  executionSignal,
                 )
               : await runJob(
                   `informant-${record.id}-${index}`,
@@ -610,7 +622,7 @@ export async function runInTart(
                     { ...config, vm: runtime },
                     async (message) => writeLog(`$ ${message}\n`),
                     `${repository.fullName}\0${job.name}`,
-                    signal,
+                    executionSignal,
                   ),
                   repository,
                   sha,
@@ -621,9 +633,13 @@ export async function runInTart(
                   (text) => logJob(job, text),
                   started,
                   runtimeSecrets,
-                  signal,
+                  executionSignal,
                 );
-        const outcome = signal?.aborted ? "cancelled" : execution.success ? "success" : "failure";
+        const outcome = executionSignal?.aborted
+          ? "cancelled"
+          : execution.success
+            ? "success"
+            : "failure";
         const detail = execution.timedOut
           ? `exit ${execution.exitCode}, timed out after ${job.timeoutMinutes}m`
           : `exit ${execution.exitCode}`;
@@ -642,34 +658,35 @@ export async function runInTart(
         return execution.success;
       },
       async (job) => {
+        const cancelled = signalForJob(job)?.aborted;
         await logJob(
           job,
           `${eventSeparator(job)}${jobEventLine(
             job.name,
-            signal?.aborted ? "finished (cancelled)" : "skipped (dependency failed)",
+            cancelled ? "finished (cancelled)" : "skipped (dependency failed)",
           )}`,
         );
         await writes;
         await flushProgress(job);
         await notify(() =>
           observer.completed?.(job, {
-            outcome: signal?.aborted ? "cancelled" : "skipped",
+            outcome: cancelled ? "cancelled" : "skipped",
             log: decoder.decode(jobLogs.get(job.name)),
           }),
         );
       },
       async (job, error) => {
         const message = error instanceof Error ? error.message : String(error);
-        const outcome = signal?.aborted ? "cancelled" : "failure";
+        const outcome = signalForJob(job)?.aborted ? "cancelled" : "failure";
         await logJob(
           job,
-          `${eventSeparator(job)}${signal?.aborted ? `[${job.name}: cancelled]\n` : `[${job.name}: ${message}]\n`}\n${jobEventLine(job.name, `finished (${outcome})`)}`,
+          `${eventSeparator(job)}${outcome === "cancelled" ? `[${job.name}: cancelled]\n` : `[${job.name}: ${message}]\n`}\n${jobEventLine(job.name, `finished (${outcome})`)}`,
         );
         await writes;
         await flushProgress(job);
         await notify(() =>
           observer.completed?.(job, {
-            outcome: signal?.aborted ? "cancelled" : "failure",
+            outcome,
             log: decoder.decode(jobLogs.get(job.name)),
           }),
         );

@@ -60,6 +60,8 @@ function harness(
     manualTriggerLabel?: string;
     requestedJobs?: string[];
     originalPullRequest?: number;
+    cancelBuild?: boolean;
+    cancelJob?: string;
   } = {},
 ) {
   const updates: Array<{ id: number; values: Record<string, unknown> }> = [];
@@ -142,6 +144,21 @@ function harness(
     saveBuild: async (record) => {
       saved.push({ ...record });
     },
+    monitorBuildCancellation: (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      if (options.cancelBuild) build.abort("Cancellation requested from informant builds.");
+      if (options.cancelJob) {
+        jobControllers
+          .get(options.cancelJob)
+          ?.abort(`Cancellation requested for ${options.cancelJob} from informant builds.`);
+      }
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    },
     runInTart: async (
       _repository,
       _sha,
@@ -151,6 +168,7 @@ function harness(
       _signal,
       runtimeSecrets,
       configuredVmJobs,
+      jobSignal,
     ) => {
       receivedBranches.push(record.branch);
       receivedConfiguredVmJobs = configuredVmJobs;
@@ -162,12 +180,17 @@ function harness(
       const success = options.success ?? true;
       for (const job of selectedConfig.jobs) {
         await observer?.started?.(job);
+        const cancelled = _signal?.aborted || jobSignal?.(job.name)?.aborted;
         await observer?.completed?.(job, {
-          outcome: success ? "success" : "failure",
+          outcome: cancelled ? "cancelled" : success ? "success" : "failure",
           log: `${job.name} output`,
         });
       }
-      return success;
+      return (
+        success &&
+        !_signal?.aborted &&
+        !selectedConfig.jobs.some((job) => jobSignal?.(job.name)?.aborted)
+      );
     },
     readLogTail: async () => "build output",
   };
@@ -1381,7 +1404,52 @@ describe("runCommit", () => {
     ).toMatchObject({ conclusion: "cancelled", summary: "Superseded by main@new-sha." });
     expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
       conclusion: "cancelled",
+      title: "Superseded by a newer commit",
       summary: "Superseded by main@new-sha.",
+    });
+  });
+
+  test("cancels one requested job and completes the aggregate as cancelled", async () => {
+    const context = harness({ cancelJob: "test" });
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(record.jobs).toEqual([{ name: "test", status: "cancelled" }]);
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "1 job cancelled",
+    });
+  });
+
+  test("explicit cancellation also stops manually triggered builds", async () => {
+    const context = harness({ manualTrigger: true, cancelBuild: true });
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(record.event?.type).toBe("manual_trigger");
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Build cancelled",
+      summary: "Cancellation requested from informant builds.",
     });
   });
 

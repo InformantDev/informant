@@ -8,7 +8,9 @@ import {
   getBuild,
   jobLogPath,
   listActiveBuilds,
+  monitorBuildCancellation,
   removeOrphanedBuildWorkspaces,
+  requestBuildCancellation,
   saveBuild,
 } from "./store.ts";
 import type { BuildRecord } from "./types.ts";
@@ -121,6 +123,54 @@ test("fresh marker-only builds survive the writer window and abandoned markers e
   await utimes(abandoned, new Date(0), new Date(0));
   await listActiveBuilds();
   expect(await Bun.file(abandoned).exists()).toBe(false);
+});
+
+test("cancellation requests target a running build or one active job", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "cancellable",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    jobs: [
+      { name: "test", status: "running" },
+      { name: "deploy", status: "queued" },
+      { name: "lint", status: "success" },
+    ],
+    owner: currentProcessOwner(),
+    logPath: join(root, "builds", "cancellable", "build.log"),
+  };
+  await createBuild(record);
+  const monitor = monitorBuildCancellation(record.id, ["test", "deploy", "lint"], 5);
+  try {
+    await requestBuildCancellation(record.id, "test");
+    for (let attempt = 0; attempt < 50 && !monitor.jobSignal("test")?.aborted; attempt++) {
+      await Bun.sleep(5);
+    }
+    expect(monitor.jobSignal("test")?.aborted).toBe(true);
+    expect(monitor.signal.aborted).toBe(false);
+    await expect(requestBuildCancellation(record.id, "lint")).rejects.toThrow(
+      "job is not running or queued: lint",
+    );
+
+    await requestBuildCancellation(record.id);
+    for (let attempt = 0; attempt < 50 && !monitor.signal.aborted; attempt++) await Bun.sleep(5);
+    expect(monitor.signal.aborted).toBe(true);
+    expect(String(monitor.signal.reason)).toContain("informant builds");
+  } finally {
+    await monitor.close();
+  }
+
+  record.status = "cancelled";
+  record.completedAt = new Date().toISOString();
+  await saveBuild(record);
+  await expect(requestBuildCancellation(record.id)).rejects.toThrow("build is not running");
 });
 
 afterEach(async () => {

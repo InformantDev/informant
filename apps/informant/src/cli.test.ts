@@ -11,7 +11,7 @@ import {
   runInvocationType,
   runManualHousekeeping,
 } from "./cli.ts";
-import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
+import { createBuild, currentProcessOwner, monitorBuildCancellation, saveBuild } from "./store.ts";
 import type { BuildRecord, Repository } from "./types.ts";
 
 test("--version prints the package version without help", async () => {
@@ -185,6 +185,18 @@ test("builds shows running jobs by default and recent history with --all", async
     );
     expect(activeOutput).toContain(" elapsed");
     expect(activeOutput).not.toContain("finished-build");
+
+    const cancellation = monitorBuildCancellation("running-build", ["test", "lint"], 5);
+    try {
+      await main(["builds", "cancel", "running-build", "--job", "test"]);
+      for (let attempt = 0; attempt < 50 && !cancellation.jobSignal("test")?.aborted; attempt++) {
+        await Bun.sleep(5);
+      }
+      expect(cancellation.jobSignal("test")?.aborted).toBe(true);
+      expect(cancellation.signal.aborted).toBe(false);
+    } finally {
+      await cancellation.close();
+    }
 
     await main(["builds", "--all"]);
     const historyOutput = String(log.mock.calls.at(-1)?.[0]);

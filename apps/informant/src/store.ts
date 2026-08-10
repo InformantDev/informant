@@ -20,6 +20,17 @@ function activeBuildPath(id: string): string {
   return join(activeBuildDirectory(), id);
 }
 
+function cancellationDirectory(id: string): string {
+  const key = createHash("sha256").update(id).digest("hex");
+  return join(dataDirectory(), "build-cancellations", key);
+}
+
+function cancellationPath(id: string, job?: string): string {
+  if (!job) return join(cancellationDirectory(id), "build");
+  const key = createHash("sha256").update(job).digest("hex");
+  return join(cancellationDirectory(id), "jobs", key);
+}
+
 export function jobLogPath(record: BuildRecord, job: string): string {
   const id = createHash("sha256").update(job).digest("hex");
   return join(dirname(record.logPath), "jobs", `${id}.log`);
@@ -78,6 +89,7 @@ async function workspaceHasLiveOwner(workspace: string): Promise<boolean> {
 
 export async function createBuild(record: BuildRecord): Promise<void> {
   await mkdir(buildDirectory(record.id), { recursive: true });
+  await rm(cancellationDirectory(record.id), { recursive: true, force: true });
   await saveBuild(record);
   await Bun.write(record.logPath, "");
 }
@@ -98,7 +110,10 @@ export async function saveBuild(record: BuildRecord): Promise<void> {
         }
         await Bun.write(temporaryPath, contents);
         await rename(temporaryPath, path);
-        if (status !== "running") await rm(activeBuildPath(record.id), { force: true });
+        if (status !== "running") {
+          await rm(activeBuildPath(record.id), { force: true });
+          await rm(cancellationDirectory(record.id), { recursive: true, force: true });
+        }
       } finally {
         await rm(temporaryPath, { force: true }).catch(() => undefined);
       }
@@ -178,6 +193,78 @@ export async function listActiveBuilds(): Promise<BuildRecord[]> {
   return builds
     .filter((build): build is BuildRecord => build !== undefined)
     .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+}
+
+export async function requestBuildCancellation(id: string, job?: string): Promise<BuildRecord> {
+  const build = await getBuild(id);
+  if (!build) throw new Error(`build not found: ${id}`);
+  if (build.status !== "running") throw new Error(`build is not running: ${id}`);
+  if (job) {
+    const state = build.jobs?.find((item) => item.name === job);
+    const legacyRunning = !build.jobs && build.runningJobs?.includes(job);
+    if (!state && !legacyRunning) throw new Error(`job not found in build ${id}: ${job}`);
+    if (state && state.status !== "queued" && state.status !== "running") {
+      throw new Error(`job is not running or queued: ${job}`);
+    }
+  }
+  const path = cancellationPath(id, job);
+  await mkdir(dirname(path), { recursive: true });
+  await Bun.write(
+    path,
+    JSON.stringify({ buildId: id, job, requestedAt: new Date().toISOString() }),
+  );
+  return build;
+}
+
+export interface BuildCancellationMonitor {
+  signal: AbortSignal;
+  jobSignal: (job: string) => AbortSignal | undefined;
+  close: () => Promise<void>;
+}
+
+export function monitorBuildCancellation(
+  id: string,
+  jobs: string[],
+  pollIntervalMs = 250,
+): BuildCancellationMonitor {
+  const buildController = new AbortController();
+  const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+  let open = true;
+  let wake: (() => void) | undefined;
+  const task = (async () => {
+    while (open && !buildController.signal.aborted) {
+      if (await Bun.file(cancellationPath(id)).exists()) {
+        buildController.abort("Cancellation requested from informant builds.");
+        break;
+      }
+      await Promise.all(
+        [...jobControllers].map(async ([job, controller]) => {
+          if (!controller.signal.aborted && (await Bun.file(cancellationPath(id, job)).exists())) {
+            controller.abort(`Cancellation requested for ${job} from informant builds.`);
+          }
+        }),
+      );
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+        const timeout = setTimeout(resolve, pollIntervalMs);
+        const finish = () => {
+          clearTimeout(timeout);
+          resolve();
+        };
+        wake = finish;
+      });
+      wake = undefined;
+    }
+  })();
+  return {
+    signal: buildController.signal,
+    jobSignal: (job) => jobControllers.get(job)?.signal,
+    close: async () => {
+      open = false;
+      wake?.();
+      await task;
+    },
+  };
 }
 
 export async function removeOrphanedBuildWorkspaces(

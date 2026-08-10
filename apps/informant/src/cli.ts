@@ -4,7 +4,7 @@ import { mkdir, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { SelectPrompt } from "@clack/core";
-import { cancel, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
+import { cancel, confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import packageJson from "../package.json" with { type: "json" };
 import {
   CONFIG_FILE,
@@ -46,6 +46,7 @@ import {
   listBuilds,
   reconcileBuildLiveness,
   removeOrphanedBuildWorkspaces,
+  requestBuildCancellation,
 } from "./store.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 import type { Repository } from "./types.ts";
@@ -74,6 +75,8 @@ Usage:
   informant hook install                 Accelerate pushes with a pre-push hook
   informant hook uninstall               Remove Informant from the pre-push hook
   informant builds [--all]               List running builds or recent history
+  informant builds cancel <build-id> [--job <name>]
+                                        Cancel a running build or one queued/running job
   informant logs [<build-id>]             Tail a build's logs or select a running job
   informant update                       Update with Homebrew and restart a running worker
   informant storage                      Show Informant disk usage and available space
@@ -366,6 +369,7 @@ interface BrowserOption {
   label: string;
   hint?: string;
   disabled?: boolean;
+  cancellable?: boolean;
 }
 
 const terminalColor = {
@@ -435,16 +439,23 @@ function buildBrowserOptions(builds: Build[]): BrowserOption[] {
       value: build.id,
       label: `${terminalColor.bold}${build.repo}${terminalColor.reset} · ${terminalColor.blue}${build.branch}@${build.sha.slice(0, 7)}${terminalColor.reset}`,
       hint: `${coloredStatus(build.status)} · ${buildTiming(build)} · ${terminalColor.dim}${build.id}${terminalColor.reset}`,
+      cancellable: build.status === "running",
     },
     ...jobsForBuild(build).map((job) => ({
       value: `${build.id}\0${job.name}`,
       label: `  ${terminalColor.dim}↳${terminalColor.reset} ${job.name}`,
       hint: coloredStatus(job.status),
+      cancellable: job.status === "queued" || job.status === "running",
     })),
   ]);
 }
 
-async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol> {
+interface BuildBrowserChoice {
+  value: string | symbol;
+  action: "logs" | "cancel";
+}
+
+async function liveBuildSelect(includeHistory: boolean): Promise<BuildBrowserChoice> {
   const load = async () =>
     buildBrowserOptions(includeHistory ? await listBuilds() : await listActiveBuilds());
   const options = await load();
@@ -470,8 +481,16 @@ async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol
         return `│  ${marker} ${option.label}${option.hint ? `  (${option.hint})` : ""}`;
       });
       const title = includeHistory ? "Recent builds" : "Running builds";
-      return `${terminalColor.cyan}◆${terminalColor.reset}  ${terminalColor.bold}${title}${terminalColor.reset}\n${lines.join("\n")}\n└  ${terminalColor.dim}↑/↓ navigate · Enter open logs · Esc back${terminalColor.reset}`;
+      const canCancel = active?.cancellable ? " · c cancel" : "";
+      return `${terminalColor.cyan}◆${terminalColor.reset}  ${terminalColor.bold}${title}${terminalColor.reset}\n${lines.join("\n")}\n└  ${terminalColor.dim}↑/↓ navigate · Enter open logs${canCancel} · Esc back${terminalColor.reset}`;
     },
+  });
+  let action: BuildBrowserChoice["action"] = "logs";
+  prompt.on("key", (character) => {
+    if (character?.toLowerCase() !== "c") return;
+    if (!prompt.options[prompt.cursor]?.cancellable) return;
+    action = "cancel";
+    prompt.state = "submit";
   });
   let open = true;
   let refreshing = false;
@@ -495,7 +514,7 @@ async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol
   try {
     const selection = (await prompt.prompt()) ?? Symbol.for("informant:no-selection");
     process.stdout.write("\x1b[1A\x1b[2K\r");
-    return selection;
+    return { value: selection, action };
   } finally {
     open = false;
     clearInterval(refresh);
@@ -624,8 +643,20 @@ async function browseBuilds(includeHistory: boolean, initialBuildId?: string): P
       initial = undefined;
     }
     const choice = await liveBuildSelect(includeHistory);
-    if (isCancel(choice) || typeof choice !== "string" || choice === "none") return;
-    const [buildId, job] = choice.split("\0", 2);
+    if (isCancel(choice.value) || typeof choice.value !== "string" || choice.value === "none")
+      return;
+    const [buildId, job] = choice.value.split("\0", 2);
+    if (choice.action === "cancel" && buildId) {
+      const accepted = await confirm({
+        message: job ? `Cancel ${job} in build ${buildId}?` : `Cancel build ${buildId}?`,
+        initialValue: false,
+      });
+      if (!isCancel(accepted) && accepted) {
+        await requestBuildCancellation(buildId, job);
+        outro(job ? `Cancellation requested for ${job}` : `Cancellation requested for ${buildId}`);
+      }
+      continue;
+    }
     if (buildId && (await browseLog(buildId, job)) === "exit") return;
   }
 }
@@ -999,6 +1030,15 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "logs") return showLogs(action);
   if (subcommand === "builds" && action === "logs")
     throw new Error("builds logs has moved to informant logs [<build-id>]");
+  if (subcommand === "builds" && action === "cancel") {
+    if (!id) throw new Error("builds cancel requires a build ID");
+    const jobs = requestedJobs(flags.job);
+    if (jobs.length > 1) throw new Error("builds cancel accepts at most one --job");
+    const job = jobs[0];
+    await requestBuildCancellation(id, job);
+    outro(job ? `Cancellation requested for ${job}` : `Cancellation requested for ${id}`);
+    return;
+  }
   if (subcommand === "builds") {
     if (process.stdin.isTTY) return browseBuilds(flags.all === true);
     return showBuilds(flags.all === true);
