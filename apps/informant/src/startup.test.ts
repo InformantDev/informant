@@ -48,6 +48,18 @@ describe("startup service", () => {
     ).toBe("/srv/informant/config/systemd/user/informant.service");
   });
 
+  test("uses the default Linux configuration location for invalid XDG paths", () => {
+    for (const value of ["", "relative/config"]) {
+      expect(linuxStartupServicePath({ XDG_CONFIG_HOME: value }, "/home/worker")).toBe(
+        "/home/worker/.config/systemd/user/informant.service",
+      );
+      expect(startupEnvironment({ XDG_CONFIG_HOME: value }, "/home/worker")).toEqual({
+        HOME: "/home/worker",
+        PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+      });
+    }
+  });
+
   test("renders a persistent LaunchAgent with escaped paths and environment", () => {
     const service = renderStartupService(
       "/Applications/Informant & tools/informant",
