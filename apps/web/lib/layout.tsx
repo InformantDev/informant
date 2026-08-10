@@ -9,5 +9,5 @@ export const baseOptions: BaseLayoutProps = {
       </span>
     ),
   },
-  githubUrl: "https://github.com/informant-ci/informant",
+  githubUrl: "https://github.com/InformantDev/informant",
 };
