@@ -325,6 +325,136 @@ describe("runCommit", () => {
     expect(second.jobChecks).toEqual(["test"]);
   });
 
+  test("drops unclaimed suites immediately when worker shutdown starts", async () => {
+    const active = harness();
+    const waiting = harness();
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const activeRun = active.dependencies.runInTart;
+    const acquireExecutionSlot = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 });
+    active.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    waiting.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    active.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return activeRun(...args);
+    };
+    let waitingClaims = 0;
+    const waitingClaim = waiting.github.claim.bind(waiting.github);
+    waiting.github.claim = async (...args) => {
+      waitingClaims++;
+      return waitingClaim(...args);
+    };
+    const execution = new AbortController();
+    const admission = new AbortController();
+
+    const activeBuild = runCommit(
+      active.github,
+      repository,
+      "active-sha",
+      "main",
+      config,
+      active.dependencies,
+    );
+    await entered.promise;
+    const waitingBuild = runCommit(
+      waiting.github,
+      repository,
+      "waiting-sha",
+      "feature",
+      config,
+      waiting.dependencies,
+      { type: "commit", id: "branch:feature:waiting-sha", branch: "feature" },
+      execution.signal,
+      admission.signal,
+    );
+    await Bun.sleep(0);
+
+    admission.abort("Worker shutdown requested.");
+
+    expect(await waitingBuild).toBeFalse();
+    expect(waitingClaims).toBe(0);
+    expect(execution.signal.aborted).toBe(false);
+    blocked.resolve();
+    await activeBuild;
+  });
+
+  test("treats an interrupted GitHub claim as unclaimed work", async () => {
+    const context = harness();
+    const enteredClaim = deferred<void>();
+    const execution = new AbortController();
+    const admission = new AbortController();
+    context.github.claim = async (...args) => {
+      const signal = args[8];
+      if (!signal) throw new Error("expected an admission signal");
+      expect(args[9]).toBe(execution.signal);
+      enteredClaim.resolve();
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
+
+    const build = runCommit(
+      context.github,
+      repository,
+      "waiting-sha",
+      "feature",
+      config,
+      context.dependencies,
+      { type: "commit", id: "branch:feature:waiting-sha", branch: "feature" },
+      execution.signal,
+      admission.signal,
+    );
+    await enteredClaim.promise;
+    admission.abort("Worker shutdown requested.");
+
+    expect(await build).toBeFalse();
+    expect(execution.signal.aborted).toBe(false);
+  });
+
+  test("preserves a pending manual request when its automatic lane is superseded", async () => {
+    const context = harness();
+    const enteredPreflight = deferred<void>();
+    const releasePreflight = deferred<void>();
+    const execution = new AbortController();
+    const admission = new AbortController();
+    let preflightSignal: AbortSignal | undefined;
+    let claimAdmissionSignal: AbortSignal | undefined;
+    let claimExecutionSignal: AbortSignal | undefined;
+    context.github.hasPendingManualTrigger = async (...args) => {
+      preflightSignal = args[4];
+      enteredPreflight.resolve();
+      await releasePreflight.promise;
+      return true;
+    };
+    context.github.claim = async (...args) => {
+      claimAdmissionSignal = args[8];
+      claimExecutionSignal = args[9];
+      return undefined;
+    };
+
+    const build = runCommit(
+      context.github,
+      repository,
+      "manual-sha",
+      "feature",
+      config,
+      context.dependencies,
+      { type: "commit", id: "branch:feature:manual-sha", branch: "feature" },
+      execution.signal,
+      admission.signal,
+    );
+    await enteredPreflight.promise;
+    execution.abort("Superseded by feature@new-sha.");
+    releasePreflight.resolve();
+
+    expect(await build).toBeUndefined();
+    expect(preflightSignal).toBe(admission.signal);
+    expect(claimAdmissionSignal).toBe(admission.signal);
+    expect(claimExecutionSignal).toBeUndefined();
+    expect(admission.signal.aborted).toBe(false);
+  });
+
   test("drops superseded automatic suites while they wait for a run slot", async () => {
     const first = harness();
     const superseded = harness();
@@ -612,6 +742,56 @@ describe("runCommit", () => {
     expect(refreshes).toBe(2);
     expect(claims).toBe(1);
     expect(signals).toEqual([undefined, controller.signal]);
+  });
+
+  test("interrupts portable container readiness before claiming during shutdown", async () => {
+    let claims = 0;
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async () => {
+        claims++;
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const dependencies = harness().dependencies;
+    const enteredReadiness = deferred<void>();
+    dependencies.refreshContainerBackend = async (signal) => {
+      if (!signal) throw new Error("expected an admission signal");
+      enteredReadiness.resolve();
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
+    const execution = new AbortController();
+    const admission = new AbortController();
+    const build = runCommit(
+      github,
+      repository,
+      "sha",
+      "main",
+      {
+        ...config,
+        jobs: [
+          {
+            ...baseJob,
+            runsOn: ["container"],
+            runtime: { type: "container", image: "docker.io/oven/bun:1" },
+          },
+        ],
+      },
+      dependencies,
+      { type: "commit", id: "branch:main:sha", branch: "main" },
+      execution.signal,
+      admission.signal,
+    );
+    await enteredReadiness.promise;
+    admission.abort("Worker shutdown requested.");
+
+    expect(await build).toBeFalse();
+    expect(claims).toBe(0);
+    expect(execution.signal.aborted).toBe(false);
   });
 
   test("does not execute a partial host subset when selected container work is unavailable", async () => {
@@ -1779,6 +1959,47 @@ describe("runCommit", () => {
       title: "Superseded by a newer commit",
       summary: "Superseded by main@new-sha.",
     });
+  });
+
+  test("marks unfinished jobs cancelled when superseded during check reconciliation", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    const automaticConfig = { ...config, triggers: [{ event: "commit" as const }] };
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 100 && values.conclusion === "cancelled") {
+        controller.abort("Superseded by main@new-sha.");
+      }
+      return updateCheck(target, id, values);
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const [job] = selectedConfig.jobs;
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      throw new Error("runtime failed");
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "old-sha",
+      "main",
+      automaticConfig,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:old-sha" },
+      controller.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(record.runningJobs).toEqual([]);
+    expect(record.jobs).toEqual([{ name: "test", status: "cancelled" }]);
   });
 
   test("cancels a running job, skips its dependent, and completes independent work", async () => {
