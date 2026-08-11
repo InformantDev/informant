@@ -144,10 +144,10 @@ and displays a failure, but reports its GitHub check as neutral, keeps the aggre
 and allows jobs that depend on it to run. Setup and reporting errors outside the job itself still fail
 the build.
 
-Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh container or Tart VM
-and isolated checkout. Use `needs` to make a job wait for one or
-more other jobs. Linux guests instead use `/mnt/shared/workspace`. In this example, `test` and `lint`
-start together; `build` starts only after both pass.
+Like GitHub Actions, jobs run in parallel by default. Each job gets an isolated checkout in its
+configured container, native host runtime, or Tart VM. Use `needs` to make a job wait for one or more
+other jobs. Linux guests instead use `/mnt/shared/workspace`. In this example, `test` and `lint` start
+together; `build` starts only after both pass.
 If a dependency fails or times out, jobs that need it are skipped.
 
 ## Host secrets
