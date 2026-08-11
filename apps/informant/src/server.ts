@@ -530,13 +530,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         return pending;
       };
       for (const target of [
-        ...branches.map((branch) => ({
-          sha: branch.sha,
-          branch: branch.name,
-          pullRequest: undefined,
-          eventId: `branch:${branch.name}:${branch.sha}`,
-          lane: `branch:${branch.name}`,
-        })),
+        // Pull requests are the latency-sensitive CI lane. Branch discovery can
+        // require loading many distinct configs and checking manual requests,
+        // so offer open PR heads to the execution scheduler first.
         ...prs
           .filter((pr) => pr.sameRepository)
           .map((pullRequest) => ({
@@ -546,6 +542,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             eventId: `pr:${pullRequest.number}:${pullRequest.headSha}`,
             lane: `pr:${pullRequest.number}`,
           })),
+        ...branches.map((branch) => ({
+          sha: branch.sha,
+          branch: branch.name,
+          pullRequest: undefined,
+          eventId: `branch:${branch.name}:${branch.sha}`,
+          lane: `branch:${branch.name}`,
+        })),
         ...state.pendingTags.map((tag) => ({
           sha: tag.sha,
           branch: tag.name,

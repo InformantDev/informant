@@ -498,6 +498,26 @@ describe("serve polling orchestration", () => {
     expect(launched).toEqual(["main"]);
   });
 
+  test("offers open pull requests before branch work", async () => {
+    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const launched: string[] = [];
+    const deps = dependencies(
+      github({
+        branches: async () => [{ name: "main", sha: "main-sha" }],
+        pullRequests: async () => [pullRequest],
+      }),
+      state,
+      async (_github, _repository, _sha, branch) => {
+        launched.push(branch);
+        return undefined;
+      },
+    );
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(launched).toEqual(["pull/7", "main"]);
+  });
+
   test("reconciles only configured caches and prepared runtime jobs", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
     const deps = dependencies(github({}), state, async () => undefined);
