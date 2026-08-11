@@ -215,22 +215,31 @@ export async function runCommit(
       for (const job of jobs) {
         labelKeys.add([...(job.runsOn ?? [])].sort().join("\0"));
       }
-      const previousScopes = [...labelKeys].flatMap((key) => {
-        const previousJobs =
-          jobsByLabels.get(key) ??
-          jobs.filter((job) => [...(job.runsOn ?? [])].sort().join("\0") === key);
-        if (!usesCapabilities) return [baseScope];
-        const labelsScope = `${baseScope}:jobs:${Buffer.from(key).toString("base64url")}`;
-        const jobsScope = Buffer.from(
-          previousJobs
-            .map((job) => job.name)
-            .sort()
-            .join("\0"),
-        ).toString("base64url");
-        return event
-          ? [labelsScope, `${labelsScope}:jobs:${jobsScope}`]
-          : [`${baseScope}:jobs:${jobsScope}`];
-      });
+      const componentScope = `${baseScope}:jobs:${Buffer.from(
+        jobs
+          .map((job) => job.name)
+          .sort()
+          .join("\0"),
+      ).toString("base64url")}`;
+      const previousScopes = [
+        ...(event ? [componentScope] : []),
+        ...[...labelKeys].flatMap((key) => {
+          const previousJobs =
+            jobsByLabels.get(key) ??
+            jobs.filter((job) => [...(job.runsOn ?? [])].sort().join("\0") === key);
+          if (!usesCapabilities) return [baseScope];
+          const labelsScope = `${baseScope}:jobs:${Buffer.from(key).toString("base64url")}`;
+          const jobsScope = Buffer.from(
+            previousJobs
+              .map((job) => job.name)
+              .sort()
+              .join("\0"),
+          ).toString("base64url");
+          return event
+            ? [labelsScope, `${labelsScope}:jobs:${jobsScope}`]
+            : [`${baseScope}:jobs:${jobsScope}`];
+        }),
+      ].filter((scope, index, scopes) => scopes.indexOf(scope) === index);
       return runCommitPartition(
         github,
         repository,

@@ -37,6 +37,11 @@ const vmJob = (name: string, cpu?: number, memoryMb?: number): JobConfig => ({
   },
 });
 
+const hostJob = (name: string): JobConfig => ({
+  ...job(name, 1, 1024),
+  runtime: { type: "host" },
+});
+
 describe("execution capacity", () => {
   test("derives capacity while retaining a minimum runnable slot", () => {
     expect(executionCapacity(16, 49_152)).toEqual({ cpu: 14, memoryMb: 36_864 });
@@ -52,7 +57,7 @@ describe("execution capacity", () => {
           job("build", 4, 8192, ["test", "lint"]),
         ]),
       ),
-    ).toEqual({ cpu: 5, memoryMb: 9216 });
+    ).toEqual({ cpu: 4, memoryMb: 8192 });
     expect(
       claimExecutionResources(
         config([
@@ -71,6 +76,19 @@ describe("execution capacity", () => {
         ]),
       ),
     ).toEqual({ cpu: 4, memoryMb: 4096 });
+  });
+
+  test("does not over-reserve a join after uneven diamond branches", () => {
+    expect(
+      claimExecutionResources(
+        config([
+          job("a", 1, 1024),
+          job("b", 1, 1024, ["a"]),
+          job("c", 8, 8192, ["a"]),
+          job("d", 8, 8192, ["b", "c"]),
+        ]),
+      ),
+    ).toEqual({ cpu: 9, memoryMb: 9216 });
   });
 
   test("admits concurrent claims up to weighted capacity", async () => {
@@ -105,6 +123,29 @@ describe("execution capacity", () => {
     const first = await acquire(vm);
     let secondEntered = false;
     const second = acquire(vm).then((release) => {
+      secondEntered = true;
+      return release;
+    });
+
+    await Bun.sleep(0);
+    expect(first).toBeFunction();
+    expect(secondEntered).toBeFalse();
+
+    first?.();
+    const releaseSecond = await second;
+    expect(releaseSecond).toBeFunction();
+    releaseSecond?.();
+  });
+
+  test("host work reserves full capacity until release", async () => {
+    const capacity = { cpu: 8, memoryMb: 16_384 };
+    const host = config([hostJob("test")]);
+    expect(claimExecutionResources(host, host.jobs, capacity)).toEqual(capacity);
+
+    const acquire = createExecutionSlotAcquirer(capacity);
+    const first = await acquire(host);
+    let secondEntered = false;
+    const second = acquire(host).then((release) => {
       secondEntered = true;
       return release;
     });

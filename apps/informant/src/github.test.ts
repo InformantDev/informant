@@ -612,7 +612,7 @@ test("automatic job claims do not consume a manual suite request", async () => {
   expect(updates).not.toContain(1);
 });
 
-test("component claims honor completed and active legacy suite scopes", async () => {
+test("job-set claims honor completed and active legacy component scopes", async () => {
   const run = async (status: "completed" | "in_progress") => {
     let posted = false;
     const checks = [
@@ -622,7 +622,7 @@ test("component claims honor completed and active legacy suite scopes", async ()
         status,
         conclusion: status === "completed" ? "success" : undefined,
         started_at: new Date().toISOString(),
-        external_id: "old-worker:event:commit:branch:main:abc123",
+        external_id: "old-worker:event:commit:branch:main:abc123:jobs:dGVzdA",
       },
     ];
     const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
@@ -633,10 +633,10 @@ test("component claims honor completed and active legacy suite scopes", async ()
       { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
       "abc123",
       "machine",
-      { type: "commit", id: "branch:main:abc123:jobs:dGVzdA" },
+      { type: "commit", id: "branch:main:abc123:job-set:dGVzdA" },
       ["test"],
       false,
-      ["commit:branch:main:abc123"],
+      ["commit:branch:main:abc123:jobs:dGVzdA"],
     );
     return { claim, posted };
   };

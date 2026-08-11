@@ -1,7 +1,8 @@
 import { existsSync } from "node:fs";
 import { chmod, mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { xdgConfigHome } from "./config-home.ts";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 
@@ -26,10 +27,7 @@ export function linuxStartupServicePath(
   environment: Record<string, string | undefined> = Bun.env,
   home = homedir(),
 ): string {
-  const configuredHome = environment.XDG_CONFIG_HOME;
-  const configHome =
-    configuredHome && isAbsolute(configuredHome) ? configuredHome : join(home, ".config");
-  return join(configHome, "systemd", "user", "informant.service");
+  return join(xdgConfigHome(environment, home), "systemd", "user", "informant.service");
 }
 
 export function renderStartupService(
@@ -160,7 +158,7 @@ export function startupEnvironment(
     HOME: home,
     PATH: source.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
   };
-  if (source.XDG_CONFIG_HOME && isAbsolute(source.XDG_CONFIG_HOME)) {
+  if (source.XDG_CONFIG_HOME === xdgConfigHome(source, home)) {
     environment.XDG_CONFIG_HOME = source.XDG_CONFIG_HOME;
   }
   for (const [key, value] of Object.entries(source)) {

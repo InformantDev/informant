@@ -22,17 +22,96 @@ function runtimeResources(runtime: JobRuntime, capacity: ExecutionResources): Ex
   return {
     cpu:
       runtime.type === "host"
-        ? 1
+        ? capacity.cpu
         : runtime.type === "vm"
           ? (runtime.cpu ?? capacity.cpu)
           : (runtime.cpu ?? DEFAULT_EXECUTION_RESOURCES.cpu),
     memoryMb:
       runtime.type === "host"
-        ? 1024
+        ? capacity.memoryMb
         : runtime.type === "vm"
           ? (runtime.memoryMb ?? capacity.memoryMb)
           : (runtime.memoryMb ?? DEFAULT_EXECUTION_RESOURCES.memoryMb),
   };
+}
+
+interface FlowEdge {
+  to: number;
+  reverse: number;
+  capacity: number;
+}
+
+function maximumFlow(graph: FlowEdge[][], source: number, sink: number): number {
+  let total = 0;
+  while (true) {
+    const levels = Array<number>(graph.length).fill(-1);
+    levels[source] = 0;
+    const queue = [source];
+    for (let index = 0; index < queue.length; index++) {
+      const node = queue[index];
+      if (node === undefined) continue;
+      const level = levels[node];
+      if (level === undefined) continue;
+      for (const edge of graph[node] ?? []) {
+        if (edge.capacity > 0 && levels[edge.to] === -1) {
+          levels[edge.to] = level + 1;
+          queue.push(edge.to);
+        }
+      }
+    }
+    if (levels[sink] === -1) return total;
+
+    const next = Array<number>(graph.length).fill(0);
+    const send = (node: number, available: number): number => {
+      if (node === sink) return available;
+      const edges = graph[node] ?? [];
+      const level = levels[node];
+      if (level === undefined) return 0;
+      let edgeIndex = next[node] ?? 0;
+      while (edgeIndex < edges.length) {
+        const edge = edges[edgeIndex];
+        if (edge && edge.capacity > 0 && levels[edge.to] === level + 1) {
+          const sent = send(edge.to, Math.min(available, edge.capacity));
+          if (sent > 0) {
+            edge.capacity -= sent;
+            const reverse = graph[edge.to]?.[edge.reverse];
+            if (reverse) reverse.capacity += sent;
+            return sent;
+          }
+        }
+        edgeIndex++;
+        next[node] = edgeIndex;
+      }
+      return 0;
+    };
+
+    while (true) {
+      const sent = send(source, Number.POSITIVE_INFINITY);
+      if (sent === 0) break;
+      total += sent;
+    }
+  }
+}
+
+function maximumAntichainWeight(weights: number[], precedence: Array<[number, number]>): number {
+  const count = weights.length;
+  const source = count * 2;
+  const sink = source + 1;
+  const graph = Array.from({ length: sink + 1 }, () => [] as FlowEdge[]);
+  const addEdge = (from: number, to: number, capacity: number) => {
+    const forward = { to, reverse: graph[to]?.length ?? 0, capacity };
+    const reverse = { to: from, reverse: graph[from]?.length ?? 0, capacity: 0 };
+    graph[from]?.push(forward);
+    graph[to]?.push(reverse);
+  };
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  for (let index = 0; index < count; index++) {
+    const weight = weights[index] ?? 0;
+    addEdge(source, index, weight);
+    addEdge(count + index, sink, weight);
+  }
+  for (const [before, after] of precedence) addEdge(before, count + after, totalWeight);
+  return totalWeight - maximumFlow(graph, source, sink);
 }
 
 /**
@@ -47,19 +126,6 @@ export function claimExecutionResources(
   capacity: ExecutionResources = executionCapacity(),
 ): ExecutionResources {
   const byName = new Map(jobs.map((job) => [job.name, job]));
-  const ordered: JobConfig[] = [];
-  const visited = new Set<string>();
-  const visit = (job: JobConfig) => {
-    if (visited.has(job.name)) return;
-    visited.add(job.name);
-    for (const dependency of job.needs) {
-      const required = byName.get(dependency);
-      if (required) visit(required);
-    }
-    ordered.push(job);
-  };
-  for (const job of jobs) visit(job);
-
   const dependencyMemo = new Map<string, boolean>();
   const dependsOn = (job: JobConfig, dependency: string): boolean => {
     const key = `${job.name}\0${dependency}`;
@@ -74,28 +140,30 @@ export function claimExecutionResources(
     return result;
   };
 
-  // Partition the DAG into chains. Concurrent jobs form an antichain and can
-  // contain at most one job from each chain, so summing each chain's largest
-  // request is a safe bound without charging sequential jobs cumulatively.
-  const chains: Array<{ last: JobConfig; cpu: number; memoryMb: number }> = [];
-  for (const job of ordered) {
-    const resources = runtimeResources(job.runtime ?? config.vm, capacity);
-    const chain = chains.find((candidate) => dependsOn(job, candidate.last.name));
-    if (chain) {
-      chain.last = job;
-      chain.cpu = Math.max(chain.cpu, resources.cpu);
-      chain.memoryMb = Math.max(chain.memoryMb, resources.memoryMb);
-    } else {
-      chains.push({ last: job, ...resources });
+  const precedence: Array<[number, number]> = [];
+  for (let before = 0; before < jobs.length; before++) {
+    const dependency = jobs[before];
+    if (!dependency) continue;
+    for (let after = 0; after < jobs.length; after++) {
+      const job = jobs[after];
+      if (job && dependsOn(job, dependency.name)) precedence.push([before, after]);
     }
   }
-  return chains.reduce(
-    (total, chain) => ({
-      cpu: total.cpu + chain.cpu,
-      memoryMb: total.memoryMb + chain.memoryMb,
-    }),
-    { cpu: 0, memoryMb: 0 },
-  );
+  const resources = jobs.map((job) => runtimeResources(job.runtime ?? config.vm, capacity));
+
+  // Runnable jobs form an antichain in the dependency order. Weighted
+  // Dilworth reduces its exact maximum weight to a capacitated bipartite
+  // matching, avoiding order-dependent and unnecessarily large chain covers.
+  return {
+    cpu: maximumAntichainWeight(
+      resources.map((resource) => resource.cpu),
+      precedence,
+    ),
+    memoryMb: maximumAntichainWeight(
+      resources.map((resource) => resource.memoryMb),
+      precedence,
+    ),
+  };
 }
 
 interface ExecutionWaiter {

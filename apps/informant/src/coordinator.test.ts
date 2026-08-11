@@ -598,6 +598,7 @@ describe("runCommit", () => {
 
     const baseScope = `commit:${event.id}`;
     const legacyScopes = [
+      `${baseScope}:jobs:${Buffer.from("gpu-test\0test").toString("base64url")}`,
       `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}`,
       `${baseScope}:jobs:${Buffer.from(labels.join("\0")).toString("base64url")}:jobs:${Buffer.from("lint\0test").toString("base64url")}`,
       `${baseScope}:jobs:${Buffer.from(gpuLabels.join("\0")).toString("base64url")}`,
