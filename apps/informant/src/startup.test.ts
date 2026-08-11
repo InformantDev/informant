@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { CommandResult } from "./process.ts";
 import {
+  linuxStartupServicePath,
   parseStartupEnvironment,
   renderLinuxStartupService,
   renderStartupService,
+  startupEnvironment,
   updateInformant,
 } from "./startup.ts";
 
@@ -22,6 +24,37 @@ describe("startup service", () => {
       ),
     ).toEqual({ PATH: "/captured/bin", INFORMANT_SECRET_TOKEN: "captured-secret" });
     expect(() => parseStartupEnvironment("[]")).toThrow("invalid property list");
+  });
+
+  test("keeps the Linux unit discoverable while preserving the machine config location", () => {
+    expect(
+      startupEnvironment(
+        {
+          PATH: "/usr/local/bin:/usr/bin",
+          XDG_CONFIG_HOME: "/srv/informant/config",
+          INFORMANT_CAPABILITIES: "linux-builder",
+          UNRELATED: "ignored",
+        },
+        "/home/worker",
+      ),
+    ).toEqual({
+      HOME: "/home/worker",
+      PATH: "/usr/local/bin:/usr/bin",
+      XDG_CONFIG_HOME: "/srv/informant/config",
+      INFORMANT_CAPABILITIES: "linux-builder",
+    });
+    expect(linuxStartupServicePath("/home/worker")).toBe(
+      "/home/worker/.config/systemd/user/informant.service",
+    );
+  });
+
+  test("uses the default Linux configuration location for invalid XDG paths", () => {
+    for (const value of ["", "relative/config"]) {
+      expect(startupEnvironment({ XDG_CONFIG_HOME: value }, "/home/worker")).toEqual({
+        HOME: "/home/worker",
+        PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+      });
+    }
   });
 
   test("renders a persistent LaunchAgent with escaped paths and environment", () => {

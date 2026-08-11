@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addRepository,
@@ -9,9 +10,35 @@ import {
   listGitHubCredentials,
   listRepositories,
   removeAllowedMount,
+  machineConfigPath,
   removeRepository,
   saveGitHubCredentials,
 } from "./machine-config.ts";
+import { startupEnvironment } from "./startup.ts";
+
+test("uses the worker's fallback configuration path for invalid XDG homes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "informant-machine-config-"));
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+
+  try {
+    for (const [index, configuredHome] of ["", "relative/config"].entries()) {
+      const home = join(directory, String(index));
+      const setupEnvironment = { XDG_CONFIG_HOME: configuredHome };
+      const setupPath = machineConfigPath(setupEnvironment, home);
+      const workerEnvironment = startupEnvironment(setupEnvironment, home);
+      const workerPath = machineConfigPath(workerEnvironment, workerEnvironment.HOME);
+
+      expect(setupPath).toBe(join(home, ".config", "informant", "config.json"));
+      expect(workerPath).toBe(setupPath);
+      await addRepository(repository, setupPath);
+      expect((await listRepositories(workerPath)).map((value) => value.fullName)).toEqual([
+        "acme/widgets",
+      ]);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("allows only named existing host files for repository mounts", async () => {
   const root = join(import.meta.dir, `.machine-mount-${crypto.randomUUID()}`);
