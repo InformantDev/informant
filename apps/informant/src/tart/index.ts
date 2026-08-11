@@ -106,11 +106,27 @@ export async function secretMount(
 export function streamingSecretRedactor(
   secrets: string[],
   output: (text: string) => Promise<void>,
-): { write: (text: string) => Promise<void>; flush: () => Promise<void> } {
-  const values = [...new Set(secrets.filter((value) => value.length > 0))].sort(
-    (a, b) => b.length - a.length,
-  );
-  const retainedCharacters = Math.max(0, ...values.map((value) => value.length - 1));
+): {
+  add: (values: string[]) => void;
+  write: (text: string) => Promise<void>;
+  flush: () => Promise<void>;
+} {
+  const known = new Set<string>();
+  const values: string[] = [];
+  let retainedCharacters = 0;
+  const add = (additional: string[]) => {
+    let changed = false;
+    for (const value of additional) {
+      if (!value || known.has(value)) continue;
+      known.add(value);
+      values.push(value);
+      changed = true;
+    }
+    if (!changed) return;
+    values.sort((a, b) => b.length - a.length);
+    retainedCharacters = Math.max(retainedCharacters, ...values.map((value) => value.length - 1));
+  };
+  add(secrets);
   let pending = "";
   const drain = async (final: boolean) => {
     const safeLength = final ? pending.length : Math.max(0, pending.length - retainedCharacters);
@@ -135,6 +151,7 @@ export function streamingSecretRedactor(
     if (redacted) await output(redacted);
   };
   return {
+    add,
     async write(text) {
       pending += text;
       await drain(false);
