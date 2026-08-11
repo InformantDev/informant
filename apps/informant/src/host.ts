@@ -20,6 +20,7 @@ export async function runOnHost(
   if (sha !== trustedSha) throw new Error("host jobs require a trusted commit");
   if ((job.cache?.length ?? 0) > 0)
     throw new Error("persistent caches are not supported by the host runtime");
+  signal?.throwIfAborted();
   const home = join(workspace, ".informant-home");
   await mkdir(home, { recursive: true });
   const secrets = await resolveJobSecrets(job, runtimeSecrets);
@@ -35,6 +36,7 @@ export async function runOnHost(
     INFORMANT_TRUSTED_SHA: trustedSha,
     HOME: home,
   };
+  signal?.throwIfAborted();
   await started();
   await log(`\n[${job.name}] $ ${job.command}\n`);
   const redactor = streamingSecretRedactor(Object.values(secrets), log);

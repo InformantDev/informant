@@ -160,7 +160,9 @@ export async function runLocalCommit(
       configuredVmJobs,
       cancellation.jobSignal,
     );
-    const cancelled = record.jobs?.some((job) => job.status === "cancelled") ?? false;
+    const cancelled =
+      cancellation.signal.aborted ||
+      (record.jobs?.some((job) => job.status === "cancelled") ?? false);
     record.status = cancelled ? "cancelled" : success ? "success" : "failure";
     record.completedAt = new Date().toISOString();
     await dependencies.saveBuild(record);
@@ -564,12 +566,13 @@ async function runCommitPartitionWithSlot(
 
   let childrenReconciled = false;
   let executionFinished = false;
-  let executionActive = false;
+  let workActive = false;
   let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
   try {
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));
+    workActive = true;
     cancellation = (dependencies.monitorBuildCancellation ?? monitorBuildCancellation)(
       record.id,
       config.jobs.map((job) => job.name),
@@ -580,7 +583,7 @@ async function runCommitPartitionWithSlot(
     cancellation.signal.addEventListener(
       "abort",
       () => {
-        if (executionActive) return;
+        if (workActive) return;
         record.status = "cancelled";
         record.runningJobs = [];
         record.jobs = record.jobs?.map((job) =>
@@ -597,6 +600,7 @@ async function runCommitPartitionWithSlot(
     let success = false;
     try {
       for (const job of config.jobs) {
+        executionSignal.throwIfAborted();
         const jobCheck = await github.createJobCheck(repository, sha, check.id, job.name);
         jobChecks.set(job.name, {
           check: jobCheck,
@@ -604,6 +608,7 @@ async function runCommitPartitionWithSlot(
           terminal: false,
           lastProgressAt: 0,
         });
+        executionSignal.throwIfAborted();
       }
 
       const runtimeSecrets: RuntimeSecrets = config.jobs.some((job) =>
@@ -611,56 +616,58 @@ async function runCommitPartitionWithSlot(
       )
         ? { GITHUB_TOKEN: () => github.createJobAccessToken(repository) }
         : {};
-      executionActive = true;
-      try {
-        success = await dependencies.runInTart(
-          repository,
-          sha,
-          config,
-          record,
-          {
-            started: async (job) => {
-              const state = jobChecks.get(job.name);
-              if (!state) return;
-              record.runningJobs?.push(job.name);
-              record.jobs = record.jobs?.map((item) =>
-                item.name === job.name ? { ...item, status: "running" } : item,
-              );
-              await dependencies.saveBuild(record).catch(() => undefined);
-              await updateJob(state, {
-                status: "in_progress",
-                title: `${job.name} is running`,
-                summary: `Running on ${record.machine}.`,
-              });
-            },
-            progress: (job, log) => {
-              const state = jobChecks.get(job.name);
-              if (state) queueProgress(state, log);
-            },
-            completed: async (job, result) => {
-              const state = jobChecks.get(job.name);
-              if (!state) return;
-              record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
-              record.jobs = record.jobs?.map((item) =>
-                item.name === job.name ? { ...item, status: result.outcome } : item,
-              );
-              await dependencies.saveBuild(record).catch(() => undefined);
-              await updateJob(state, completedValues(job, result.outcome, result.log), true);
-            },
+      success = await dependencies.runInTart(
+        repository,
+        sha,
+        config,
+        record,
+        {
+          started: async (job) => {
+            const state = jobChecks.get(job.name);
+            if (!state) return;
+            record.runningJobs?.push(job.name);
+            record.jobs = record.jobs?.map((item) =>
+              item.name === job.name ? { ...item, status: "running" } : item,
+            );
+            await dependencies.saveBuild(record).catch(() => undefined);
+            await updateJob(state, {
+              status: "in_progress",
+              title: `${job.name} is running`,
+              summary: `Running on ${record.machine}.`,
+            });
           },
-          executionSignal,
-          runtimeSecrets,
-          configuredVmJobs,
-          cancellation.jobSignal,
-        );
-      } finally {
-        executionActive = false;
-      }
+          progress: (job, log) => {
+            const state = jobChecks.get(job.name);
+            if (state) queueProgress(state, log);
+          },
+          completed: async (job, result) => {
+            const state = jobChecks.get(job.name);
+            if (!state) return;
+            record.runningJobs = record.runningJobs?.filter((name) => name !== job.name);
+            record.jobs = record.jobs?.map((item) =>
+              item.name === job.name ? { ...item, status: result.outcome } : item,
+            );
+            await dependencies.saveBuild(record).catch(() => undefined);
+            await updateJob(state, completedValues(job, result.outcome, result.log), true);
+          },
+        },
+        executionSignal,
+        runtimeSecrets,
+        configuredVmJobs,
+        cancellation.jobSignal,
+      );
     } catch (error) {
       executionError = error;
+    } finally {
+      workActive = false;
     }
 
     if (executionSignal?.aborted) {
+      const unfinishedJobs = new Set(
+        record.jobs
+          ?.filter((job) => job.status === "queued" || job.status === "running")
+          .map((job) => job.name),
+      );
       record.status = "cancelled";
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
@@ -670,6 +677,7 @@ async function runCommitPartitionWithSlot(
       executionFinished = true;
       await dependencies.saveBuild(record);
       for (const state of jobChecks.values()) {
+        if (cancellation.signal.aborted && !unfinishedJobs.has(state.job.name)) continue;
         state.desired = cancelledValues(state.job.name);
         state.terminal = false;
       }

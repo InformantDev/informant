@@ -1263,6 +1263,105 @@ describe("runCommit", () => {
     expect(context.updates).toEqual([]);
   });
 
+  test("honors local build cancellation after the final job completes", async () => {
+    const context = harness();
+    const jobsCompleted = deferred<void>();
+    const cleanup = deferred<void>();
+    const buildController = new AbortController();
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      return {
+        signal: buildController.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const job = selectedConfig.jobs[0];
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      await observer?.completed?.(job, { outcome: "success", log: "finished" });
+      jobsCompleted.resolve();
+      await cleanup.promise;
+      return true;
+    };
+
+    const running = runLocalCommit(repository, "sha", "main", config, {
+      dependencies: context.dependencies,
+    });
+    await jobsCompleted.promise;
+    buildController.abort("Cancellation requested from informant builds.");
+    cleanup.resolve();
+    const record = await running;
+
+    expect(record.status).toBe("cancelled");
+    expect(record.jobs).toEqual([{ name: "test", status: "success" }]);
+  });
+
+  test("keeps cancellation during job check creation active until setup exits", async () => {
+    const context = harness({ manualTrigger: true });
+    const checkStarted = deferred<void>();
+    const releaseCheck = deferred<void>();
+    const buildController = new AbortController();
+    const createJobCheck = context.github.createJobCheck.bind(context.github);
+    context.dependencies.createBuild = async (record) => {
+      context.saved.push({ ...record });
+    };
+    context.github.createJobCheck = async (...args) => {
+      if (args[3] === "test") {
+        checkStarted.resolve();
+        await releaseCheck.promise;
+      }
+      return createJobCheck(...args);
+    };
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      return {
+        signal: buildController.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    let executed = false;
+    context.dependencies.runInTart = async () => {
+      executed = true;
+      return true;
+    };
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const running = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      { ...config, jobs: [base, { ...base, name: "lint" }] },
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+
+    await checkStarted.promise;
+    buildController.abort("Cancellation requested from informant builds.");
+    await Bun.sleep(0);
+    expect(context.saved.at(-1)?.status).toBe("running");
+    releaseCheck.resolve();
+    const record = await running;
+
+    if (!record) throw new Error("expected a build record");
+    expect(executed).toBeFalse();
+    expect(context.jobChecks).toEqual(["test"]);
+    expect(record.status).toBe("cancelled");
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Build cancelled",
+    });
+  });
+
   test("cancels created job checks when later check creation fails", async () => {
     const context = harness();
     const createJobCheck = context.github.createJobCheck.bind(context.github);
@@ -1605,6 +1704,9 @@ describe("runCommit", () => {
 
   test("keeps a cancelled build active until runtime cleanup finishes", async () => {
     const context = harness({ manualTrigger: true });
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multipleJobs = { ...config, jobs: [base, { ...base, name: "lint" }] };
     const started = deferred<void>();
     const cleanup = deferred<void>();
     const buildController = new AbortController();
@@ -1624,12 +1726,14 @@ describe("runCommit", () => {
       observer,
       signal,
     ) => {
-      const job = selectedConfig.jobs[0];
-      if (!job || !signal) throw new Error("expected an abortable job");
-      await observer?.started?.(job);
+      const [completed, running] = selectedConfig.jobs;
+      if (!completed || !running || !signal) throw new Error("expected two abortable jobs");
+      await observer?.started?.(completed);
+      await observer?.completed?.(completed, { outcome: "success", log: "finished" });
+      await observer?.started?.(running);
       started.resolve();
       await cleanup.promise;
-      await observer?.completed?.(job, { outcome: "cancelled", log: "cancelled output" });
+      await observer?.completed?.(running, { outcome: "cancelled", log: "cancelled output" });
       return false;
     };
 
@@ -1638,7 +1742,7 @@ describe("runCommit", () => {
       repository,
       "sha",
       "main",
-      config,
+      multipleJobs,
       context.dependencies,
       { type: "commit", branch: "main", id: "branch:main:sha" },
     );
@@ -1651,7 +1755,20 @@ describe("runCommit", () => {
 
     if (!record) throw new Error("expected a build record");
     expect(record.status).toBe("cancelled");
+    expect(record.jobs).toEqual([
+      { name: "test", status: "success" },
+      { name: "lint", status: "cancelled" },
+    ]);
     expect(record.event?.type).toBe("manual_trigger");
+    expect(
+      context.updates
+        .filter((update) => update.id === 100 && update.values.status === "completed")
+        .map((update) => update.values.conclusion),
+    ).toEqual(["success"]);
+    expect(
+      context.updates.find((update) => update.id === 101 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "cancelled" });
     expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
       conclusion: "cancelled",
       title: "Build cancelled",

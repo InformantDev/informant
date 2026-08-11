@@ -437,6 +437,7 @@ export async function scheduleJobs(
   ) => Promise<boolean | "cancelled">,
   skipJob: (job: InformantConfig["jobs"][number]) => Promise<void> = async () => {},
   failJob: (job: InformantConfig["jobs"][number], error: unknown) => Promise<void> = async () => {},
+  jobCancelled: (job: InformantConfig["jobs"][number]) => boolean = () => false,
 ): Promise<boolean> {
   const jobsByName = new Map(jobs.map((job, index) => [job.name, { job, index }]));
   const executions = new Map<string, Promise<boolean>>();
@@ -452,6 +453,10 @@ export async function scheduleJobs(
     )
       .then(async (dependencies) => {
         if (dependencies.some((success) => !success)) {
+          await skipJob(job);
+          return false;
+        }
+        if (jobCancelled(job)) {
           await skipJob(job);
           return false;
         }
@@ -695,6 +700,7 @@ export async function runInTart(
           }),
         );
       },
+      (job) => Boolean(signalForJob(job)?.aborted),
     );
   } catch (error) {
     runFailed = true;

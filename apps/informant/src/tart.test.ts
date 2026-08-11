@@ -897,4 +897,27 @@ describe("job scheduler", () => {
     expect(executed).toEqual(["review"]);
     expect(skipped).toEqual(["publish"]);
   });
+
+  test("cancels a queued job before its runtime callback starts", async () => {
+    const controller = new AbortController();
+    const executed: string[] = [];
+    const cancelled: string[] = [];
+    expect(
+      await scheduleJobs(
+        [job("build"), job("deploy", ["build"])],
+        async (current) => {
+          executed.push(current.name);
+          if (current.name === "build") controller.abort("cancel deploy");
+          return true;
+        },
+        async (current) => {
+          cancelled.push(current.name);
+        },
+        undefined,
+        (current) => current.name === "deploy" && controller.signal.aborted,
+      ),
+    ).toBe(false);
+    expect(executed).toEqual(["build"]);
+    expect(cancelled).toEqual(["deploy"]);
+  });
 });
