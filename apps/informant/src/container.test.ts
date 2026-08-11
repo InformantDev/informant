@@ -535,6 +535,7 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
   );
   const output: string[] = [];
   const locks: string[] = [];
+  const lockAttempts: Array<number | undefined> = [];
   const job: JobConfig = {
     name: "review",
     command: "codex exec review",
@@ -564,8 +565,9 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
       {
         allowedMounts: { "codex-auth": join(codexHome, "auth.json") },
         dataPath: join(root, "data"),
-        withImageLock: async (name, callback) => {
+        withImageLock: async (name, callback, _signal, maximumAttempts) => {
           locks.push(name);
+          lockAttempts.push(maximumAttempts);
           return callback();
         },
         command: async (args, options) => {
@@ -577,7 +579,7 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
               join(source, "auth.json"),
               JSON.stringify({ tokens: { access_token: "refreshed-access" } }),
             );
-            await options?.onOutput?.("access-secret");
+            await options?.onOutput?.("access-secret refreshed-access");
           }
           return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
         },
@@ -589,10 +591,62 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
     });
     expect(output.join("")).toContain("[REDACTED]");
     expect(output.join("")).not.toContain("access-secret");
+    expect(output.join("")).not.toContain("refreshed-access");
     expect(locks).toEqual([
       "prepared-container-image-references",
       `host-file-${digest("codex-auth")}`,
     ]);
+    expect(lockAttempts).toEqual([undefined, Number.POSITIVE_INFINITY]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("writes back a refreshed mounted file when the container job is interrupted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-interrupt-"));
+  const source = join(root, "auth.json");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  const job: JobConfig = {
+    name: "review",
+    command: "codex exec review",
+    optional: true,
+    timeoutMinutes: 1,
+    environment: { CODEX_HOME: "/mnt/informant-codex" },
+    secrets: [],
+    mounts: [{ source: "codex-auth", target: "/mnt/informant-codex", writeBack: true }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        job,
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { "codex-auth": source },
+          dataPath: join(root, "data"),
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] !== "run") return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+            const volume = args.find((arg) => arg.endsWith(":/mnt/informant-codex"));
+            if (!volume) throw new Error("expected Codex auth mount");
+            const staged = volume.slice(0, -":/mnt/informant-codex".length);
+            await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "refreshed" }));
+            throw new Error("interrupted");
+          },
+        },
+      ),
+    ).rejects.toThrow("interrupted");
+    expect(await Bun.file(source).json()).toEqual({ token: "refreshed" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

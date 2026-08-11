@@ -251,6 +251,16 @@ function credentialStrings(value: unknown): string[] {
   return Object.values(value).flatMap(credentialStrings);
 }
 
+async function mountedFileValues(path: string): Promise<string[]> {
+  const contents = await readFile(path, "utf8").catch(() => "");
+  if (!contents) return [];
+  try {
+    return [contents, ...credentialStrings(JSON.parse(contents))];
+  } catch {
+    return [contents];
+  }
+}
+
 async function stageFileMounts(
   requested: NonNullable<JobConfig["mounts"]>,
   configured?: Record<string, string>,
@@ -277,13 +287,6 @@ async function stageFileMounts(
       await copyFile(source, staged);
       const mode = metadata.mode & 0o777;
       await chmod(staged, mode);
-      const contents = await readFile(source, "utf8").catch(() => "");
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(contents);
-      } catch {
-        parsed = undefined;
-      }
       return {
         name: mount.source,
         directory,
@@ -292,7 +295,7 @@ async function stageFileMounts(
         target: mount.target,
         writeBack: mount.writeBack,
         mode,
-        values: [...(contents ? [contents] : []), ...credentialStrings(parsed)],
+        values: await mountedFileValues(source),
       };
     }),
   );
@@ -728,11 +731,24 @@ export async function runInContainer(
         [...Object.values(secrets), ...fileMounts.flatMap((mount) => mount.values)],
         log,
       );
+      const refreshMountedValues = async () => {
+        redactor.add(
+          (
+            await Promise.all(
+              fileMounts.map((mount) => mountedFileValues(join(mount.directory, mount.filename))),
+            )
+          ).flat(),
+        );
+      };
       const result = await runCommand(args, {
         env: secrets,
         signal: executionSignal,
-        onOutput: redactor.write,
+        onOutput: async (text) => {
+          await refreshMountedValues();
+          await redactor.write(text);
+        },
       });
+      await refreshMountedValues();
       await redactor.flush();
       return result;
     };
@@ -743,15 +759,32 @@ export async function runInContainer(
         operations.allowedMounts,
         operations.dataPath,
       );
+      let outcome: Awaited<ReturnType<typeof run>> | undefined;
+      let runError: unknown;
+      let persistenceError: unknown;
       try {
-        const outcome = await run(staged);
+        outcome = await run(staged);
+      } catch (error) {
+        runError = error;
+      }
+      try {
         await Promise.all(staged.map(persistFileMount));
-        return outcome;
+      } catch (error) {
+        persistenceError = error;
       } finally {
         await Promise.all(
           staged.map((mount) => rm(mount.directory, { recursive: true, force: true })),
         );
       }
+      if (runError && persistenceError)
+        throw new AggregateError(
+          [runError, persistenceError],
+          "container job failed and mounted files could not be written back",
+        );
+      if (runError) throw runError;
+      if (persistenceError) throw persistenceError;
+      if (!outcome) throw new Error("container job did not return a result");
+      return outcome;
     };
     const writable = [
       ...new Set(
@@ -761,7 +794,12 @@ export async function runInContainer(
     const withMountLocks = (index: number): Promise<Awaited<ReturnType<typeof run>>> => {
       const name = writable[index];
       return name
-        ? lock(`host-file-${digest(name)}`, () => withMountLocks(index + 1), executionSignal)
+        ? lock(
+            `host-file-${digest(name)}`,
+            () => withMountLocks(index + 1),
+            executionSignal,
+            Number.POSITIVE_INFINITY,
+          )
         : executeWithMounts();
     };
     const result = (job.mounts?.length ?? 0) > 0 ? await withMountLocks(0) : await run();

@@ -9,8 +9,8 @@ import {
   listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
-  removeAllowedMount,
   machineConfigPath,
+  removeAllowedMount,
   removeRepository,
   saveGitHubCredentials,
 } from "./machine-config.ts";
