@@ -18,6 +18,7 @@ export const MANUAL_TRIGGER_REQUEST_NAME = "Informant CI / trigger";
 export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
 const CLAIM_CLEANUP_TIMEOUT_MS = 5_000;
+const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
 const rateLimitGates = new Map<string, number>();
 const RETRYABLE_CHECK_CONCLUSIONS = new Set([
   "action_required",
@@ -1049,6 +1050,16 @@ export class GitHubClient {
     const historicalCompleted = new Set(
       existing.filter((check) => check.status === "completed").map((check) => check.id),
     );
+    const interruptedClaims = new Set(
+      existing
+        .filter(
+          (check) =>
+            check.status === "completed" &&
+            check.conclusion === "cancelled" &&
+            check.output?.title === INTERRUPTED_CLAIM_TITLE,
+        )
+        .map((check) => check.id),
+    );
     const active = existing.filter(
       (check) => check.status === "in_progress" && check.name !== MANUAL_TRIGGER_REQUEST_NAME,
     );
@@ -1106,26 +1117,33 @@ export class GitHubClient {
     if (
       !requested &&
       stale.length === 0 &&
-      existing.some((check) => check.status === "completed")
+      existing.some((check) => check.status === "completed" && !interruptedClaims.has(check.id))
     ) {
       return undefined;
     }
 
     signal?.throwIfAborted();
-    const candidate = await this.createCheck(
-      repository,
-      sha,
-      `${machineId}:event:${scope}`,
-      "in_progress",
-      [],
-      name,
-      context ? manualTriggerRequestMetadata({ context, jobs: [] }) : undefined,
-      signal,
-    );
+    const candidateExternalId = `${machineId}:event:${scope}`;
+    let candidate: CheckRun | undefined;
     try {
+      candidate = await this.createCheck(
+        repository,
+        sha,
+        candidateExternalId,
+        "in_progress",
+        [],
+        name,
+        context ? manualTriggerRequestMetadata({ context, jobs: [] }) : undefined,
+        executionSignal,
+      );
+      // Candidate creation is non-idempotent, so admission cancellation must not
+      // interrupt the POST after dispatch. Do not begin election if admission
+      // stopped while GitHub was creating the candidate.
+      signal?.throwIfAborted();
       const election = await this.checks(repository, sha, name, executionSignal);
       const ignoredCompletions = new Set([
         ...stale.map((check) => check.id),
+        ...interruptedClaims,
         ...(requested ? historicalCompleted : []),
       ]);
       const completed = election.some(
@@ -1196,18 +1214,33 @@ export class GitHubClient {
       );
       return completed ? undefined : { requestedJobs: [], manualTrigger, retry: true };
     } catch (error) {
-      await this.updateCheck(
-        repository,
-        candidate.id,
-        {
-          status: "completed",
-          conclusion: "cancelled",
-          title: "Claim interrupted",
-          summary: "The worker stopped before claim election completed.",
-          text: candidate.output?.text,
-        },
-        AbortSignal.timeout(CLAIM_CLEANUP_TIMEOUT_MS),
-      ).catch(() => undefined);
+      const cleanupSignal = AbortSignal.timeout(CLAIM_CLEANUP_TIMEOUT_MS);
+      const interrupted = candidate
+        ? [candidate]
+        : await this.checks(repository, sha, name, cleanupSignal)
+            .then((checks) =>
+              checks.filter(
+                (check) =>
+                  check.status === "in_progress" && check.external_id === candidateExternalId,
+              ),
+            )
+            .catch(() => []);
+      await Promise.all(
+        interrupted.map((check) =>
+          this.updateCheck(
+            repository,
+            check.id,
+            {
+              status: "completed",
+              conclusion: "cancelled",
+              title: INTERRUPTED_CLAIM_TITLE,
+              summary: "The worker stopped before claim election completed; it may be retried.",
+              text: check.output?.text,
+            },
+            cleanupSignal,
+          ).catch(() => undefined),
+        ),
+      );
       throw error;
     }
   }
