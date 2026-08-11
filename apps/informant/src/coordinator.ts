@@ -4,7 +4,7 @@ import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
 import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./config.ts";
 import { refreshSelectedContainerBackend } from "./container-backend.ts";
 import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
-import type { GitHubClient } from "./github.ts";
+import type { ClaimResult, GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
 import { withImageLock } from "./tart/vm.ts";
@@ -174,11 +174,29 @@ export async function runCommit(
   dependencies: CoordinatorDependencies = defaultDependencies,
   event?: RunEvent,
   signal?: AbortSignal,
+  admissionSignal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
-  const manualTrigger =
-    event?.type === "comment"
-      ? false
-      : await github.hasPendingManualTrigger(repository, sha, event?.branch, branch);
+  const manualAdmissionSignal = admissionSignal ?? signal;
+  const automaticAdmissionSignal =
+    signal && admissionSignal
+      ? AbortSignal.any([signal, admissionSignal])
+      : (admissionSignal ?? signal);
+  let manualTrigger = false;
+  if (event?.type !== "comment") {
+    try {
+      manualTrigger = await github.hasPendingManualTrigger(
+        repository,
+        sha,
+        event?.branch,
+        branch,
+        manualAdmissionSignal,
+      );
+    } catch (error) {
+      if (manualAdmissionSignal?.aborted) return false;
+      throw error;
+    }
+  }
+  const claimSignal = manualTrigger ? manualAdmissionSignal : automaticAdmissionSignal;
   const hasTriggers =
     (config.triggers?.length ?? 0) > 0 || config.jobs.some((job) => job.triggers !== undefined);
   const selected =
@@ -203,11 +221,16 @@ export async function runCommit(
   const needsContainerBackend = potentiallyCapable.jobs.some(
     (job) => job.runtime?.type === "container",
   );
-  if (
-    needsContainerBackend &&
-    !(await (dependencies.refreshContainerBackend ?? refreshSelectedContainerBackend)(signal))
-  ) {
-    return false;
+  if (needsContainerBackend) {
+    try {
+      const ready = await (dependencies.refreshContainerBackend ?? refreshSelectedContainerBackend)(
+        claimSignal,
+      );
+      if (!ready) return false;
+    } catch (error) {
+      if (claimSignal?.aborted) return false;
+      throw error;
+    }
   }
   const capabilities = usesCapabilities
     ? [
@@ -284,6 +307,7 @@ export async function runCommit(
         jobs.map((job) => job.name),
         !manualTrigger,
         manualTrigger ? [] : previousScopes,
+        claimSignal,
       );
     }),
   );
@@ -302,13 +326,14 @@ async function runCommitPartition(
   scopeJobs?: string[],
   requireRunSlot = false,
   legacyScopes: string[] = [],
+  admissionSignal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
   if (config.jobs.length === 0) return undefined;
   const release = requireRunSlot
-    ? await (dependencies.acquireExecutionSlot ?? acquireExecutionSlot)(config, signal)
+    ? await (dependencies.acquireExecutionSlot ?? acquireExecutionSlot)(config, admissionSignal)
     : undefined;
   if (requireRunSlot && !release) return false;
-  if (requireRunSlot && signal?.aborted) {
+  if (requireRunSlot && admissionSignal?.aborted) {
     release?.();
     return false;
   }
@@ -325,6 +350,7 @@ async function runCommitPartition(
       scopeJobs,
       !requireRunSlot,
       legacyScopes,
+      admissionSignal,
     );
   } finally {
     release?.();
@@ -343,6 +369,7 @@ async function runCommitPartitionWithSlot(
   scopeJobs?: string[],
   acceptManualTrigger = true,
   legacyScopes: string[] = [],
+  admissionSignal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
@@ -356,18 +383,26 @@ async function runCommitPartitionWithSlot(
           id: `${event.id}:job-set:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
         }
       : event;
-  const claim = await github.claim(
-    repository,
-    sha,
-    machine,
-    scopedEvent
-      ? { type: scopedEvent.type, id: scopedEvent.id, branch: scopedEvent.branch, label: branch }
-      : undefined,
-    scopeJobs,
-    acceptManualTrigger,
-    legacyScopes,
-    acceptManualTrigger,
-  );
+  let claim: ClaimResult | undefined;
+  try {
+    claim = await github.claim(
+      repository,
+      sha,
+      machine,
+      scopedEvent
+        ? { type: scopedEvent.type, id: scopedEvent.id, branch: scopedEvent.branch, label: branch }
+        : undefined,
+      scopeJobs,
+      acceptManualTrigger,
+      legacyScopes,
+      acceptManualTrigger,
+      admissionSignal,
+      acceptManualTrigger ? undefined : signal,
+    );
+  } catch (error) {
+    if (admissionSignal?.aborted) return false;
+    throw error;
+  }
   if (acceptManualTrigger && claim && !claim.manualTrigger) return false;
   if (claim?.retry) return false;
   if (!claim?.check) return undefined;
