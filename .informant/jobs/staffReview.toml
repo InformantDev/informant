@@ -47,7 +47,8 @@ staff review post
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["GITHUB_TOKEN"]
-codex_auth = "host"
+environment = { CODEX_HOME = "/mnt/informant-codex" }
+mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back = true }]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
 set -eu

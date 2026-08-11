@@ -763,14 +763,14 @@ describe("serve polling orchestration", () => {
     ).toEqual([trustedJob, setupJob]);
   });
 
-  test("pins jobs that use host Codex authentication", () => {
+  test("pins jobs that request allowed host file mounts", () => {
     const configuredJob = config.jobs[0];
     if (!configuredJob) throw new Error("expected a configured job");
     const trustedJob = {
       ...configuredJob,
       name: "review",
       command: "trusted review",
-      codexAuth: "host" as const,
+      mounts: [{ source: "codex-auth", target: "/mnt/codex", writeBack: true }],
       runtime: { type: "container" as const, image: "trusted-container" },
     };
     const result = applySecretPolicy(

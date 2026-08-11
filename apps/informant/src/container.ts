@@ -11,8 +11,9 @@ import {
   rename,
   rm,
 } from "node:fs/promises";
-import { availableParallelism, homedir, totalmem } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { availableParallelism, totalmem } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { listAllowedMounts } from "./machine-config.ts";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
@@ -230,11 +231,16 @@ export interface ContainerPreparationOperations {
 type ContainerRunOperations = Pick<
   ContainerPreparationOperations,
   "command" | "withImageLock" | "dataPath"
-> & { codexHome?: string };
+> & { allowedMounts?: Record<string, string> };
 
-interface StagedCodexAuth {
+interface StagedFileMount {
+  name: string;
   directory: string;
   source: string;
+  filename: string;
+  target: string;
+  writeBack: boolean;
+  mode: number;
   values: string[];
 }
 
@@ -245,49 +251,62 @@ function credentialStrings(value: unknown): string[] {
   return Object.values(value).flatMap(credentialStrings);
 }
 
-async function stageHostCodexAuth(
-  configuredHome?: string,
+async function stageFileMounts(
+  requested: NonNullable<JobConfig["mounts"]>,
+  configured?: Record<string, string>,
   dataPath = dataDirectory(),
-): Promise<StagedCodexAuth> {
-  const home = configuredHome ?? Bun.env.CODEX_HOME ?? join(homedir(), ".codex");
-  const source = join(home, "auth.json");
-  let contents: string;
-  try {
-    contents = await readFile(source, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT")
-      throw new Error(
-        `host Codex login was not found at ${source}; run codex login with file credential storage`,
-      );
-    throw error;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(contents);
-  } catch {
-    throw new Error(`host Codex login at ${source} is not valid JSON`);
-  }
-  const parent = join(dataPath, "codex-auth-staging");
+): Promise<StagedFileMount[]> {
+  const allowed =
+    configured ??
+    Object.fromEntries((await listAllowedMounts()).map(({ name, source }) => [name, source]));
+  const parent = join(dataPath, "file-mount-staging");
   await mkdir(parent, { recursive: true, mode: 0o700 });
-  const directory = await mkdtemp(join(parent, "job-"));
-  const staged = join(directory, "auth.json");
-  await Bun.write(staged, contents);
-  await chmod(staged, 0o600);
-  return { directory, source, values: credentialStrings(parsed) };
+  return Promise.all(
+    requested.map(async (mount) => {
+      const configuredSource = allowed[mount.source];
+      if (!configuredSource)
+        throw new Error(
+          `mount ${mount.source} is not allowed on this worker; run informant mount allow ${mount.source} <file>`,
+        );
+      const source = await realpath(configuredSource);
+      const metadata = await lstat(source);
+      if (!metadata.isFile()) throw new Error(`allowed mount source is not a file: ${source}`);
+      const directory = await mkdtemp(join(parent, "job-"));
+      const filename = basename(source);
+      const staged = join(directory, filename);
+      await copyFile(source, staged);
+      const mode = metadata.mode & 0o777;
+      await chmod(staged, mode);
+      const contents = await readFile(source, "utf8").catch(() => "");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(contents);
+      } catch {
+        parsed = undefined;
+      }
+      return {
+        name: mount.source,
+        directory,
+        source,
+        filename,
+        target: mount.target,
+        writeBack: mount.writeBack,
+        mode,
+        values: [...(contents ? [contents] : []), ...credentialStrings(parsed)],
+      };
+    }),
+  );
 }
 
-async function persistHostCodexAuth(auth: StagedCodexAuth): Promise<void> {
-  const staged = join(auth.directory, "auth.json");
-  const contents = await readFile(staged, "utf8");
-  try {
-    JSON.parse(contents);
-  } catch {
-    throw new Error("Codex produced an invalid refreshed auth.json");
-  }
-  const temporary = `${auth.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
-  await Bun.write(temporary, contents);
-  await chmod(temporary, 0o600);
-  await rename(temporary, auth.source);
+async function persistFileMount(mount: StagedFileMount): Promise<void> {
+  if (!mount.writeBack) return;
+  const staged = join(mount.directory, mount.filename);
+  const metadata = await lstat(staged);
+  if (!metadata.isFile()) throw new Error(`mounted file was removed: ${mount.name}`);
+  const temporary = `${mount.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
+  await copyFile(staged, temporary);
+  await chmod(temporary, mount.mode);
+  await rename(temporary, mount.source);
 }
 
 const preparedContainerReferencesDirectory = (dataPath = dataDirectory()) =>
@@ -683,21 +702,20 @@ export async function runInContainer(
       reference: `${repository.fullName}\0${job.name}`,
       dataPath: operations.dataPath,
     });
-    const run = async (auth?: StagedCodexAuth) => {
+    const run = async (fileMounts: StagedFileMount[] = []) => {
       const mounts = caches.mounts.map((mount) => ({
         source: mount.path,
         target: `/mnt/shared/${mount.name}`,
       }));
-      if (auth) mounts.push({ source: auth.directory, target: "/mnt/informant-codex" });
+      mounts.push(
+        ...fileMounts.map((mount) => ({ source: mount.directory, target: mount.target })),
+      );
       const args = containerRunArguments({
         name,
         image,
         workspace: hostWorkspace,
         command: wrapped,
-        environment: {
-          ...environment,
-          ...(auth ? { CODEX_HOME: "/mnt/informant-codex" } : {}),
-        },
+        environment,
         mounts,
         secretNames: Object.keys(secrets),
         cpu: resources.cpu,
@@ -707,7 +725,7 @@ export async function runInContainer(
       await started();
       await log(`\n[${job.name}] $ ${job.command}\n`);
       const redactor = streamingSecretRedactor(
-        [...Object.values(secrets), ...(auth?.values ?? [])],
+        [...Object.values(secrets), ...fileMounts.flatMap((mount) => mount.values)],
         log,
       );
       const result = await runCommand(args, {
@@ -719,23 +737,34 @@ export async function runInContainer(
       return result;
     };
     const lock = operations.withImageLock ?? withImageLock;
-    const result =
-      job.codexAuth === "host"
-        ? await lock(
-            "host-codex-auth",
-            async () => {
-              const auth = await stageHostCodexAuth(operations.codexHome, operations.dataPath);
-              try {
-                const outcome = await run(auth);
-                await persistHostCodexAuth(auth);
-                return outcome;
-              } finally {
-                await rm(auth.directory, { recursive: true, force: true });
-              }
-            },
-            executionSignal,
-          )
-        : await run();
+    const executeWithMounts = async () => {
+      const staged = await stageFileMounts(
+        job.mounts ?? [],
+        operations.allowedMounts,
+        operations.dataPath,
+      );
+      try {
+        const outcome = await run(staged);
+        await Promise.all(staged.map(persistFileMount));
+        return outcome;
+      } finally {
+        await Promise.all(
+          staged.map((mount) => rm(mount.directory, { recursive: true, force: true })),
+        );
+      }
+    };
+    const writable = [
+      ...new Set(
+        (job.mounts ?? []).filter((mount) => mount.writeBack).map((mount) => mount.source),
+      ),
+    ].sort();
+    const withMountLocks = (index: number): Promise<Awaited<ReturnType<typeof run>>> => {
+      const name = writable[index];
+      return name
+        ? lock(`host-file-${digest(name)}`, () => withMountLocks(index + 1), executionSignal)
+        : executeWithMounts();
+    };
+    const result = (job.mounts?.length ?? 0) > 0 ? await withMountLocks(0) : await run();
     return {
       success: result.exitCode === 0 && !result.timedOut,
       exitCode: result.exitCode,

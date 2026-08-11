@@ -166,28 +166,35 @@ change the trusted command, select a hostile VM image, or remove a required secr
 trusted command may inspect the proposed checkout, but it must not execute scripts or install packages
 from that checkout while secrets are present.
 
-## Host Codex subscription authentication
+## Allowed host file mounts
 
-Container jobs can reuse a Codex CLI subscription login already present on the worker:
-
-```toml
-codex_auth = "host"
-```
-
-Informant reads `auth.json` from `$CODEX_HOME` or `~/.codex`, mounts an isolated copy into the
-container, serializes jobs that use it, and writes a valid refreshed credential back after the run.
-Only `auth.json` is exposed; the worker's Codex configuration, sessions, and skills are not mounted.
-These jobs receive the same default-branch trust protections as secret-bearing jobs.
-
-The host login must use file credential storage. If `~/.codex/auth.json` does not exist, sign in again
-with a one-run configuration override:
+Container jobs can request host files by a machine-local allowlist name. The repository never
+specifies a host path. First allow an existing file on the worker:
 
 ```bash
-codex -c 'cli_auth_credentials_store="file"' login
+informant mount allow codex-auth "$HOME/.codex/auth.json"
 ```
 
-Treat this login like any other automation credential: use it only on a trusted private worker and
-restrict who can add branches to repositories whose pull requests run authenticated agent jobs.
+If a Codex login is stored only in the system keychain, create the file-backed login first with
+`codex -c 'cli_auth_credentials_store="file"' login`.
+
+Then request that name from a job and choose a container directory. Informant mounts a temporary
+directory containing the file under its original basename:
+
+```toml
+environment = { CODEX_HOME = "/mnt/informant-codex" }
+mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back = true }]
+```
+
+`write_back` defaults to `false`. When enabled, Informant serializes jobs using the same writable
+source and atomically copies the resulting file back to the allowed host path. This supports files
+such as Codex's `auth.json`, whose tokens may refresh during a run. Informant redacts the original
+file contents and JSON string values from job logs, exposes no other files from the source directory,
+and applies the same default-branch trust protections as secret-bearing jobs.
+
+Use `informant mount list` to inspect the allowlist and `informant mount remove <name>` to revoke an
+entry. Treat mounted credentials like other automation secrets: use them only on trusted private
+workers and restrict who can add branches to repositories that request them.
 
 ## Automatic triggers
 

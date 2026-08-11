@@ -35,7 +35,11 @@ export interface JobConfig {
   timeoutMinutes: number;
   environment: Record<string, string>;
   secrets: string[];
-  codexAuth?: "host";
+  mounts?: Array<{
+    source: string;
+    target: string;
+    writeBack: boolean;
+  }>;
   needs: string[];
   runsOn?: string[];
   runtime?: JobRuntime;

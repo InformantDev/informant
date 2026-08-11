@@ -437,22 +437,30 @@ describe("configuration", () => {
     ).toThrow("also set in environment");
   });
 
-  test("parses host Codex authentication only for container jobs", () => {
+  test("parses named file mounts only for container jobs", () => {
     const configured = configTemplate().replace(
       'command = "bun install --frozen-lockfile && bun test"',
-      'command = "bun install --frozen-lockfile && bun test"\ncodex_auth = "host"',
+      'command = "bun install --frozen-lockfile && bun test"\nmounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
     );
-    expect(parseConfig(configured).jobs[0]?.codexAuth).toBe("host");
-    expect(() => parseConfig(configured.replace('"host"', '"shared"'))).toThrow(
-      "codex_auth must be host",
-    );
+    expect(parseConfig(configured).jobs[0]?.mounts).toEqual([
+      { source: "codex-auth", target: "/mnt/codex", writeBack: true },
+    ]);
+    expect(() =>
+      parseConfig(configured.replace('source = "codex-auth"', 'source = "bad/name"')),
+    ).toThrow("source must be an allowed mount name");
+    expect(() =>
+      parseConfig(configured.replace('target = "/mnt/codex"', 'target = "relative"')),
+    ).toThrow("target must be an absolute container directory");
     expect(() =>
       parseConfig(
         configured
-          .replace('codex_auth = "host"', 'codex_auth = "host"\nhost = {}\nruns_on = ["linux"]')
+          .replace(
+            'mounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
+            'mounts = [{ source = "codex-auth", target = "/mnt/codex" }]\nhost = {}\nruns_on = ["linux"]',
+          )
           .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []"),
       ),
-    ).toThrow("codex_auth is supported only for container jobs");
+    ).toThrow("mounts is supported only for container jobs");
   });
 
   test("parses and validates job filters", () => {

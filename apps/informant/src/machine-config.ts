@@ -1,6 +1,6 @@
-import { mkdir } from "node:fs/promises";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { parseRepository } from "./config.ts";
 import type { Repository } from "./types.ts";
 
@@ -14,6 +14,7 @@ export interface GitHubCredentials {
 interface MachineConfig {
   version: 1;
   repositories: string[];
+  allowedMounts?: Record<string, string>;
   githubApps?: GitHubCredentials[];
   /** Legacy single-installation configuration. */
   github?: GitHubCredentials;
@@ -34,12 +35,67 @@ async function readMachineConfig(path = machineConfigPath()): Promise<MachineCon
     );
   }
   if (!Array.isArray(value.repositories)) throw new Error(`invalid Informant config: ${path}`);
+  if (
+    value.allowedMounts !== undefined &&
+    (!value.allowedMounts ||
+      typeof value.allowedMounts !== "object" ||
+      Array.isArray(value.allowedMounts) ||
+      Object.entries(value.allowedMounts).some(
+        ([name, source]) =>
+          !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) ||
+          typeof source !== "string" ||
+          !isAbsolute(source),
+      ))
+  )
+    throw new Error(`invalid allowed mounts in Informant config: ${path}`);
   return {
     version: value.version,
     repositories: value.repositories.map(String),
+    allowedMounts: value.allowedMounts,
     githubApps: Array.isArray(value.githubApps) ? value.githubApps : undefined,
     github: value.github,
   };
+}
+
+export async function listAllowedMounts(
+  path = machineConfigPath(),
+): Promise<Array<{ name: string; source: string }>> {
+  const config = await readMachineConfig(path);
+  return Object.entries(config.allowedMounts ?? {})
+    .map(([name, source]) => ({ name, source }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export async function allowMount(
+  name: string,
+  source: string,
+  path = machineConfigPath(),
+): Promise<void> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
+    throw new Error("mount name must contain only letters, numbers, dots, underscores, and dashes");
+  const canonical = await realpath(source).catch(() => undefined);
+  if (!canonical || !(await lstat(canonical)).isFile())
+    throw new Error(`allowed mount source must be an existing file: ${source}`);
+  const config = await readMachineConfig(path);
+  await writeMachineConfig(
+    {
+      ...config,
+      allowedMounts: { ...config.allowedMounts, [name]: canonical },
+    },
+    path,
+  );
+}
+
+export async function removeAllowedMount(
+  name: string,
+  path = machineConfigPath(),
+): Promise<boolean> {
+  const config = await readMachineConfig(path);
+  if (!Object.hasOwn(config.allowedMounts ?? {}, name)) return false;
+  const allowedMounts = { ...config.allowedMounts };
+  delete allowedMounts[name];
+  await writeMachineConfig({ ...config, allowedMounts }, path);
+  return true;
 }
 
 async function writeMachineConfig(

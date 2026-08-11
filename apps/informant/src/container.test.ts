@@ -12,7 +12,7 @@ import {
   prunePreparedContainerImages,
   runInContainer,
 } from "./container.ts";
-import { shellQuote } from "./tart/vm.ts";
+import { digest, shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
 const temporaryDataPaths: string[] = [];
@@ -525,8 +525,8 @@ test("passes secrets through the client environment and always removes the conta
   expect(output.join("")).not.toContain("line one");
 });
 
-test("mounts, redacts, and persists host Codex subscription authentication", async () => {
-  const root = await mkdtemp(join(tmpdir(), "informant-codex-auth-"));
+test("mounts, redacts, and writes back an allowed host file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-mount-"));
   const codexHome = join(root, "codex-home");
   await mkdir(codexHome);
   await Bun.write(
@@ -540,9 +540,9 @@ test("mounts, redacts, and persists host Codex subscription authentication", asy
     command: "codex exec review",
     optional: true,
     timeoutMinutes: 1,
-    environment: {},
+    environment: { CODEX_HOME: "/mnt/informant-codex" },
     secrets: [],
-    codexAuth: "host",
+    mounts: [{ source: "codex-auth", target: "/mnt/informant-codex", writeBack: true }],
     needs: [],
     runtime: { type: "container", image: "oven/bun:1" },
   };
@@ -562,7 +562,7 @@ test("mounts, redacts, and persists host Codex subscription authentication", asy
       {},
       undefined,
       {
-        codexHome,
+        allowedMounts: { "codex-auth": join(codexHome, "auth.json") },
         dataPath: join(root, "data"),
         withImageLock: async (name, callback) => {
           locks.push(name);
@@ -589,10 +589,53 @@ test("mounts, redacts, and persists host Codex subscription authentication", asy
     });
     expect(output.join("")).toContain("[REDACTED]");
     expect(output.join("")).not.toContain("access-secret");
-    expect(locks).toEqual(["prepared-container-image-references", "host-codex-auth"]);
+    expect(locks).toEqual([
+      "prepared-container-image-references",
+      `host-file-${digest("codex-auth")}`,
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("rejects repository file mounts that are not allowed by the worker", async () => {
+  const invocations: string[][] = [];
+  const job: JobConfig = {
+    name: "review",
+    command: "cat /mnt/credential/token",
+    optional: false,
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    mounts: [{ source: "credential", target: "/mnt/credential", writeBack: false }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  await expect(
+    runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      job,
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: {},
+        dataPath: temporaryContainerDataPath(),
+        withImageLock: passthroughImageLock,
+        command: async (args) => {
+          invocations.push(args);
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    ),
+  ).rejects.toThrow("mount credential is not allowed on this worker");
+  expect(invocations.some((args) => args[1] === "run")).toBe(false);
 });
 
 test("prepared jobs copy source into the baked workspace before running", async () => {

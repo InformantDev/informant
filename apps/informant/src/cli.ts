@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync } from "node:fs";
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { mkdir, readdir, realpath, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { SelectPrompt } from "@clack/core";
@@ -23,8 +23,11 @@ import { installPostPushHook, uninstallPostPushHook } from "./hook.ts";
 import { formatHousekeepingSummary, runHousekeeping } from "./housekeeping.ts";
 import {
   addRepository,
+  allowMount,
+  listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
+  removeAllowedMount,
   removeRepository,
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
@@ -58,6 +61,9 @@ Usage:
   informant repo add [owner/repo]         Register a repository on this machine
   informant repo list                     List registered repositories
   informant repo remove [owner/repo]      Stop handling a repository
+  informant mount allow <name> <file>     Allow jobs to request a host file by name
+  informant mount list                    List allowed host file mounts
+  informant mount remove <name>           Remove a host file from the allowlist
   informant serve [--once]                Poll all registered repositories
   informant run --local [--ref <ref>] [--job <name>]
                                         Run all or selected jobs locally
@@ -808,6 +814,31 @@ async function manageRepositories(action?: string, value?: string): Promise<void
   throw new Error("repo action must be one of: add, list, remove");
 }
 
+async function manageMounts(action?: string, name?: string, source?: string): Promise<void> {
+  if (action === "list" || !action) {
+    const mounts = await listAllowedMounts();
+    console.log(
+      mounts.length
+        ? mounts.map((mount) => `${mount.name}\t${mount.source}`).join("\n")
+        : "No host files are allowed for job mounts.",
+    );
+    return;
+  }
+  if (action === "allow") {
+    if (!name || !source) throw new Error("usage: informant mount allow <name> <file>");
+    await allowMount(name, source);
+    outro(`Allowed ${name} to mount ${await realpath(source)}`);
+    return;
+  }
+  if (action === "remove") {
+    if (!name || source) throw new Error("usage: informant mount remove <name>");
+    const removed = await removeAllowedMount(name);
+    outro(removed ? `Removed allowed mount ${name}` : `Allowed mount ${name} was not configured`);
+    return;
+  }
+  throw new Error("mount action must be one of: allow, list, remove");
+}
+
 async function doctor(): Promise<void> {
   const requiredChecks: Array<[string, string[]]> = [
     ["git", ["git", "--version"]],
@@ -881,7 +912,7 @@ async function doctor(): Promise<void> {
 
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
-  const [subcommand, action, id] = positional;
+  const [subcommand, action, id, value] = positional;
   if (flags.version || subcommand === "--version") {
     console.log(packageJson.version);
     return;
@@ -913,6 +944,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   if (subcommand === "repo") return manageRepositories(action, id);
+  if (subcommand === "mount") return manageMounts(action, id, value);
   if (subcommand === "image") return manageImages(action);
   if (subcommand === "cache") return manageCaches(action);
   if (subcommand === "serve") {

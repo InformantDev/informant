@@ -1,13 +1,35 @@
 import { expect, test } from "bun:test";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   addRepository,
+  allowMount,
   getGitHubCredentials,
+  listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
+  removeAllowedMount,
   removeRepository,
   saveGitHubCredentials,
 } from "./machine-config.ts";
+
+test("allows only named existing host files for repository mounts", async () => {
+  const root = join(import.meta.dir, `.machine-mount-${crypto.randomUUID()}`);
+  const path = join(root, "config.json");
+  const source = join(root, "auth.json");
+  try {
+    await mkdir(root);
+    await Bun.write(source, "credential");
+    await allowMount("codex-auth", source, path);
+    expect(await listAllowedMounts(path)).toEqual([{ name: "codex-auth", source }]);
+    expect(allowMount("bad/name", source, path)).rejects.toThrow("mount name");
+    expect(allowMount("missing", join(root, "missing"), path)).rejects.toThrow("existing file");
+    expect(await removeAllowedMount("codex-auth", path)).toBe(true);
+    expect(await removeAllowedMount("codex-auth", path)).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("registers and removes machine repositories without duplicates", async () => {
   const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
