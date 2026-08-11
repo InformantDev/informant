@@ -17,6 +17,7 @@ export interface PollState {
   tagRefs?: Array<{ name: string; sha: string }>;
   tagsPolledAt?: string;
   pendingTags: Array<{ name: string; sha: string }>;
+  missingConfigs?: Array<{ sha: string; checkedAt: string }>;
 }
 
 function path(repo: string) {
@@ -24,8 +25,9 @@ function path(repo: string) {
 }
 export async function readPollState(repo: string): Promise<PollState> {
   const file = Bun.file(path(repo));
-  if (!(await file.exists())) return { pending: [], seenCommentIds: [], pendingTags: [] };
-  const state = (await file.json()) as Partial<PollState>;
+  if (!(await file.exists()))
+    return { pending: [], seenCommentIds: [], pendingTags: [], missingConfigs: [] };
+  const state = (await file.json()) as Partial<PollState> & { missingConfigShas?: unknown[] };
   return {
     cursor: state.cursor,
     pending: state.pending ?? [],
@@ -33,6 +35,15 @@ export async function readPollState(repo: string): Promise<PollState> {
     tagRefs: state.tagRefs,
     tagsPolledAt: state.tagsPolledAt,
     pendingTags: state.pendingTags ?? [],
+    missingConfigs: [
+      ...(state.missingConfigs ?? []).filter(
+        (entry): entry is { sha: string; checkedAt: string } =>
+          typeof entry?.sha === "string" && typeof entry.checkedAt === "string",
+      ),
+      ...(state.missingConfigShas ?? [])
+        .filter((sha): sha is string => typeof sha === "string")
+        .map((sha) => ({ sha, checkedAt: new Date(0).toISOString() })),
+    ],
   };
 }
 export async function savePollState(repo: string, state: PollState): Promise<void> {
