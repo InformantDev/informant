@@ -307,11 +307,44 @@ test("keeps a shared readiness probe healthy when its initiating caller cancels"
   await expect(initiating).rejects.toThrow("initiating job cancelled");
   blocked.resolve();
   expect(await joined).toBe(podmanContainerBackend);
-  expect(signals).toEqual([undefined, undefined]);
+  expect(signals).toHaveLength(2);
+  expect(signals[0]).toBe(signals[1]);
+  expect(signals[0]).not.toBe(controller.signal);
+  expect(signals[0]?.aborted).toBe(false);
   expect(containerBackendReadiness()).toMatchObject({
     backend: podmanContainerBackend,
     ready: true,
   });
+});
+
+test("cancels the underlying readiness probe when its last waiter leaves", async () => {
+  const probing = deferred<void>();
+  const controller = new AbortController();
+  let probeSignal: AbortSignal | undefined;
+  const runCommand = async (argv: string[], options?: { signal?: AbortSignal }) => {
+    if (argv[1] !== "info") return result();
+    probeSignal = options?.signal;
+    probing.resolve();
+    return new Promise<ReturnType<typeof result>>((_resolve, reject) => {
+      const signal = options?.signal;
+      if (!signal) return reject(new Error("expected a shared readiness signal"));
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  };
+  const pending = refreshContainerBackend(
+    30_000,
+    podmanContainerBackend,
+    runCommand,
+    1_000,
+    controller.signal,
+  );
+  await probing.promise;
+  controller.abort(new Error("worker shutdown requested"));
+
+  await expect(pending).rejects.toThrow("worker shutdown requested");
+  expect(probeSignal).not.toBe(controller.signal);
+  expect(probeSignal?.aborted).toBe(true);
 });
 
 test("bounds every Apple Container readiness and start command", async () => {

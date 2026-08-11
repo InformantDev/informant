@@ -227,15 +227,43 @@ export function selectContainerBackend(
 }
 
 let readiness: { backend: ContainerBackend; checkedAt: number; error?: Error } | undefined;
-let refreshInFlight: { backend: ContainerBackend; result: Promise<boolean> } | undefined;
+interface ReadinessRefresh {
+  backend: ContainerBackend;
+  controller: AbortController;
+  result: Promise<boolean>;
+  settled: boolean;
+  waiters: number;
+}
+let refreshInFlight: ReadinessRefresh | undefined;
 
-function waitForReadiness(result: Promise<boolean>, signal?: AbortSignal): Promise<boolean> {
-  if (!signal) return result;
-  signal.throwIfAborted();
+function waitForReadiness(refresh: ReadinessRefresh, signal?: AbortSignal): Promise<boolean> {
+  signal?.throwIfAborted();
+  refresh.waiters++;
+  let waiting = true;
+  const release = () => {
+    if (!waiting) return;
+    waiting = false;
+    refresh.waiters--;
+    if (refresh.waiters === 0 && !refresh.settled) {
+      refresh.controller.abort("Container readiness probe no longer needed.");
+    }
+  };
+  if (!signal) return refresh.result.finally(release);
   return new Promise((resolve, reject) => {
-    const abort = () => reject(signal.reason);
+    let finished = false;
+    const finish = <T>(callback: (value: T) => void, value: T) => {
+      if (finished) return;
+      finished = true;
+      signal.removeEventListener("abort", abort);
+      release();
+      callback(value);
+    };
+    const abort = () => finish(reject, signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    result.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    refresh.result.then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
   });
 }
 
@@ -254,6 +282,7 @@ export async function initializeContainerBackend(
     readiness = { backend, checkedAt: now };
     return true;
   } catch (error) {
+    if (signal?.aborted) throw signal.reason;
     readiness = {
       backend,
       checkedAt: now,
@@ -279,12 +308,19 @@ export async function refreshContainerBackend(
     return readiness.error === undefined;
   }
   if (!backend) return initializeContainerBackend(backend, runCommand, now, signal);
-  if (refreshInFlight?.backend === backend) return waitForReadiness(refreshInFlight.result, signal);
-  const result = initializeContainerBackend(backend, runCommand, now).finally(() => {
-    if (refreshInFlight?.result === result) refreshInFlight = undefined;
-  });
-  refreshInFlight = { backend, result };
-  return waitForReadiness(result, signal);
+  if (refreshInFlight?.backend === backend) return waitForReadiness(refreshInFlight, signal);
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  let refresh!: ReadinessRefresh;
+  const result = initializeContainerBackend(backend, runCommand, now, controller.signal).finally(
+    () => {
+      refresh.settled = true;
+      if (refreshInFlight === refresh) refreshInFlight = undefined;
+    },
+  );
+  refresh = { backend, controller, result, settled: false, waiters: 0 };
+  refreshInFlight = refresh;
+  return waitForReadiness(refresh, signal);
 }
 
 export function refreshSelectedContainerBackend(signal?: AbortSignal): Promise<boolean> {
@@ -328,5 +364,8 @@ export function containerBackendReadiness():
 
 export function resetContainerBackendReadiness(): void {
   readiness = undefined;
+  if (refreshInFlight && !refreshInFlight.settled) {
+    refreshInFlight.controller.abort("Container readiness state reset.");
+  }
   refreshInFlight = undefined;
 }

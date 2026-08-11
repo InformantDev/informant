@@ -260,6 +260,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const inFlightRuns = new Map<string, Promise<void>>();
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
   const shutdownControllers = new Set<AbortController>();
+  const admissionControllers = new Set<AbortController>();
+  const admissionSignal = (controller: AbortController) =>
+    options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
   const completedComments = new Set<number>();
   const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
@@ -319,6 +322,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     shutdownControllers.clear();
     automaticLanes.clear();
   };
+  const abortAdmissions = () => {
+    for (const controller of admissionControllers) {
+      controller.abort(options.signal?.reason ?? "Worker shutdown requested.");
+    }
+    admissionControllers.clear();
+  };
   const waitForDelay = (milliseconds: number) =>
     waitForAbortableDelay(milliseconds, options.signal, dependencies.sleep);
   const drainRuns = async () => {
@@ -336,8 +345,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       for (const id of completedTagEvents) completedTags.delete(id);
     }
   };
-  const drainForShutdown = async () => {
-    const draining = drainRuns();
+  const drainForShutdown = async (pendingDrain?: Promise<void>) => {
+    abortAdmissions();
+    const draining = pendingDrain ?? drainRuns();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<false>((resolve) => {
       timeout = setTimeout(
@@ -351,6 +361,30 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     abortInFlightRuns();
     await draining;
+  };
+  const drainOnce = async () => {
+    const draining = drainRuns();
+    const signal = options.signal;
+    if (!signal) {
+      await draining;
+      return;
+    }
+    if (signal.aborted) {
+      await drainForShutdown(draining);
+      return;
+    }
+    let onAbort = () => {};
+    const shutdownRequested = new Promise<true>((resolve) => {
+      onAbort = () => resolve(true);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      if (await Promise.race([draining.then(() => false as const), shutdownRequested])) {
+        await drainForShutdown(draining);
+      }
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   };
   do {
     if (recoveryPending) {
@@ -500,13 +534,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         return pending;
       };
       for (const target of [
-        ...branches.map((branch) => ({
-          sha: branch.sha,
-          branch: branch.name,
-          pullRequest: undefined,
-          eventId: `branch:${branch.name}:${branch.sha}`,
-          lane: `branch:${branch.name}`,
-        })),
+        // Pull requests are the latency-sensitive CI lane. Branch discovery can
+        // require loading many distinct configs and checking manual requests,
+        // so offer open PR heads to the execution scheduler first.
         ...prs
           .filter((pr) => pr.sameRepository)
           .map((pullRequest) => ({
@@ -516,6 +546,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             eventId: `pr:${pullRequest.number}:${pullRequest.headSha}`,
             lane: `pr:${pullRequest.number}`,
           })),
+        ...branches.map((branch) => ({
+          sha: branch.sha,
+          branch: branch.name,
+          pullRequest: undefined,
+          eventId: `branch:${branch.name}:${branch.sha}`,
+          lane: `branch:${branch.name}`,
+        })),
         ...state.pendingTags.map((tag) => ({
           sha: tag.sha,
           branch: tag.name,
@@ -571,6 +608,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             return;
           }
           const controller = new AbortController();
+          const admissionController = new AbortController();
+          admissionControllers.add(admissionController);
           if (!("tag" in target)) {
             automaticLanes.set(target.lane, { sha: target.sha, controller });
           }
@@ -586,6 +625,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               id: target.eventId,
             },
             controller.signal,
+            admissionSignal(admissionController),
           );
           shutdownControllers.add(controller);
           const run = result
@@ -606,6 +646,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             .finally(() => {
               inFlightRuns.delete(target.eventId);
               shutdownControllers.delete(controller);
+              admissionControllers.delete(admissionController);
               if (
                 !("tag" in target) &&
                 automaticLanes.get(target.lane)?.controller === controller
@@ -698,6 +739,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             return;
           }
           const controller = new AbortController();
+          const admissionController = new AbortController();
+          admissionControllers.add(admissionController);
           const result = executeCommit(
             github,
             repository,
@@ -707,6 +750,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             undefined,
             context,
             controller.signal,
+            admissionSignal(admissionController),
           );
           shutdownControllers.add(controller);
           const run = result
@@ -719,6 +763,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             .finally(() => {
               inFlightRuns.delete(eventId);
               shutdownControllers.delete(controller);
+              admissionControllers.delete(admissionController);
               idle();
             });
           inFlightRuns.set(eventId, run);
@@ -745,7 +790,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       lastPollError = pollError;
     }
     if (options.once) {
-      await drainRuns();
+      await drainOnce();
       return;
     }
     if (!(await waitForDelay(intervalSeconds * 1_000))) {
