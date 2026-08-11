@@ -181,12 +181,57 @@ test("post-claim election ignores admission cancellation but honors forced shutd
 
   await enteredElection;
   admission.abort("Worker shutdown requested.");
-  expect(candidateSignal).toBe(execution.signal);
+  expect(candidateSignal).toBe(admission.signal);
   expect(electionSignal).toBe(execution.signal);
   expect(electionSignal?.aborted).toBe(false);
   execution.abort("Graceful worker shutdown timed out.");
 
   expect(await pending.catch((error) => error)).toBe("Graceful worker shutdown timed out.");
+});
+
+test("candidate creation honors admission cancellation", async () => {
+  let candidateSignal: AbortSignal | null | undefined;
+  let enterCandidate!: () => void;
+  const enteredCandidate = new Promise<void>((resolve) => {
+    enterCandidate = resolve;
+  });
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method !== "POST") return Response.json({ check_runs: [] });
+    candidateSignal = init.signal;
+    enterCandidate();
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init.signal;
+      if (!signal) return reject(new Error("expected an admission signal"));
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as typeof globalThis.fetch;
+  const repository = {
+    owner: "candidate-signal",
+    repo: "widgets",
+    fullName: "candidate-signal/widgets",
+  };
+  const admission = new AbortController();
+  const execution = new AbortController();
+  const pending = new GitHubClient({ token: "installation-token", fetch }).claim(
+    repository,
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+    undefined,
+    true,
+    [],
+    false,
+    admission.signal,
+    execution.signal,
+  );
+
+  await enteredCandidate;
+  expect(candidateSignal).toBe(admission.signal);
+  admission.abort("Worker shutdown requested.");
+
+  expect(await pending.catch((error) => error)).toBe("Worker shutdown requested.");
+  expect(execution.signal.aborted).toBe(false);
 });
 
 test("check output strips terminal control sequences", async () => {

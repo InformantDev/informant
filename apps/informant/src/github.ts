@@ -1119,7 +1119,7 @@ export class GitHubClient {
       [],
       name,
       context ? manualTriggerRequestMetadata({ context, jobs: [] }) : undefined,
-      executionSignal,
+      signal,
     );
     const election = await this.checks(repository, sha, name, executionSignal);
     const ignoredCompletions = new Set([
