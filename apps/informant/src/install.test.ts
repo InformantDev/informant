@@ -10,7 +10,9 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(options: { architecture?: string; validChecksum?: boolean } = {}) {
+async function fixture(
+  options: { architecture?: string; runnable?: boolean; validChecksum?: boolean } = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "informant-installer-test-"));
   roots.push(root);
   const bin = join(root, "bin");
@@ -20,7 +22,8 @@ async function fixture(options: { architecture?: string; validChecksum?: boolean
 
   const target = ["aarch64", "arm64"].includes(options.architecture ?? "") ? "arm64" : "x64";
   const asset = `informant-linux-${target}`;
-  const binary = "#!/bin/sh\nprintf '9.9.9\\n'\n";
+  const binary =
+    options.runnable === false ? "#!/bin/sh\nexit 1\n" : "#!/bin/sh\nprintf '9.9.9\\n'\n";
   await writeFile(join(release, asset), binary);
   await chmod(join(release, asset), 0o755);
   const digest = new Bun.CryptoHasher("sha256").update(binary).digest("hex");
@@ -37,12 +40,23 @@ async function fixture(options: { architecture?: string; validChecksum?: boolean
     join(bin, "curl"),
     `#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = "--output" ]; then destination=$2; shift 2; continue; fi\n  url=$1; shift\ndone\ncp "$FAKE_RELEASE_DIR/\${url##*/}" "$destination"\n`,
   );
-  await Promise.all([chmod(join(bin, "uname"), 0o755), chmod(join(bin, "curl"), 0o755)]);
+  await writeFile(
+    join(bin, "systemctl"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"\nif [ "$2" = "is-active" ]; then exit "\${FAKE_SERVICE_ACTIVE:-3}"; fi\nexit 0\n`,
+  );
+  await Promise.all([
+    chmod(join(bin, "uname"), 0o755),
+    chmod(join(bin, "curl"), 0o755),
+    chmod(join(bin, "systemctl"), 0o755),
+  ]);
 
-  return { root, bin, release, install };
+  return { root, bin, release, install, systemctlLog: join(root, "systemctl.log") };
 }
 
-async function runInstaller(paths: Awaited<ReturnType<typeof fixture>>) {
+async function runInstaller(
+  paths: Awaited<ReturnType<typeof fixture>>,
+  environment: Record<string, string> = {},
+) {
   return Bun.$`sh ${installer}`
     .env({
       ...process.env,
@@ -51,6 +65,8 @@ async function runInstaller(paths: Awaited<ReturnType<typeof fixture>>) {
       INFORMANT_INSTALL_DIR: paths.install,
       INFORMANT_RELEASE_ROOT: "https://example.invalid/releases",
       FAKE_RELEASE_DIR: paths.release,
+      FAKE_SYSTEMCTL_LOG: paths.systemctlLog,
+      ...environment,
     })
     .quiet()
     .nothrow();
@@ -77,6 +93,29 @@ describe("Linux installer", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr.toString()).toContain("checksum verification failed");
     expect(await readFile(installed, "utf8")).toBe("existing installation");
+  });
+
+  test("does not replace an existing installation when the downloaded binary cannot run", async () => {
+    const paths = await fixture({ runnable: false });
+    const installed = join(paths.install, "informant");
+    await writeFile(installed, "existing installation");
+
+    const result = await runInstaller(paths);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("the downloaded binary could not run");
+    expect(await readFile(installed, "utf8")).toBe("existing installation");
+  });
+
+  test("restarts an active systemd user service after installing", async () => {
+    const paths = await fixture();
+    const result = await runInstaller(paths, { FAKE_SERVICE_ACTIVE: "0" });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain("Restarted the active Informant worker");
+    expect(await readFile(paths.systemctlLog, "utf8")).toBe(
+      "--user is-active --quiet informant.service\n--user restart informant.service\n",
+    );
   });
 
   test("selects the ARM64 release on aarch64 Linux", async () => {

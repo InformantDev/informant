@@ -74,10 +74,21 @@ temporary_binary="$install_dir/.informant.$$"
 trap 'rm -rf "$temporary_directory"; rm -f "$temporary_binary"' EXIT HUP INT TERM
 cp "$temporary_directory/$asset" "$temporary_binary"
 chmod 0755 "$temporary_binary"
+installed_version=$("$temporary_binary" --version) || fail "the downloaded binary could not run"
 mv -f "$temporary_binary" "$install_dir/informant"
 
-installed_version=$("$install_dir/informant" --version) || fail "the installed binary could not run"
+restarted=false
+if command -v systemctl >/dev/null 2>&1 && \
+  systemctl --user is-active --quiet informant.service >/dev/null 2>&1; then
+  systemctl --user restart informant.service || \
+    fail "Informant was installed but its active worker could not be restarted"
+  restarted=true
+fi
+
 printf 'Installed Informant %s to %s/informant\n' "$installed_version" "$install_dir"
+if [ "$restarted" = true ]; then
+  printf 'Restarted the active Informant worker.\n'
+fi
 
 case ":${PATH:-}:" in
   *":$install_dir:"*) ;;
