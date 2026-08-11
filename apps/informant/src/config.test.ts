@@ -437,6 +437,24 @@ describe("configuration", () => {
     ).toThrow("also set in environment");
   });
 
+  test("parses host Codex authentication only for container jobs", () => {
+    const configured = configTemplate().replace(
+      'command = "bun install --frozen-lockfile && bun test"',
+      'command = "bun install --frozen-lockfile && bun test"\ncodex_auth = "host"',
+    );
+    expect(parseConfig(configured).jobs[0]?.codexAuth).toBe("host");
+    expect(() => parseConfig(configured.replace('"host"', '"shared"'))).toThrow(
+      "codex_auth must be host",
+    );
+    expect(() =>
+      parseConfig(
+        configured
+          .replace('codex_auth = "host"', 'codex_auth = "host"\nhost = {}\nruns_on = ["linux"]')
+          .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []"),
+      ),
+    ).toThrow("codex_auth is supported only for container jobs");
+  });
+
   test("parses and validates job filters", () => {
     const configured = configTemplate().replace(
       'command = "bun install --frozen-lockfile && bun test"',

@@ -474,6 +474,10 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         `jobs[${index}].secrets contains ${conflictingSecret}, which is also set in environment`,
       );
     }
+    const codexAuth = job.codex_auth;
+    if (codexAuth !== undefined && codexAuth !== "host") {
+      throw new Error(`jobs[${index}].codex_auth must be host`);
+    }
     const timeoutMinutes = Number(job.timeout_minutes ?? defaultTimeoutMinutes);
     if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
       throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
@@ -504,6 +508,9 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     if (runtime.type === "host" && (cache?.length ?? 0) > 0) {
       throw new Error(`jobs[${index}].cache is not supported for host jobs`);
     }
+    if (codexAuth === "host" && runtime.type !== "container") {
+      throw new Error(`jobs[${index}].codex_auth is supported only for container jobs`);
+    }
     const runsOn = job.runs_on ?? (runtime.type === "host" ? undefined : ["darwin", "arm64"]);
     if (runtime.type === "host" && runsOn === undefined) {
       throw new Error(`jobs[${index}].runs_on is required for host jobs`);
@@ -531,6 +538,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         : undefined,
       environment,
       secrets,
+      ...(codexAuth === "host" ? { codexAuth } : {}),
       triggers:
         job.triggers === undefined
           ? topTriggers

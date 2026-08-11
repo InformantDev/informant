@@ -8,9 +8,10 @@ import {
   readdir,
   readFile,
   realpath,
+  rename,
   rm,
 } from "node:fs/promises";
-import { availableParallelism, totalmem } from "node:os";
+import { availableParallelism, homedir, totalmem } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
@@ -229,7 +230,65 @@ export interface ContainerPreparationOperations {
 type ContainerRunOperations = Pick<
   ContainerPreparationOperations,
   "command" | "withImageLock" | "dataPath"
->;
+> & { codexHome?: string };
+
+interface StagedCodexAuth {
+  directory: string;
+  source: string;
+  values: string[];
+}
+
+function credentialStrings(value: unknown): string[] {
+  if (typeof value === "string") return value ? [value] : [];
+  if (Array.isArray(value)) return value.flatMap(credentialStrings);
+  if (!value || typeof value !== "object") return [];
+  return Object.values(value).flatMap(credentialStrings);
+}
+
+async function stageHostCodexAuth(
+  configuredHome?: string,
+  dataPath = dataDirectory(),
+): Promise<StagedCodexAuth> {
+  const home = configuredHome ?? Bun.env.CODEX_HOME ?? join(homedir(), ".codex");
+  const source = join(home, "auth.json");
+  let contents: string;
+  try {
+    contents = await readFile(source, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      throw new Error(
+        `host Codex login was not found at ${source}; run codex login with file credential storage`,
+      );
+    throw error;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(contents);
+  } catch {
+    throw new Error(`host Codex login at ${source} is not valid JSON`);
+  }
+  const parent = join(dataPath, "codex-auth-staging");
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const directory = await mkdtemp(join(parent, "job-"));
+  const staged = join(directory, "auth.json");
+  await Bun.write(staged, contents);
+  await chmod(staged, 0o600);
+  return { directory, source, values: credentialStrings(parsed) };
+}
+
+async function persistHostCodexAuth(auth: StagedCodexAuth): Promise<void> {
+  const staged = join(auth.directory, "auth.json");
+  const contents = await readFile(staged, "utf8");
+  try {
+    JSON.parse(contents);
+  } catch {
+    throw new Error("Codex produced an invalid refreshed auth.json");
+  }
+  const temporary = `${auth.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
+  await Bun.write(temporary, contents);
+  await chmod(temporary, 0o600);
+  await rename(temporary, auth.source);
+}
 
 const preparedContainerReferencesDirectory = (dataPath = dataDirectory()) =>
   join(dataPath, "prepared-container-image-references");
@@ -624,31 +683,59 @@ export async function runInContainer(
       reference: `${repository.fullName}\0${job.name}`,
       dataPath: operations.dataPath,
     });
-    const mounts = caches.mounts.map((mount) => ({
-      source: mount.path,
-      target: `/mnt/shared/${mount.name}`,
-    }));
-    const args = containerRunArguments({
-      name,
-      image,
-      workspace: hostWorkspace,
-      command: wrapped,
-      environment,
-      mounts,
-      secretNames: Object.keys(secrets),
-      cpu: resources.cpu,
-      memoryMb: resources.memoryMb,
-      preparedWorkspace: usesPreparedWorkspace,
-    });
-    await started();
-    await log(`\n[${job.name}] $ ${job.command}\n`);
-    const redactor = streamingSecretRedactor(Object.values(secrets), log);
-    const result = await runCommand(args, {
-      env: secrets,
-      signal: executionSignal,
-      onOutput: redactor.write,
-    });
-    await redactor.flush();
+    const run = async (auth?: StagedCodexAuth) => {
+      const mounts = caches.mounts.map((mount) => ({
+        source: mount.path,
+        target: `/mnt/shared/${mount.name}`,
+      }));
+      if (auth) mounts.push({ source: auth.directory, target: "/mnt/informant-codex" });
+      const args = containerRunArguments({
+        name,
+        image,
+        workspace: hostWorkspace,
+        command: wrapped,
+        environment: {
+          ...environment,
+          ...(auth ? { CODEX_HOME: "/mnt/informant-codex" } : {}),
+        },
+        mounts,
+        secretNames: Object.keys(secrets),
+        cpu: resources.cpu,
+        memoryMb: resources.memoryMb,
+        preparedWorkspace: usesPreparedWorkspace,
+      });
+      await started();
+      await log(`\n[${job.name}] $ ${job.command}\n`);
+      const redactor = streamingSecretRedactor(
+        [...Object.values(secrets), ...(auth?.values ?? [])],
+        log,
+      );
+      const result = await runCommand(args, {
+        env: secrets,
+        signal: executionSignal,
+        onOutput: redactor.write,
+      });
+      await redactor.flush();
+      return result;
+    };
+    const lock = operations.withImageLock ?? withImageLock;
+    const result =
+      job.codexAuth === "host"
+        ? await lock(
+            "host-codex-auth",
+            async () => {
+              const auth = await stageHostCodexAuth(operations.codexHome, operations.dataPath);
+              try {
+                const outcome = await run(auth);
+                await persistHostCodexAuth(auth);
+                return outcome;
+              } finally {
+                await rm(auth.directory, { recursive: true, force: true });
+              }
+            },
+            executionSignal,
+          )
+        : await run();
     return {
       success: result.exitCode === 0 && !result.timedOut,
       exitCode: result.exitCode,

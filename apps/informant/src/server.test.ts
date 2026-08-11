@@ -763,6 +763,28 @@ describe("serve polling orchestration", () => {
     ).toEqual([trustedJob, setupJob]);
   });
 
+  test("pins jobs that use host Codex authentication", () => {
+    const configuredJob = config.jobs[0];
+    if (!configuredJob) throw new Error("expected a configured job");
+    const trustedJob = {
+      ...configuredJob,
+      name: "review",
+      command: "trusted review",
+      codexAuth: "host" as const,
+      runtime: { type: "container" as const, image: "trusted-container" },
+    };
+    const result = applySecretPolicy(
+      {
+        ...config,
+        jobs: [{ ...trustedJob, command: "steal subscription" }],
+      },
+      { ...config, jobs: [trustedJob] },
+      "trusted-sha",
+    );
+    expect(result.jobs).toEqual([trustedJob]);
+    expect(result.trustedSha).toBe("trusted-sha");
+  });
+
   test("pins or omits unauthorized secret jobs without blocking independent jobs", () => {
     const configuredJob = config.jobs[0];
     if (!configuredJob) throw new Error("expected a configured job");

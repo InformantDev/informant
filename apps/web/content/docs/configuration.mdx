@@ -166,6 +166,29 @@ change the trusted command, select a hostile VM image, or remove a required secr
 trusted command may inspect the proposed checkout, but it must not execute scripts or install packages
 from that checkout while secrets are present.
 
+## Host Codex subscription authentication
+
+Container jobs can reuse a Codex CLI subscription login already present on the worker:
+
+```toml
+codex_auth = "host"
+```
+
+Informant reads `auth.json` from `$CODEX_HOME` or `~/.codex`, mounts an isolated copy into the
+container, serializes jobs that use it, and writes a valid refreshed credential back after the run.
+Only `auth.json` is exposed; the worker's Codex configuration, sessions, and skills are not mounted.
+These jobs receive the same default-branch trust protections as secret-bearing jobs.
+
+The host login must use file credential storage. If `~/.codex/auth.json` does not exist, sign in again
+with a one-run configuration override:
+
+```bash
+codex -c 'cli_auth_credentials_store="file"' login
+```
+
+Treat this login like any other automation credential: use it only on a trusted private worker and
+restrict who can add branches to repositories whose pull requests run authenticated agent jobs.
+
 ## Automatic triggers
 
 Events are `commit` and `comment`. A commit rule can filter either exact branch names or pull requests.

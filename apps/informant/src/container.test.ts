@@ -525,6 +525,76 @@ test("passes secrets through the client environment and always removes the conta
   expect(output.join("")).not.toContain("line one");
 });
 
+test("mounts, redacts, and persists host Codex subscription authentication", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-codex-auth-"));
+  const codexHome = join(root, "codex-home");
+  await mkdir(codexHome);
+  await Bun.write(
+    join(codexHome, "auth.json"),
+    JSON.stringify({ tokens: { access_token: "access-secret", refresh_token: "refresh-secret" } }),
+  );
+  const output: string[] = [];
+  const locks: string[] = [];
+  const job: JobConfig = {
+    name: "review",
+    command: "codex exec review",
+    optional: true,
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    codexAuth: "host",
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  try {
+    const result = await runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      job,
+      async (text) => {
+        output.push(text);
+      },
+      async () => {},
+      {},
+      undefined,
+      {
+        codexHome,
+        dataPath: join(root, "data"),
+        withImageLock: async (name, callback) => {
+          locks.push(name);
+          return callback();
+        },
+        command: async (args, options) => {
+          if (args[1] === "run") {
+            const volume = args.find((arg) => arg.endsWith(":/mnt/informant-codex"));
+            if (!volume) throw new Error("expected Codex auth mount");
+            const source = volume.slice(0, -":/mnt/informant-codex".length);
+            await Bun.write(
+              join(source, "auth.json"),
+              JSON.stringify({ tokens: { access_token: "refreshed-access" } }),
+            );
+            await options?.onOutput?.("access-secret");
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    );
+    expect(result).toEqual({ success: true, exitCode: 0, timedOut: false });
+    expect(await Bun.file(join(codexHome, "auth.json")).json()).toEqual({
+      tokens: { access_token: "refreshed-access" },
+    });
+    expect(output.join("")).toContain("[REDACTED]");
+    expect(output.join("")).not.toContain("access-secret");
+    expect(locks).toEqual(["prepared-container-image-references", "host-codex-auth"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("prepared jobs copy source into the baked workspace before running", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "informant-$'-prepared-run-"));
   await Bun.write(join(workspace, "package.json"), '{"name":"test"}\n');
