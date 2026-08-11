@@ -25,10 +25,13 @@ function cancellationDirectory(id: string): string {
   return join(dataDirectory(), "build-cancellations", key);
 }
 
-function cancellationPath(id: string, job?: string): string {
-  if (!job) return join(cancellationDirectory(id), "build");
-  const key = createHash("sha256").update(job).digest("hex");
-  return join(cancellationDirectory(id), "jobs", key);
+function cancellationRequestDirectory(id: string): string {
+  return join(cancellationDirectory(id), "requests");
+}
+
+function cancellationRequestPath(id: string, requestId: string): string {
+  const key = createHash("sha256").update(requestId).digest("hex");
+  return join(cancellationRequestDirectory(id), key);
 }
 
 function cancellationAcknowledgementPath(id: string, requestId: string): string {
@@ -238,20 +241,14 @@ export async function requestBuildCancellation(
   validateCancellationTarget(build, id, job);
   const requestId = operations.requestId ?? crypto.randomUUID();
   const acknowledgement = cancellationAcknowledgementPath(id, requestId);
-  const path = cancellationPath(id, job);
-  await mkdir(dirname(path), { recursive: true });
+  const path = cancellationRequestPath(id, requestId);
+  await mkdir(cancellationRequestDirectory(id), { recursive: true });
   await (operations.write ?? Bun.write)(
     path,
     JSON.stringify({ buildId: id, job, requestId, requestedAt: new Date().toISOString() }),
   );
   const sleep = operations.sleep ?? Bun.sleep;
   const deadline = Date.now() + (operations.timeoutMs ?? 5_000);
-  const removeRequest = async () => {
-    const request = (await Bun.file(path)
-      .json()
-      .catch(() => undefined)) as CancellationRequest | undefined;
-    if (request?.requestId === requestId) await rm(path, { force: true });
-  };
   try {
     while (Date.now() < deadline) {
       if (await Bun.file(acknowledgement).exists()) return build;
@@ -260,14 +257,15 @@ export async function requestBuildCancellation(
       try {
         validateCancellationTarget(current, id, job);
       } catch (error) {
-        await removeRequest();
+        await rm(path, { force: true });
         throw error;
       }
       await sleep(25);
     }
-    await removeRequest();
+    await rm(path, { force: true });
     throw new Error(`cancellation request was not acknowledged for ${job ?? id}`);
   } finally {
+    await rm(path, { force: true });
     await rm(acknowledgement, { force: true });
   }
 }
@@ -285,48 +283,55 @@ export function monitorBuildCancellation(
 ): BuildCancellationMonitor {
   const buildController = new AbortController();
   const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+  const requestDirectory = cancellationRequestDirectory(id);
   let open = true;
   let wake: (() => void) | undefined;
-  const removeRequest = async (path: string, requestId: string) => {
-    const current = (await Bun.file(path)
-      .json()
-      .catch(() => undefined)) as CancellationRequest | undefined;
-    if (current?.requestId === requestId) await rm(path, { force: true });
-  };
-  const acknowledge = async (controller: AbortController, reason: string, job?: string) => {
-    await buildSaves.get(id)?.catch(() => undefined);
-    const path = cancellationPath(id, job);
-    const request = (await Bun.file(path)
-      .json()
-      .catch(() => undefined)) as CancellationRequest | undefined;
-    if (!request?.requestId) return false;
-    const current = await getBuild(id);
-    try {
-      if (!current) throw new Error(`build not found: ${id}`);
-      validateCancellationTarget(current, id, job);
-    } catch {
-      await removeRequest(path, request.requestId);
-      return false;
+  const acknowledge = async (path: string, request: CancellationRequest, build: BuildRecord) => {
+    if (!request.requestId || request.buildId !== id) {
+      await rm(path, { force: true });
+      return;
     }
-    controller.abort(reason);
-    await removeRequest(path, request.requestId);
+    const controller = request.job ? jobControllers.get(request.job) : buildController;
+    try {
+      if (!controller) throw new Error(`job not found in build ${id}: ${request.job}`);
+      validateCancellationTarget(build, id, request.job);
+    } catch {
+      await rm(path, { force: true });
+      return;
+    }
+    controller.abort(
+      request.job
+        ? `Cancellation requested for ${request.job} from informant builds.`
+        : "Cancellation requested from informant builds.",
+    );
     const acknowledgement = cancellationAcknowledgementPath(id, request.requestId);
     await mkdir(dirname(acknowledgement), { recursive: true });
     await Bun.write(acknowledgement, "");
-    return true;
+    await rm(path, { force: true });
   };
   const task = (async () => {
     while (open) {
-      await acknowledge(buildController, "Cancellation requested from informant builds.");
-      await Promise.all(
-        [...jobControllers].map(async ([job, controller]) => {
-          await acknowledge(
-            controller,
-            `Cancellation requested for ${job} from informant builds.`,
-            job,
+      const entries = await readdir(requestDirectory, {
+        withFileTypes: true,
+      }).catch(() => []);
+      const paths = entries
+        .filter((entry) => entry.isFile())
+        .map((entry) => join(requestDirectory, entry.name));
+      if (paths.length > 0) {
+        await buildSaves.get(id)?.catch(() => undefined);
+        const build = await getBuild(id);
+        if (build) {
+          await Promise.all(
+            paths.map(async (path) => {
+              const request = (await Bun.file(path)
+                .json()
+                .catch(() => undefined)) as CancellationRequest | undefined;
+              if (request) await acknowledge(path, request, build);
+              else await rm(path, { force: true });
+            }),
           );
-        }),
-      );
+        } else await Promise.all(paths.map((path) => rm(path, { force: true })));
+      }
       await new Promise<void>((resolve) => {
         wake = resolve;
         const timeout = setTimeout(resolve, pollIntervalMs);

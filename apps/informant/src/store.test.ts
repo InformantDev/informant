@@ -149,7 +149,16 @@ test("cancellation requests target a running build or one active job", async () 
   await createBuild(record);
   const monitor = monitorBuildCancellation(record.id, ["test", "deploy", "lint"], 5);
   try {
-    await requestBuildCancellation(record.id, "test");
+    await Promise.all([
+      requestBuildCancellation(record.id, "test", {
+        requestId: "concurrent-job-cancellation-one",
+        timeoutMs: 500,
+      }),
+      requestBuildCancellation(record.id, "test", {
+        requestId: "concurrent-job-cancellation-two",
+        timeoutMs: 500,
+      }),
+    ]);
     for (let attempt = 0; attempt < 50 && !monitor.jobSignal("test")?.aborted; attempt++) {
       await Bun.sleep(5);
     }
