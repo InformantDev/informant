@@ -23,6 +23,32 @@ const SEEN_COMMENT_LIMIT = 1_000;
 const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 24 * 60 * 60_000;
+const MISSING_CONFIG_TTL_MS = 24 * 60 * 60_000;
+const MISSING_CONFIG_LIMIT = 256;
+
+class MissingRepositoryConfigError extends Error {}
+
+function unexpiredMissingConfigs(
+  entries: Array<{ sha: string; checkedAt: string }>,
+  now = Date.now(),
+) {
+  return entries.filter((entry) => {
+    const checkedAt = Date.parse(entry.checkedAt);
+    return Number.isFinite(checkedAt) && now - checkedAt < MISSING_CONFIG_TTL_MS;
+  });
+}
+
+function boundMissingConfigs(
+  entries: Array<{ sha: string; checkedAt: string }>,
+  retainedShas: ReadonlySet<string>,
+) {
+  const retained: typeof entries = [];
+  const stale: typeof entries = [];
+  for (const entry of entries) {
+    (retainedShas.has(entry.sha) ? retained : stale).push(entry);
+  }
+  return [...stale.slice(-MISSING_CONFIG_LIMIT), ...retained];
+}
 
 async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE);
@@ -188,7 +214,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   let intervalSeconds = 30;
   let lastPollError: string | undefined;
   let rateLimitUntil = 0;
-  const configs = new Map<string, ReturnType<typeof repositoryConfig>>();
+  const configs = new Map<string, Promise<InformantConfig | undefined>>();
   const inFlightRuns = new Map<string, Promise<void>>();
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
   const shutdownControllers = new Set<AbortController>();
@@ -202,14 +228,37 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     });
   };
   let recoveryPending = true;
-  const configAt = (sha: string) => {
+  const configAt = (
+    sha: string,
+    state: Awaited<ReturnType<typeof readPollState>>,
+    missingConfigShas: Set<string>,
+    onMissingConfig: () => Promise<void> | void,
+  ) => {
+    const now = Date.now();
+    if (missingConfigShas.has(sha)) return Promise.resolve(undefined);
     const cached = configs.get(sha);
     if (cached) return cached;
-    const pending = loadRepositoryConfig(github, repository, sha);
-    configs.set(sha, pending);
-    void pending.catch(() => {
-      if (configs.get(sha) === pending) configs.delete(sha);
+    const pending = loadRepositoryConfig(github, repository, sha).catch(async (error) => {
+      if (error instanceof GitHubApiError && error.status === 404) {
+        state.missingConfigs = [
+          ...(state.missingConfigs ?? []).filter((entry) => entry.sha !== sha),
+          { sha, checkedAt: new Date(now).toISOString() },
+        ];
+        missingConfigShas.add(sha);
+        await onMissingConfig();
+        return undefined;
+      }
+      throw error;
     });
+    configs.set(sha, pending);
+    void pending.then(
+      (config) => {
+        if (!config && configs.get(sha) === pending) configs.delete(sha);
+      },
+      () => {
+        if (configs.get(sha) === pending) configs.delete(sha);
+      },
+    );
     return pending;
   };
   const errorDetail = (error: unknown) => {
@@ -289,9 +338,27 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       return;
     }
     try {
+      const state = await loadPollState(repository.fullName);
+      state.missingConfigs = unexpiredMissingConfigs(state.missingConfigs ?? []);
+      const missingConfigShas = new Set(state.missingConfigs.map((entry) => entry.sha));
+      let missingConfigsDirty = false;
+      const persistState = async () => {
+        await persistPollState(repository.fullName, state);
+        missingConfigsDirty = false;
+      };
+      const flushMissingConfigs = async () => {
+        if (missingConfigsDirty) await persistState();
+      };
+      const markMissingConfig = async (persistImmediately = false) => {
+        missingConfigsDirty = true;
+        if (persistImmediately) await persistState();
+      };
       const defaultBranch = await github.defaultBranch(repository);
       const defaultSha = await github.branchHead(repository, defaultBranch);
-      const bootstrap = await configAt(defaultSha);
+      const bootstrap = await configAt(defaultSha, state, missingConfigShas, () =>
+        markMissingConfig(true),
+      );
+      if (!bootstrap) throw new MissingRepositoryConfigError();
       const storageReferences = await Promise.allSettled([
         (dependencies.reconcilePreparedImageReferences ?? reconcilePreparedImageReferences)(
           repository.fullName,
@@ -333,7 +400,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       }
       if (removedStorageReferences > 0) idle();
       intervalSeconds = bootstrap.pollIntervalSeconds;
-      const state = await loadPollState(repository.fullName);
       const hasTagTriggers = bootstrap.jobs.some((job) =>
         (job.triggers ?? bootstrap.triggers ?? []).some((rule) => rule.tag !== undefined),
       );
@@ -346,6 +412,16 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         shouldPollTags ? github.tags(repository) : undefined,
         github.pullRequests(repository),
       ]);
+      const retainedConfigShas = new Set([
+        defaultSha,
+        ...branches.map((branch) => branch.sha),
+        ...prs.filter((pr) => pr.sameRepository).map((pr) => pr.headSha),
+        ...state.pendingTags.map((tag) => tag.sha),
+        ...state.pending.map((comment) => comment.sha),
+      ]);
+      state.missingConfigs = boundMissingConfigs(state.missingConfigs, retainedConfigShas);
+      missingConfigShas.clear();
+      for (const entry of state.missingConfigs) missingConfigShas.add(entry.sha);
       const completedTagEvents = new Set(completedTags);
       if (completedTagEvents.size > 0) {
         state.pendingTags = state.pendingTags.filter(
@@ -367,7 +443,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         state.tagRefs = tags;
         state.tagsPolledAt = new Date().toISOString();
       }
-      await persistPollState(repository.fullName, state);
+      await persistState();
       for (const id of completedTagEvents) completedTags.delete(id);
       const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
       const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
@@ -417,6 +493,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         })),
       ]) {
         if (options.signal?.aborted) {
+          await flushMissingConfigs();
           await drainForShutdown();
           return;
         }
@@ -433,7 +510,14 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           pullRequest: target.pullRequest,
         };
         try {
-          const config = applySecretPolicy(await configAt(target.sha), bootstrap, defaultSha);
+          const targetConfig = await configAt(
+            target.sha,
+            state,
+            missingConfigShas,
+            markMissingConfig,
+          );
+          if (!targetConfig) continue;
+          const config = applySecretPolicy(targetConfig, bootstrap, defaultSha);
           const matches =
             selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), context.branch)
               .jobs.length > 0;
@@ -443,12 +527,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
                 state.pendingTags = state.pendingTags.filter(
                   (item) => item.name !== target.tag || item.sha !== target.sha,
                 );
-                await persistPollState(repository.fullName, state);
+                await persistState();
               }
               continue;
             }
           }
           if (options.signal?.aborted) {
+            await flushMissingConfigs();
             await drainForShutdown();
             return;
           }
@@ -501,11 +586,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           message(`${target.branch}@${target.sha.slice(0, 7)} failed: ${errorDetail(error)}`);
         }
       }
+      await flushMissingConfigs();
 
       if (completedComments.size > 0) {
         const completed = new Set(completedComments);
         state.pending = state.pending.filter((item) => !completed.has(item.id));
-        await persistPollState(repository.fullName, state);
+        await persistState();
         for (const id of completed) completedComments.delete(id);
       }
       if (!state.cursor) {
@@ -515,7 +601,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           new Date(0).toISOString(),
         );
         state.seenCommentIds = latest.map((comment) => comment.id);
-        await persistPollState(repository.fullName, state);
+        await persistState();
       } else {
         const previousCursor = state.cursor;
         const overlap = new Date(
@@ -546,13 +632,20 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             });
         }
         state.seenCommentIds = state.seenCommentIds.slice(-SEEN_COMMENT_LIMIT);
-        await persistPollState(repository.fullName, state);
+        await persistState();
       }
       for (const pending of [...state.pending]) {
         const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
         if (inFlightRuns.has(eventId)) continue;
         try {
-          const config = applySecretPolicy(await configAt(pending.sha), bootstrap, defaultSha);
+          const pendingConfig = await configAt(
+            pending.sha,
+            state,
+            missingConfigShas,
+            markMissingConfig,
+          );
+          if (!pendingConfig) continue;
+          const config = applySecretPolicy(pendingConfig, bootstrap, defaultSha);
           const context: EventContext & { id: string } = {
             type: "comment" as const,
             pullRequest: pending.pullRequest,
@@ -563,10 +656,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               .jobs.length > 0;
           if (!matches) {
             state.pending = state.pending.filter((item) => item.id !== pending.id);
-            await persistPollState(repository.fullName, state);
+            await persistState();
             continue;
           }
           if (options.signal?.aborted) {
+            await flushMissingConfigs();
             await drainForShutdown();
             return;
           }
@@ -599,11 +693,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           message(`comment ${pending.id} failed: ${errorDetail(error)}`);
         }
       }
+      await flushMissingConfigs();
       lastPollError = undefined;
     } catch (error) {
       const detail = errorDetail(error);
       const pollError =
-        detail.startsWith("GitHub 404:") && detail.includes("rest/repos/contents")
+        error instanceof MissingRepositoryConfigError ||
+        (detail.startsWith("GitHub 404:") && detail.includes("rest/repos/contents"))
           ? `waiting for ${CONFIG_FILE}`
           : detail.startsWith("GitHub 409:") && detail.includes("rest/git/refs")
             ? "waiting for the repository's first commit"

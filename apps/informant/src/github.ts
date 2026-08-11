@@ -78,7 +78,7 @@ function manualTriggerRequestMetadata(request: ManualTriggerRequest): string {
 function manualTriggerContext(check: CheckRun): ManualTriggerContext | undefined {
   const request = manualTriggerRequest(check);
   if (request) return request.context;
-  const encoded = check.external_id?.match(/:context:([^:]+)(?::jobs:|$)/)?.[1];
+  const encoded = check.external_id?.match(/:context:([^:]+)(?::(?:job-set|jobs):|$)/)?.[1];
   if (!encoded) return undefined;
   try {
     const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
@@ -106,24 +106,30 @@ function previousTriggerContext(
   const persistedContext = manualTriggerContext(check);
   if (persistedContext) return persistedContext;
   const manualContext = check.external_id.match(
-    /:event:manual:[^:]+:context:([^:]+)(?::jobs:[^:]+)*$/,
+    /:event:manual:[^:]+:context:([^:]+)(?::(?:job-set|jobs):[^:]+)*$/,
   )?.[1];
   if (manualContext) {
     return manualTriggerContext({ ...check, external_id: `request:context:${manualContext}` });
   }
-  const branch = check.external_id.match(/:event:commit:branch:([^:]+):([^:]+)(?::jobs:[^:]+)*$/);
+  const branch = check.external_id.match(
+    /:event:commit:branch:([^:]+):([^:]+)(?::(?:job-set|jobs):[^:]+)*$/,
+  );
   if (branch?.[1] && branch[2] === sha) return { branch: branch[1], label: branch[1] };
-  const pullRequest = check.external_id.match(/:event:commit:pr:(\d+):([^:]+)(?::jobs:[^:]+)*$/);
+  const pullRequest = check.external_id.match(
+    /:event:commit:pr:(\d+):([^:]+)(?::(?:job-set|jobs):[^:]+)*$/,
+  );
   if (pullRequest?.[1] && pullRequest[2] === sha)
     return { branch: null, label: `pull/${pullRequest[1]}` };
-  const tag = check.external_id.match(/:event:commit:tag:([^:]+):([^:]+)(?::jobs:[^:]+)*$/);
+  const tag = check.external_id.match(
+    /:event:commit:tag:([^:]+):([^:]+)(?::(?:job-set|jobs):[^:]+)*$/,
+  );
   if (tag?.[1] && tag[2] === sha) return { branch: null, label: tag[1] };
   return undefined;
 }
 
 function baseEventScope(check: CheckRun): string | undefined {
   const scope = check.external_id?.split(":event:")[1];
-  return scope?.replace(/(?::jobs:[^:]+)+$/, "");
+  return scope?.replace(/(?::(?:job-set|jobs):[^:]+)+$/, "");
 }
 
 export class GitHubApiError extends Error {
@@ -833,7 +839,7 @@ export class GitHubClient {
         ? [previousAggregate]
         : [];
     const originalPullRequestMatch = previousAggregate?.external_id?.match(
-      /:event:commit:pr:(\d+):([^:]+)(?::jobs:[^:]+)*$/,
+      /:event:commit:pr:(\d+):([^:]+)(?::(?:job-set|jobs):[^:]+)*$/,
     );
     const originalPullRequestNumber = Number(originalPullRequestMatch?.[1]);
     const originalPullRequest =
