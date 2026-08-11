@@ -4,15 +4,16 @@ description: How GitHub Checks act as a decentralized work queue.
 ---
 
 ```text
-GitHub branch/PR/comment ──poll──▶ Linux worker ──▶ native checkout
-                                  macOS worker ──▶ Apple Container / Tart VM
+GitHub branch/PR/comment ──poll──▶ Linux worker ──▶ rootless Podman / native checkout
+                                   macOS worker ──▶ Apple Container / Tart VM / native checkout
                                         │
                                         ▼
                                   GitHub Checks
 ```
 
 Workers advertise `self-hosted`, their operating system, architecture, hostname, and optional custom
-capabilities. A worker filters jobs before entering the claim election, then groups them by normalized
+capabilities. A healthy selected container backend adds the dynamic `container` capability. Linux
+probes rootless Podman directly; this is daemonless and does not depend on systemd. A worker filters jobs before entering the claim election, then groups them by normalized
 `runs_on` requirements. Each requirement group is a separate claim scope. Workers with overlapping
 capabilities therefore compete for shared jobs, while Linux and macOS workers can claim different jobs
 for the same commit without stealing work from each other.
