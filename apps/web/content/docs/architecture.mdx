@@ -4,12 +4,29 @@ description: How GitHub Checks act as a decentralized work queue.
 ---
 
 ```text
-GitHub branch/PR/comment ──poll──▶ Linux worker ──▶ rootless Podman / native checkout
-                                   macOS worker ──▶ Apple Container / Tart VM / native checkout
-                                        │
-                                        ▼
-                                  GitHub Checks
+GitHub branch/PR/comment ──webhook──▶ Tailscale Funnel lead
+                                           │ tailnet dispatch
+                              ┌────────────┴────────────┐
+                              ▼                         ▼
+                     Linux worker               macOS worker
+                rootless Podman / host    Apple Container / Tart / host
+                              └────────────┬────────────┘
+                                           ▼
+                                      GitHub Checks
 ```
+
+When Tailscale is installed and Informant is configured as a lead, the lead publishes only the
+signed GitHub webhook endpoint through Funnel. Each machine also exposes a small worker endpoint on
+its Tailscale IPv4 address. The lead discovers online Informant peers from `tailscale status --json`
+and dispatches repository notifications across the tailnet. Every notified machine performs one
+GitHub synchronization and enters the existing capability-specific Checks election. Job definitions,
+GitHub credentials, and secrets are never sent between workers.
+
+A connected network worker does not run a timer or poll GitHub continuously. A lead performs one
+synchronization at startup to recover events received while it was offline, then reacts to webhooks.
+If Tailscale is not configured, `informant serve` retains the polling path. A configured worker never
+silently falls back to polling when disconnected; reconnect Tailscale or explicitly run
+`informant tailscale disable`. Funnel never exposes the private worker/build API.
 
 Workers advertise `self-hosted`, their operating system, architecture, hostname, and optional custom
 capabilities. A healthy selected container backend adds the dynamic `container` capability. Linux
@@ -44,12 +61,12 @@ the same SHA elect independently. Comment runs use the distinct `Informant CI / 
 Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
 already has an older completed result.
 
-Automatic builds are grouped into branch and pull-request lanes. When polling observes a new SHA in a
+Automatic builds are grouped into branch and pull-request lanes. When synchronization observes a new SHA in a
 lane, the worker that owns the previous SHA aborts its commands, cleans up its Tart VMs, and concludes
-its checks as cancelled. Every machine polls the same registered repository heads, so this cancellation
+its checks as cancelled. Every notified machine checks the same registered repository heads, so this cancellation
 does not depend on the machine that claims the replacement build. Manual and comment-triggered runs are
 not part of an automatic lane and are never superseded by a push.
 
 GitHub UI re-runs use the same path. Clicking **Re-run** resets Informant's Check Suite to queued.
-Workers observe that state through the Checks API, elect one claimant, and create a fresh Check Run.
-Informant does not need a public webhook endpoint to receive the re-run request.
+Workers observe that state after a `check_suite` webhook or during the next polling cycle, elect one
+claimant, and create a fresh Check Run.

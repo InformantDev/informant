@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addRepository,
+  clearTailscaleConfig,
   getGitHubCredentials,
+  getTailscaleConfig,
   listGitHubCredentials,
   listRepositories,
   machineConfigPath,
   removeRepository,
   saveGitHubCredentials,
+  saveTailscaleConfig,
 } from "./machine-config.ts";
 import { startupEnvironment } from "./startup.ts";
 
@@ -34,6 +37,31 @@ test("uses the worker's fallback configuration path for invalid XDG homes", asyn
     }
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stores Tailscale role configuration without changing repositories", async () => {
+  const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+  const tailscale = {
+    mode: "lead" as const,
+    funnelUrl: "https://lead.example.ts.net",
+    webhookSecret: "secret",
+    workerPort: 7639,
+    funnelPort: 7640,
+  };
+  try {
+    await addRepository(repository, path);
+    await saveTailscaleConfig(tailscale, path);
+    expect(await getTailscaleConfig(path)).toEqual(tailscale);
+    expect((await listRepositories(path)).map((value) => value.fullName)).toEqual([
+      repository.fullName,
+    ]);
+    expect(await clearTailscaleConfig(path)).toBe(true);
+    expect(await getTailscaleConfig(path)).toBeUndefined();
+    expect(await clearTailscaleConfig(path)).toBe(false);
+  } finally {
+    await Bun.file(path).delete();
   }
 });
 

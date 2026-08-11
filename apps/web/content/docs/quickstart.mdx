@@ -8,6 +8,7 @@ description: Put a Linux or macOS machine on CI duty in a few minutes.
 - Apple Silicon macOS 13 or newer; Apple Container jobs require macOS 26 or newer
 - Or Debian/Ubuntu/Fedora/RHEL Linux with rootless Podman and cgroups v2
 - Git and GitHub CLI; Homebrew for the documented macOS installation
+- Optional but recommended: Tailscale with Funnel enabled for webhook-driven multi-machine workers
 
 ## Install Informant
 
@@ -50,8 +51,8 @@ Informant will:
    memory, security, and writable bind-mount constraints. Podman is daemonless; Informant does not
    start a service and does not require systemd.
 2. Ask whether your account or an organization should own the App.
-3. Open GitHub with **Checks: read/write**, **Contents: read**, **Pull requests: read/write**, and
-   webhooks disabled.
+3. If Tailscale is connected, enable a Funnel and open GitHub with the signed webhook and required
+   events already configured. Otherwise create the App with webhooks disabled and use polling.
 4. Receive and protect the generated private key automatically.
 5. Open GitHub's installation screen so you can choose repositories.
 6. Detect the installation and save its credentials without changing this machine's registered
@@ -99,4 +100,7 @@ or configure that command in the host's existing process supervisor. Podman itse
 in either arrangement.
 
 Register more repositories with `informant repo add owner/repository`. Run the same registration and
-serve commands on another machine to add capacity. There is no shared database to configure.
+serve commands on another machine to add capacity. When connecting the lead's existing GitHub App on
+a Tailscale peer, setup selects worker mode: it receives repository notifications from the lead and
+does not continuously poll. Run `informant tailscale status` on any machine to inspect the topology.
+There is no shared database to configure.

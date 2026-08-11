@@ -1,0 +1,111 @@
+import { expect, test } from "bun:test";
+import { createHmac, generateKeyPairSync } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  actionableWebhook,
+  configureGitHubAppWebhook,
+  parseTailscaleStatus,
+  tailscaleExecutable,
+  validGitHubSignature,
+} from "./tailscale.ts";
+
+test("uses a Tailscale executable available on PATH", () => {
+  expect(
+    tailscaleExecutable((name) => (name === "tailscale" ? "/usr/local/bin/tailscale" : null)),
+  ).toBe("/usr/local/bin/tailscale");
+});
+
+test("activates and configures the GitHub App webhook with an App JWT", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-tailscale-test-"));
+  const privateKeyFile = join(root, "app.pem");
+  const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({
+    format: "pem",
+    type: "pkcs8",
+  });
+  await Bun.write(privateKeyFile, privateKey);
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  try {
+    await configureGitHubAppWebhook(
+      { appId: "123", installationId: "456", privateKeyFile },
+      "https://lead.example.ts.net",
+      "shared-secret",
+      (async (input, init) => {
+        requests.push({ url: String(input), init });
+        return Response.json({});
+      }) as typeof fetch,
+    );
+    expect(requests.map((request) => request.url)).toEqual([
+      "https://api.github.com/app",
+      "https://api.github.com/app/hook/config",
+    ]);
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      webhook_active: true,
+      webhook_url: "https://lead.example.ts.net/webhooks/github",
+    });
+    expect(JSON.parse(String(requests[1]?.init?.body))).toEqual({
+      url: "https://lead.example.ts.net/webhooks/github",
+      content_type: "json",
+      secret: "shared-secret",
+    });
+    expect(new Headers(requests[0]?.init?.headers).get("Authorization")).toMatch(/^Bearer /);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("parses this machine and online peers from Tailscale status", () => {
+  const status = parseTailscaleStatus(
+    "/usr/bin/tailscale",
+    JSON.stringify({
+      BackendState: "Running",
+      Self: {
+        ID: "self-id",
+        HostName: "lead",
+        DNSName: "lead.example.ts.net.",
+        TailscaleIPs: ["100.64.0.1", "fd7a::1"],
+        Online: true,
+      },
+      Peer: {
+        "peer-key": {
+          ID: "worker-id",
+          HostName: "worker",
+          TailscaleIPs: ["100.64.0.2"],
+          Online: true,
+        },
+      },
+    }),
+  );
+
+  expect(status.online).toBe(true);
+  expect(status.self.dnsName).toBe("lead.example.ts.net");
+  expect(status.peers).toEqual([
+    {
+      id: "worker-id",
+      hostName: "worker",
+      dnsName: undefined,
+      addresses: ["100.64.0.2"],
+      online: true,
+    },
+  ]);
+});
+
+test("verifies GitHub webhook signatures without accepting malformed values", () => {
+  const body = JSON.stringify({ repository: { full_name: "owner/repo" } });
+  const signature = `sha256=${createHmac("sha256", "secret").update(body).digest("hex")}`;
+  expect(validGitHubSignature(body, signature, "secret")).toBe(true);
+  expect(validGitHubSignature(body, signature, "different-secret")).toBe(false);
+  expect(validGitHubSignature(body, "sha256=not-hex", "secret")).toBe(false);
+  expect(validGitHubSignature(body, null, "secret")).toBe(false);
+});
+
+test("dispatches only webhook actions that can create trigger work", () => {
+  expect(actionableWebhook("push", {})).toBe(true);
+  expect(actionableWebhook("pull_request", { action: "synchronize" })).toBe(true);
+  expect(actionableWebhook("issue_comment", { action: "created" })).toBe(true);
+  expect(actionableWebhook("issue_comment", { action: "edited" })).toBe(false);
+  expect(actionableWebhook("check_suite", { action: "rerequested" })).toBe(true);
+  expect(actionableWebhook("check_suite", { action: "completed" })).toBe(false);
+  expect(actionableWebhook("installation", { action: "created" })).toBe(false);
+});
