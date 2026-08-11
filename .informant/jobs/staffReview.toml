@@ -1,4 +1,5 @@
 name = "Staff Review"
+runs_on = ["container"]
 optional = true
 command = """
 set -eu
@@ -50,7 +51,7 @@ secrets = ["GITHUB_TOKEN"]
 environment = { CODEX_HOME = "/mnt/informant-codex" }
 mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back = true }]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
-container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
+container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update

@@ -17,6 +17,11 @@ import {
   selectJobs,
 } from "./config.ts";
 import { prunePreparedContainerImages } from "./container.ts";
+import {
+  containerBackendReadiness,
+  initializeContainerBackend,
+  selectContainerBackend,
+} from "./container-backend.ts";
 import { runCommit, runLocalCommit } from "./coordinator.ts";
 import { GitHubClient } from "./github.ts";
 import { installPostPushHook, uninstallPostPushHook } from "./hook.ts";
@@ -53,7 +58,7 @@ import {
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 import type { Repository } from "./types.ts";
 
-const HELP = `Informant ${packageJson.version} — background CI on your Macs
+const HELP = `Informant ${packageJson.version} — background CI on your Linux and macOS machines
 
 Usage:
   informant setup                        Add a private GitHub App for an account
@@ -302,7 +307,7 @@ async function manualTrigger(
     id: contextBranch ? `branch:${contextBranch}:${sha}` : `ref:${sha}`,
   });
   if (!build) {
-    progress.stop("Another machine is already running this commit.");
+    progress.stop("No work was claimed locally; another eligible worker may run this request.");
     await clean();
     return;
   }
@@ -690,7 +695,7 @@ export async function pruneRuntimeImages(
   const runtimes = [
     { label: "Tart images", prune: operations.tart ?? prunePreparedImages },
     {
-      label: "Apple Container images",
+      label: `${selectContainerBackend()?.name ?? "Container"} images`,
       prune: operations.container ?? prunePreparedContainerImages,
     },
   ];
@@ -868,15 +873,16 @@ async function doctor(): Promise<void> {
     console.log(`✗ disk space — ${error instanceof Error ? error.message : error}`);
     failed = true;
   }
-  const container = await command(["container", "system", "status"]);
+  const selectedContainer = selectContainerBackend();
+  const containerReady = await initializeContainerBackend(selectedContainer);
+  const containerStatus = containerBackendReadiness();
   const tart = await command(["tart", "--version"]);
   const sshpass = await command(["sshpass", "-V"]);
   const tartHost = process.platform === "darwin" && process.arch === "arm64";
-  const containerReady = container.exitCode === 0;
   const tartReady = tart.exitCode === 0 && sshpass.exitCode === 0 && tartHost;
   const hostReady = process.platform === "linux" || process.platform === "darwin";
   console.log(
-    `${containerReady ? "✓" : "○"} Apple Container${containerReady ? "" : ` — ${container.stderr.trim() || "not found or not running"}`}`,
+    `${containerReady ? "✓" : "○"} ${selectedContainer?.name ?? "container runtime"}${containerReady ? "" : ` — ${containerStatus?.error?.message ?? "not supported on this host"}`}`,
   );
   console.log(
     `${tart.exitCode === 0 ? "✓" : "○"} Tart${tart.exitCode === 0 ? "" : ` — ${tart.stderr.trim() || "not found"}`}`,
@@ -890,7 +896,7 @@ async function doctor(): Promise<void> {
   console.log(`${hostReady ? "✓" : "○"} native host jobs — ${process.platform}/${process.arch}`);
   if (!containerReady && !tartReady && !hostReady) {
     console.log(
-      "✗ runtime — install and start Apple Container for container jobs or Tart and sshpass for VM jobs",
+      "✗ runtime — run informant setup for container jobs or install Tart and sshpass for VM jobs",
     );
     failed = true;
   }

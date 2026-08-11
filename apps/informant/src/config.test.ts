@@ -17,7 +17,7 @@ cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 
 const vmConfigTemplate = () =>
   configTemplate().replace(
-    '[container]\nimage = "oven/bun:1"',
+    '[container]\nimage = "docker.io/oven/bun:1"',
     `[vm]
 image = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
 os = "macos"
@@ -33,7 +33,9 @@ sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
 
 describe("configuration", () => {
   test("parses the generated template", () => {
-    const config = parseConfig(configTemplate());
+    const config = parseConfigFiles(directoryConfigTemplate(), [
+      { path: ".informant/jobs/test.toml", source: jobTemplate() },
+    ]);
     expect(directoryConfigTemplate()).not.toContain("poll_interval_seconds");
     expect(config.pollIntervalSeconds).toBe(30);
     expect(config.filters).toEqual([{ branch: { names: ["main"] } }]);
@@ -47,13 +49,13 @@ describe("configuration", () => {
         environment: {},
         secrets: [],
         needs: [],
-        runsOn: ["darwin", "arm64"],
+        runsOn: ["container"],
         triggers: [{ event: "commit", branch: undefined, tag: undefined, pullRequest: undefined }],
         filters: [{ branch: { names: ["main"] } }],
         cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
         runtime: {
           type: "container",
-          image: "oven/bun:1",
+          image: "docker.io/oven/bun:1",
           cpu: undefined,
           memoryMb: undefined,
           prepare: undefined,
@@ -68,7 +70,8 @@ describe("configuration", () => {
       { path: ".informant/jobs/test.toml", source: jobTemplate() },
       {
         path: ".informant/jobs/build.toml",
-        source: 'name = "build"\ncommand = "bun run build"\nneeds = ["test"]',
+        source:
+          'name = "build"\ncommand = "bun run build"\nneeds = ["test"]\nruns_on = ["container"]',
       },
     ]);
     expect(config.jobs.map((job) => job.name)).toEqual(["test", "build"]);
@@ -185,7 +188,10 @@ describe("configuration", () => {
 
   test("parses container defaults and per-job VM overrides", () => {
     const source = configTemplate()
-      .replace('image = "oven/bun:1"', 'image = "oven/bun:1"\ncpu = 2\nmemory_mb = 512')
+      .replace(
+        'image = "docker.io/oven/bun:1"',
+        'image = "docker.io/oven/bun:1"\ncpu = 2\nmemory_mb = 512',
+      )
       .replace(
         'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
         'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]\nvm = { image = "macos", os = "macos", cpu = 4 }',
@@ -199,25 +205,25 @@ describe("configuration", () => {
     const containerOnly = source.replace(/\nvm = \{[^\n]+\}/, "");
     expect(parseConfig(containerOnly).jobs[0]?.runtime).toEqual({
       type: "container",
-      image: "oven/bun:1",
+      image: "docker.io/oven/bun:1",
       cpu: 2,
       memoryMb: 512,
       prepare: undefined,
       prepareInputs: undefined,
     });
-    expect(() => parseConfig(containerOnly.replace('image = "oven/bun:1"', 'image = ""'))).toThrow(
-      "container.image must be a non-empty string",
-    );
+    expect(() =>
+      parseConfig(containerOnly.replace('image = "docker.io/oven/bun:1"', 'image = ""')),
+    ).toThrow("container.image must be a non-empty string");
   });
 
   test("parses container overrides and validates runtime tables", () => {
     const source = configTemplate().replace(
       'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
-      'cache = []\ncontainer = { image = "oven/bun:1", cpu = 1 }',
+      'cache = []\ncontainer = { image = "docker.io/oven/bun:1", cpu = 1 }',
     );
     expect(parseConfig(source).jobs[0]?.runtime).toEqual({
       type: "container",
-      image: "oven/bun:1",
+      image: "docker.io/oven/bun:1",
       cpu: 1,
       memoryMb: undefined,
       prepare: undefined,
@@ -225,7 +231,10 @@ describe("configuration", () => {
     });
     expect(() =>
       parseConfig(
-        source.replace('container = { image = "oven/bun:1", cpu = 1 }', "container = true"),
+        source.replace(
+          'container = { image = "docker.io/oven/bun:1", cpu = 1 }',
+          "container = true",
+        ),
       ),
     ).toThrow("jobs[0].container must be a table");
   });
@@ -254,8 +263,8 @@ describe("configuration", () => {
       parseConfig(
         configTemplate()
           .replace(
-            '[container]\nimage = "oven/bun:1"',
-            'cache = [{ paths = ["~/.cache/tool"], shared = true }]\n[container]\nimage = "oven/bun:1"',
+            '[container]\nimage = "docker.io/oven/bun:1"',
+            'cache = [{ paths = ["~/.cache/tool"], shared = true }]\n[container]\nimage = "docker.io/oven/bun:1"',
           )
           .replace('command = "bun install --frozen-lockfile && bun test"', 'command = "test"')
           .replace('name = "test"', 'name = "host-test"')
@@ -269,14 +278,17 @@ describe("configuration", () => {
 
   test("container preparation can be inherited and overridden per job", () => {
     const source = configTemplate()
-      .replace('image = "oven/bun:1"', 'image = "oven/bun:1"\nprepare = "install shared"')
+      .replace(
+        'image = "docker.io/oven/bun:1"',
+        'image = "docker.io/oven/bun:1"\nprepare = "install shared"',
+      )
       .replace(
         'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
         'cache = []\ncontainer = { prepare = "install job tools" }',
       );
     expect(parseConfig(source).jobs[0]?.runtime).toEqual({
       type: "container",
-      image: "oven/bun:1",
+      image: "docker.io/oven/bun:1",
       cpu: undefined,
       memoryMb: undefined,
       prepare: "install job tools",
@@ -290,8 +302,8 @@ describe("configuration", () => {
   test("container preparation inputs can be inherited and overridden per job", () => {
     const source = configTemplate()
       .replace(
-        'image = "oven/bun:1"',
-        'image = "oven/bun:1"\nprepare = "seed cache"\nprepareInputs = ["bun.lock", "packages/*/package.json"]',
+        'image = "docker.io/oven/bun:1"',
+        'image = "docker.io/oven/bun:1"\nprepare = "seed cache"\nprepareInputs = ["bun.lock", "packages/*/package.json"]',
       )
       .replace(
         'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',

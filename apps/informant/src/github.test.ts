@@ -75,6 +75,30 @@ test("rate limited requests wait and retry once", async () => {
   expect(requests).toBe(2);
 });
 
+test("shutdown interrupts a rate limit wait before retrying", async () => {
+  const shutdown = new AbortController();
+  let requests = 0;
+  const fetch = (async () => {
+    requests++;
+    return new Response('{"message":"API rate limit exceeded"}', {
+      status: 403,
+      headers: { "retry-after": "60" },
+    });
+  }) as unknown as typeof globalThis.fetch;
+  const repository = { owner: "abort-test", repo: "widgets", fullName: "abort-test/widgets" };
+  const pending = new GitHubClient({
+    token: "installation-token",
+    fetch,
+    repository,
+  }).defaultBranch(repository, shutdown.signal);
+
+  while (requests === 0) await Bun.sleep(1);
+  shutdown.abort("Worker shutdown requested.");
+
+  expect(await pending.catch((error) => error)).toBe("Worker shutdown requested.");
+  expect(requests).toBe(1);
+});
+
 test("check output strips terminal control sequences", async () => {
   let requestBody: { output?: { text?: string } } | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {

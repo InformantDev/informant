@@ -5,7 +5,7 @@ import "./global.css";
 
 export const metadata: Metadata = {
   title: { default: "Informant — your machines, on CI duty", template: "%s · Informant" },
-  description: "Private, distributed CI on local Macs using GitHub Checks and Tart VMs.",
+  description: "Private, distributed CI on Linux and macOS using GitHub Checks and isolated jobs.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

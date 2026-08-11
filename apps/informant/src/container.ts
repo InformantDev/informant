@@ -14,6 +14,14 @@ import {
 } from "node:fs/promises";
 import { availableParallelism, totalmem } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  appleContainerBackend,
+  CONTAINER_READINESS_TIMEOUT_MS,
+  type ContainerBackend,
+  type ContainerRunOptions,
+  requireContainerBackend,
+  selectContainerBackend,
+} from "./container-backend.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
@@ -33,26 +41,46 @@ const FILE_MOUNT_RESCAN_MS = 50;
 const MAX_PENDING_MOUNT_OUTPUT_BYTES = 256 * 1024;
 
 function containerCommandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
-  return new Error(`${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+  return new Error(
+    `${action}: ${result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.exitCode}`}`,
+  );
 }
 
-export async function appleContainerInstalled(runCommand = command): Promise<boolean> {
-  return (await runCommand(["container", "--version"])).exitCode === 0;
+export async function appleContainerInstalled(
+  runCommand = command,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const result = await runCommand(["container", "--version"], {
+    timeoutMs: CONTAINER_READINESS_TIMEOUT_MS,
+    signal,
+  });
+  return result.exitCode === 0 && !result.timedOut;
 }
 
-export async function ensureAppleContainerSystem(runCommand = command): Promise<void> {
-  let status = await runCommand(["container", "system", "status", "--format", "json"]);
-  if (status.exitCode === 0) return;
-
-  const start = await runCommand(["container", "system", "start", "--enable-kernel-install"]);
-  if (start.exitCode !== 0) throw containerCommandError("could not start Apple Container", start);
-  status = await runCommand(["container", "system", "status", "--format", "json"]);
-  if (status.exitCode !== 0) throw containerCommandError("Apple Container is not ready", status);
+export async function ensureAppleContainerSystem(
+  runCommand = command,
+  signal?: AbortSignal,
+): Promise<void> {
+  const options = { timeoutMs: CONTAINER_READINESS_TIMEOUT_MS, signal };
+  let status = await runCommand(["container", "system", "status", "--format", "json"], options);
+  if (status.exitCode === 0 && !status.timedOut) return;
+  const start = await runCommand(
+    ["container", "system", "start", "--enable-kernel-install"],
+    options,
+  );
+  if (start.exitCode !== 0 || start.timedOut)
+    throw containerCommandError("could not start Apple Container", start);
+  status = await runCommand(["container", "system", "status", "--format", "json"], options);
+  if (status.exitCode !== 0 || status.timedOut)
+    throw containerCommandError("Apple Container is not ready", status);
 }
 
-export async function startAppleContainerSystem(runCommand = command): Promise<boolean> {
-  if (!(await appleContainerInstalled(runCommand))) return false;
-  await ensureAppleContainerSystem(runCommand);
+export async function startAppleContainerSystem(
+  runCommand = command,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!(await appleContainerInstalled(runCommand, signal))) return false;
+  await ensureAppleContainerSystem(runCommand, signal);
   return true;
 }
 
@@ -139,12 +167,6 @@ async function acquireContainerResources(
   });
 }
 
-function containerVolume(source: string, target: string): string {
-  if (source.includes(":"))
-    throw new Error(`Apple Container cannot mount a host path containing a colon: ${source}`);
-  return `${source}:${target}`;
-}
-
 export function preparedContainerImage(
   runtime: ContainerRuntime,
   prepareInputsDigest?: string,
@@ -229,11 +251,12 @@ export interface ContainerPreparationOperations {
   withImageLock?: typeof withImageLock;
   reference?: string;
   dataPath?: string;
+  backend?: ContainerBackend;
 }
 
 type ContainerRunOperations = Pick<
   ContainerPreparationOperations,
-  "command" | "withImageLock" | "dataPath"
+  "command" | "withImageLock" | "dataPath" | "backend"
 > & { allowedMounts?: Record<string, string> };
 
 interface StagedFileMount {
@@ -456,12 +479,13 @@ async function preparedContainerReferenceValues(
 export async function listPreparedContainerImages(
   runCommand: typeof command = command,
   signal?: AbortSignal,
+  backend: ContainerBackend = selectContainerBackend() ?? appleContainerBackend,
 ): Promise<string[]> {
-  const result = await runCommand(["container", "image", "list", "--quiet"], { signal });
+  const result = await runCommand(backend.listImagesArguments(), { signal });
   if (result.exitCode !== 0) throw containerCommandError("could not list container images", result);
   return result.stdout
     .split("\n")
-    .map((image) => image.trim())
+    .map((image) => backend.normalizeImageName(image.trim()))
     .filter((image) => /^informant-prepared-container:[0-9a-f]{16}$/.test(image));
 }
 
@@ -473,6 +497,7 @@ async function activatePreparedContainerImage(
   lock: typeof withImageLock,
   signal?: AbortSignal,
   dataPath?: string,
+  backend: ContainerBackend = selectContainerBackend() ?? appleContainerBackend,
 ): Promise<void> {
   if (!reference) return;
   await lock(
@@ -493,7 +518,7 @@ async function activatePreparedContainerImage(
         if (!referenced.includes(previous)) {
           const result = await lock(
             `container-${digest(previous).slice(0, 24)}`,
-            () => runCommand(["container", "image", "delete", previous], { signal }),
+            () => runCommand(backend.removeImageArguments(previous), { signal }),
             signal,
           );
           if (result.exitCode === 0) {
@@ -556,6 +581,7 @@ export async function prunePreparedContainerImages(
   dataPath = dataDirectory(),
   lock: typeof withImageLock = withImageLock,
   knownOnly = false,
+  backend: ContainerBackend = selectContainerBackend() ?? appleContainerBackend,
 ): Promise<number> {
   return lock("prepared-container-image-references", async () => {
     const referenced = new Set(
@@ -572,13 +598,13 @@ export async function prunePreparedContainerImages(
           ),
         )
       : undefined;
-    const images = (await listPreparedContainerImages(runCommand)).filter(
+    const images = (await listPreparedContainerImages(runCommand, undefined, backend)).filter(
       (image) => !referenced.has(image) && (!known || known.has(image)),
     );
     let removed = 0;
     for (const image of images) {
       const result = await lock(`container-${digest(image).slice(0, 24)}`, () =>
-        runCommand(["container", "image", "delete", image]),
+        runCommand(backend.removeImageArguments(image)),
       );
       if (result.exitCode === 0) {
         await rm(preparedContainerHistoryPath(image, dataPath), { force: true });
@@ -593,8 +619,9 @@ export async function pruneKnownPreparedContainerImages(
   runCommand: typeof command = command,
   dataPath = dataDirectory(),
   lock: typeof withImageLock = withImageLock,
+  backend: ContainerBackend = selectContainerBackend() ?? appleContainerBackend,
 ): Promise<number> {
-  return prunePreparedContainerImages(runCommand, dataPath, lock, true);
+  return prunePreparedContainerImages(runCommand, dataPath, lock, true, backend);
 }
 
 export async function ensurePreparedContainer(
@@ -606,6 +633,7 @@ export async function ensurePreparedContainer(
 ): Promise<string> {
   const runCommand = operations.command ?? command;
   const lock = operations.withImageLock ?? withImageLock;
+  const backend = operations.backend ?? appleContainerBackend;
   const preparationCommand = runtime.prepare;
   if (!preparationCommand) {
     await activatePreparedContainerImage(
@@ -616,6 +644,7 @@ export async function ensurePreparedContainer(
       lock,
       signal,
       operations.dataPath,
+      backend,
     );
     return runtime.image;
   }
@@ -638,25 +667,13 @@ export async function ensurePreparedContainer(
       `FROM ${runtime.image}\nUSER 0\nCOPY informant-prepare.sh /tmp/informant-prepare.sh\n${inputSetup}${preparationLayer}`,
     );
     const image = await lock(
-      "container-builder",
+      backend.kind === "apple" ? "container-builder" : `container-${digest(prepared).slice(0, 24)}`,
       async () => {
-        const existing = await runCommand(["container", "image", "inspect", prepared], { signal });
+        const existing = await runCommand(backend.inspectImageArguments(prepared), { signal });
         if (existing.exitCode === 0) return prepared;
 
         await onMessage(`Preparing container image ${prepared}`);
-        const args = [
-          "container",
-          "build",
-          "--file",
-          "Dockerfile",
-          "--tag",
-          prepared,
-          "--progress",
-          "plain",
-        ];
-        if (runtime.cpu) args.push("--cpus", String(runtime.cpu));
-        if (runtime.memoryMb) args.push("--memory", `${runtime.memoryMb}M`);
-        args.push(".");
+        const args = backend.buildArguments(prepared, runtime.cpu, runtime.memoryMb);
         const preparation = await runCommand(args, {
           cwd: context,
           signal,
@@ -678,6 +695,7 @@ export async function ensurePreparedContainer(
       lock,
       signal,
       operations.dataPath,
+      backend,
     );
     return image;
   } finally {
@@ -685,50 +703,11 @@ export async function ensurePreparedContainer(
   }
 }
 
-export function containerRunArguments(options: {
-  name: string;
-  image: string;
-  workspace: string;
-  command: string;
-  environment: Record<string, string>;
-  mounts?: Array<{ source: string; target: string }>;
-  secretNames?: string[];
-  cpu?: number;
-  memoryMb?: number;
-  preparedWorkspace?: boolean;
-}): string[] {
-  const args = [
-    "container",
-    "run",
-    "--rm",
-    "--init",
-    "--ulimit",
-    "nofile=65536:65536",
-    "--name",
-    options.name,
-    "--workdir",
-    "/workspace",
-    "--user",
-    "0:0",
-    "--entrypoint",
-    "/bin/sh",
-  ];
-  args.push(
-    "--volume",
-    containerVolume(
-      options.workspace,
-      options.preparedWorkspace ? options.workspace : "/workspace",
-    ),
-  );
-  for (const mount of options.mounts ?? [])
-    args.push("--volume", containerVolume(mount.source, mount.target));
-  for (const [key, value] of Object.entries(options.environment))
-    args.push("--env", `${key}=${value}`);
-  for (const name of options.secretNames ?? []) args.push("--env", name);
-  if (options.cpu) args.push("--cpus", String(options.cpu));
-  if (options.memoryMb) args.push("--memory", `${options.memoryMb}M`);
-  args.push(options.image, "-lc", options.command);
-  return args;
+export function containerRunArguments(
+  options: ContainerRunOptions,
+  backend: ContainerBackend = appleContainerBackend,
+): string[] {
+  return backend.runArguments(options);
 }
 
 export async function runInContainer(
@@ -757,12 +736,19 @@ export async function runInContainer(
   );
   const executionSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
   const runCommand = operations.command ?? command;
+  const selectedBackend =
+    operations.backend ?? (operations.command ? appleContainerBackend : selectContainerBackend());
   const resources = {
     cpu: runtime.cpu ?? DEFAULT_CONTAINER_RESOURCES.cpu,
     memoryMb: runtime.memoryMb ?? DEFAULT_CONTAINER_RESOURCES.memoryMb,
   };
   let releaseSlot: (() => void) | undefined;
+  let backend: ContainerBackend | undefined;
   try {
+    backend =
+      operations.command && !operations.backend
+        ? appleContainerBackend
+        : await requireContainerBackend(selectedBackend, runCommand, executionSignal);
     executionSignal.throwIfAborted();
     const secrets = await resolveJobSecrets(job, runtimeSecrets);
     executionSignal.throwIfAborted();
@@ -800,10 +786,11 @@ export async function runInContainer(
       withImageLock: operations.withImageLock ?? withImageLock,
       reference: `${repository.fullName}\0${job.name}`,
       dataPath: operations.dataPath,
+      backend,
     });
     const run = async (fileMounts: StagedFileMount[] = []) => {
       if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
-        await log(`[${job.name}] waiting for an available Apple Container slot\n`);
+        await log(`[${job.name}] waiting for an available container slot\n`);
       releaseSlot = await acquireContainerResources(resources, executionSignal);
       const mounts = caches.mounts.map((mount) => ({
         source: mount.path,
@@ -812,18 +799,21 @@ export async function runInContainer(
       mounts.push(
         ...fileMounts.map((mount) => ({ source: mount.directory, target: mount.target })),
       );
-      const args = containerRunArguments({
-        name,
-        image,
-        workspace: hostWorkspace,
-        command: wrapped,
-        environment,
-        mounts,
-        secretNames: Object.keys(secrets),
-        cpu: resources.cpu,
-        memoryMb: resources.memoryMb,
-        preparedWorkspace: usesPreparedWorkspace,
-      });
+      const args = containerRunArguments(
+        {
+          name,
+          image,
+          workspace: hostWorkspace,
+          command: wrapped,
+          environment,
+          mounts,
+          secretNames: Object.keys(secrets),
+          cpu: resources.cpu,
+          memoryMb: resources.memoryMb,
+          preparedWorkspace: usesPreparedWorkspace,
+        },
+        backend,
+      );
       await started();
       await log(`\n[${job.name}] $ ${job.command}\n`);
       const redactor = streamingSecretRedactor(
@@ -967,7 +957,8 @@ export async function runInContainer(
     clearTimeout(timeout);
     if (releaseSlot) {
       try {
-        await runCommand(["container", "delete", "--force", name], { timeoutMs: 30_000 });
+        if (backend)
+          await runCommand(backend.removeContainerArguments(name), { timeoutMs: 30_000 });
       } finally {
         releaseSlot();
       }

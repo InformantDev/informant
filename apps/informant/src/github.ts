@@ -28,6 +28,28 @@ const RETRYABLE_CHECK_CONCLUSIONS = new Set([
   "timed_out",
 ]);
 
+async function abortableSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  if (!signal) {
+    await Bun.sleep(milliseconds);
+    return;
+  }
+  let abort!: () => void;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(resolve, milliseconds);
+      abort = () => {
+        clearTimeout(timeout);
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    });
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
 export interface ClaimResult {
   check?: CheckRun;
   requestedJobs: string[];
@@ -207,7 +229,8 @@ export class GitHubClient {
     this.rateLimitKey = options.repository?.owner.toLowerCase() ?? "default";
   }
 
-  async authenticate(): Promise<void> {
+  async authenticate(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (this.token && Date.now() < this.tokenExpiresAt - 60_000) return;
     const environmentAccount = Bun.env.INFORMANT_GITHUB_ACCOUNT;
     const environmentMatches =
@@ -259,6 +282,7 @@ export class GitHubClient {
       `${API}/app/installations/${installationId}/access_tokens`,
       {
         method: "POST",
+        signal,
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${jwt}`,
@@ -342,14 +366,19 @@ export class GitHubClient {
     return `${unsigned}.${createSign("RSA-SHA256").update(unsigned).sign(privateKey, "base64url")}`;
   }
 
-  private async api<T>(path: string, init: RequestInit = {}): Promise<T> {
-    await this.authenticate();
+  private async api<T>(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<T> {
+    const requestSignal = signal ?? init.signal ?? undefined;
+    await this.authenticate(requestSignal);
     for (let attempt = 0; ; attempt++) {
+      requestSignal?.throwIfAborted();
       const blockedUntil = rateLimitGates.get(this.rateLimitKey) ?? 0;
-      if (blockedUntil > Date.now()) await Bun.sleep(blockedUntil - Date.now());
+      if (blockedUntil > Date.now()) {
+        await abortableSleep(blockedUntil - Date.now(), requestSignal);
+      }
 
       const response = await this.request(`${API}${path}`, {
         ...init,
+        signal: requestSignal,
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${this.token}`,
@@ -368,18 +397,25 @@ export class GitHubClient {
     }
   }
 
-  async branchHead(repository: Repository, branch: string): Promise<string> {
+  async branchHead(repository: Repository, branch: string, signal?: AbortSignal): Promise<string> {
     const ref = await this.api<{ object: { sha: string } }>(
       `/repos/${repository.fullName}/git/ref/heads/${encodeURIComponent(branch)}`,
+      {},
+      signal,
     );
     return ref.object.sha;
   }
 
-  async branches(repository: Repository): Promise<Array<{ name: string; sha: string }>> {
+  async branches(
+    repository: Repository,
+    signal?: AbortSignal,
+  ): Promise<Array<{ name: string; sha: string }>> {
     const values: Array<{ name: string; commit: { sha: string } }> = [];
     for (let page = 1; ; page++) {
       const pageValues = await this.api<typeof values>(
         `/repos/${repository.fullName}/branches?per_page=100&page=${page}`,
+        {},
+        signal,
       );
       values.push(...pageValues);
       if (pageValues.length < 100) break;
@@ -387,11 +423,16 @@ export class GitHubClient {
     return values.map((value) => ({ name: value.name, sha: value.commit.sha }));
   }
 
-  async tags(repository: Repository): Promise<Array<{ name: string; sha: string }>> {
+  async tags(
+    repository: Repository,
+    signal?: AbortSignal,
+  ): Promise<Array<{ name: string; sha: string }>> {
     const values: Array<{ name: string; commit: { sha: string } }> = [];
     for (let page = 1; ; page++) {
       const pageValues = await this.api<typeof values>(
         `/repos/${repository.fullName}/tags?per_page=100&page=${page}`,
+        {},
+        signal,
       );
       values.push(...pageValues);
       if (pageValues.length < 100) break;
@@ -420,7 +461,7 @@ export class GitHubClient {
     };
   }
 
-  async pullRequests(repository: Repository): Promise<PullRequest[]> {
+  async pullRequests(repository: Repository, signal?: AbortSignal): Promise<PullRequest[]> {
     type Raw = {
       number: number;
       state: "open" | "closed";
@@ -432,6 +473,8 @@ export class GitHubClient {
     for (let page = 1; ; page++) {
       const pageValues = await this.api<Raw[]>(
         `/repos/${repository.fullName}/pulls?state=open&per_page=100&page=${page}`,
+        {},
+        signal,
       );
       values.push(...pageValues);
       if (pageValues.length < 100) break;
@@ -439,24 +482,34 @@ export class GitHubClient {
     return values.map((value) => this.parsePullRequest(value, repository));
   }
 
-  async pullRequest(repository: Repository, number: number): Promise<PullRequest> {
+  async pullRequest(
+    repository: Repository,
+    number: number,
+    signal?: AbortSignal,
+  ): Promise<PullRequest> {
     const value = await this.api<{
       number: number;
       state: "open" | "closed";
       draft: boolean;
       base: { ref: string };
       head: { sha: string; repo: { full_name: string } | null };
-    }>(`/repos/${repository.fullName}/pulls/${number}`);
+    }>(`/repos/${repository.fullName}/pulls/${number}`, {}, signal);
     return this.parsePullRequest(value, repository);
   }
 
-  async pullRequestComments(repository: Repository, since?: string): Promise<PullRequestComment[]> {
+  async pullRequestComments(
+    repository: Repository,
+    since?: string,
+    signal?: AbortSignal,
+  ): Promise<PullRequestComment[]> {
     type Raw = { id: number; issue_url: string; created_at: string; updated_at: string };
     const values: Raw[] = [];
     for (let page = 1; ; page++) {
       const query = since ? `&since=${encodeURIComponent(since)}` : "";
       const pageValues = await this.api<Raw[]>(
         `/repos/${repository.fullName}/issues/comments?sort=created&direction=asc&per_page=100&page=${page}${query}`,
+        {},
+        signal,
       );
       values.push(...pageValues);
       if (pageValues.length < 100) break;
@@ -472,10 +525,13 @@ export class GitHubClient {
   async latestPullRequestComments(
     repository: Repository,
     limit = 100,
+    signal?: AbortSignal,
   ): Promise<PullRequestComment[]> {
     type Raw = { id: number; issue_url: string; created_at: string; updated_at: string };
     const values = await this.api<Raw[]>(
       `/repos/${repository.fullName}/issues/comments?sort=updated&direction=desc&per_page=${limit}&page=1`,
+      {},
+      signal,
     );
     return values.map((value) => ({
       id: value.id,
@@ -485,22 +541,40 @@ export class GitHubClient {
     }));
   }
 
-  async defaultBranch(repository: Repository): Promise<string> {
-    const result = await this.api<{ default_branch: string }>(`/repos/${repository.fullName}`);
+  async defaultBranch(repository: Repository, signal?: AbortSignal): Promise<string> {
+    const result = await this.api<{ default_branch: string }>(
+      `/repos/${repository.fullName}`,
+      {},
+      signal,
+    );
     return result.default_branch;
   }
 
-  async fileContent(repository: Repository, sha: string, path: string): Promise<string> {
+  async fileContent(
+    repository: Repository,
+    sha: string,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
     const result = await this.api<{ content: string; encoding: string }>(
       `/repos/${repository.fullName}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(sha)}`,
+      {},
+      signal,
     );
     if (result.encoding !== "base64") throw new Error(`unsupported GitHub content encoding`);
     return Buffer.from(result.content.replaceAll("\n", ""), "base64").toString("utf8");
   }
 
-  async directoryFiles(repository: Repository, sha: string, path: string): Promise<string[]> {
+  async directoryFiles(
+    repository: Repository,
+    sha: string,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<string[]> {
     const result = await this.api<Array<{ name: string; path: string; type: string }>>(
       `/repos/${repository.fullName}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(sha)}`,
+      {},
+      signal,
     );
     return result
       .filter((entry) => entry.type === "file" && entry.name.endsWith(".toml"))
@@ -508,14 +582,21 @@ export class GitHubClient {
       .sort();
   }
 
-  async checks(repository: Repository, sha: string, name = CLAIM_NAME): Promise<CheckRun[]> {
-    await this.authenticate();
+  async checks(
+    repository: Repository,
+    sha: string,
+    name = CLAIM_NAME,
+    signal?: AbortSignal,
+  ): Promise<CheckRun[]> {
+    await this.authenticate(signal);
     const appId = this.appId;
     const appFilter = appId ? `&app_id=${encodeURIComponent(appId)}` : "";
     const checks: CheckRun[] = [];
     for (let page = 1; ; page++) {
       const result = await this.api<{ check_runs: CheckRun[] }>(
         `/repos/${repository.fullName}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=all&per_page=100&page=${page}${appFilter}`,
+        {},
+        signal,
       );
       checks.push(...result.check_runs);
       if (result.check_runs.length < 100) break;
@@ -614,9 +695,10 @@ export class GitHubClient {
     sha: string,
     branch?: string,
     label?: string,
+    signal?: AbortSignal,
   ): Promise<boolean> {
-    const checks = await this.checks(repository, sha, CLAIM_NAME);
-    const requests = await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME);
+    const checks = await this.checks(repository, sha, CLAIM_NAME, signal);
+    const requests = await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME, signal);
     if (
       [...checks, ...requests].some(
         (check) =>
