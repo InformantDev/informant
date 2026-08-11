@@ -5,6 +5,15 @@ export interface CommandResult {
   timedOut: boolean;
 }
 
+export interface CommandOptions {
+  cwd?: string;
+  env?: Record<string, string>;
+  inheritEnv?: boolean;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  onOutput?: (text: string) => Promise<void> | void;
+}
+
 const MAX_CAPTURE_CHARS = 1024 * 1024;
 
 async function captureTail(
@@ -38,14 +47,7 @@ async function captureTail(
 
 export async function command(
   argv: string[],
-  options: {
-    cwd?: string;
-    env?: Record<string, string>;
-    inheritEnv?: boolean;
-    timeoutMs?: number;
-    signal?: AbortSignal;
-    onOutput?: (text: string) => Promise<void> | void;
-  } = {},
+  options: CommandOptions = {},
 ): Promise<CommandResult> {
   options.signal?.throwIfAborted();
   const spawned = (() => {
@@ -106,14 +108,7 @@ export async function command(
 export async function requireCommand(
   argv: string[],
   errorMessage?: string,
-  options?: {
-    cwd?: string;
-    env?: Record<string, string>;
-    inheritEnv?: boolean;
-    timeoutMs?: number;
-    signal?: AbortSignal;
-    onOutput?: (text: string) => Promise<void> | void;
-  },
+  options?: CommandOptions,
 ): Promise<string> {
   const result = await command(argv, options);
   if (result.exitCode !== 0) {

@@ -1,11 +1,11 @@
 ---
 title: Informant
-description: Private, distributed CI running on the Macs you already own.
+description: Private, distributed CI running on your Linux and macOS machines.
 ---
 
-Informant is a polling CI worker for macOS. It watches configured GitHub branches, coordinates with
-other Informant machines through the Checks API, and runs jobs in disposable Apple containers or Tart
-VMs.
+Informant is a polling CI worker for Linux and macOS. It watches configured GitHub branches,
+coordinates with other Informant machines through the Checks API, and runs jobs in disposable Apple
+Container environments, rootless Podman containers, native checkouts, or Tart VMs.
 
 ## Why polling?
 
@@ -19,8 +19,9 @@ pushes to start immediately rather than at the next poll.
    branch.
 2. It resolves each configured branch head and looks for an existing `Informant CI` check.
 3. Interested workers create claims. The oldest active check wins; every loser cancels itself.
-4. The winner clones the exact commit and runs each job in its configured container or Tart VM. Independent jobs run
-   concurrently, while `needs` dependencies impose ordering.
+4. The winner clones the exact commit and runs each job in its configured container, isolated native
+   checkout, or Tart VM. Independent jobs run concurrently, while `needs` dependencies impose
+   ordering.
 5. Each running job publishes its latest log tail to GitHub about every 10 seconds, followed by its
    terminal conclusion. Local build logs retain up to 10 MiB of stdout and stderr per build and include
    a truncation marker when output exceeds that limit.

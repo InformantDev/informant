@@ -51,11 +51,18 @@ and follow a currently running job, or pass a build ID to follow its combined lo
 timestamps job lifecycle events while leaving command output unchanged.
 
 `informant storage` breaks down the data directory into caches, builds and logs, and other files. It
-also includes Informant-owned Tart VM images, counts prepared Apple Container images, reports free
-host capacity, and shows runtime-wide Apple Container image usage when that runtime is available.
+also includes Informant-owned Tart VM images, counts prepared images in Apple Container or rootless
+Podman, reports free host capacity, and shows runtime-wide container image usage when available.
 Container layers are shared, so their physical usage cannot be attributed to Informant alone; the
-command keeps that shared total separate and labels it runtime-wide. The report ends with cleanup
-commands and notes when a command can affect images outside Informant.
+command keeps that shared total separate and labels it runtime-wide. Informant's prune command remains
+scoped to Informant prepared images. It does not suggest or run a global Podman prune, which could
+affect unrelated images or interrupted Buildah work owned by the same user.
+
+`informant doctor` names the selected backend and verifies Apple Container readiness on macOS or
+rootless Podman health on Linux. Missing, unhealthy, or rootful Podman prevents the worker from
+claiming `runs_on = ["container"]` jobs; host-only jobs remain available. `informant setup` can install
+Podman from Debian/Ubuntu or Fedora/RHEL packages and smoke tests `docker.io/oven/bun:1`. It never uses
+curl-to-shell or starts a systemd service.
 
 The worker runs housekeeping at startup and whenever all builds become idle. It keeps at least the
 100 newest build records, removes additional records after 30 days, globally expires old keyed-cache
@@ -80,7 +87,9 @@ check when less than 10 GB or 5% remains, since builds and runtime image prepara
 have enough working space.
 
 `informant startup enable` installs and immediately loads a per-user macOS LaunchAgent or Linux
-systemd user service. The worker
+systemd user service. It therefore requires a working systemd user manager on Linux. On hosts without
+one, run `informant serve` in the foreground or configure it in the host's existing supervisor; Podman
+does not need a daemon or systemd unit. The managed worker
 restarts if it exits and starts again when you log in. Its output is written to `worker.stdout.log`
 and `worker.stderr.log` in the Informant data directory. Run `informant startup enable` again after
 changing any `INFORMANT_*` environment-variable overrides so the service captures the new values.

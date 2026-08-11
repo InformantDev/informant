@@ -7,17 +7,25 @@ import {
   containerJobCommand,
   containerRunArguments,
   ensurePreparedContainer,
+  listPreparedContainerImages,
   preparedContainerImage,
   pruneKnownPreparedContainerImages,
   prunePreparedContainerImages,
   runInContainer,
 } from "./container.ts";
+import {
+  appleContainerBackend,
+  initializeContainerBackend,
+  podmanContainerBackend,
+  resetContainerBackendReadiness,
+} from "./container-backend.ts";
 import { shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
 const temporaryDataPaths: string[] = [];
 
 afterEach(async () => {
+  resetContainerBackendReadiness();
   await Promise.all(
     temporaryDataPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -147,6 +155,75 @@ test("preserves commas in Apple Container volume paths", () => {
   ).toContain("/tmp/workspace,one:/workspace");
 });
 
+test("normalizes Podman localhost prepared image names", async () => {
+  const commands: string[][] = [];
+  const images = await listPreparedContainerImages(
+    async (argv) => {
+      commands.push(argv);
+      return {
+        exitCode: 0,
+        stdout: "localhost/informant-prepared-container:0123456789abcdef\ndocker.io/oven/bun:1\n",
+        stderr: "",
+        timedOut: false,
+      };
+    },
+    undefined,
+    podmanContainerBackend,
+  );
+  expect(commands).toEqual([podmanContainerBackend.listImagesArguments()]);
+  expect(images).toEqual(["informant-prepared-container:0123456789abcdef"]);
+});
+
+test("executes and force-removes jobs with rootless Podman", async () => {
+  const invocations: string[][] = [];
+  const runCommand = async (args: string[]) => {
+    invocations.push(args);
+    return {
+      exitCode: 0,
+      stdout:
+        args[1] === "info"
+          ? JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } })
+          : "",
+      stderr: "",
+      timedOut: false,
+    };
+  };
+  await initializeContainerBackend(podmanContainerBackend, runCommand);
+  const result = await runInContainer(
+    { owner: "owner", repo: "repo", fullName: "owner/repo" },
+    "sha",
+    "main",
+    "trusted",
+    false,
+    process.cwd(),
+    {
+      name: "podman",
+      command: "true",
+      optional: false,
+      timeoutMinutes: 1,
+      environment: {},
+      secrets: [],
+      needs: [],
+      runtime: { type: "container", image: "docker.io/oven/bun:1" },
+    },
+    async () => {},
+    async () => {},
+    {},
+    undefined,
+    {
+      backend: podmanContainerBackend,
+      command: runCommand,
+      dataPath: temporaryContainerDataPath(),
+    },
+  );
+  expect(result.success).toBe(true);
+  const run = invocations.find((args) => args[1] === "run");
+  expect(run).toContain("no-new-privileges");
+  expect(run).toContain("--cpus");
+  expect(run).toContain("--memory");
+  expect(invocations.at(-1)?.slice(0, 3)).toEqual(["podman", "rm", "--force"]);
+});
+
 test("prepares and reuses a deterministic container image", async () => {
   const runtime = {
     type: "container" as const,
@@ -267,8 +344,23 @@ test("tracks prepared container image references and prunes images after their l
       dataPath,
     });
     expect(deleted).toEqual([first]);
-    expect(await pruneKnownPreparedContainerImages(command, dataPath, withImageLock)).toBe(0);
-    expect(await prunePreparedContainerImages(command, dataPath, withImageLock)).toBe(1);
+    expect(
+      await pruneKnownPreparedContainerImages(
+        command,
+        dataPath,
+        withImageLock,
+        appleContainerBackend,
+      ),
+    ).toBe(0);
+    expect(
+      await prunePreparedContainerImages(
+        command,
+        dataPath,
+        withImageLock,
+        false,
+        appleContainerBackend,
+      ),
+    ).toBe(1);
     expect(deleted).toEqual([first, orphan]);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -389,23 +481,27 @@ test("preparation inputs cannot traverse a symbolic link", async () => {
   }
 });
 
-test("serializes concurrent preparation of the same container image", async () => {
+test("deduplicates concurrent Podman preparation of the same container image", async () => {
   const runtime = { type: "container" as const, image: "base", prepare: "install tools" };
-  let tail = Promise.resolve();
+  const tails = new Map<string, Promise<void>>();
   let imageExists = false;
   let builds = 0;
   const operations = {
-    withImageLock: async <T>(_image: string, callback: () => Promise<T>): Promise<T> => {
-      const previous = tail;
+    backend: podmanContainerBackend,
+    withImageLock: async <T>(image: string, callback: () => Promise<T>): Promise<T> => {
+      const previous = tails.get(image) ?? Promise.resolve();
       let release = () => {};
-      tail = new Promise<void>((resolve) => {
+      const current = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const tail = previous.then(() => current);
+      tails.set(image, tail);
       await previous;
       try {
         return await callback();
       } finally {
         release();
+        if (tails.get(image) === tail) tails.delete(image);
       }
     },
     command: async (args: string[]) => {
@@ -458,6 +554,67 @@ test("serializes preparation of different images through the shared Apple builde
   );
 
   expect(locks).toEqual(["container-builder", "container-builder"]);
+});
+
+test("prepares distinct Podman images concurrently", async () => {
+  const tails = new Map<string, Promise<void>>();
+  const locks: string[] = [];
+  let builds = 0;
+  let activeBuilds = 0;
+  let maximumActiveBuilds = 0;
+  const bothBuilding = deferred<void>();
+  const operations = {
+    backend: podmanContainerBackend,
+    withImageLock: async <T>(image: string, callback: () => Promise<T>): Promise<T> => {
+      locks.push(image);
+      const previous = tails.get(image) ?? Promise.resolve();
+      let release = () => {};
+      const current = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const tail = previous.then(() => current);
+      tails.set(image, tail);
+      await previous;
+      try {
+        return await callback();
+      } finally {
+        release();
+        if (tails.get(image) === tail) tails.delete(image);
+      }
+    },
+    command: async (args: string[]) => {
+      if (args[1] === "image") return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+      if (args[1] === "build") {
+        builds++;
+        activeBuilds++;
+        maximumActiveBuilds = Math.max(maximumActiveBuilds, activeBuilds);
+        if (builds === 2) bothBuilding.resolve();
+        if (builds === 1) await Promise.race([bothBuilding.promise, Bun.sleep(100)]);
+        activeBuilds--;
+      }
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  };
+
+  await Promise.all([
+    ensurePreparedContainer(
+      { type: "container", image: "base-a", prepare: "install a" },
+      undefined,
+      () => {},
+      undefined,
+      operations,
+    ),
+    ensurePreparedContainer(
+      { type: "container", image: "base-b", prepare: "install b" },
+      undefined,
+      () => {},
+      undefined,
+      operations,
+    ),
+  ]);
+
+  expect(new Set(locks).size).toBe(2);
+  expect(maximumActiveBuilds).toBe(2);
 });
 
 test("passes secrets through the client environment and always removes the container", async () => {

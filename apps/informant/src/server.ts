@@ -1,8 +1,9 @@
 import { CONFIG_FILE, JOBS_DIRECTORY, parseConfigFiles, selectTriggeredJobs } from "./config.ts";
 import {
   reconcilePreparedContainerImageReferences,
-  startAppleContainerSystem,
+  type startAppleContainerSystem,
 } from "./container.ts";
+import { containerBackendReadiness, refreshSelectedContainerBackend } from "./container-backend.ts";
 import { runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import {
@@ -126,6 +127,7 @@ export interface ServerDependencies {
   savePollState?: typeof savePollState;
   recoverInterruptedBuilds?: typeof recoverInterruptedBuilds;
   startAppleContainerSystem?: typeof startAppleContainerSystem;
+  initializeContainerBackend?: (signal?: AbortSignal) => Promise<boolean>;
   housekeeping?: typeof runHousekeeping;
   updateCacheConfiguration?: typeof updateCacheConfiguration;
   reconcilePreparedImageReferences?: typeof reconcilePreparedImageReferences;
@@ -772,7 +774,19 @@ export async function serveRepositories(
   repositories: Repository[],
   options: ServerOptions = {},
 ): Promise<void> {
-  await (options.dependencies?.startAppleContainerSystem ?? startAppleContainerSystem)();
+  if (options.dependencies?.initializeContainerBackend) {
+    await options.dependencies.initializeContainerBackend(options.signal);
+  } else if (options.dependencies?.startAppleContainerSystem) {
+    await options.dependencies.startAppleContainerSystem();
+  } else {
+    const ready = await refreshSelectedContainerBackend(options.signal);
+    const status = containerBackendReadiness();
+    if (!ready && status) {
+      options.onMessage?.(
+        `${status.backend.name} unavailable; container jobs will not be claimed: ${status.error?.message ?? "not ready"}`,
+      );
+    }
+  }
   let configuredRepositories = repositories;
   const performHousekeeping = options.dependencies?.housekeeping ?? runHousekeeping;
   let pendingHousekeeping: Promise<void> | undefined;

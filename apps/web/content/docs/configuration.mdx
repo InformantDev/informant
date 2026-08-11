@@ -19,7 +19,7 @@ triggers = [
 filters = []
 
 [container]
-image = "oven/bun:1"
+image = "docker.io/oven/bun:1"
 cpu = 2
 memory_mb = 2048
 prepare = "apt-get update && apt-get install -y git"
@@ -52,6 +52,11 @@ Every worker automatically provides `self-hosted`, its platform (`linux` or `dar
 (`x64` or `arm64`), and lowercase hostname. Add custom comma-separated labels with
 `INFORMANT_CAPABILITIES`, for example `INFORMANT_CAPABILITIES=gpu,large`.
 
+Workers also provide `container` only when their platform backend passes its health check. Use
+`runs_on = ["container"]` for a portable container job that can run with Apple Container on macOS or
+rootless Podman on Linux. Generated jobs use this label. Version 1 configurations that omit `runs_on`
+for non-host jobs retain the legacy `["darwin", "arm64"]` behavior.
+
 `host = {}` runs the command directly on the worker in a fresh detached checkout with an isolated
 home directory. It is intentionally explicit because repository code is not isolated from the host;
 use it only for trusted repositories. Persistent Informant caches are not supported for host jobs,
@@ -63,10 +68,23 @@ Jobs with the same normalized `runs_on` labels share one claim election. Workers
 capabilities still compete for shared jobs instead of executing them twice. A job and every job in its
 `needs` chain must use the same `runs_on` labels; cross-worker dependency chains are rejected.
 
-Container jobs require [Apple Container](https://github.com/apple/container) and run as UID 0 with the
-checkout mounted at `/workspace`. Cache directories use isolated host storage under `/home/root` in
-the container. Declared secrets are inherited by name from the Container client environment, never
-included in command arguments, and redacted using the same policy as VMs.
+Container jobs use [Apple Container](https://github.com/apple/container) on Apple Silicon macOS and
+rootless [Podman](https://podman.io/) on Linux. Podman runs directly as the worker user without a
+daemon, socket, systemd unit, or rootful service. Informant rejects rootful Podman and does not
+advertise the `container` capability when the selected backend is missing or unhealthy. Run
+`informant setup` to install and verify it.
+
+Jobs run as UID 0 inside the container with the checkout mounted at `/workspace`. With rootless
+Podman, container root maps into the unprivileged worker user's namespace; Informant also adds
+`--security-opt no-new-privileges`. On SELinux hosts, Podman privately relabels the disposable job
+workspace with `:Z` and uses shared `:z` labels for Informant cache mounts. This preserves SELinux
+separation between job workspaces while allowing intentionally shared caches to be mounted by multiple
+containers. Apple Container uses its own lightweight VM isolation. CPU and memory limits apply on both
+backends. Rootless Podman also requires cgroups v2 so those limits are enforceable. Cache directories
+use isolated host storage under `/home/root`.
+Declared secrets are inherited by name from the client environment, never included in command
+arguments, and redacted using the same policy as VMs. Prefer fully qualified image references such as
+`docker.io/oven/bun:1` so registry resolution is consistent across backends.
 
 Informant mounts the checkout and other Tart shared directories beneath `/mnt/shared` on Linux;
 Linux user caches are beneath `/home/<user>`. On macOS, these remain `/Volumes/My Shared Files` and
@@ -77,6 +95,7 @@ VirtioFS share with passwordless `sudo`.
 
 ```toml
 name = "test"
+runs_on = ["container"]
 command = """
 set -euo pipefail
 bun install --frozen-lockfile
@@ -91,6 +110,7 @@ cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 
 ```toml
 name = "lint"
+runs_on = ["container"]
 command = """
 bun run check
 """
@@ -106,6 +126,7 @@ triggers = [
 
 ```toml
 name = "build"
+runs_on = ["container"]
 command = """
 bun run build
 """
@@ -123,10 +144,10 @@ and displays a failure, but reports its GitHub check as neutral, keeps the aggre
 and allows jobs that depend on it to run. Setup and reporting errors outside the job itself still fail
 the build.
 
-Like GitHub Actions, jobs run in parallel by default. Each job gets its own fresh container or Tart VM
-and isolated checkout. Use `needs` to make a job wait for one or
-more other jobs. Linux guests instead use `/mnt/shared/workspace`. In this example, `test` and `lint`
-start together; `build` starts only after both pass.
+Like GitHub Actions, jobs run in parallel by default. Each job gets an isolated checkout in its
+configured container, native host runtime, or Tart VM. Use `needs` to make a job wait for one or more
+other jobs. Linux guests instead use `/mnt/shared/workspace`. In this example, `test` and `lint` start
+together; `build` starts only after both pass.
 If a dependency fails or times out, jobs that need it are skipped.
 
 ## Host secrets
@@ -204,13 +225,18 @@ evaluated.
 
 `vm.prepare` and `container.prepare` run once when a worker first sees that image and preparation
 command. Informant keeps the result as a local Tart or OCI image and starts jobs from it, so tools do
-not need to be installed in every job. Container preparation builds an isolated image with Apple
-Container's BuildKit integration. It does not receive the job checkout, environment, caches, or
+not need to be installed in every job. Container preparation builds an isolated OCI image with the
+selected backend. It does not receive the job checkout, environment, caches, or
 secrets by default. Changing the source image or preparation command creates a new prepared image.
 Because preparation is part of the runtime table, different jobs can use different preparation
 commands.
 
-Informant tracks which configured repository jobs use each prepared Tart or Apple Container image.
+Podman preparation uses `--force-rm` to remove intermediate Buildah containers after failures. Cleanup
+is best effort: abrupt process termination can still leave internal Buildah state for Podman's own
+cleanup tooling. Informant does not run a global Podman prune because that could delete non-Informant
+build or image state owned by the same user.
+
+Informant tracks which configured repository jobs use each prepared Tart or container image.
 When the final reference moves to another image, or a repository or job is removed, idle housekeeping
 deletes the unreferenced image. `informant image prune` runs that cleanup immediately.
 
@@ -224,7 +250,7 @@ without removing prepared files, then runs the job there. A lockfile change prep
 ordinary source changes reuse the installed dependencies:
 
 ```toml
-container.image = "oven/bun:1"
+container.image = "docker.io/oven/bun:1"
 container.prepareInputs = ["bun.lock", "package.json", "apps/*/package.json"]
 cache = []
 container.prepare = """
@@ -237,9 +263,9 @@ The corresponding job command should use the baked dependencies directly rather 
 `bun install` again.
 
 Preparation is automatic. `informant image prepare` warms configured Tart VM images, while the first
-container job warms its prepared Apple Container image. `informant image list` lists prepared Tart
+container job warms its prepared container image. `informant image list` lists prepared Tart
 images, and `informant image prune` removes unreferenced prepared images from both runtimes. Use
-`container image` to inspect the full Apple Container inventory. Every worker prepares its own local
+`container image` on macOS or `podman image` on Linux to inspect the full inventory. Every worker prepares its own local
 copy, which keeps multi-machine setup automatic.
 
 ## Persistent job caches
