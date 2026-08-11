@@ -1,6 +1,6 @@
 name = "Staff Review"
-# Workers advertise this label only after allowing the codex-auth mount.
-runs_on = ["container", "staff-review"]
+# Route to Codex-capable workers configured with the codex-auth mount.
+runs_on = ["container", "codex"]
 optional = true
 command = """
 set -eu
