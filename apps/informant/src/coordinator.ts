@@ -176,7 +176,8 @@ export async function runCommit(
   signal?: AbortSignal,
   admissionSignal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
-  const claimSignal =
+  const manualAdmissionSignal = admissionSignal ?? signal;
+  const automaticAdmissionSignal =
     signal && admissionSignal
       ? AbortSignal.any([signal, admissionSignal])
       : (admissionSignal ?? signal);
@@ -188,13 +189,14 @@ export async function runCommit(
         sha,
         event?.branch,
         branch,
-        claimSignal,
+        manualAdmissionSignal,
       );
     } catch (error) {
-      if (claimSignal?.aborted) return false;
+      if (manualAdmissionSignal?.aborted) return false;
       throw error;
     }
   }
+  const claimSignal = manualTrigger ? manualAdmissionSignal : automaticAdmissionSignal;
   const hasTriggers =
     (config.triggers?.length ?? 0) > 0 || config.jobs.some((job) => job.triggers !== undefined);
   const selected =
@@ -395,7 +397,7 @@ async function runCommitPartitionWithSlot(
       legacyScopes,
       acceptManualTrigger,
       admissionSignal,
-      signal,
+      acceptManualTrigger ? undefined : signal,
     );
   } catch (error) {
     if (admissionSignal?.aborted) return false;

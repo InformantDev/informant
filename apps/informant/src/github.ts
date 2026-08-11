@@ -17,6 +17,7 @@ export const COMMENT_CLAIM_NAME = "Informant CI / comment";
 export const MANUAL_TRIGGER_REQUEST_NAME = "Informant CI / trigger";
 export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
+const CLAIM_CLEANUP_TIMEOUT_MS = 5_000;
 const rateLimitGates = new Map<string, number>();
 const RETRYABLE_CHECK_CONCLUSIONS = new Set([
   "action_required",
@@ -1121,77 +1122,93 @@ export class GitHubClient {
       context ? manualTriggerRequestMetadata({ context, jobs: [] }) : undefined,
       signal,
     );
-    const election = await this.checks(repository, sha, name, executionSignal);
-    const ignoredCompletions = new Set([
-      ...stale.map((check) => check.id),
-      ...(requested ? historicalCompleted : []),
-    ]);
-    const completed = election.some(
-      (check) =>
-        check.status === "completed" && matchesScope(check) && !ignoredCompletions.has(check.id),
-    );
-    const contenders = election
-      .filter(
+    try {
+      const election = await this.checks(repository, sha, name, executionSignal);
+      const ignoredCompletions = new Set([
+        ...stale.map((check) => check.id),
+        ...(requested ? historicalCompleted : []),
+      ]);
+      const completed = election.some(
         (check) =>
-          matchesScope(check) || (acceptsLegacyCommit && !check.external_id?.includes(":event:")),
-      )
-      .filter((check) => check.status === "in_progress")
-      .sort((a, b) => {
-        const legacyOrder =
-          Number(matchesLegacyManualScope(b)) - Number(matchesLegacyManualScope(a));
-        return legacyOrder || a.id - b.id;
-      });
-    if (!completed && contenders[0]?.id === candidate.id) {
-      const jobRequests = pendingRequests.map(requestedJobsFor);
-      const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
-        ? []
-        : [...new Set(jobRequests.flat())];
-      // GitHub's polling API does not expose whether a queued failed suite was
-      // rerequested as "all" or "failed". Prefer retrying its unsuccessful and
-      // incomplete jobs; explicit Informant requests still support all jobs.
-      if (suiteRerun && failedRerunJobs.length > 0) requestedJobs.push(...failedRerunJobs);
-      if (eligible) {
-        const supported = requestedJobs.filter((job) => eligible.has(job));
-        requestedJobs.splice(0, requestedJobs.length, ...supported);
-      }
-      await Promise.all(
-        pendingRequests.map((check) =>
-          this.updateCheck(
-            repository,
-            check.id,
-            {
-              status: "completed",
-              conclusion: "neutral",
-              title: "Request accepted",
-              summary: `Build request accepted by ${hostname()}.`,
-              text: check.output?.text,
-            },
-            executionSignal,
-          ),
-        ),
+          check.status === "completed" && matchesScope(check) && !ignoredCompletions.has(check.id),
       );
-      return {
-        check: candidate,
-        requestedJobs,
-        manualTrigger,
-        manualTriggerBranch: context?.branch,
-        manualTriggerLabel: context?.label,
-        originalPullRequest,
-      };
-    }
+      const contenders = election
+        .filter(
+          (check) =>
+            matchesScope(check) || (acceptsLegacyCommit && !check.external_id?.includes(":event:")),
+        )
+        .filter((check) => check.status === "in_progress")
+        .sort((a, b) => {
+          const legacyOrder =
+            Number(matchesLegacyManualScope(b)) - Number(matchesLegacyManualScope(a));
+          return legacyOrder || a.id - b.id;
+        });
+      if (!completed && contenders[0]?.id === candidate.id) {
+        const jobRequests = pendingRequests.map(requestedJobsFor);
+        const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
+          ? []
+          : [...new Set(jobRequests.flat())];
+        // GitHub's polling API does not expose whether a queued failed suite was
+        // rerequested as "all" or "failed". Prefer retrying its unsuccessful and
+        // incomplete jobs; explicit Informant requests still support all jobs.
+        if (suiteRerun && failedRerunJobs.length > 0) requestedJobs.push(...failedRerunJobs);
+        if (eligible) {
+          const supported = requestedJobs.filter((job) => eligible.has(job));
+          requestedJobs.splice(0, requestedJobs.length, ...supported);
+        }
+        await Promise.all(
+          pendingRequests.map((check) =>
+            this.updateCheck(
+              repository,
+              check.id,
+              {
+                status: "completed",
+                conclusion: "neutral",
+                title: "Request accepted",
+                summary: `Build request accepted by ${hostname()}.`,
+                text: check.output?.text,
+              },
+              executionSignal,
+            ),
+          ),
+        );
+        return {
+          check: candidate,
+          requestedJobs,
+          manualTrigger,
+          manualTriggerBranch: context?.branch,
+          manualTriggerLabel: context?.label,
+          originalPullRequest,
+        };
+      }
 
-    await this.updateCheck(
-      repository,
-      candidate.id,
-      {
-        status: "completed",
-        conclusion: "cancelled",
-        title: "Claim lost",
-        summary: "Another Informant machine claimed this commit first.",
-        text: candidate.output?.text,
-      },
-      executionSignal,
-    );
-    return completed ? undefined : { requestedJobs: [], manualTrigger, retry: true };
+      await this.updateCheck(
+        repository,
+        candidate.id,
+        {
+          status: "completed",
+          conclusion: "cancelled",
+          title: "Claim lost",
+          summary: "Another Informant machine claimed this commit first.",
+          text: candidate.output?.text,
+        },
+        executionSignal,
+      );
+      return completed ? undefined : { requestedJobs: [], manualTrigger, retry: true };
+    } catch (error) {
+      await this.updateCheck(
+        repository,
+        candidate.id,
+        {
+          status: "completed",
+          conclusion: "cancelled",
+          title: "Claim interrupted",
+          summary: "The worker stopped before claim election completed.",
+          text: candidate.output?.text,
+        },
+        AbortSignal.timeout(CLAIM_CLEANUP_TIMEOUT_MS),
+      ).catch(() => undefined);
+      throw error;
+    }
   }
 }

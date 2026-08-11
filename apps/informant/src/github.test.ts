@@ -133,12 +133,21 @@ test("suite rerun detection forwards its cancellation signal", async () => {
 test("post-claim election ignores admission cancellation but honors forced shutdown", async () => {
   let reads = 0;
   let candidateSignal: AbortSignal | null | undefined;
+  let cleanupSignal: AbortSignal | null | undefined;
+  let cleanupBody:
+    | { status?: string; conclusion?: string; output?: { title?: string } }
+    | undefined;
   let electionSignal: AbortSignal | null | undefined;
   let enterElection!: () => void;
   const enteredElection = new Promise<void>((resolve) => {
     enterElection = resolve;
   });
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "PATCH") {
+      cleanupSignal = init.signal;
+      cleanupBody = JSON.parse(String(init.body));
+      return Response.json({ id: 1, name: "Informant CI", status: "completed" });
+    }
     if (init?.method === "POST") {
       candidateSignal = init.signal;
       return Response.json({
@@ -187,6 +196,13 @@ test("post-claim election ignores admission cancellation but honors forced shutd
   execution.abort("Graceful worker shutdown timed out.");
 
   expect(await pending.catch((error) => error)).toBe("Graceful worker shutdown timed out.");
+  expect(cleanupSignal).not.toBe(admission.signal);
+  expect(cleanupSignal).not.toBe(execution.signal);
+  expect(cleanupBody).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+    output: { title: "Claim interrupted" },
+  });
 });
 
 test("candidate creation honors admission cancellation", async () => {

@@ -396,6 +396,49 @@ describe("runCommit", () => {
     expect(execution.signal.aborted).toBe(false);
   });
 
+  test("preserves a pending manual request when its automatic lane is superseded", async () => {
+    const context = harness();
+    const enteredPreflight = deferred<void>();
+    const releasePreflight = deferred<void>();
+    const execution = new AbortController();
+    const admission = new AbortController();
+    let preflightSignal: AbortSignal | undefined;
+    let claimAdmissionSignal: AbortSignal | undefined;
+    let claimExecutionSignal: AbortSignal | undefined;
+    context.github.hasPendingManualTrigger = async (...args) => {
+      preflightSignal = args[4];
+      enteredPreflight.resolve();
+      await releasePreflight.promise;
+      return true;
+    };
+    context.github.claim = async (...args) => {
+      claimAdmissionSignal = args[8];
+      claimExecutionSignal = args[9];
+      return undefined;
+    };
+
+    const build = runCommit(
+      context.github,
+      repository,
+      "manual-sha",
+      "feature",
+      config,
+      context.dependencies,
+      { type: "commit", id: "branch:feature:manual-sha", branch: "feature" },
+      execution.signal,
+      admission.signal,
+    );
+    await enteredPreflight.promise;
+    execution.abort("Superseded by feature@new-sha.");
+    releasePreflight.resolve();
+
+    expect(await build).toBeUndefined();
+    expect(preflightSignal).toBe(admission.signal);
+    expect(claimAdmissionSignal).toBe(admission.signal);
+    expect(claimExecutionSignal).toBeUndefined();
+    expect(admission.signal.aborted).toBe(false);
+  });
+
   test("drops superseded automatic suites while they wait for a run slot", async () => {
     const first = harness();
     const superseded = harness();
