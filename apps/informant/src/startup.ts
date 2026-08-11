@@ -330,9 +330,37 @@ export async function updateInformant(
     writeStartupService?: (environment: Record<string, string>) => Promise<unknown>;
   } = {},
 ): Promise<{ restarted: boolean }> {
-  if ((options.platform ?? process.platform) !== "darwin")
-    throw new Error("Homebrew updates are supported only on macOS");
+  const currentPlatform = options.platform ?? process.platform;
+  if (currentPlatform !== "darwin" && currentPlatform !== "linux") {
+    throw new Error("Homebrew updates are supported only on macOS and Linux");
+  }
   const run = options.command ?? command;
+  if (currentPlatform === "linux") {
+    const initialService = await run([
+      "systemctl",
+      "--user",
+      "is-active",
+      "--quiet",
+      "informant.service",
+    ]);
+    const active = initialService.exitCode === 0;
+    const upgraded = await run(["brew", "upgrade", "informantdev/tap/informant"], {
+      onOutput: options.onOutput,
+    });
+    if (upgraded.exitCode !== 0) {
+      throw new Error(
+        `could not update Informant with Homebrew: ${upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
+      );
+    }
+    if (!active) return { restarted: false };
+    const restarted = await run(["systemctl", "--user", "restart", "informant.service"]);
+    if (restarted.exitCode !== 0) {
+      throw new Error(
+        `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,
+      );
+    }
+    return { restarted: true };
+  }
   const domain = launchDomain(options.uid);
   const service = `${domain}/${LABEL}`;
   const initialService = await run(["launchctl", "print", service]);

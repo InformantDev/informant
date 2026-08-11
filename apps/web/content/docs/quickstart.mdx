@@ -7,33 +7,35 @@ description: Put a Linux or macOS machine on CI duty in a few minutes.
 
 - Apple Silicon macOS 13 or newer; Apple Container jobs require macOS 26 or newer
 - Or Debian/Ubuntu/Fedora/RHEL Linux with rootless Podman and cgroups v2
-- Git and GitHub CLI; Homebrew for the documented macOS installation
+- Git and GitHub CLI; Homebrew or `curl` for the supported installation paths
 - Optional but recommended: Tailscale with Funnel enabled for webhook-driven multi-machine workers
 
 ## Install Informant
 
-On macOS, install the standalone Informant binary from its Homebrew tap and GitHub CLI:
+On macOS or Linux, Homebrew installs the standalone Informant binary and GitHub CLI:
 
 ```bash
 brew install informantdev/tap/informant
-brew install gh
 gh auth login
 informant --version
 ```
 
-On Linux, install Informant separately before running setup. The repository currently provides a
-standalone binary build path from a source checkout with Bun installed:
+On Linux without Homebrew, use the checksum-verifying installer, then install
+[GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md) through your distribution:
 
 ```bash
-bun install
-bun run --cwd apps/informant build:binary
-sudo install -m 0755 apps/informant/dist/informant /usr/local/bin/informant
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/InformantDev/informant/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+gh auth login
 informant --version
 ```
 
-`informant setup` can install the Podman packages described below; it does not install Informant.
-Install GitHub CLI through the distribution's package instructions and authenticate with
-`gh auth login`.
+The installer selects x86-64 or ARM64 from the latest GitHub Release, verifies `SHA256SUMS`, and
+installs to `~/.local/bin` without administrator privileges. Set `INFORMANT_INSTALL_DIR` to choose a
+different directory or `INFORMANT_VERSION=0.1.2` to install a specific release. Re-run the installer
+to update a direct installation. `informant setup` can install the Podman packages described below;
+it does not install GitHub CLI.
 
 ## Create the GitHub App
 

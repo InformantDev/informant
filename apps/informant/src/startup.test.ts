@@ -196,6 +196,53 @@ describe("startup service", () => {
     ]);
   });
 
+  test("updates through Homebrew and restarts an active Linux service", async () => {
+    const invocations: string[][] = [];
+    const updated = await updateInformant({
+      platform: "linux",
+      command: async (argv) => {
+        invocations.push(argv);
+        return result();
+      },
+    });
+
+    expect(updated).toEqual({ restarted: true });
+    expect(invocations).toEqual([
+      ["systemctl", "--user", "is-active", "--quiet", "informant.service"],
+      ["brew", "upgrade", "informantdev/tap/informant"],
+      ["systemctl", "--user", "restart", "informant.service"],
+    ]);
+  });
+
+  test("does not start an inactive Linux service after updating", async () => {
+    const invocations: string[][] = [];
+    const updated = await updateInformant({
+      platform: "linux",
+      command: async (argv) => {
+        invocations.push(argv);
+        return argv[2] === "is-active" ? result(3) : result();
+      },
+    });
+
+    expect(updated).toEqual({ restarted: false });
+    expect(invocations).toEqual([
+      ["systemctl", "--user", "is-active", "--quiet", "informant.service"],
+      ["brew", "upgrade", "informantdev/tap/informant"],
+    ]);
+  });
+
+  test("reports Linux service restart failures after updating", async () => {
+    await expect(
+      updateInformant({
+        platform: "linux",
+        command: async (argv) =>
+          argv[2] === "restart" ? result(1, "user manager unavailable") : result(),
+      }),
+    ).rejects.toThrow(
+      "Informant was updated but its service could not be restarted: user manager unavailable",
+    );
+  });
+
   test("starts and verifies a loaded service that temporarily has no worker PID", async () => {
     const invocations: string[][] = [];
     let serviceChecks = 0;

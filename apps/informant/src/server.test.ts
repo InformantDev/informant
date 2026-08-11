@@ -498,6 +498,26 @@ describe("serve polling orchestration", () => {
     expect(launched).toEqual(["main"]);
   });
 
+  test("offers open pull requests before branch work", async () => {
+    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const launched: string[] = [];
+    const deps = dependencies(
+      github({
+        branches: async () => [{ name: "main", sha: "main-sha" }],
+        pullRequests: async () => [pullRequest],
+      }),
+      state,
+      async (_github, _repository, _sha, branch) => {
+        launched.push(branch);
+        return undefined;
+      },
+    );
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(launched).toEqual(["pull/7", "main"]);
+  });
+
   test("reconciles only configured caches and prepared runtime jobs", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
     const deps = dependencies(github({}), state, async () => undefined);
@@ -1024,9 +1044,10 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal?.reason).toBe("Graceful worker shutdown timed out.");
   });
 
-  test("interrupts the polling interval and drains automatic runs on shutdown", async () => {
+  test("cancels admission while draining claimed automatic runs on shutdown", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;
+    let receivedAdmissionSignal: AbortSignal | undefined;
     let releaseSleep!: () => void;
     const sleepStarted = new Promise<void>((resolve) => {
       releaseSleep = resolve;
@@ -1037,8 +1058,19 @@ describe("serve polling orchestration", () => {
       dependencies: dependencies(
         github({ branches: async () => [{ name: "main", sha: "sha" }] }),
         { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
-        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
+        async (
+          _github,
+          _repository,
+          _sha,
+          _branch,
+          _config,
+          _deps,
+          _event,
+          signal,
+          admissionSignal,
+        ) => {
           receivedSignal = signal;
+          receivedAdmissionSignal = admissionSignal;
           return runSettled.promise;
         },
         async () => sleepStarted,
@@ -1047,14 +1079,110 @@ describe("serve polling orchestration", () => {
 
     await Promise.resolve();
     while (!receivedSignal) await Promise.resolve();
-    outer.abort();
-    await Promise.resolve();
+    outer.abort("Worker shutdown requested.");
+    while (!receivedAdmissionSignal?.aborted) await Promise.resolve();
     expect(receivedSignal.aborted).toBe(false);
+    expect(receivedAdmissionSignal?.aborted).toBe(true);
+    expect(receivedAdmissionSignal?.reason).toBe("Worker shutdown requested.");
     runSettled.resolve(undefined);
     await server;
     releaseSleep();
 
     expect(receivedSignal.aborted).toBe(false);
+  });
+
+  test("cancels admission immediately while the poll loop is blocked", async () => {
+    const outer = new AbortController();
+    const commentsStarted = deferred<void>();
+    const releaseComments = deferred<void>();
+    const admissionAborted = deferred<void>();
+    let receivedAdmissionSignal: AbortSignal | undefined;
+    const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
+    client.pullRequestComments = async () => {
+      commentsStarted.resolve();
+      await releaseComments.promise;
+      return [];
+    };
+    const server = serve(repository, {
+      signal: outer.signal,
+      dependencies: dependencies(
+        client,
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
+        async (
+          _github,
+          _repository,
+          _sha,
+          _branch,
+          _config,
+          _deps,
+          _event,
+          _signal,
+          admissionSignal,
+        ) => {
+          receivedAdmissionSignal = admissionSignal;
+          admissionSignal?.addEventListener("abort", () => admissionAborted.resolve(), {
+            once: true,
+          });
+          return admissionAborted.promise.then(() => false);
+        },
+      ),
+    });
+
+    await commentsStarted.promise;
+    outer.abort("Worker shutdown requested.");
+    await admissionAborted.promise;
+
+    expect(receivedAdmissionSignal?.aborted).toBe(true);
+    expect(receivedAdmissionSignal?.reason).toBe("Worker shutdown requested.");
+    releaseComments.resolve();
+    await server;
+  });
+
+  test("cancels admission when shutdown interrupts --once draining", async () => {
+    const outer = new AbortController();
+    const enteredRun = deferred<void>();
+    let receivedSignal: AbortSignal | undefined;
+    let receivedAdmissionSignal: AbortSignal | undefined;
+    const server = serve(repository, {
+      once: true,
+      signal: outer.signal,
+      dependencies: dependencies(
+        github({ branches: async () => [{ name: "main", sha: "sha" }] }),
+        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        async (
+          _github,
+          _repository,
+          _sha,
+          _branch,
+          _config,
+          _deps,
+          _event,
+          signal,
+          admissionSignal,
+        ) => {
+          receivedSignal = signal;
+          receivedAdmissionSignal = admissionSignal;
+          enteredRun.resolve();
+          return new Promise((resolve) => {
+            if (admissionSignal?.aborted) resolve(false);
+            else admissionSignal?.addEventListener("abort", () => resolve(false), { once: true });
+          });
+        },
+      ),
+    });
+
+    await enteredRun.promise;
+    outer.abort("Worker shutdown requested.");
+    await server;
+
+    expect(receivedSignal?.aborted).toBe(false);
+    expect(receivedAdmissionSignal?.aborted).toBe(true);
+    expect(receivedAdmissionSignal?.reason).toBe("Worker shutdown requested.");
   });
 
   test("passes the shutdown signal to GitHub polling requests", async () => {
