@@ -57,6 +57,14 @@ bun run typecheck
 bun run docs:dev
 ```
 
+## Releases
+
+Tags matching `v*` run the Informant `release` job. It builds and smoke-tests the standalone Linux
+binaries, publishes all four platform binaries with checksums and a generated Homebrew formula, and
+opens the formula update PR in `InformantDev/homebrew-tap`. The release worker must provide
+`INFORMANT_SECRET_RELEASE_GITHUB_TOKEN` with release write access to this repository and contents and
+pull-request write access to the tap.
+
 ## License
 
 [Apache License 2.0](LICENSE).
