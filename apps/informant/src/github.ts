@@ -607,13 +607,16 @@ export class GitHubClient {
   private async jobChecksByClaim(
     repository: Repository,
     sha: string,
+    signal?: AbortSignal,
   ): Promise<Map<number, CheckRun[]>> {
-    await this.authenticate();
+    await this.authenticate(signal);
     const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
     const checks: CheckRun[] = [];
     for (let page = 1; ; page++) {
       const result = await this.api<{ check_runs: CheckRun[] }>(
         `/repos/${repository.fullName}/commits/${sha}/check-runs?filter=all&per_page=100&page=${page}${appFilter}`,
+        {},
+        signal,
       );
       checks.push(...result.check_runs);
       if (result.check_runs.length < 100) break;
@@ -631,8 +634,13 @@ export class GitHubClient {
     return checksByClaim;
   }
 
-  async jobChecks(repository: Repository, sha: string, claimId: number): Promise<CheckRun[]> {
-    return (await this.jobChecksByClaim(repository, sha)).get(claimId) ?? [];
+  async jobChecks(
+    repository: Repository,
+    sha: string,
+    claimId: number,
+    signal?: AbortSignal,
+  ): Promise<CheckRun[]> {
+    return (await this.jobChecksByClaim(repository, sha, signal)).get(claimId) ?? [];
   }
 
   async recoverInterruptedCheck(
@@ -681,11 +689,14 @@ export class GitHubClient {
     repository: Repository,
     sha: string,
     name = CLAIM_NAME,
+    signal?: AbortSignal,
   ): Promise<string | undefined> {
-    await this.authenticate();
+    await this.authenticate(signal);
     const appFilter = this.appId ? `&app_id=${encodeURIComponent(this.appId)}` : "";
     const result = await this.api<{ check_suites: Array<{ status?: string | null }> }>(
       `/repos/${repository.fullName}/commits/${sha}/check-suites?check_name=${encodeURIComponent(name)}&per_page=1${appFilter}`,
+      {},
+      signal,
     );
     return result.check_suites[0]?.status ?? undefined;
   }
@@ -764,26 +775,31 @@ export class GitHubClient {
     requestedJobs: string[] = [],
     name = CLAIM_NAME,
     metadata?: string,
+    signal?: AbortSignal,
   ): Promise<CheckRun> {
     const requestId =
       status === "queued" && metadata === undefined
         ? `${externalId}:jobs:${Buffer.from(JSON.stringify(requestedJobs)).toString("base64url")}`
         : externalId;
-    const check = await this.api<CheckRun>(`/repos/${repository.fullName}/check-runs`, {
-      method: "POST",
-      body: JSON.stringify({
-        name: githubText(name),
-        head_sha: sha,
-        status,
-        external_id: requestId,
-        started_at: status === "in_progress" ? new Date().toISOString() : undefined,
-        output: {
-          title: "Informant CI",
-          summary: githubText(`Claimed by ${hostname()}`),
-          text: metadata,
-        },
-      }),
-    });
+    const check = await this.api<CheckRun>(
+      `/repos/${repository.fullName}/check-runs`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name: githubText(name),
+          head_sha: sha,
+          status,
+          external_id: requestId,
+          started_at: status === "in_progress" ? new Date().toISOString() : undefined,
+          output: {
+            title: "Informant CI",
+            summary: githubText(`Claimed by ${hostname()}`),
+            text: metadata,
+          },
+        }),
+      },
+      signal,
+    );
     return metadata ? { ...check, output: { ...check.output, text: metadata } } : check;
   }
 
@@ -837,21 +853,26 @@ export class GitHubClient {
       summary: string;
       text?: string;
     },
+    signal?: AbortSignal,
   ): Promise<CheckRun> {
-    return this.api(`/repos/${repository.fullName}/check-runs/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        status: values.status,
-        conclusion: values.conclusion,
-        started_at: values.status === "in_progress" ? new Date().toISOString() : undefined,
-        completed_at: values.status === "completed" ? new Date().toISOString() : undefined,
-        output: {
-          title: githubText(values.title),
-          summary: githubText(values.summary),
-          text: outputTail(values.text),
-        },
-      }),
-    });
+    return this.api(
+      `/repos/${repository.fullName}/check-runs/${id}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          status: values.status,
+          conclusion: values.conclusion,
+          started_at: values.status === "in_progress" ? new Date().toISOString() : undefined,
+          completed_at: values.status === "completed" ? new Date().toISOString() : undefined,
+          output: {
+            title: githubText(values.title),
+            summary: githubText(values.summary),
+            text: outputTail(values.text),
+          },
+        }),
+      },
+      signal,
+    );
   }
 
   async claim(
@@ -866,13 +887,14 @@ export class GitHubClient {
     acceptManualTrigger = true,
     legacyScopes: string[] = [],
     requireManualTrigger = false,
+    signal?: AbortSignal,
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
-    const initialChecks = await this.checks(repository, sha, initialName);
+    const initialChecks = await this.checks(repository, sha, initialName, signal);
     const manualRequestChecks =
       event.type === "comment" || !acceptManualTrigger
         ? []
-        : await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME);
+        : await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME, signal);
     const allRequestedChecks =
       event.type === "comment" || !acceptManualTrigger
         ? []
@@ -907,7 +929,7 @@ export class GitHubClient {
       event.type !== "comment" &&
       allRequestedChecks.length === 0 &&
       initialChecks.some((check) => check.status === "completed") &&
-      (await this.checkSuiteStatus(repository, sha, initialName)) === "queued";
+      (await this.checkSuiteStatus(repository, sha, initialName, signal)) === "queued";
     const previousAggregates = suiteRerun
       ? initialChecks
           .filter((check) => check.status === "completed" && check.conclusion !== "neutral")
@@ -932,7 +954,7 @@ export class GitHubClient {
         : undefined;
     const latestRerunJobs = new Map<string, CheckRun>();
     const rerunChecksByClaim = rerunAggregates.length
-      ? await this.jobChecksByClaim(repository, sha)
+      ? await this.jobChecksByClaim(repository, sha, signal)
       : new Map<number, CheckRun[]>();
     for (const aggregate of rerunAggregates) {
       for (const check of rerunChecksByClaim.get(aggregate.id) ?? []) {
@@ -1040,26 +1062,36 @@ export class GitHubClient {
       );
     await Promise.all(
       allStale.map(async (check) => {
-        const jobs = (await this.jobChecks(repository, sha, check.id)).filter(
+        const jobs = (await this.jobChecks(repository, sha, check.id, signal)).filter(
           (job) => job.status !== "completed",
         );
         await Promise.all(
           jobs.map((job) =>
-            this.updateCheck(repository, job.id, {
-              status: "completed",
-              conclusion: "cancelled",
-              title: "Stale worker job",
-              summary: "The worker claim expired before this job completed.",
-            }),
+            this.updateCheck(
+              repository,
+              job.id,
+              {
+                status: "completed",
+                conclusion: "cancelled",
+                title: "Stale worker job",
+                summary: "The worker claim expired before this job completed.",
+              },
+              signal,
+            ),
           ),
         );
-        return this.updateCheck(repository, check.id, {
-          status: "completed",
-          conclusion: "cancelled",
-          title: "Stale worker claim",
-          summary: "The worker did not complete this claim within 24 hours; it may be retried.",
-          text: check.output?.text,
-        });
+        return this.updateCheck(
+          repository,
+          check.id,
+          {
+            status: "completed",
+            conclusion: "cancelled",
+            title: "Stale worker claim",
+            summary: "The worker did not complete this claim within 24 hours; it may be retried.",
+            text: check.output?.text,
+          },
+          signal,
+        );
       }),
     );
     if (active.length > stale.length) return { requestedJobs: [], manualTrigger, retry: true };
@@ -1077,6 +1109,7 @@ export class GitHubClient {
       return undefined;
     }
 
+    signal?.throwIfAborted();
     const candidate = await this.createCheck(
       repository,
       sha,

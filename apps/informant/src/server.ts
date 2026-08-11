@@ -256,6 +256,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const inFlightRuns = new Map<string, Promise<void>>();
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
   const shutdownControllers = new Set<AbortController>();
+  const admissionControllers = new Set<AbortController>();
   const completedComments = new Set<number>();
   const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
@@ -315,6 +316,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     shutdownControllers.clear();
     automaticLanes.clear();
   };
+  const abortAdmissions = () => {
+    for (const controller of admissionControllers) {
+      controller.abort(options.signal?.reason ?? "Worker shutdown requested.");
+    }
+    admissionControllers.clear();
+  };
   const waitForDelay = (milliseconds: number) =>
     waitForAbortableDelay(milliseconds, options.signal, dependencies.sleep);
   const drainRuns = async () => {
@@ -333,6 +340,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
   };
   const drainForShutdown = async () => {
+    abortAdmissions();
     const draining = drainRuns();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<false>((resolve) => {
@@ -567,6 +575,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             return;
           }
           const controller = new AbortController();
+          const admissionController = new AbortController();
+          admissionControllers.add(admissionController);
           if (!("tag" in target)) {
             automaticLanes.set(target.lane, { sha: target.sha, controller });
           }
@@ -582,6 +592,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               id: target.eventId,
             },
             controller.signal,
+            admissionController.signal,
           );
           shutdownControllers.add(controller);
           const run = result
@@ -602,6 +613,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             .finally(() => {
               inFlightRuns.delete(target.eventId);
               shutdownControllers.delete(controller);
+              admissionControllers.delete(admissionController);
               if (
                 !("tag" in target) &&
                 automaticLanes.get(target.lane)?.controller === controller
@@ -694,6 +706,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             return;
           }
           const controller = new AbortController();
+          const admissionController = new AbortController();
+          admissionControllers.add(admissionController);
           const result = executeCommit(
             github,
             repository,
@@ -703,6 +717,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             undefined,
             context,
             controller.signal,
+            admissionController.signal,
           );
           shutdownControllers.add(controller);
           const run = result
@@ -715,6 +730,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             .finally(() => {
               inFlightRuns.delete(eventId);
               shutdownControllers.delete(controller);
+              admissionControllers.delete(admissionController);
               idle();
             });
           inFlightRuns.set(eventId, run);

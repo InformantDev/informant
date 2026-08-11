@@ -947,9 +947,10 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal?.reason).toBe("Graceful worker shutdown timed out.");
   });
 
-  test("interrupts the polling interval and drains automatic runs on shutdown", async () => {
+  test("cancels admission while draining claimed automatic runs on shutdown", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;
+    let receivedAdmissionSignal: AbortSignal | undefined;
     let releaseSleep!: () => void;
     const sleepStarted = new Promise<void>((resolve) => {
       releaseSleep = resolve;
@@ -960,8 +961,19 @@ describe("serve polling orchestration", () => {
       dependencies: dependencies(
         github({ branches: async () => [{ name: "main", sha: "sha" }] }),
         { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
-        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
+        async (
+          _github,
+          _repository,
+          _sha,
+          _branch,
+          _config,
+          _deps,
+          _event,
+          signal,
+          admissionSignal,
+        ) => {
           receivedSignal = signal;
+          receivedAdmissionSignal = admissionSignal;
           return runSettled.promise;
         },
         async () => sleepStarted,
@@ -970,9 +982,11 @@ describe("serve polling orchestration", () => {
 
     await Promise.resolve();
     while (!receivedSignal) await Promise.resolve();
-    outer.abort();
-    await Promise.resolve();
+    outer.abort("Worker shutdown requested.");
+    while (!receivedAdmissionSignal?.aborted) await Promise.resolve();
     expect(receivedSignal.aborted).toBe(false);
+    expect(receivedAdmissionSignal?.aborted).toBe(true);
+    expect(receivedAdmissionSignal?.reason).toBe("Worker shutdown requested.");
     runSettled.resolve(undefined);
     await server;
     releaseSleep();

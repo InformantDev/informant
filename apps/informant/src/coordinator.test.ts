@@ -308,6 +308,92 @@ describe("runCommit", () => {
     expect(second.jobChecks).toEqual(["test"]);
   });
 
+  test("drops unclaimed suites immediately when worker shutdown starts", async () => {
+    const active = harness();
+    const waiting = harness();
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const activeRun = active.dependencies.runInTart;
+    const acquireExecutionSlot = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 });
+    active.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    waiting.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    active.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return activeRun(...args);
+    };
+    let waitingClaims = 0;
+    const waitingClaim = waiting.github.claim.bind(waiting.github);
+    waiting.github.claim = async (...args) => {
+      waitingClaims++;
+      return waitingClaim(...args);
+    };
+    const execution = new AbortController();
+    const admission = new AbortController();
+
+    const activeBuild = runCommit(
+      active.github,
+      repository,
+      "active-sha",
+      "main",
+      config,
+      active.dependencies,
+    );
+    await entered.promise;
+    const waitingBuild = runCommit(
+      waiting.github,
+      repository,
+      "waiting-sha",
+      "feature",
+      config,
+      waiting.dependencies,
+      { type: "commit", id: "branch:feature:waiting-sha", branch: "feature" },
+      execution.signal,
+      admission.signal,
+    );
+    await Bun.sleep(0);
+
+    admission.abort("Worker shutdown requested.");
+
+    expect(await waitingBuild).toBeFalse();
+    expect(waitingClaims).toBe(0);
+    expect(execution.signal.aborted).toBe(false);
+    blocked.resolve();
+    await activeBuild;
+  });
+
+  test("treats an interrupted GitHub claim as unclaimed work", async () => {
+    const context = harness();
+    const enteredClaim = deferred<void>();
+    const execution = new AbortController();
+    const admission = new AbortController();
+    context.github.claim = async (...args) => {
+      const signal = args[8];
+      if (!signal) throw new Error("expected an admission signal");
+      enteredClaim.resolve();
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
+
+    const build = runCommit(
+      context.github,
+      repository,
+      "waiting-sha",
+      "feature",
+      config,
+      context.dependencies,
+      { type: "commit", id: "branch:feature:waiting-sha", branch: "feature" },
+      execution.signal,
+      admission.signal,
+    );
+    await enteredClaim.promise;
+    admission.abort("Worker shutdown requested.");
+
+    expect(await build).toBeFalse();
+    expect(execution.signal.aborted).toBe(false);
+  });
+
   test("drops superseded automatic suites while they wait for a run slot", async () => {
     const first = harness();
     const superseded = harness();
