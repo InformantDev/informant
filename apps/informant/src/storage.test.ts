@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { podmanContainerBackend } from "./container-backend.ts";
 import type { CommandResult } from "./process.ts";
 import {
   allocatedDirectorySizes,
@@ -136,6 +137,43 @@ describe("storage reporting", () => {
     expect(output).toMatch(/Tart VM images\s+unavailable · tart not found/);
     expect(output).toMatch(/Container images\s+unavailable · container not running/);
     expect(output).toContain("excludes unavailable Tart image size and shared container data");
+  });
+
+  test("parses rootless Podman system df records without suggesting global prune", async () => {
+    const report = await collectStorageReport("/tmp/informant-storage-test", {
+      containerBackend: podmanContainerBackend,
+      dataEntries: async () => [],
+      directorySizes: async () => new Map(),
+      fileSystemSpace: async () => ({ availableBytes: 100, totalBytes: 1_000 }),
+      listTartImages: async () => [],
+      runCommand: async (argv) =>
+        argv[2] === "ls"
+          ? result("localhost/informant-prepared-container:0123456789abcdef\n")
+          : result(
+              JSON.stringify([
+                {
+                  Type: "Images",
+                  Total: "3",
+                  Active: "1",
+                  Size: "2.1GB",
+                  Reclaimable: "1.2GB (57%)",
+                  RawSize: 2_100_000_000,
+                  RawReclaimable: 1_200_000_000,
+                },
+                { Type: "Containers", RawSize: 400, RawReclaimable: 300 },
+                { Type: "Local Volumes", RawSize: 200, RawReclaimable: 100 },
+              ]),
+            ),
+    });
+    expect(report.container).toMatchObject({
+      backend: "rootless Podman",
+      preparedCount: 1,
+      imageBytes: 2_100_000_000,
+      reclaimableImageBytes: 1_200_000_000,
+    });
+    const output = formatStorageReport(report);
+    expect(output).toContain("rootless Podman image store");
+    expect(output).not.toContain("podman image prune --all");
   });
 });
 

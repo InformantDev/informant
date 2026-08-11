@@ -2,6 +2,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
 import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./config.ts";
+import { refreshSelectedContainerBackend } from "./container-backend.ts";
 import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
@@ -18,6 +19,8 @@ export interface CoordinatorDependencies {
   runInTart: typeof runInTart;
   readLogTail: (path: string) => Promise<string>;
   housekeepingBarrier?: <T>(callback: () => Promise<T>) => Promise<T>;
+  refreshContainerBackend?: (signal?: AbortSignal) => Promise<boolean>;
+  workerCapabilities?: () => string[];
   acquireExecutionSlot?: AcquireExecutionSlot;
 }
 
@@ -172,9 +175,6 @@ export async function runCommit(
   event?: RunEvent,
   signal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
-  const usesCapabilities = config.jobs.some(
-    (job) => (job.runsOn?.length ?? 0) > 0 || job.runtime?.type === "host",
-  );
   const manualTrigger =
     event?.type === "comment"
       ? false
@@ -185,7 +185,39 @@ export async function runCommit(
     !manualTrigger && event && hasTriggers
       ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
       : config;
-  const capabilities = usesCapabilities ? workerCapabilities() : [];
+  const usesCapabilities = config.jobs.some(
+    (job) =>
+      (job.runsOn?.length ?? 0) > 0 ||
+      job.runtime?.type === "host" ||
+      job.runtime?.type === "container",
+  );
+  const advertisedCapabilities = usesCapabilities
+    ? (dependencies.workerCapabilities ?? workerCapabilities)()
+    : [];
+  const baseCapabilities = advertisedCapabilities.filter(
+    (capability) => capability.toLowerCase() !== "container",
+  );
+  const potentiallyCapable = usesCapabilities
+    ? selectCapableJobs(selected, [...baseCapabilities, "container"])
+    : selected;
+  const needsContainerBackend = potentiallyCapable.jobs.some(
+    (job) => job.runtime?.type === "container",
+  );
+  if (
+    needsContainerBackend &&
+    !(await (dependencies.refreshContainerBackend ?? refreshSelectedContainerBackend)(signal))
+  ) {
+    return false;
+  }
+  const capabilities = usesCapabilities
+    ? [
+        ...baseCapabilities,
+        ...(needsContainerBackend ||
+        advertisedCapabilities.some((capability) => capability.toLowerCase() === "container")
+          ? ["container"]
+          : []),
+      ]
+    : [];
   const untriggeredCapable = usesCapabilities ? selectCapableJobs(config, capabilities) : config;
   const capable = usesCapabilities ? selectCapableJobs(selected, capabilities) : selected;
   let partitions: JobConfig[][];

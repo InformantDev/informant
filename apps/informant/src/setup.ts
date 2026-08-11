@@ -4,6 +4,7 @@ import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import { appleContainerInstalled, ensureAppleContainerSystem } from "./container.ts";
+import { podmanContainerBackend } from "./container-backend.ts";
 import {
   listGitHubCredentials,
   listRepositories,
@@ -28,6 +29,12 @@ interface ContainerSetupOperations {
   arch?: string;
 }
 
+interface PodmanSetupOperations {
+  command?: typeof command;
+  installPackages?: (commands: string[][]) => Promise<void>;
+  osRelease?: string;
+}
+
 async function installPackage(path: string): Promise<void> {
   const process = Bun.spawn(["sudo", "/usr/sbin/installer", "-pkg", path, "-target", "/"], {
     stdin: "inherit",
@@ -37,8 +44,61 @@ async function installPackage(path: string): Promise<void> {
   if ((await process.exited) !== 0) throw new Error("Apple Container installer failed");
 }
 
+export async function installPrivilegedPackages(
+  commands: string[][],
+  operations: {
+    uid?: number;
+    run?: (argv: string[]) => Promise<number>;
+  } = {},
+): Promise<void> {
+  const run =
+    operations.run ??
+    (async (argv: string[]) => {
+      const child = Bun.spawn(argv, {
+        stdin: "inherit",
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+      return child.exited;
+    });
+  const uid = operations.uid ?? process.getuid?.();
+  for (const argv of commands) {
+    if ((await run(uid === 0 ? argv : ["sudo", ...argv])) !== 0)
+      throw new Error(`${argv[0]} failed to install Podman`);
+  }
+}
+
+function podmanInstallCommands(osRelease: string): string[][] {
+  const id = osRelease
+    .match(/^ID=(?:"([^"]+)"|([^\n]+))$/m)
+    ?.slice(1)
+    .find(Boolean)
+    ?.trim();
+  const like =
+    osRelease
+      .match(/^ID_LIKE=(?:"([^"]+)"|([^\n]+))$/m)
+      ?.slice(1)
+      .find(Boolean) ?? "";
+  const family = `${id ?? ""} ${like}`.toLowerCase();
+  const packages = ["podman", "uidmap", "slirp4netns", "fuse-overlayfs"];
+  if (/(debian|ubuntu)/.test(family)) {
+    return [
+      ["apt-get", "update"],
+      ["apt-get", "install", "-y", ...packages],
+    ];
+  }
+  if (/(fedora|rhel|centos|rocky|almalinux)/.test(family)) {
+    return [["dnf", "install", "-y", "podman", "shadow-utils", "slirp4netns", "fuse-overlayfs"]];
+  }
+  throw new Error(
+    "automatic Podman installation supports Debian/Ubuntu and Fedora/RHEL; install rootless Podman with your package manager",
+  );
+}
+
 function commandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
-  return new Error(`${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+  return new Error(
+    `${action}: ${result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.exitCode}`}`,
+  );
 }
 
 export async function prepareAppleContainer(
@@ -97,6 +157,55 @@ export async function prepareAppleContainer(
     throw commandError("Apple Container could not run the Informant default image", smokeTest);
 }
 
+export async function preparePodman(operations: PodmanSetupOperations = {}): Promise<void> {
+  const runCommand = operations.command ?? command;
+  const installed = await runCommand(["podman", "--version"]);
+  if (installed.exitCode !== 0) {
+    const source = operations.osRelease ?? (await readFile("/etc/os-release", "utf8"));
+    await (operations.installPackages ?? installPrivilegedPackages)(podmanInstallCommands(source));
+  }
+  await podmanContainerBackend.initialize(runCommand);
+  const workspace = await mkdtemp(join(tmpdir(), "informant-podman-smoke-"));
+  const marker = join(workspace, "informant-smoke-test");
+  try {
+    const smokeTest = await runCommand(
+      [
+        "podman",
+        "run",
+        "--rm",
+        "--init",
+        "--ulimit",
+        "nofile=65536:65536",
+        "--workdir",
+        "/workspace",
+        "--user",
+        "0:0",
+        "--cpus",
+        "1",
+        "--memory",
+        "256M",
+        "--security-opt",
+        "no-new-privileges",
+        "--volume",
+        `${workspace}:/workspace:Z`,
+        "--entrypoint",
+        "/bin/sh",
+        "docker.io/oven/bun:1",
+        "-lc",
+        "bun --version && touch /workspace/informant-smoke-test",
+      ],
+      { timeoutMs: 120_000 },
+    );
+    if (smokeTest.exitCode !== 0 || smokeTest.timedOut)
+      throw commandError("rootless Podman could not run the Informant default image", smokeTest);
+    if (!(await Bun.file(marker).exists())) {
+      throw new Error("rootless Podman could not write to a bind-mounted workspace");
+    }
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
+
 async function setupAppleContainer(): Promise<void> {
   if (!(await appleContainerInstalled())) {
     const install = await confirm({
@@ -108,6 +217,20 @@ async function setupAppleContainer(): Promise<void> {
   console.log("Preparing Apple Container…");
   await prepareAppleContainer();
   console.log("Apple Container is ready.");
+}
+
+async function setupPodman(): Promise<void> {
+  const installed = (await command(["podman", "--version"])).exitCode === 0;
+  if (!installed) {
+    const install = await confirm({
+      message: "Install rootless Podman for container jobs? (requires administrator privileges)",
+      initialValue: true,
+    });
+    if (isCancel(install) || !install) return;
+  }
+  console.log("Preparing rootless Podman…");
+  await preparePodman();
+  console.log("Rootless Podman is ready.");
 }
 
 interface ManifestApp {
@@ -192,7 +315,7 @@ async function storeInstallation(
 }
 
 async function openBrowser(url: string): Promise<void> {
-  const result = await command(["open", url]);
+  const result = await command([platform() === "linux" ? "xdg-open" : "open", url]);
   if (result.exitCode !== 0) throw new Error(`could not open browser: ${result.stderr}`);
 }
 
@@ -306,6 +429,7 @@ async function finishSetup(account: string): Promise<void> {
 export async function setup(): Promise<void> {
   intro("Informant setup");
   if (platform() === "darwin" && arch() === "arm64") await setupAppleContainer();
+  if (platform() === "linux") await setupPodman();
   const setupType = await select({
     message: "How should this machine be configured?",
     options: [

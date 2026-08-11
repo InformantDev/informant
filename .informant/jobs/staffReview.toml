@@ -1,4 +1,5 @@
 name = "Staff Review"
+runs_on = ["container"]
 optional = true
 command = """
 set -eu
@@ -41,7 +42,7 @@ staff review post
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
-container = { image = "oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
+container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
