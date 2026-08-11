@@ -415,6 +415,36 @@ function parseHost(value: unknown, label: string): JobRuntime {
   return { type: "host" };
 }
 
+function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  const mounts = value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      throw new Error(`${label}[${index}] must be a table`);
+    const raw = item as Record<string, unknown>;
+    if (Object.keys(raw).some((key) => !["source", "target", "write_back"].includes(key)))
+      throw new Error(`${label}[${index}] contains an unsupported field`);
+    if (typeof raw.source !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(raw.source))
+      throw new Error(`${label}[${index}].source must be an allowed mount name`);
+    if (
+      typeof raw.target !== "string" ||
+      !raw.target.startsWith("/") ||
+      raw.target.split("/").includes("..") ||
+      raw.target.includes(":")
+    )
+      throw new Error(`${label}[${index}].target must be an absolute container directory`);
+    const writeBack = raw.write_back ?? false;
+    if (typeof writeBack !== "boolean")
+      throw new Error(`${label}[${index}].write_back must be a boolean`);
+    return { source: raw.source, target: raw.target, writeBack };
+  });
+  if (new Set(mounts.map((mount) => mount.source)).size !== mounts.length)
+    throw new Error(`${label} must not contain duplicate sources`);
+  if (new Set(mounts.map((mount) => mount.target)).size !== mounts.length)
+    throw new Error(`${label} must not contain duplicate targets`);
+  return mounts;
+}
+
 export function parseConfig(source: string, label = CONFIG_FILE): InformantConfig {
   const raw = Bun.TOML.parse(source) as Record<string, unknown>;
   if (raw.version !== 1) {
@@ -475,6 +505,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         `jobs[${index}].secrets contains ${conflictingSecret}, which is also set in environment`,
       );
     }
+    const mounts = parseMounts(job.mounts, `jobs[${index}].mounts`);
     const timeoutMinutes = Number(job.timeout_minutes ?? defaultTimeoutMinutes);
     if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
       throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
@@ -505,6 +536,9 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     if (runtime.type === "host" && (cache?.length ?? 0) > 0) {
       throw new Error(`jobs[${index}].cache is not supported for host jobs`);
     }
+    if ((mounts?.length ?? 0) > 0 && runtime.type !== "container") {
+      throw new Error(`jobs[${index}].mounts is supported only for container jobs`);
+    }
     const runsOn = job.runs_on ?? (runtime.type === "host" ? undefined : ["darwin", "arm64"]);
     if (runtime.type === "host" && runsOn === undefined) {
       throw new Error(`jobs[${index}].runs_on is required for host jobs`);
@@ -532,6 +566,7 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
         : undefined,
       environment,
       secrets,
+      ...(mounts === undefined ? {} : { mounts }),
       triggers:
         job.triggers === undefined
           ? topTriggers
