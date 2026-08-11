@@ -19,6 +19,11 @@ export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
 const CLAIM_CLEANUP_TIMEOUT_MS = 5_000;
 const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
+const RETRYABLE_CLAIM_TITLES = new Set([
+  INTERRUPTED_CLAIM_TITLE,
+  "Claim lost",
+  "Stale worker claim",
+]);
 const rateLimitGates = new Map<string, number>();
 const RETRYABLE_CHECK_CONCLUSIONS = new Set([
   "action_required",
@@ -1050,13 +1055,13 @@ export class GitHubClient {
     const historicalCompleted = new Set(
       existing.filter((check) => check.status === "completed").map((check) => check.id),
     );
-    const interruptedClaims = new Set(
+    const retryableClaims = new Set(
       existing
         .filter(
           (check) =>
             check.status === "completed" &&
             check.conclusion === "cancelled" &&
-            check.output?.title === INTERRUPTED_CLAIM_TITLE,
+            RETRYABLE_CLAIM_TITLES.has(check.output?.title ?? ""),
         )
         .map((check) => check.id),
     );
@@ -1075,7 +1080,7 @@ export class GitHubClient {
       );
     await Promise.all(
       allStale.map(async (check) => {
-        const jobs = (await this.jobChecks(repository, sha, check.id, signal)).filter(
+        const jobs = (await this.jobChecks(repository, sha, check.id, executionSignal)).filter(
           (job) => job.status !== "completed",
         );
         await Promise.all(
@@ -1089,7 +1094,7 @@ export class GitHubClient {
                 title: "Stale worker job",
                 summary: "The worker claim expired before this job completed.",
               },
-              signal,
+              executionSignal,
             ),
           ),
         );
@@ -1103,7 +1108,7 @@ export class GitHubClient {
             summary: "The worker did not complete this claim within 24 hours; it may be retried.",
             text: check.output?.text,
           },
-          signal,
+          executionSignal,
         );
       }),
     );
@@ -1117,7 +1122,7 @@ export class GitHubClient {
     if (
       !requested &&
       stale.length === 0 &&
-      existing.some((check) => check.status === "completed" && !interruptedClaims.has(check.id))
+      existing.some((check) => check.status === "completed" && !retryableClaims.has(check.id))
     ) {
       return undefined;
     }
@@ -1143,7 +1148,7 @@ export class GitHubClient {
       const election = await this.checks(repository, sha, name, executionSignal);
       const ignoredCompletions = new Set([
         ...stale.map((check) => check.id),
-        ...interruptedClaims,
+        ...retryableClaims,
         ...(requested ? historicalCompleted : []),
       ]);
       const completed = election.some(

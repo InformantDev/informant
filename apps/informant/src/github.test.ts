@@ -332,21 +332,82 @@ test("uncertain candidate creation is reconciled after forced shutdown", async (
   });
 });
 
-test("interrupted claims do not suppress a later retry", async () => {
-  const interrupted: CheckRun = {
+test("stale cleanup finishes before admission cancellation is honored", async () => {
+  const stale: CheckRun = {
     id: 1,
     name: "Informant CI",
-    status: "completed",
-    conclusion: "cancelled",
+    status: "in_progress",
+    started_at: "2000-01-01T00:00:00.000Z",
     external_id: "old-worker:event:commit:branch:main:abc123",
-    output: { title: "Claim interrupted" },
   };
+  let cleanupSignal: AbortSignal | null | undefined;
+  let enterCleanup!: () => void;
+  let resolveCleanup!: (response: Response) => void;
+  let candidateCreated = false;
+  const cleanupStarted = new Promise<void>((resolve) => {
+    enterCleanup = resolve;
+  });
+  const cleanupResponse = new Promise<Response>((resolve) => {
+    resolveCleanup = resolve;
+  });
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      candidateCreated = true;
+      return Response.json({});
+    }
+    if (init?.method === "PATCH") {
+      cleanupSignal = init.signal;
+      enterCleanup();
+      return cleanupResponse;
+    }
+    if (url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME) {
+      return Response.json({ check_runs: [] });
+    }
+    if (url.searchParams.has("check_name")) return Response.json({ check_runs: [stale] });
+    return Response.json({ check_runs: [] });
+  }) as typeof globalThis.fetch;
+  const admission = new AbortController();
+  const execution = new AbortController();
+  const pending = new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "stale-signal", repo: "widgets", fullName: "stale-signal/widgets" },
+    "abc123",
+    "replacement",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+    undefined,
+    true,
+    [],
+    false,
+    admission.signal,
+    execution.signal,
+  );
+
+  await cleanupStarted;
+  expect(cleanupSignal).toBe(execution.signal);
+  admission.abort("Worker shutdown requested.");
+  resolveCleanup(Response.json({ ...stale, status: "completed", conclusion: "cancelled" }));
+
+  expect(await pending.catch((error) => error)).toBe("Worker shutdown requested.");
+  expect(candidateCreated).toBe(false);
+});
+
+test("claim bookkeeping completions do not suppress a later retry", async () => {
+  const bookkeeping = ["Claim interrupted", "Claim lost", "Stale worker claim"].map(
+    (title, index): CheckRun => ({
+      id: index + 1,
+      name: "Informant CI",
+      status: "completed",
+      conclusion: "cancelled",
+      external_id: `old-worker-${index}:event:commit:branch:main:abc123`,
+      output: { title },
+    }),
+  );
   let candidate: CheckRun | undefined;
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
-      candidate = { id: 2, ...body } as CheckRun;
+      candidate = { id: 4, ...body } as CheckRun;
       return Response.json(candidate);
     }
     if (url.pathname.endsWith("/check-suites")) {
@@ -355,7 +416,7 @@ test("interrupted claims do not suppress a later retry", async () => {
     if (url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME) {
       return Response.json({ check_runs: [] });
     }
-    return Response.json({ check_runs: [interrupted, ...(candidate ? [candidate] : [])] });
+    return Response.json({ check_runs: [...bookkeeping, ...(candidate ? [candidate] : [])] });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -365,7 +426,7 @@ test("interrupted claims do not suppress a later retry", async () => {
     { type: "commit", id: "branch:main:abc123", branch: "main" },
   );
 
-  expect(claim?.check?.id).toBe(2);
+  expect(claim?.check?.id).toBe(4);
 });
 
 test("check output strips terminal control sequences", async () => {
