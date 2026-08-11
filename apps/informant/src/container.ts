@@ -244,6 +244,13 @@ interface StagedFileMount {
   values: string[];
 }
 
+interface ResolvedFileMount {
+  name: string;
+  source: string;
+  target: string;
+  writeBack: boolean;
+}
+
 function credentialStrings(value: unknown): string[] {
   if (typeof value === "string") return value ? [value] : [];
   if (Array.isArray(value)) return value.flatMap(credentialStrings);
@@ -261,17 +268,14 @@ async function mountedFileValues(path: string): Promise<string[]> {
   }
 }
 
-async function stageFileMounts(
+async function resolveFileMounts(
   requested: NonNullable<JobConfig["mounts"]>,
   configured?: Record<string, string>,
-  dataPath = dataDirectory(),
-): Promise<StagedFileMount[]> {
+): Promise<ResolvedFileMount[]> {
   const allowed =
     configured ??
     Object.fromEntries((await listAllowedMounts()).map(({ name, source }) => [name, source]));
-  const parent = join(dataPath, "file-mount-staging");
-  await mkdir(parent, { recursive: true, mode: 0o700 });
-  return Promise.all(
+  const resolved = await Promise.all(
     requested.map(async (mount) => {
       const configuredSource = allowed[mount.source];
       if (!configuredSource)
@@ -281,24 +285,55 @@ async function stageFileMounts(
       const source = await realpath(configuredSource);
       const metadata = await lstat(source);
       if (!metadata.isFile()) throw new Error(`allowed mount source is not a file: ${source}`);
-      const directory = await mkdtemp(join(parent, "job-"));
-      const filename = basename(source);
-      const staged = join(directory, filename);
-      await copyFile(source, staged);
-      const mode = metadata.mode & 0o777;
-      await chmod(staged, mode);
       return {
         name: mount.source,
-        directory,
         source,
+        target: mount.target,
+        writeBack: mount.writeBack,
+      };
+    }),
+  );
+  if (new Set(resolved.map((mount) => mount.source)).size !== resolved.length)
+    throw new Error("job mounts resolve to the same allowed host file");
+  return resolved;
+}
+
+async function stageFileMounts(
+  requested: ResolvedFileMount[],
+  dataPath = dataDirectory(),
+): Promise<StagedFileMount[]> {
+  const parent = join(dataPath, "file-mount-staging");
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const stagedMounts: StagedFileMount[] = [];
+  const createdDirectories: string[] = [];
+  try {
+    for (const mount of requested) {
+      const metadata = await lstat(mount.source);
+      const directory = await mkdtemp(join(parent, "job-"));
+      createdDirectories.push(directory);
+      const filename = basename(mount.source);
+      const staged = join(directory, filename);
+      await copyFile(mount.source, staged);
+      const mode = metadata.mode & 0o777;
+      await chmod(staged, mode);
+      stagedMounts.push({
+        name: mount.name,
+        directory,
+        source: mount.source,
         filename,
         target: mount.target,
         writeBack: mount.writeBack,
         mode,
-        values: await mountedFileValues(source),
-      };
-    }),
-  );
+        values: await mountedFileValues(mount.source),
+      });
+    }
+    return stagedMounts;
+  } catch (error) {
+    await Promise.all(
+      createdDirectories.map((directory) => rm(directory, { recursive: true, force: true })),
+    );
+    throw error;
+  }
 }
 
 async function persistFileMount(mount: StagedFileMount): Promise<void> {
@@ -753,12 +788,9 @@ export async function runInContainer(
       return result;
     };
     const lock = operations.withImageLock ?? withImageLock;
+    const resolvedMounts = await resolveFileMounts(job.mounts ?? [], operations.allowedMounts);
     const executeWithMounts = async () => {
-      const staged = await stageFileMounts(
-        job.mounts ?? [],
-        operations.allowedMounts,
-        operations.dataPath,
-      );
+      const staged = await stageFileMounts(resolvedMounts, operations.dataPath);
       let outcome: Awaited<ReturnType<typeof run>> | undefined;
       let runError: unknown;
       let persistenceError: unknown;
@@ -787,22 +819,20 @@ export async function runInContainer(
       return outcome;
     };
     const writable = [
-      ...new Set(
-        (job.mounts ?? []).filter((mount) => mount.writeBack).map((mount) => mount.source),
-      ),
+      ...new Set(resolvedMounts.filter((mount) => mount.writeBack).map((mount) => mount.source)),
     ].sort();
     const withMountLocks = (index: number): Promise<Awaited<ReturnType<typeof run>>> => {
-      const name = writable[index];
-      return name
+      const source = writable[index];
+      return source
         ? lock(
-            `host-file-${digest(name)}`,
+            `host-file-${digest(source)}`,
             () => withMountLocks(index + 1),
             executionSignal,
             Number.POSITIVE_INFINITY,
           )
         : executeWithMounts();
     };
-    const result = (job.mounts?.length ?? 0) > 0 ? await withMountLocks(0) : await run();
+    const result = resolvedMounts.length > 0 ? await withMountLocks(0) : await run();
     return {
       success: result.exitCode === 0 && !result.timedOut,
       exitCode: result.exitCode,

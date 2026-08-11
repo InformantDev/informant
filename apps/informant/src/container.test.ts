@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -594,7 +594,7 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
     expect(output.join("")).not.toContain("refreshed-access");
     expect(locks).toEqual([
       "prepared-container-image-references",
-      `host-file-${digest("codex-auth")}`,
+      `host-file-${digest(join(codexHome, "auth.json"))}`,
     ]);
     expect(lockAttempts).toEqual([undefined, Number.POSITIVE_INFINITY]);
   } finally {
@@ -647,6 +647,105 @@ test("writes back a refreshed mounted file when the container job is interrupted
       ),
     ).rejects.toThrow("interrupted");
     expect(await Bun.file(source).json()).toEqual({ token: "refreshed" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("serializes different allowlist aliases for the same host file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-alias-"));
+  const source = join(root, "credential.json");
+  await Bun.write(source, "credential");
+  const lockNames: string[] = [];
+  const run = (alias: string) =>
+    runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      {
+        name: `review-${alias}`,
+        command: "true",
+        optional: true,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts: [{ source: alias, target: "/mnt/credential", writeBack: true }],
+        needs: [],
+        runtime: { type: "container", image: "oven/bun:1" },
+      },
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { first: source, second: source },
+        dataPath: join(root, "data"),
+        withImageLock: async (name, callback) => {
+          if (name.startsWith("host-file-")) lockNames.push(name);
+          return callback();
+        },
+        command: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }),
+      },
+    );
+  try {
+    await run("first");
+    await run("second");
+    expect(lockNames).toEqual([`host-file-${digest(source)}`, `host-file-${digest(source)}`]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cleans staged files when a later mount fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-staging-"));
+  const first = join(root, "first.txt");
+  const second = join(root, "second.txt");
+  await Bun.write(first, "first-secret");
+  await Bun.write(second, "second-secret");
+  let hostLocks = 0;
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        {
+          name: "review",
+          command: "true",
+          optional: true,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          mounts: [
+            { source: "first", target: "/mnt/first", writeBack: true },
+            { source: "second", target: "/mnt/second", writeBack: true },
+          ],
+          needs: [],
+          runtime: { type: "container", image: "oven/bun:1" },
+        },
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { first, second },
+          dataPath: join(root, "data"),
+          withImageLock: async (name, callback) => {
+            if (name.startsWith("host-file-") && ++hostLocks === 2) await rm(second);
+            return callback();
+          },
+          command: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }),
+        },
+      ),
+    ).rejects.toThrow();
+    const staging = join(root, "data", "file-mount-staging");
+    expect(await readdir(staging)).toEqual([]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
