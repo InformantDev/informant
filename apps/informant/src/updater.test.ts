@@ -287,4 +287,61 @@ describe("automatic update services", () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+
+  test("preserves Linux definitions when the timer cannot be stopped", async () => {
+    const home = await mkdtemp(join(tmpdir(), "informant-update-home-"));
+    const executable = join(home, "bin", "informant");
+    try {
+      await mkdir(join(home, "bin"));
+      await Bun.write(executable, "executable");
+      const timer = await enableAutomaticUpdates({
+        platform: "linux",
+        home,
+        executable,
+        environment: { HOME: home, PATH: join(home, "bin") },
+        command: async () => result(),
+      });
+      await expect(
+        disableAutomaticUpdates({
+          platform: "linux",
+          home,
+          command: async () => result(1, "timer is still active"),
+        }),
+      ).rejects.toThrow("timer is still active");
+      expect(await Bun.file(timer).exists()).toBe(true);
+      expect(
+        await Bun.file(join(home, ".config/systemd/user/informant-update.service")).exists(),
+      ).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves the macOS definition when the agent cannot be stopped", async () => {
+    const home = await mkdtemp(join(tmpdir(), "informant-update-home-"));
+    const executable = join(home, "informant");
+    try {
+      await Bun.write(executable, "executable");
+      const path = await enableAutomaticUpdates({
+        platform: "darwin",
+        home,
+        logs: join(home, "logs"),
+        uid: 501,
+        executable,
+        environment: { HOME: home, PATH: home },
+        command: async () => result(),
+      });
+      await expect(
+        disableAutomaticUpdates({
+          platform: "darwin",
+          home,
+          uid: 501,
+          command: async () => result(5, "agent is still loaded"),
+        }),
+      ).rejects.toThrow("agent is still loaded");
+      expect(await Bun.file(path).exists()).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });

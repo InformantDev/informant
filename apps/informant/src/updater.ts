@@ -405,16 +405,28 @@ export async function disableAutomaticUpdates(
     if (uid === undefined) throw new Error("could not determine the current user ID");
     const domain = `gui/${uid}`;
     const result = await run(["launchctl", "bootout", domain, path]);
+    if (result.exitCode !== 0) {
+      if (!existed) return false;
+      throw new Error(
+        `could not disable automatic Informant updates: ${result.stderr.trim() || `launchctl exited ${result.exitCode}`}`,
+      );
+    }
     await rm(path, { force: true });
-    return existed || result.exitCode === 0;
+    return true;
   }
   if (currentPlatform === "linux") {
     const paths = linuxAutomaticUpdatePaths(options.home);
     const existed = existsSync(paths.service) || existsSync(paths.timer);
     const result = await run(["systemctl", "--user", "disable", "--now", "informant-update.timer"]);
+    if (result.exitCode !== 0) {
+      if (!existed) return false;
+      throw new Error(
+        `could not disable automatic Informant updates: ${result.stderr.trim() || `systemctl exited ${result.exitCode}`}`,
+      );
+    }
     await Promise.all([rm(paths.service, { force: true }), rm(paths.timer, { force: true })]);
     await run(["systemctl", "--user", "daemon-reload"]);
-    return existed || result.exitCode === 0;
+    return true;
   }
   throw new Error("automatic Informant updates are supported only on macOS and Linux");
 }
