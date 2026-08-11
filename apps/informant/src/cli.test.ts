@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import packageJson from "../package.json" with { type: "json" };
 import {
   branchNameFromSymbolicRef,
   cleanOrphanedBuildWorkspacesInBackground,
@@ -19,7 +20,7 @@ test("--version prints the package version without help", async () => {
   try {
     await main(["--version"]);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith("0.1.3");
+    expect(log).toHaveBeenCalledWith(packageJson.version);
   } finally {
     log.mockRestore();
   }
