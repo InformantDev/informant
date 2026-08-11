@@ -481,23 +481,27 @@ test("preparation inputs cannot traverse a symbolic link", async () => {
   }
 });
 
-test("serializes concurrent preparation of the same container image", async () => {
+test("deduplicates concurrent Podman preparation of the same container image", async () => {
   const runtime = { type: "container" as const, image: "base", prepare: "install tools" };
-  let tail = Promise.resolve();
+  const tails = new Map<string, Promise<void>>();
   let imageExists = false;
   let builds = 0;
   const operations = {
-    withImageLock: async <T>(_image: string, callback: () => Promise<T>): Promise<T> => {
-      const previous = tail;
+    backend: podmanContainerBackend,
+    withImageLock: async <T>(image: string, callback: () => Promise<T>): Promise<T> => {
+      const previous = tails.get(image) ?? Promise.resolve();
       let release = () => {};
-      tail = new Promise<void>((resolve) => {
+      const current = new Promise<void>((resolve) => {
         release = resolve;
       });
+      const tail = previous.then(() => current);
+      tails.set(image, tail);
       await previous;
       try {
         return await callback();
       } finally {
         release();
+        if (tails.get(image) === tail) tails.delete(image);
       }
     },
     command: async (args: string[]) => {
@@ -550,6 +554,67 @@ test("serializes preparation of different images through the shared Apple builde
   );
 
   expect(locks).toEqual(["container-builder", "container-builder"]);
+});
+
+test("prepares distinct Podman images concurrently", async () => {
+  const tails = new Map<string, Promise<void>>();
+  const locks: string[] = [];
+  let builds = 0;
+  let activeBuilds = 0;
+  let maximumActiveBuilds = 0;
+  const bothBuilding = deferred<void>();
+  const operations = {
+    backend: podmanContainerBackend,
+    withImageLock: async <T>(image: string, callback: () => Promise<T>): Promise<T> => {
+      locks.push(image);
+      const previous = tails.get(image) ?? Promise.resolve();
+      let release = () => {};
+      const current = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const tail = previous.then(() => current);
+      tails.set(image, tail);
+      await previous;
+      try {
+        return await callback();
+      } finally {
+        release();
+        if (tails.get(image) === tail) tails.delete(image);
+      }
+    },
+    command: async (args: string[]) => {
+      if (args[1] === "image") return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+      if (args[1] === "build") {
+        builds++;
+        activeBuilds++;
+        maximumActiveBuilds = Math.max(maximumActiveBuilds, activeBuilds);
+        if (builds === 2) bothBuilding.resolve();
+        if (builds === 1) await Promise.race([bothBuilding.promise, Bun.sleep(100)]);
+        activeBuilds--;
+      }
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  };
+
+  await Promise.all([
+    ensurePreparedContainer(
+      { type: "container", image: "base-a", prepare: "install a" },
+      undefined,
+      () => {},
+      undefined,
+      operations,
+    ),
+    ensurePreparedContainer(
+      { type: "container", image: "base-b", prepare: "install b" },
+      undefined,
+      () => {},
+      undefined,
+      operations,
+    ),
+  ]);
+
+  expect(new Set(locks).size).toBe(2);
+  expect(maximumActiveBuilds).toBe(2);
 });
 
 test("passes secrets through the client environment and always removes the container", async () => {

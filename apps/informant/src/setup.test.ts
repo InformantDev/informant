@@ -220,6 +220,23 @@ test("reports a failed Podman smoke test", async () => {
   expect(await Bun.file(workspace).exists()).toBe(false);
 });
 
+test("bounds the Podman smoke test and reports a timeout", async () => {
+  let timeoutMs: number | undefined;
+  await expect(
+    preparePodman({
+      command: async (args, options) => {
+        if (args[1] === "info") return success(rootlessPodmanInfo);
+        if (args[1] === "run") {
+          timeoutMs = options?.timeoutMs;
+          return { ...success(), timedOut: true };
+        }
+        return success();
+      },
+    }),
+  ).rejects.toThrow("rootless Podman could not run the Informant default image: timed out");
+  expect(timeoutMs).toBe(120_000);
+});
+
 test("rejects a smoke test that cannot write through the bind mount", async () => {
   await expect(
     preparePodman({

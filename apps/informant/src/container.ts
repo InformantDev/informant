@@ -487,7 +487,7 @@ export async function ensurePreparedContainer(
       `FROM ${runtime.image}\nUSER 0\nCOPY informant-prepare.sh /tmp/informant-prepare.sh\n${inputSetup}${preparationLayer}`,
     );
     const image = await lock(
-      "container-builder",
+      backend.kind === "apple" ? "container-builder" : `container-${digest(prepared).slice(0, 24)}`,
       async () => {
         const existing = await runCommand(backend.inspectImageArguments(prepared), { signal });
         if (existing.exitCode === 0) return prepared;
@@ -568,7 +568,7 @@ export async function runInContainer(
     backend =
       operations.command && !operations.backend
         ? appleContainerBackend
-        : await requireContainerBackend(selectedBackend, runCommand);
+        : await requireContainerBackend(selectedBackend, runCommand, executionSignal);
     executionSignal.throwIfAborted();
     if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
       await log(`[${job.name}] waiting for an available container slot\n`);

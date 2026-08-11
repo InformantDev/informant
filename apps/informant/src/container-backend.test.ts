@@ -5,6 +5,7 @@ import {
   initializeContainerBackend,
   podmanContainerBackend,
   refreshContainerBackend,
+  requireContainerBackend,
   resetContainerBackendReadiness,
   selectContainerBackend,
   validateRootlessPodmanInfo,
@@ -16,6 +17,14 @@ const result = (exitCode = 0, stdout = "", stderr = "") => ({
   stderr,
   timedOut: false,
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 afterEach(resetContainerBackendReadiness);
 
@@ -133,6 +142,27 @@ test("coalesces concurrent stale readiness probes", async () => {
   expect(probes).toBe(1);
 });
 
+test("cancels a caller that joins an in-flight readiness probe", async () => {
+  const blocked = deferred<void>();
+  const runCommand = async (argv: string[]) => {
+    if (argv[1] === "info") {
+      await blocked.promise;
+      return result(
+        0,
+        JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } }),
+      );
+    }
+    return result();
+  };
+  const probe = refreshContainerBackend(30_000, podmanContainerBackend, runCommand, 1_000);
+  const controller = new AbortController();
+  const joined = requireContainerBackend(podmanContainerBackend, runCommand, controller.signal);
+  controller.abort(new Error("job cancelled"));
+  await expect(joined).rejects.toThrow("job cancelled");
+  blocked.resolve();
+  expect(await probe).toBe(true);
+});
+
 test("re-probes stale success and allows stale failure to recover", async () => {
   let rootless = true;
   const runCommand = async (argv: string[]) =>
@@ -195,7 +225,33 @@ test("rejects rootless Podman without cgroups v2", () => {
     validateRootlessPodmanInfo(
       JSON.stringify({ Host: { Security: { Rootless: true }, CgroupVersion: 2 } }),
     ),
+  ).toThrow("requires cgroups v2");
+  expect(() =>
+    validateRootlessPodmanInfo(
+      JSON.stringify({ Host: { Security: { Rootless: true }, CgroupVersion: "V2" } }),
+    ),
   ).not.toThrow();
+});
+
+test("rejects misleading or contradictory Podman security fields", () => {
+  expect(() =>
+    validateRootlessPodmanInfo(
+      JSON.stringify({
+        host: { security: { rootless: false }, cgroupVersion: "v1" },
+        store: { security: { rootless: true }, cgroupVersion: "v2" },
+      }),
+    ),
+  ).toThrow("not running rootless");
+  expect(() =>
+    validateRootlessPodmanInfo(
+      '{"host":{"security":{"rootless":true},"cgroupVersion":"v2"},"Host":{"Security":{"Rootless":false},"CgroupVersion":"v1"}}',
+    ),
+  ).toThrow("not running rootless");
+  expect(() =>
+    validateRootlessPodmanInfo(
+      JSON.stringify({ host: { security: { rootless: "true" }, cgroupVersion: "v2" } }),
+    ),
+  ).toThrow("not running rootless");
 });
 
 test("treats timed-out readiness commands as unhealthy", async () => {
@@ -225,6 +281,22 @@ test("bounds and forwards cancellation to readiness commands", async () => {
     { timeoutMs: 15_000, signal: controller.signal },
     { timeoutMs: 15_000, signal: controller.signal },
   ]);
+});
+
+test("forwards job cancellation while requiring a container backend", async () => {
+  const controller = new AbortController();
+  const signals: Array<AbortSignal | undefined> = [];
+  await requireContainerBackend(
+    podmanContainerBackend,
+    async (argv, options) => {
+      signals.push(options?.signal);
+      return argv[1] === "info"
+        ? result(0, JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } }))
+        : result();
+    },
+    controller.signal,
+  );
+  expect(signals).toEqual([controller.signal, controller.signal]);
 });
 
 test("bounds every Apple Container readiness and start command", async () => {

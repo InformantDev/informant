@@ -96,7 +96,9 @@ function podmanInstallCommands(osRelease: string): string[][] {
 }
 
 function commandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
-  return new Error(`${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+  return new Error(
+    `${action}: ${result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.exitCode}`}`,
+  );
 }
 
 export async function prepareAppleContainer(
@@ -166,32 +168,35 @@ export async function preparePodman(operations: PodmanSetupOperations = {}): Pro
   const workspace = await mkdtemp(join(tmpdir(), "informant-podman-smoke-"));
   const marker = join(workspace, "informant-smoke-test");
   try {
-    const smokeTest = await runCommand([
-      "podman",
-      "run",
-      "--rm",
-      "--init",
-      "--ulimit",
-      "nofile=65536:65536",
-      "--workdir",
-      "/workspace",
-      "--user",
-      "0:0",
-      "--cpus",
-      "1",
-      "--memory",
-      "256M",
-      "--security-opt",
-      "no-new-privileges",
-      "--volume",
-      `${workspace}:/workspace:Z`,
-      "--entrypoint",
-      "/bin/sh",
-      "docker.io/oven/bun:1",
-      "-lc",
-      "bun --version && touch /workspace/informant-smoke-test",
-    ]);
-    if (smokeTest.exitCode !== 0)
+    const smokeTest = await runCommand(
+      [
+        "podman",
+        "run",
+        "--rm",
+        "--init",
+        "--ulimit",
+        "nofile=65536:65536",
+        "--workdir",
+        "/workspace",
+        "--user",
+        "0:0",
+        "--cpus",
+        "1",
+        "--memory",
+        "256M",
+        "--security-opt",
+        "no-new-privileges",
+        "--volume",
+        `${workspace}:/workspace:Z`,
+        "--entrypoint",
+        "/bin/sh",
+        "docker.io/oven/bun:1",
+        "-lc",
+        "bun --version && touch /workspace/informant-smoke-test",
+      ],
+      { timeoutMs: 120_000 },
+    );
+    if (smokeTest.exitCode !== 0 || smokeTest.timedOut)
       throw commandError("rootless Podman could not run the Informant default image", smokeTest);
     if (!(await Bun.file(marker).exists())) {
       throw new Error("rootless Podman could not write to a bind-mounted workspace");

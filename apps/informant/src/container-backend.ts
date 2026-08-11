@@ -138,23 +138,10 @@ export const appleContainerBackend: ContainerBackend = {
   normalizeImageName: (name) => name,
 };
 
-function rootlessMarker(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  for (const [key, child] of Object.entries(value)) {
-    if (key.toLowerCase() === "rootless" && child === true) return true;
-    if (rootlessMarker(child)) return true;
-  }
-  return false;
-}
-
-function findCaseInsensitiveField(value: unknown, name: string): unknown {
-  if (!value || typeof value !== "object") return undefined;
-  for (const [key, child] of Object.entries(value)) {
-    if (key.toLowerCase() === name.toLowerCase()) return child;
-    const nested = findCaseInsensitiveField(child, name);
-    if (nested !== undefined) return nested;
-  }
-  return undefined;
+function caseInsensitiveField(value: unknown, name: string): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const matches = Object.entries(value).filter(([key]) => key.toLowerCase() === name.toLowerCase());
+  return matches.length === 1 ? matches[0]?.[1] : undefined;
 }
 
 export function validateRootlessPodmanInfo(source: string): void {
@@ -164,17 +151,16 @@ export function validateRootlessPodmanInfo(source: string): void {
   } catch {
     throw new Error("Podman returned invalid information; run `podman info` to diagnose it");
   }
-  if (!rootlessMarker(info)) {
+  const host = caseInsensitiveField(info, "host");
+  const security = caseInsensitiveField(host, "security");
+  const rootless = caseInsensitiveField(security, "rootless");
+  if (rootless !== true) {
     throw new Error(
       "Podman is not running rootless; configure rootless Podman for this user and verify `podman info --format json` reports rootless=true",
     );
   }
-  const cgroupVersion = findCaseInsensitiveField(info, "cgroupVersion");
-  if (
-    cgroupVersion !== 2 &&
-    String(cgroupVersion).toLowerCase() !== "v2" &&
-    cgroupVersion !== "2"
-  ) {
+  const cgroupVersion = caseInsensitiveField(host, "cgroupVersion");
+  if (typeof cgroupVersion !== "string" || cgroupVersion.toLowerCase() !== "v2") {
     throw new Error(
       "Podman requires cgroups v2 for bounded container jobs; configure cgroups v2 and verify `podman info --format json` reports cgroupVersion=v2",
     );
@@ -243,6 +229,16 @@ export function selectContainerBackend(
 let readiness: { backend: ContainerBackend; checkedAt: number; error?: Error } | undefined;
 let refreshInFlight: { backend: ContainerBackend; result: Promise<boolean> } | undefined;
 
+function waitForReadiness(result: Promise<boolean>, signal?: AbortSignal): Promise<boolean> {
+  if (!signal) return result;
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    result.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
 export async function initializeContainerBackend(
   backend = selectContainerBackend(),
   runCommand: ContainerCommandRunner = command,
@@ -283,12 +279,12 @@ export async function refreshContainerBackend(
     return readiness.error === undefined;
   }
   if (!backend) return initializeContainerBackend(backend, runCommand, now, signal);
-  if (refreshInFlight?.backend === backend) return refreshInFlight.result;
+  if (refreshInFlight?.backend === backend) return waitForReadiness(refreshInFlight.result, signal);
   const result = initializeContainerBackend(backend, runCommand, now, signal).finally(() => {
     if (refreshInFlight?.result === result) refreshInFlight = undefined;
   });
   refreshInFlight = { backend, result };
-  return result;
+  return waitForReadiness(result, signal);
 }
 
 export function refreshSelectedContainerBackend(signal?: AbortSignal): Promise<boolean> {
@@ -304,9 +300,16 @@ export function refreshSelectedContainerBackend(signal?: AbortSignal): Promise<b
 export async function requireContainerBackend(
   backend = selectContainerBackend(),
   runCommand: ContainerCommandRunner = command,
+  signal?: AbortSignal,
 ): Promise<ContainerBackend> {
   if (!backend) throw new Error(`container jobs are not supported on ${platform()}/${arch()}`);
-  await refreshContainerBackend(CONTAINER_READINESS_MAX_AGE_MS, backend, runCommand);
+  await refreshContainerBackend(
+    CONTAINER_READINESS_MAX_AGE_MS,
+    backend,
+    runCommand,
+    Date.now(),
+    signal,
+  );
   if (readiness?.error) throw readiness.error;
   return backend;
 }
