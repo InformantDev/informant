@@ -1,0 +1,108 @@
+name = "release"
+runs_on = ["container"]
+needs = ["build"]
+timeout_minutes = 45
+triggers = [{ event = "commit", tag = { patterns = ["v*"] } }]
+secrets = ["RELEASE_GITHUB_TOKEN"]
+command = """
+set -eu
+
+tag="$INFORMANT_BRANCH"
+if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+  echo "release tags must use semantic versions such as v0.2.0" >&2
+  exit 1
+fi
+version=${tag#v}
+package_version=$(bun -e 'console.log((await Bun.file("apps/informant/package.json").json()).version)')
+if [ "$version" != "$package_version" ]; then
+  echo "tag $tag does not match package version $package_version" >&2
+  exit 1
+fi
+
+release_token=$RELEASE_GITHUB_TOKEN
+unset RELEASE_GITHUB_TOKEN
+
+bun install --frozen-lockfile --ignore-scripts
+bun run --cwd apps/informant build:all
+
+artifacts="$PWD/artifacts"
+mkdir -p "$artifacts"
+cp apps/informant/dist/informant-darwin-arm64 "$artifacts/"
+cp apps/informant/dist/informant-darwin-x64 "$artifacts/"
+cp apps/informant/dist/informant-linux-arm64 "$artifacts/"
+cp apps/informant/dist/informant-linux-x64 "$artifacts/"
+(
+  cd "$artifacts"
+  sha256sum informant-* > SHA256SUMS
+)
+scripts/render-homebrew-formula.sh "$tag" "$artifacts/SHA256SUMS" "$artifacts/informant.rb"
+
+case "$(uname -m)" in
+  x86_64 | amd64) native_asset=informant-linux-x64 ;;
+  aarch64 | arm64) native_asset=informant-linux-arm64 ;;
+  *) echo "cannot smoke-test binaries on $(uname -m)" >&2; exit 1 ;;
+esac
+"$artifacts/$native_asset" --version
+
+export GH_TOKEN="$release_token"
+if gh release view "$tag" --repo "$INFORMANT_REPOSITORY" >/dev/null 2>&1; then
+  gh release upload "$tag" \
+    "$artifacts"/informant-* \
+    "$artifacts/informant.rb" \
+    "$artifacts/SHA256SUMS" \
+    --clobber \
+    --repo "$INFORMANT_REPOSITORY"
+else
+  gh release create "$tag" \
+    "$artifacts"/informant-* \
+    "$artifacts/informant.rb" \
+    "$artifacts/SHA256SUMS" \
+    --generate-notes \
+    --verify-tag \
+    --title "$tag" \
+    --repo "$INFORMANT_REPOSITORY"
+fi
+
+tap_directory=$(mktemp -d)
+trap 'rm -rf "$tap_directory"' EXIT HUP INT TERM
+gh auth setup-git
+gh repo clone InformantDev/homebrew-tap "$tap_directory"
+cp "$artifacts/informant.rb" "$tap_directory/Formula/informant.rb"
+if git -C "$tap_directory" diff --quiet -- Formula/informant.rb; then
+  echo "Homebrew formula already matches $tag"
+  exit 0
+fi
+
+tap_branch="automation/informant-$tag"
+git -C "$tap_directory" checkout -B "$tap_branch" origin/main
+git -C "$tap_directory" config user.name "Informant Release Bot"
+git -C "$tap_directory" config user.email "release-bot@informant.dev"
+git -C "$tap_directory" add Formula/informant.rb
+git -C "$tap_directory" commit -m "chore: update Informant to $tag"
+git -C "$tap_directory" push --force-with-lease --set-upstream origin "$tap_branch"
+
+existing_pr=$(gh pr list \
+  --repo InformantDev/homebrew-tap \
+  --head "$tap_branch" \
+  --state open \
+  --json url \
+  --jq '.[0].url // empty')
+if [ -n "$existing_pr" ]; then
+  echo "Homebrew update PR: $existing_pr"
+else
+  gh pr create \
+    --repo InformantDev/homebrew-tap \
+    --head "$tap_branch" \
+    --base main \
+    --title "Update Informant to $tag" \
+    --body "Automated by the Informant release job for InformantDev/informant@$tag."
+fi
+"""
+container = { image = "docker.io/oven/bun:1", cpu = 4, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = """
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates gh git grep
+rm -rf /var/lib/apt/lists/*
+bun install --frozen-lockfile --ignore-scripts
+""" }
