@@ -35,6 +35,11 @@ export interface JobConfig {
   timeoutMinutes: number;
   environment: Record<string, string>;
   secrets: string[];
+  mounts?: Array<{
+    source: string;
+    target: string;
+    writeBack: boolean;
+  }>;
   needs: string[];
   runsOn?: string[];
   runtime?: JobRuntime;

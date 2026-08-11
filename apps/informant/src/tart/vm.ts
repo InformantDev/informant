@@ -215,6 +215,7 @@ export async function withImageLock<T>(
   image: string,
   callback: () => Promise<T>,
   signal?: AbortSignal,
+  maximumAttempts = 600,
 ): Promise<T> {
   const directory = join(dataDirectory(), "locks");
   const path = join(directory, `${image}.lock`);
@@ -289,7 +290,8 @@ export async function withImageLock<T>(
         if (reclaimed) continue;
       }
     }
-    if (attempt >= 600) throw new Error(`timed out waiting for prepared image lock: ${image}`);
+    if (attempt >= maximumAttempts)
+      throw new Error(`timed out waiting for prepared image lock: ${image}`);
     await abortableSleep(1_000, signal);
   }
   try {

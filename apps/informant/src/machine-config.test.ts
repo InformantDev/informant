@@ -1,15 +1,19 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addRepository,
+  allowMount,
   clearTailscaleConfig,
   getGitHubCredentials,
   getTailscaleConfig,
+  listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
+  MAX_ALLOWED_MOUNT_BYTES,
   machineConfigPath,
+  removeAllowedMount,
   removeRepository,
   saveGitHubCredentials,
   saveTailscaleConfig,
@@ -62,6 +66,28 @@ test("stores Tailscale role configuration without changing repositories", async 
     expect(await clearTailscaleConfig(path)).toBe(false);
   } finally {
     await Bun.file(path).delete();
+  }
+});
+
+test("allows only named existing host files for repository mounts", async () => {
+  const root = join(import.meta.dir, `.machine-mount-${crypto.randomUUID()}`);
+  const path = join(root, "config.json");
+  const source = join(root, "auth.json");
+  try {
+    await mkdir(root);
+    await Bun.write(source, "credential");
+    await allowMount("codex-auth", source, path);
+    expect(await listAllowedMounts(path)).toEqual([{ name: "codex-auth", source }]);
+    expect(allowMount("bad/name", source, path)).rejects.toThrow("mount name");
+    expect(allowMount("missing", join(root, "missing"), path)).rejects.toThrow("existing file");
+    await Bun.write(source, Buffer.alloc(MAX_ALLOWED_MOUNT_BYTES + 1));
+    expect(allowMount("too-large", source, path)).rejects.toThrow(
+      `exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`,
+    );
+    expect(await removeAllowedMount("codex-auth", path)).toBe(true);
+    expect(await removeAllowedMount("codex-auth", path)).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

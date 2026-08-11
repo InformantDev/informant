@@ -5,7 +5,6 @@ command = """
 set -eu
 review_root="$PWD"
 review_home="$(mktemp -d)"
-printf '{}\n' > "$review_home/settings.json"
 pr_number="${INFORMANT_BRANCH#pull/}"
 if [ "$pr_number" = "$INFORMANT_BRANCH" ]; then
   echo "staff review can only run for a pull request" >&2
@@ -33,14 +32,24 @@ unset GH_TOKEN
 export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
 cd "$review_root"
-amp --settings-file "$review_home/settings.json" --mcp-config '{}' --no-ide --no-notifications \
-  --visibility unlisted --mode medium --execute "/staff-review $slug"
+printf '$staff-review %s\n' "$slug" | codex exec \
+  --ephemeral \
+  --sandbox workspace-write \
+  --ignore-user-config \
+  --ignore-rules \
+  -c 'web_search="disabled"' \
+  -c sandbox_workspace_write.network_access=false \
+  -c shell_environment_policy.ignore_default_excludes=false \
+  -c "projects.\"$review_root\".trust_level=\"untrusted\"" \
+  -
 
 export GH_TOKEN="$github_token"
 staff review post
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
-secrets = ["AMP_API_KEY", "GITHUB_TOKEN"]
+secrets = ["GITHUB_TOKEN"]
+environment = { CODEX_HOME = "/mnt/informant-codex" }
+mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back = true }]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
 set -eu
@@ -50,8 +59,8 @@ apt-get install -y --no-install-recommends ca-certificates curl git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
 mkdir -p "$HOME/.bun/install/global"
-bun add --global @ampcode/cli-linux-arm64@0.0.1784917055-ge644b2
-ln -sf "$HOME/.bun/install/global/node_modules/@ampcode/cli-linux-arm64/amp" /usr/local/bin/amp
+bun add --global @openai/codex@0.147.0-linux-arm64
+ln -sf "$HOME/.bun/install/global/node_modules/@openai/codex/vendor/aarch64-unknown-linux-musl/bin/codex" /usr/local/bin/codex
 curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.10.3/staff-linux-arm64 \
   -o /usr/local/bin/staff
 chmod +x /usr/local/bin/staff
