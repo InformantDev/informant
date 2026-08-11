@@ -395,6 +395,7 @@ async function runCommitPartitionWithSlot(
       legacyScopes,
       acceptManualTrigger,
       admissionSignal,
+      signal,
     );
   } catch (error) {
     if (admissionSignal?.aborted) return false;

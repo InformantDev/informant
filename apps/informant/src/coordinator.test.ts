@@ -371,6 +371,7 @@ describe("runCommit", () => {
     context.github.claim = async (...args) => {
       const signal = args[8];
       if (!signal) throw new Error("expected an admission signal");
+      expect(args[9]).toBe(execution.signal);
       enteredClaim.resolve();
       return new Promise((_resolve, reject) => {
         signal.addEventListener("abort", () => reject(signal.reason), { once: true });

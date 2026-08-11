@@ -1026,6 +1026,48 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal.aborted).toBe(false);
   });
 
+  test("cancels admission when shutdown interrupts --once draining", async () => {
+    const outer = new AbortController();
+    const enteredRun = deferred<void>();
+    let receivedSignal: AbortSignal | undefined;
+    let receivedAdmissionSignal: AbortSignal | undefined;
+    const server = serve(repository, {
+      once: true,
+      signal: outer.signal,
+      dependencies: dependencies(
+        github({ branches: async () => [{ name: "main", sha: "sha" }] }),
+        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        async (
+          _github,
+          _repository,
+          _sha,
+          _branch,
+          _config,
+          _deps,
+          _event,
+          signal,
+          admissionSignal,
+        ) => {
+          receivedSignal = signal;
+          receivedAdmissionSignal = admissionSignal;
+          enteredRun.resolve();
+          return new Promise((resolve) => {
+            if (admissionSignal?.aborted) resolve(false);
+            else admissionSignal?.addEventListener("abort", () => resolve(false), { once: true });
+          });
+        },
+      ),
+    });
+
+    await enteredRun.promise;
+    outer.abort("Worker shutdown requested.");
+    await server;
+
+    expect(receivedSignal?.aborted).toBe(false);
+    expect(receivedAdmissionSignal?.aborted).toBe(true);
+    expect(receivedAdmissionSignal?.reason).toBe("Worker shutdown requested.");
+  });
+
   test("passes the shutdown signal to GitHub polling requests", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;

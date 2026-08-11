@@ -726,7 +726,7 @@ export class GitHubClient {
     }
     return (
       checks.some((check) => check.status === "completed") &&
-      (await this.checkSuiteStatus(repository, sha, CLAIM_NAME)) === "queued"
+      (await this.checkSuiteStatus(repository, sha, CLAIM_NAME, signal)) === "queued"
     );
   }
 
@@ -888,6 +888,7 @@ export class GitHubClient {
     legacyScopes: string[] = [],
     requireManualTrigger = false,
     signal?: AbortSignal,
+    executionSignal?: AbortSignal,
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName, signal);
@@ -1118,8 +1119,9 @@ export class GitHubClient {
       [],
       name,
       context ? manualTriggerRequestMetadata({ context, jobs: [] }) : undefined,
+      executionSignal,
     );
-    const election = await this.checks(repository, sha, name);
+    const election = await this.checks(repository, sha, name, executionSignal);
     const ignoredCompletions = new Set([
       ...stale.map((check) => check.id),
       ...(requested ? historicalCompleted : []),
@@ -1154,13 +1156,18 @@ export class GitHubClient {
       }
       await Promise.all(
         pendingRequests.map((check) =>
-          this.updateCheck(repository, check.id, {
-            status: "completed",
-            conclusion: "neutral",
-            title: "Request accepted",
-            summary: `Build request accepted by ${hostname()}.`,
-            text: check.output?.text,
-          }),
+          this.updateCheck(
+            repository,
+            check.id,
+            {
+              status: "completed",
+              conclusion: "neutral",
+              title: "Request accepted",
+              summary: `Build request accepted by ${hostname()}.`,
+              text: check.output?.text,
+            },
+            executionSignal,
+          ),
         ),
       );
       return {
@@ -1173,13 +1180,18 @@ export class GitHubClient {
       };
     }
 
-    await this.updateCheck(repository, candidate.id, {
-      status: "completed",
-      conclusion: "cancelled",
-      title: "Claim lost",
-      summary: "Another Informant machine claimed this commit first.",
-      text: candidate.output?.text,
-    });
+    await this.updateCheck(
+      repository,
+      candidate.id,
+      {
+        status: "completed",
+        conclusion: "cancelled",
+        title: "Claim lost",
+        summary: "Another Informant machine claimed this commit first.",
+        text: candidate.output?.text,
+      },
+      executionSignal,
+    );
     return completed ? undefined : { requestedJobs: [], manualTrigger, retry: true };
   }
 }

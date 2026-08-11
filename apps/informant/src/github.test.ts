@@ -99,6 +99,96 @@ test("shutdown interrupts a rate limit wait before retrying", async () => {
   expect(requests).toBe(1);
 });
 
+test("suite rerun detection forwards its cancellation signal", async () => {
+  let suiteSignal: AbortSignal | null | undefined;
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith("/check-suites")) {
+      suiteSignal = init?.signal;
+      return Response.json({ check_suites: [{ status: "queued" }] });
+    }
+    const name = url.searchParams.get("check_name");
+    return Response.json({
+      check_runs:
+        name === MANUAL_TRIGGER_REQUEST_NAME
+          ? []
+          : [{ id: 1, name: "Informant CI", status: "completed" }],
+    });
+  }) as typeof globalThis.fetch;
+  const repository = { owner: "rerun-signal", repo: "widgets", fullName: "rerun-signal/widgets" };
+  const shutdown = new AbortController();
+
+  expect(
+    await new GitHubClient({ token: "installation-token", fetch }).hasPendingManualTrigger(
+      repository,
+      "abc123",
+      "main",
+      "main",
+      shutdown.signal,
+    ),
+  ).toBe(true);
+  expect(suiteSignal).toBe(shutdown.signal);
+});
+
+test("post-claim election ignores admission cancellation but honors forced shutdown", async () => {
+  let reads = 0;
+  let candidateSignal: AbortSignal | null | undefined;
+  let electionSignal: AbortSignal | null | undefined;
+  let enterElection!: () => void;
+  const enteredElection = new Promise<void>((resolve) => {
+    enterElection = resolve;
+  });
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      candidateSignal = init.signal;
+      return Response.json({
+        id: 1,
+        name: "Informant CI",
+        status: "in_progress",
+        external_id: "worker:event:commit:branch:main:abc123",
+      });
+    }
+    reads++;
+    if (reads <= 2) return Response.json({ check_runs: [] });
+    electionSignal = init?.signal;
+    enterElection();
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return reject(new Error("expected an execution signal"));
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as typeof globalThis.fetch;
+  const repository = {
+    owner: "election-signal",
+    repo: "widgets",
+    fullName: "election-signal/widgets",
+  };
+  const admission = new AbortController();
+  const execution = new AbortController();
+  const pending = new GitHubClient({ token: "installation-token", fetch }).claim(
+    repository,
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+    undefined,
+    true,
+    [],
+    false,
+    admission.signal,
+    execution.signal,
+  );
+
+  await enteredElection;
+  admission.abort("Worker shutdown requested.");
+  expect(candidateSignal).toBe(execution.signal);
+  expect(electionSignal).toBe(execution.signal);
+  expect(electionSignal?.aborted).toBe(false);
+  execution.abort("Graceful worker shutdown timed out.");
+
+  expect(await pending.catch((error) => error)).toBe("Graceful worker shutdown timed out.");
+});
+
 test("check output strips terminal control sequences", async () => {
   let requestBody: { output?: { text?: string } } | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {

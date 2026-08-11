@@ -341,9 +341,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       for (const id of completedTagEvents) completedTags.delete(id);
     }
   };
-  const drainForShutdown = async () => {
+  const drainForShutdown = async (pendingDrain?: Promise<void>) => {
     abortAdmissions();
-    const draining = drainRuns();
+    const draining = pendingDrain ?? drainRuns();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<false>((resolve) => {
       timeout = setTimeout(
@@ -357,6 +357,30 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     abortInFlightRuns();
     await draining;
+  };
+  const drainOnce = async () => {
+    const draining = drainRuns();
+    const signal = options.signal;
+    if (!signal) {
+      await draining;
+      return;
+    }
+    if (signal.aborted) {
+      await drainForShutdown(draining);
+      return;
+    }
+    let onAbort = () => {};
+    const shutdownRequested = new Promise<true>((resolve) => {
+      onAbort = () => resolve(true);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      if (await Promise.race([draining.then(() => false as const), shutdownRequested])) {
+        await drainForShutdown(draining);
+      }
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   };
   do {
     if (recoveryPending) {
@@ -759,7 +783,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       lastPollError = pollError;
     }
     if (options.once) {
-      await drainRuns();
+      await drainOnce();
       return;
     }
     if (!(await waitForDelay(intervalSeconds * 1_000))) {
