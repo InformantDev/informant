@@ -31,6 +31,18 @@ function cancellationPath(id: string, job?: string): string {
   return join(cancellationDirectory(id), "jobs", key);
 }
 
+function cancellationAcknowledgementPath(id: string, requestId: string): string {
+  const key = createHash("sha256").update(requestId).digest("hex");
+  return join(buildDirectory(id), "cancellation-acknowledgements", key);
+}
+
+interface CancellationRequest {
+  buildId: string;
+  job?: string;
+  requestId?: string;
+  requestedAt: string;
+}
+
 export function jobLogPath(record: BuildRecord, job: string): string {
   const id = createHash("sha256").update(job).digest("hex");
   return join(dirname(record.logPath), "jobs", `${id}.log`);
@@ -90,6 +102,10 @@ async function workspaceHasLiveOwner(workspace: string): Promise<boolean> {
 export async function createBuild(record: BuildRecord): Promise<void> {
   await mkdir(buildDirectory(record.id), { recursive: true });
   await rm(cancellationDirectory(record.id), { recursive: true, force: true });
+  await rm(join(buildDirectory(record.id), "cancellation-acknowledgements"), {
+    recursive: true,
+    force: true,
+  });
   await saveBuild(record);
   await Bun.write(record.logPath, "");
 }
@@ -195,26 +211,65 @@ export async function listActiveBuilds(): Promise<BuildRecord[]> {
     .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 }
 
-export async function requestBuildCancellation(id: string, job?: string): Promise<BuildRecord> {
+function validateCancellationTarget(build: BuildRecord, id: string, job?: string): void {
+  if (build.status !== "running") throw new Error(`build is not running: ${id}`);
+  if (!job) return;
+  const state = build.jobs?.find((item) => item.name === job);
+  const legacyRunning = !build.jobs && build.runningJobs?.includes(job);
+  if (!state && !legacyRunning) throw new Error(`job not found in build ${id}: ${job}`);
+  if (state && state.status !== "queued" && state.status !== "running") {
+    throw new Error(`job is not running or queued: ${job}`);
+  }
+}
+
+export async function requestBuildCancellation(
+  id: string,
+  job?: string,
+  operations: {
+    requestId?: string;
+    timeoutMs?: number;
+    write?: (path: string, contents: string) => Promise<unknown>;
+    sleep?: (milliseconds: number) => Promise<void>;
+  } = {},
+): Promise<BuildRecord> {
   let build = await getBuild(id);
   if (!build) throw new Error(`build not found: ${id}`);
   if (build.status === "running") build = await reconcileBuildLiveness(build);
-  if (build.status !== "running") throw new Error(`build is not running: ${id}`);
-  if (job) {
-    const state = build.jobs?.find((item) => item.name === job);
-    const legacyRunning = !build.jobs && build.runningJobs?.includes(job);
-    if (!state && !legacyRunning) throw new Error(`job not found in build ${id}: ${job}`);
-    if (state && state.status !== "queued" && state.status !== "running") {
-      throw new Error(`job is not running or queued: ${job}`);
-    }
-  }
+  validateCancellationTarget(build, id, job);
+  const requestId = operations.requestId ?? crypto.randomUUID();
+  const acknowledgement = cancellationAcknowledgementPath(id, requestId);
   const path = cancellationPath(id, job);
   await mkdir(dirname(path), { recursive: true });
-  await Bun.write(
+  await (operations.write ?? Bun.write)(
     path,
-    JSON.stringify({ buildId: id, job, requestedAt: new Date().toISOString() }),
+    JSON.stringify({ buildId: id, job, requestId, requestedAt: new Date().toISOString() }),
   );
-  return build;
+  const sleep = operations.sleep ?? Bun.sleep;
+  const deadline = Date.now() + (operations.timeoutMs ?? 5_000);
+  const removeRequest = async () => {
+    const request = (await Bun.file(path)
+      .json()
+      .catch(() => undefined)) as CancellationRequest | undefined;
+    if (request?.requestId === requestId) await rm(path, { force: true });
+  };
+  try {
+    while (Date.now() < deadline) {
+      if (await Bun.file(acknowledgement).exists()) return build;
+      const current = await getBuild(id);
+      if (!current) throw new Error(`build not found: ${id}`);
+      try {
+        validateCancellationTarget(current, id, job);
+      } catch (error) {
+        await removeRequest();
+        throw error;
+      }
+      await sleep(25);
+    }
+    await removeRequest();
+    throw new Error(`cancellation request was not acknowledged for ${job ?? id}`);
+  } finally {
+    await rm(acknowledgement, { force: true });
+  }
 }
 
 export interface BuildCancellationMonitor {
@@ -232,17 +287,40 @@ export function monitorBuildCancellation(
   const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
   let open = true;
   let wake: (() => void) | undefined;
+  const acknowledge = async (controller: AbortController, reason: string, job?: string) => {
+    await buildSaves.get(id)?.catch(() => undefined);
+    const path = cancellationPath(id, job);
+    const request = (await Bun.file(path)
+      .json()
+      .catch(() => undefined)) as CancellationRequest | undefined;
+    if (!request?.requestId) return false;
+    const current = await getBuild(id);
+    try {
+      if (!current) throw new Error(`build not found: ${id}`);
+      validateCancellationTarget(current, id, job);
+    } catch {
+      await rm(path, { force: true });
+      return false;
+    }
+    controller.abort(reason);
+    const acknowledgement = cancellationAcknowledgementPath(id, request.requestId);
+    await mkdir(dirname(acknowledgement), { recursive: true });
+    await Bun.write(acknowledgement, "");
+    return true;
+  };
   const task = (async () => {
     while (open && !buildController.signal.aborted) {
-      if (await Bun.file(cancellationPath(id)).exists()) {
-        buildController.abort("Cancellation requested from informant builds.");
+      if (await acknowledge(buildController, "Cancellation requested from informant builds.")) {
         break;
       }
       await Promise.all(
         [...jobControllers].map(async ([job, controller]) => {
-          if (!controller.signal.aborted && (await Bun.file(cancellationPath(id, job)).exists())) {
-            controller.abort(`Cancellation requested for ${job} from informant builds.`);
-          }
+          if (!controller.signal.aborted)
+            await acknowledge(
+              controller,
+              `Cancellation requested for ${job} from informant builds.`,
+              job,
+            );
         }),
       );
       await new Promise<void>((resolve) => {

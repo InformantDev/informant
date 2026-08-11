@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, rm, stat, utimes } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   claimBuildWorkspace,
   createBuild,
@@ -194,6 +194,52 @@ test("cancellation reconciles a build whose owning worker exited", async () => {
   await expect(requestBuildCancellation(record.id)).rejects.toThrow("build is not running");
   expect((await getBuild(record.id))?.status).toBe("cancelled");
   expect(await listActiveBuilds()).toEqual([]);
+});
+
+test("cancellation reports completion that races marker creation", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
+  const record: BuildRecord = {
+    id: "completion-race",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    jobs: [{ name: "test", status: "running" }],
+    owner,
+    logPath: join(root, "builds", "completion-race", "build.log"),
+  };
+  await createBuild(record);
+
+  await expect(
+    requestBuildCancellation(record.id, undefined, {
+      requestId: "raced-request",
+      write: async (path, contents) => {
+        record.status = "success";
+        record.runningJobs = [];
+        record.jobs = [{ name: "test", status: "success" }];
+        record.completedAt = new Date().toISOString();
+        await saveBuild(record);
+        await mkdir(dirname(path), { recursive: true });
+        await Bun.write(path, contents);
+      },
+    }),
+  ).rejects.toThrow("build is not running: completion-race");
+
+  const monitor = monitorBuildCancellation(record.id, ["test"], 5);
+  try {
+    await Bun.sleep(20);
+    expect(monitor.signal.aborted).toBeFalse();
+    expect(monitor.jobSignal("test")?.aborted).toBeFalse();
+  } finally {
+    await monitor.close();
+  }
 });
 
 afterEach(async () => {
