@@ -15,6 +15,7 @@ import {
   renderAutomaticUpdateService,
   renderLinuxAutomaticUpdateService,
   renderLinuxAutomaticUpdateTimer,
+  resolveInformantExecutable,
   updateInformantIfAvailable,
 } from "./updater.ts";
 
@@ -50,6 +51,25 @@ describe("release updates", () => {
       version: "0.2.0",
       assets: [{ name: "informant-linux-x64", url: "https://release/binary" }],
     });
+  });
+
+  test("rejects suffix-tagged releases even when GitHub does not mark them prerelease", async () => {
+    await expect(latestInformantRelease(async () => releaseResponse("0.2.0-beta"))).rejects.toThrow(
+      "invalid stable release version",
+    );
+  });
+
+  test("uses Homebrew's stable path on macOS and the running binary on Linux", () => {
+    const operations = {
+      processExecutable: "/opt/homebrew/Cellar/informant/0.2.0/bin/informant",
+      which: () => "/opt/homebrew/bin/informant",
+    };
+    expect(resolveInformantExecutable("darwin", undefined, operations)).toBe(
+      "/opt/homebrew/bin/informant",
+    );
+    expect(resolveInformantExecutable("linux", undefined, operations)).toBe(
+      "/opt/homebrew/Cellar/informant/0.2.0/bin/informant",
+    );
   });
 
   test("does nothing when the installed version is current", async () => {
@@ -142,6 +162,7 @@ describe("release updates", () => {
       await installLinuxRelease(release, {
         arch: "x64",
         executable,
+        command: async () => result(0, "", "0.2.0\n"),
         fetch: async (input) => {
           const url = String(input);
           return url.endsWith("binary")
@@ -150,6 +171,87 @@ describe("release updates", () => {
         },
       });
       expect(await Bun.file(executable).text()).toBe("new executable");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("does not replace Linux with a correctly checksummed but invalid binary", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    const executable = join(directory, "informant");
+    const binary = new TextEncoder().encode("broken executable");
+    const checksum = createHash("sha256").update(binary).digest("hex");
+    const release: InformantRelease = {
+      tag: "v0.2.0",
+      version: "0.2.0",
+      assets: [
+        { name: "informant-linux-x64", url: "https://release/binary" },
+        { name: "SHA256SUMS", url: "https://release/checksums" },
+      ],
+    };
+    try {
+      await Bun.write(executable, "old executable");
+      await expect(
+        installLinuxRelease(release, {
+          arch: "x64",
+          executable,
+          command: async () => result(126, "cannot execute"),
+          fetch: async (input) =>
+            String(input).endsWith("binary")
+              ? new Response(binary)
+              : new Response(`${checksum}  informant-linux-x64\n`),
+        }),
+      ).rejects.toThrow("downloaded binary reported cannot execute instead of 0.2.0");
+      expect(await Bun.file(executable).text()).toBe("old executable");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("retries a pending worker restart without reinstalling the current version", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    const pendingRestartFile = join(directory, "pending-restart");
+    let installs = 0;
+    let phase: "install" | "retry" = "install";
+    let retryServiceChecks = 0;
+    const run = async (argv: string[]) => {
+      if (argv[0] === "systemctl" && argv[2] === "is-active") return result();
+      if (argv[0] === "systemctl" && argv[2] === "show") {
+        if (phase === "retry") retryServiceChecks++;
+        return result(0, "", phase === "retry" && retryServiceChecks > 1 ? "200\n" : "100\n");
+      }
+      if (argv[0] === "kill" && phase === "install") return result(1, "temporary restart failure");
+      return result();
+    };
+    try {
+      await expect(
+        updateInformantIfAvailable("0.1.2", {
+          platform: "linux",
+          pendingRestartFile,
+          fetch: async () => releaseResponse("0.2.0"),
+          installLinux: async () => {
+            installs++;
+          },
+          command: run,
+        }),
+      ).rejects.toThrow("temporary restart failure");
+      expect(await Bun.file(pendingRestartFile).text()).toBe("0.2.0\n");
+
+      phase = "retry";
+      expect(
+        await updateInformantIfAvailable("0.2.0", {
+          platform: "linux",
+          pendingRestartFile,
+          fetch: async () => releaseResponse("0.2.0"),
+          installLinux: async () => {
+            installs++;
+          },
+          command: run,
+          sleep: async () => {},
+        }),
+      ).toEqual({ updated: false, restarted: true, version: "0.2.0" });
+      expect(installs).toBe(1);
+      expect(await Bun.file(pendingRestartFile).exists()).toBe(false);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

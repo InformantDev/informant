@@ -69,7 +69,9 @@ export async function latestInformantRelease(request: Fetch = fetch): Promise<In
     throw new Error("could not check for Informant updates: invalid latest release");
   }
   const parsed = versionParts(value.tag_name);
-  if (!parsed) throw new Error("could not check for Informant updates: invalid release version");
+  if (!parsed || parsed.prerelease) {
+    throw new Error("could not check for Informant updates: invalid stable release version");
+  }
   const assets = (value.assets ?? []).flatMap((asset) =>
     typeof asset.name === "string" && typeof asset.browser_download_url === "string"
       ? [{ name: asset.name, url: asset.browser_download_url }]
@@ -90,10 +92,19 @@ async function download(asset: ReleaseAsset, request: Fetch): Promise<Uint8Array
   return new Uint8Array(await response.arrayBuffer());
 }
 
-function installedExecutable(configured?: string): string {
+export function resolveInformantExecutable(
+  platform: string,
+  configured?: string,
+  operations: {
+    processExecutable?: string;
+    which?: (name: string) => string | null;
+  } = {},
+): string {
   if (configured) return configured;
-  if (basename(process.execPath) === "informant") return process.execPath;
-  const executable = Bun.which("informant");
+  const running = operations.processExecutable ?? process.execPath;
+  const executable = (operations.which ?? Bun.which)("informant");
+  if (platform === "darwin" && executable) return executable;
+  if (basename(running) === "informant") return running;
   if (executable) return executable;
   throw new Error("could not locate the installed Informant executable");
 }
@@ -114,6 +125,7 @@ export async function installLinuxRelease(
   release: InformantRelease,
   options: {
     arch?: string;
+    command?: typeof command;
     executable?: string;
     fetch?: Fetch;
   } = {},
@@ -143,13 +155,25 @@ export async function installLinuxRelease(
     throw new Error(`checksum verification failed for ${name}`);
   }
 
-  const executable = installedExecutable(options.executable);
+  const executable = resolveInformantExecutable("linux", options.executable);
   const temporary = join(
     dirname(executable),
     `.${basename(executable)}.update-${crypto.randomUUID()}`,
   );
   try {
     await writeFile(temporary, binary, { flag: "wx", mode: 0o755 });
+    const validation = await (options.command ?? command)([temporary, "--version"], {
+      timeoutMs: 30_000,
+    });
+    if (
+      validation.exitCode !== 0 ||
+      validation.timedOut ||
+      validation.stdout.trim() !== release.version
+    ) {
+      throw new Error(
+        `downloaded binary reported ${validation.stdout.trim() || validation.stderr.trim() || `exit ${validation.exitCode}`} instead of ${release.version}`,
+      );
+    }
     await rename(temporary, executable);
   } catch (error) {
     throw new Error(
@@ -175,7 +199,7 @@ async function installMacRelease(
   if (
     installed.exitCode !== 0 ||
     !versionParts(installed.stdout.trim()) ||
-    compareVersions(installed.stdout.trim(), release.version) < 0
+    compareVersions(installed.stdout.trim(), release.version) !== 0
   ) {
     throw new Error(
       `Homebrew did not install Informant ${release.version}; the formula may still be updating`,
@@ -191,6 +215,7 @@ export async function updateInformantIfAvailable(
     fetch?: Fetch;
     installLinux?: (release: InformantRelease) => Promise<void>;
     onOutput?: (text: string) => Promise<void> | void;
+    pendingRestartFile?: string;
     platform?: string;
     restartTimeoutMs?: number;
     sleep?: (milliseconds: number) => Promise<unknown>;
@@ -198,32 +223,54 @@ export async function updateInformantIfAvailable(
   } = {},
 ): Promise<{ updated: boolean; restarted: boolean; version: string }> {
   const release = await latestInformantRelease(options.fetch);
-  if (compareVersions(release.version, currentVersion) <= 0) {
-    return { updated: false, restarted: false, version: currentVersion };
-  }
   const currentPlatform = options.platform ?? process.platform;
   const run = options.command ?? command;
-  const install =
-    currentPlatform === "linux"
+  const pendingRestartFile =
+    options.pendingRestartFile ?? join(dataDirectory(), "update-pending-restart");
+  const pendingRestartState = Bun.file(pendingRestartFile);
+  const pendingRestart = (await pendingRestartState.exists())
+    ? await pendingRestartState.text()
+    : undefined;
+  const updateAvailable = compareVersions(release.version, currentVersion) > 0;
+  const retryRestart = !updateAvailable && pendingRestart?.trim() === currentVersion;
+  if (!updateAvailable && !retryRestart) {
+    return { updated: false, restarted: false, version: currentVersion };
+  }
+  const install = retryRestart
+    ? async () => {}
+    : currentPlatform === "linux"
       ? () =>
           options.installLinux?.(release) ??
           installLinuxRelease(release, {
+            command: run,
             executable: options.executable,
             fetch: options.fetch,
           })
       : currentPlatform === "darwin"
         ? () => installMacRelease(release, run, options.onOutput)
         : undefined;
+  const installAndMarkRestart = async () => {
+    await install?.();
+    if (!retryRestart) {
+      await mkdir(dirname(pendingRestartFile), { recursive: true });
+      await Bun.write(pendingRestartFile, `${release.version}\n`);
+    }
+  };
   const result = await updateInformant({
     command: run,
-    install,
+    install: installAndMarkRestart,
     onOutput: options.onOutput,
     platform: currentPlatform,
     restartTimeoutMs: options.restartTimeoutMs,
     sleep: options.sleep,
     uid: options.uid,
   });
-  return { updated: true, restarted: result.restarted, version: release.version };
+  await rm(pendingRestartFile, { force: true });
+  return {
+    updated: !retryRestart,
+    restarted: result.restarted,
+    version: retryRestart ? currentVersion : release.version,
+  };
 }
 
 function escapeXml(value: string): string {
@@ -361,7 +408,7 @@ export async function enableAutomaticUpdates(
 ): Promise<string> {
   const currentPlatform = options.platform ?? process.platform;
   const run = options.command ?? command;
-  const executable = installedExecutable(options.executable);
+  const executable = resolveInformantExecutable(currentPlatform, options.executable);
   const environment = options.environment ?? updaterEnvironment();
   if (currentPlatform === "darwin") {
     const path = automaticUpdateServicePath(options.home);
