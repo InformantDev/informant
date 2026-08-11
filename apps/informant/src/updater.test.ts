@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { CommandResult } from "./process.ts";
 import {
   compareVersions,
@@ -11,6 +11,7 @@ import {
   type InformantRelease,
   installLinuxRelease,
   latestInformantRelease,
+  linuxAutomaticUpdatePaths,
   renderAutomaticUpdateService,
   renderLinuxAutomaticUpdateService,
   renderLinuxAutomaticUpdateTimer,
@@ -207,7 +208,7 @@ describe("automatic update services", () => {
     expect(service).toContain('ExecStart="/opt/Informant tools/informant" update --automatic');
     expect(service).toContain('Environment="HOME=/home/worker"');
     expect(service).toContain("TimeoutStartSec=24h");
-    expect(timer).toContain("OnUnitActiveSec=21600s");
+    expect(timer).toContain("OnUnitInactiveSec=21600s");
     expect(timer).toContain("Persistent=true");
     expect(timer).toContain("WantedBy=timers.target");
   });
@@ -231,7 +232,7 @@ describe("automatic update services", () => {
         command: run,
       });
       expect(timer).toBe(join(home, ".config/systemd/user/informant-update.timer"));
-      expect(await Bun.file(timer).text()).toContain("OnUnitActiveSec=21600s");
+      expect(await Bun.file(timer).text()).toContain("OnUnitInactiveSec=21600s");
       expect(commands).toContainEqual([
         "systemctl",
         "--user",
@@ -340,6 +341,58 @@ describe("automatic update services", () => {
         }),
       ).rejects.toThrow("agent is still loaded");
       expect(await Bun.file(path).exists()).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("places Linux units under an absolute XDG configuration home", () => {
+    expect(
+      linuxAutomaticUpdatePaths("/home/worker", {
+        XDG_CONFIG_HOME: "/srv/worker-config",
+      }),
+    ).toEqual({
+      service: "/srv/worker-config/systemd/user/informant-update.service",
+      timer: "/srv/worker-config/systemd/user/informant-update.timer",
+    });
+    expect(
+      linuxAutomaticUpdatePaths("/home/worker", { XDG_CONFIG_HOME: "relative-config" }),
+    ).toEqual({
+      service: "/home/worker/.config/systemd/user/informant-update.service",
+      timer: "/home/worker/.config/systemd/user/informant-update.timer",
+    });
+  });
+
+  test("restores existing Linux definitions when re-enabling fails", async () => {
+    const home = await mkdtemp(join(tmpdir(), "informant-update-home-"));
+    const executable = join(home, "bin", "informant");
+    const environment = { HOME: home, PATH: join(home, "bin") };
+    try {
+      await mkdir(join(home, "bin"));
+      await Bun.write(executable, "executable");
+      const timer = await enableAutomaticUpdates({
+        platform: "linux",
+        home,
+        executable,
+        environment,
+        command: async () => result(),
+      });
+      const service = join(dirname(timer), "informant-update.service");
+      const previousTimer = await Bun.file(timer).text();
+      const previousService = await Bun.file(service).text();
+
+      await expect(
+        enableAutomaticUpdates({
+          platform: "linux",
+          home,
+          executable,
+          environment: { ...environment, PATH: "/new/path" },
+          command: async (argv) =>
+            argv[2] === "enable" ? result(1, "temporary user manager failure") : result(),
+        }),
+      ).rejects.toThrow("temporary user manager failure");
+      expect(await Bun.file(timer).text()).toBe(previousTimer);
+      expect(await Bun.file(service).text()).toBe(previousService);
     } finally {
       await rm(home, { recursive: true, force: true });
     }

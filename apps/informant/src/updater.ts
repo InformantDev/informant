@@ -3,6 +3,7 @@ import { constants, existsSync } from "node:fs";
 import { access, chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { arch, homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { xdgConfigHome } from "./config-home.ts";
 import { command } from "./process.ts";
 import { updateInformant } from "./startup.ts";
 import { dataDirectory } from "./store.ts";
@@ -91,17 +92,22 @@ async function download(asset: ReleaseAsset, request: Fetch): Promise<Uint8Array
 
 function installedExecutable(configured?: string): string {
   if (configured) return configured;
+  if (basename(process.execPath) === "informant") return process.execPath;
   const executable = Bun.which("informant");
   if (executable) return executable;
-  if (basename(process.execPath) === "informant") return process.execPath;
   throw new Error("could not locate the installed Informant executable");
 }
 
 function updaterEnvironment(): Record<string, string> {
-  return {
-    HOME: homedir(),
+  const home = homedir();
+  const environment: Record<string, string> = {
+    HOME: home,
     PATH: Bun.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
   };
+  if (Bun.env.XDG_CONFIG_HOME === xdgConfigHome(Bun.env, home)) {
+    environment.XDG_CONFIG_HOME = Bun.env.XDG_CONFIG_HOME;
+  }
+  return environment;
 }
 
 export async function installLinuxRelease(
@@ -237,11 +243,14 @@ export function automaticUpdateServicePath(home = homedir()): string {
   return join(home, "Library", "LaunchAgents", `${UPDATE_LABEL}.plist`);
 }
 
-export function linuxAutomaticUpdatePaths(home = homedir()): {
+export function linuxAutomaticUpdatePaths(
+  home = homedir(),
+  environment: Record<string, string | undefined> = Bun.env,
+): {
   service: string;
   timer: string;
 } {
-  const directory = join(home, ".config", "systemd", "user");
+  const directory = join(xdgConfigHome(environment, home), "systemd", "user");
   return {
     service: join(directory, "informant-update.service"),
     timer: join(directory, "informant-update.timer"),
@@ -316,13 +325,27 @@ Description=Check for Informant updates
 
 [Timer]
 OnBootSec=5m
-OnUnitActiveSec=${UPDATE_INTERVAL_SECONDS}s
+OnUnitInactiveSec=${UPDATE_INTERVAL_SECONDS}s
 Persistent=true
 Unit=informant-update.service
 
 [Install]
 WantedBy=timers.target
 `;
+}
+
+async function existingDefinition(path: string): Promise<Uint8Array | undefined> {
+  const file = Bun.file(path);
+  return (await file.exists()) ? new Uint8Array(await file.arrayBuffer()) : undefined;
+}
+
+async function restoreDefinition(path: string, source: Uint8Array | undefined): Promise<void> {
+  if (!source) {
+    await rm(path, { force: true });
+    return;
+  }
+  await writeFile(path, source, { mode: 0o600 });
+  await chmod(path, 0o600);
 }
 
 export async function enableAutomaticUpdates(
@@ -343,6 +366,7 @@ export async function enableAutomaticUpdates(
   if (currentPlatform === "darwin") {
     const path = automaticUpdateServicePath(options.home);
     const logs = options.logs ?? dataDirectory();
+    const previous = await existingDefinition(path);
     await mkdir(dirname(path), { recursive: true });
     await mkdir(logs, { recursive: true });
     await Bun.write(path, renderAutomaticUpdateService(executable, environment, logs));
@@ -353,7 +377,8 @@ export async function enableAutomaticUpdates(
     await run(["launchctl", "bootout", domain, path]);
     const loaded = await run(["launchctl", "bootstrap", domain, path]);
     if (loaded.exitCode !== 0) {
-      await rm(path, { force: true });
+      await restoreDefinition(path, previous);
+      if (previous) await run(["launchctl", "bootstrap", domain, path]);
       throw new Error(
         `could not enable automatic Informant updates: ${loaded.stderr.trim() || "launchctl failed"}`,
       );
@@ -368,12 +393,17 @@ export async function enableAutomaticUpdates(
         `automatic Informant updates require a user-writable install; reinstall Informant under ${join(options.home ?? homedir(), ".local", "bin")}`,
       );
     }
-    const paths = linuxAutomaticUpdatePaths(options.home);
+    const paths = linuxAutomaticUpdatePaths(options.home, environment);
     await mkdir(dirname(paths.service), { recursive: true });
+    const [previousService, previousTimer] = await Promise.all([
+      existingDefinition(paths.service),
+      existingDefinition(paths.timer),
+    ]);
     await Bun.write(paths.service, renderLinuxAutomaticUpdateService(executable, environment));
     await Bun.write(paths.timer, renderLinuxAutomaticUpdateTimer());
     await Promise.all([chmod(paths.service, 0o600), chmod(paths.timer, 0o600)]);
     const reloaded = await run(["systemctl", "--user", "daemon-reload"]);
+    let failure = reloaded;
     if (reloaded.exitCode === 0) {
       const enabled = await run([
         "systemctl",
@@ -383,18 +413,28 @@ export async function enableAutomaticUpdates(
         "informant-update.timer",
       ]);
       if (enabled.exitCode === 0) return paths.timer;
-      reloaded.stderr = enabled.stderr;
+      failure = enabled;
     }
-    await Promise.all([rm(paths.service, { force: true }), rm(paths.timer, { force: true })]);
+    await Promise.all([
+      restoreDefinition(paths.service, previousService),
+      restoreDefinition(paths.timer, previousTimer),
+    ]);
+    await run(["systemctl", "--user", "daemon-reload"]);
     throw new Error(
-      `could not enable automatic Informant updates: Linux requires a running systemd user manager (${reloaded.stderr.trim() || "systemctl failed"})`,
+      `could not enable automatic Informant updates: Linux requires a running systemd user manager (${failure.stderr.trim() || "systemctl failed"})`,
     );
   }
   throw new Error("automatic Informant updates are supported only on macOS and Linux");
 }
 
 export async function disableAutomaticUpdates(
-  options: { command?: typeof command; home?: string; platform?: string; uid?: number } = {},
+  options: {
+    command?: typeof command;
+    environment?: Record<string, string | undefined>;
+    home?: string;
+    platform?: string;
+    uid?: number;
+  } = {},
 ): Promise<boolean> {
   const currentPlatform = options.platform ?? process.platform;
   const run = options.command ?? command;
@@ -415,7 +455,7 @@ export async function disableAutomaticUpdates(
     return true;
   }
   if (currentPlatform === "linux") {
-    const paths = linuxAutomaticUpdatePaths(options.home);
+    const paths = linuxAutomaticUpdatePaths(options.home, options.environment);
     const existed = existsSync(paths.service) || existsSync(paths.timer);
     const result = await run(["systemctl", "--user", "disable", "--now", "informant-update.timer"]);
     if (result.exitCode !== 0) {

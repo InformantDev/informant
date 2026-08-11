@@ -194,7 +194,6 @@ describe("startup service", () => {
       ["systemctl", "--user", "show", "--property=MainPID", "--value", "informant.service"],
     ]);
   });
-
   test("starts and verifies a loaded service that temporarily has no worker PID", async () => {
     const invocations: string[][] = [];
     let serviceChecks = 0;
