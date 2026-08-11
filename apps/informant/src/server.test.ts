@@ -1046,6 +1046,58 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal.aborted).toBe(false);
   });
 
+  test("cancels admission immediately while the poll loop is blocked", async () => {
+    const outer = new AbortController();
+    const commentsStarted = deferred<void>();
+    const releaseComments = deferred<void>();
+    const admissionAborted = deferred<void>();
+    let receivedAdmissionSignal: AbortSignal | undefined;
+    const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
+    client.pullRequestComments = async () => {
+      commentsStarted.resolve();
+      await releaseComments.promise;
+      return [];
+    };
+    const server = serve(repository, {
+      signal: outer.signal,
+      dependencies: dependencies(
+        client,
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
+        async (
+          _github,
+          _repository,
+          _sha,
+          _branch,
+          _config,
+          _deps,
+          _event,
+          _signal,
+          admissionSignal,
+        ) => {
+          receivedAdmissionSignal = admissionSignal;
+          admissionSignal?.addEventListener("abort", () => admissionAborted.resolve(), {
+            once: true,
+          });
+          return admissionAborted.promise.then(() => false);
+        },
+      ),
+    });
+
+    await commentsStarted.promise;
+    outer.abort("Worker shutdown requested.");
+    await admissionAborted.promise;
+
+    expect(receivedAdmissionSignal?.aborted).toBe(true);
+    expect(receivedAdmissionSignal?.reason).toBe("Worker shutdown requested.");
+    releaseComments.resolve();
+    await server;
+  });
+
   test("cancels admission when shutdown interrupts --once draining", async () => {
     const outer = new AbortController();
     const enteredRun = deferred<void>();

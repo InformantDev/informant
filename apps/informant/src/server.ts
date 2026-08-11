@@ -259,6 +259,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
   const shutdownControllers = new Set<AbortController>();
   const admissionControllers = new Set<AbortController>();
+  const admissionSignal = (controller: AbortController) =>
+    options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
   const completedComments = new Set<number>();
   const completedTags = new Set<string>();
   const message = options.onMessage ?? console.log;
@@ -621,7 +623,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               id: target.eventId,
             },
             controller.signal,
-            admissionController.signal,
+            admissionSignal(admissionController),
           );
           shutdownControllers.add(controller);
           const run = result
@@ -746,7 +748,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             undefined,
             context,
             controller.signal,
-            admissionController.signal,
+            admissionSignal(admissionController),
           );
           shutdownControllers.add(controller);
           const run = result
