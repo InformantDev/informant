@@ -21,13 +21,15 @@ On Linux, install Informant separately from Podman. From a source checkout with 
 ```bash
 bun install
 bun run --cwd apps/informant build:binary
-sudo install -m 0755 apps/informant/dist/informant /usr/local/bin/informant
+mkdir -p "$HOME/.local/bin"
+install -m 0755 apps/informant/dist/informant "$HOME/.local/bin/informant"
 informant setup
 ```
 
 `informant setup` can install Podman packages, but it does not install Informant itself. On Linux
-without a systemd user manager, run `informant serve` in the foreground or under the supervisor
-already used by the host.
+ensure `~/.local/bin` is on `PATH`; keeping the binary user-owned allows automatic updates. Without a
+systemd user manager, run `informant serve` in the foreground or under the supervisor already used by
+the host.
 
 Informant requires GitHub CLI (`gh`) and a GitHub App installation with **Checks: read/write**,
 **Contents: read**, and **Pull requests: read/write** permissions. Native host jobs run on Linux or

@@ -6,13 +6,16 @@ import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/p
 import { appleContainerInstalled, ensureAppleContainerSystem } from "./container.ts";
 import { podmanContainerBackend } from "./container-backend.ts";
 import {
+  automaticUpdatesPreference,
   listGitHubCredentials,
   listRepositories,
   machineConfigPath,
+  saveAutomaticUpdatesPreference,
   saveGitHubCredentials,
 } from "./machine-config.ts";
 import { command } from "./process.ts";
 import { serveRepositories } from "./server.ts";
+import { disableAutomaticUpdates, enableAutomaticUpdates } from "./updater.ts";
 
 const API = "https://api.github.com";
 const APP_URL = "https://github.com/InformantDev/informant";
@@ -419,6 +422,17 @@ async function connectExistingApp(): Promise<string | undefined> {
 
 async function finishSetup(account: string): Promise<void> {
   const repositories = await listRepositories();
+  if ((await automaticUpdatesPreference()) === undefined) {
+    const automaticUpdates = await confirm({
+      message: "Automatically install new Informant versions and restart the startup worker?",
+      initialValue: true,
+    });
+    if (!isCancel(automaticUpdates)) {
+      if (automaticUpdates) await enableAutomaticUpdates();
+      else await disableAutomaticUpdates();
+      await saveAutomaticUpdatesPreference(automaticUpdates);
+    }
+  }
   const start = await confirm({ message: "Start the worker now?", initialValue: true });
   outro(`GitHub App configured for ${account}.`);
   if (!isCancel(start) && start) {

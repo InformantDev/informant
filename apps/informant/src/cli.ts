@@ -31,11 +31,12 @@ import {
   listGitHubCredentials,
   listRepositories,
   removeRepository,
+  saveAutomaticUpdatesPreference,
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
-import { disableStartup, enableStartup, updateInformant } from "./startup.ts";
+import { disableStartup, enableStartup } from "./startup.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
@@ -54,6 +55,11 @@ import {
 } from "./store.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 import type { Repository } from "./types.ts";
+import {
+  disableAutomaticUpdates,
+  enableAutomaticUpdates,
+  updateInformantIfAvailable,
+} from "./updater.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Linux and macOS machines
 
@@ -80,7 +86,9 @@ Usage:
   informant hook uninstall               Remove Informant from the pre-push hook
   informant builds [--all]               List running builds or recent history
   informant logs [<build-id>]             Tail a build's logs or select a running job
-  informant update                       Update with Homebrew and restart a running worker
+  informant update                       Install a newer release and restart a running worker
+  informant auto-update enable           Check for and install new releases automatically
+  informant auto-update disable          Disable automatic release checks
   informant storage                      Show Informant disk usage and available space
   informant doctor                       Check host dependencies, auth, and disk space
   informant --version
@@ -906,17 +914,34 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   }
   if (subcommand === "update") {
     if (action) throw new Error("update does not accept arguments");
-    const updated = await updateInformant({
+    const updated = await updateInformantIfAvailable(packageJson.version, {
       onOutput: (output) => {
         process.stdout.write(output);
       },
     });
-    outro(
-      updated.restarted
-        ? "Updated Informant and restarted the worker"
-        : "Updated Informant; the startup worker is not running",
-    );
+    const message = !updated.updated
+      ? `Informant ${updated.version} is already current`
+      : updated.restarted
+        ? `Updated Informant to ${updated.version} and restarted the worker`
+        : `Updated Informant to ${updated.version}; the startup worker is not running`;
+    if (flags.automatic === true) console.log(message);
+    else outro(message);
     return;
+  }
+  if (subcommand === "auto-update" && action === "enable") {
+    const path = await enableAutomaticUpdates();
+    await saveAutomaticUpdatesPreference(true);
+    outro(`Enabled automatic Informant updates at ${path}`);
+    return;
+  }
+  if (subcommand === "auto-update" && action === "disable") {
+    const disabled = await disableAutomaticUpdates();
+    await saveAutomaticUpdatesPreference(false);
+    outro(disabled ? "Disabled automatic Informant updates" : "Automatic updates are not enabled");
+    return;
+  }
+  if (subcommand === "auto-update") {
+    throw new Error("auto-update action must be one of: enable, disable");
   }
   if (subcommand === "repo") return manageRepositories(action, id);
   if (subcommand === "image") return manageImages(action);

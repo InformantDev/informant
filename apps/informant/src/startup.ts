@@ -271,6 +271,7 @@ export async function disableStartup(): Promise<{ path: string; disabled: boolea
 export async function updateInformant(
   options: {
     command?: typeof command;
+    install?: () => Promise<void>;
     platform?: string;
     uid?: number;
     onOutput?: (text: string) => Promise<void> | void;
@@ -279,28 +280,52 @@ export async function updateInformant(
     writeStartupService?: (environment: Record<string, string>) => Promise<unknown>;
   } = {},
 ): Promise<{ restarted: boolean }> {
-  if ((options.platform ?? process.platform) !== "darwin")
-    throw new Error("Homebrew updates are supported only on macOS");
+  const currentPlatform = options.platform ?? process.platform;
+  if (currentPlatform !== "darwin" && currentPlatform !== "linux") {
+    throw new Error("Informant updates are supported only on macOS and Linux");
+  }
   const run = options.command ?? command;
-  const domain = launchDomain(options.uid);
-  const service = `${domain}/${LABEL}`;
-  const initialService = await run(["launchctl", "print", service]);
+  const domain = currentPlatform === "darwin" ? launchDomain(options.uid) : undefined;
+  const service = domain ? `${domain}/${LABEL}` : "informant.service";
+  const serviceStatus = () =>
+    currentPlatform === "darwin"
+      ? run(["launchctl", "print", service])
+      : run(["systemctl", "--user", "show", "--property=MainPID", "--value", service]);
+  const initialService =
+    currentPlatform === "darwin"
+      ? await serviceStatus()
+      : await run(["systemctl", "--user", "is-active", service]);
   const loaded = initialService.exitCode === 0;
-  const upgraded = await run(["brew", "upgrade", "informantdev/tap/informant"], {
-    onOutput: options.onOutput,
-  });
-  if (upgraded.exitCode !== 0) {
-    throw new Error(
-      `could not update Informant with Homebrew: ${upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
-    );
+  if (options.install) {
+    await options.install();
+  } else if (currentPlatform === "darwin") {
+    const upgraded = await run(["brew", "upgrade", "informantdev/tap/informant"], {
+      onOutput: options.onOutput,
+    });
+    if (upgraded.exitCode !== 0) {
+      throw new Error(
+        `could not update Informant with Homebrew: ${upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
+      );
+    }
+  } else {
+    throw new Error("a Linux update installer is required");
   }
   if (!loaded) return { restarted: false };
-  const currentService = await run(["launchctl", "print", service]);
-  const previousPid = currentService.exitCode === 0 ? servicePid(currentService.stdout) : undefined;
-  await migrateStartupServiceDefinition(run, options.writeStartupService);
+  const currentService = await serviceStatus();
+  const previousPid =
+    currentService.exitCode === 0
+      ? currentPlatform === "darwin"
+        ? servicePid(currentService.stdout)
+        : Number(currentService.stdout.trim()) || undefined
+      : undefined;
+  if (currentPlatform === "darwin") {
+    await migrateStartupServiceDefinition(run, options.writeStartupService);
+  }
   const restartCommand = previousPid
     ? ["kill", "-TERM", String(previousPid)]
-    : ["launchctl", "kickstart", service];
+    : currentPlatform === "darwin"
+      ? ["launchctl", "kickstart", service]
+      : ["systemctl", "--user", "restart", service];
   const restarted = await run(restartCommand);
   if (restarted.exitCode !== 0) {
     throw new Error(
@@ -311,8 +336,13 @@ export async function updateInformant(
   const sleep = options.sleep ?? Bun.sleep;
   let elapsed = 0;
   while (true) {
-    const current = await run(["launchctl", "print", service]);
-    const currentPid = current.exitCode === 0 ? servicePid(current.stdout) : undefined;
+    const current = await serviceStatus();
+    const currentPid =
+      current.exitCode === 0
+        ? currentPlatform === "darwin"
+          ? servicePid(current.stdout)
+          : Number(current.stdout.trim()) || undefined
+        : undefined;
     if (currentPid && (!previousPid || currentPid !== previousPid)) return { restarted: true };
     if (elapsed >= timeoutMs) break;
     const delay = Math.min(RESTART_POLL_INTERVAL_MS, timeoutMs - elapsed);

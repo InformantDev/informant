@@ -15,6 +15,7 @@ export interface GitHubCredentials {
 interface MachineConfig {
   version: 1;
   repositories: string[];
+  automaticUpdates?: boolean;
   githubApps?: GitHubCredentials[];
   /** Legacy single-installation configuration. */
   github?: GitHubCredentials;
@@ -40,12 +41,30 @@ async function readMachineConfig(path = machineConfigPath()): Promise<MachineCon
     );
   }
   if (!Array.isArray(value.repositories)) throw new Error(`invalid Informant config: ${path}`);
+  if (value.automaticUpdates !== undefined && typeof value.automaticUpdates !== "boolean") {
+    throw new Error(`invalid Informant config: ${path}`);
+  }
   return {
     version: value.version,
     repositories: value.repositories.map(String),
+    automaticUpdates: value.automaticUpdates,
     githubApps: Array.isArray(value.githubApps) ? value.githubApps : undefined,
     github: value.github,
   };
+}
+
+export async function automaticUpdatesPreference(
+  path = machineConfigPath(),
+): Promise<boolean | undefined> {
+  return (await readMachineConfig(path)).automaticUpdates;
+}
+
+export async function saveAutomaticUpdatesPreference(
+  enabled: boolean,
+  path = machineConfigPath(),
+): Promise<void> {
+  const config = await readMachineConfig(path);
+  await writeMachineConfig({ ...config, automaticUpdates: enabled }, path);
 }
 
 async function writeMachineConfig(

@@ -4,11 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addRepository,
+  automaticUpdatesPreference,
   getGitHubCredentials,
   listGitHubCredentials,
   listRepositories,
   machineConfigPath,
   removeRepository,
+  saveAutomaticUpdatesPreference,
   saveGitHubCredentials,
 } from "./machine-config.ts";
 import { startupEnvironment } from "./startup.ts";
@@ -81,6 +83,28 @@ test("saving GitHub credentials preserves registered repositories", async () => 
     await saveGitHubCredentials(credentials, path);
     expect(await getGitHubCredentials(repository, path)).toEqual(credentials);
     expect((await listRepositories(path)).map((value) => value.fullName)).toEqual(["acme/widgets"]);
+  } finally {
+    await Bun.file(path).delete();
+  }
+});
+
+test("stores the initial automatic-update choice without changing machine credentials", async () => {
+  const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
+  const credentials = {
+    account: "acme",
+    appId: "123",
+    installationId: "456",
+    privateKeyFile: "/tmp/informant.pem",
+  };
+
+  try {
+    expect(await automaticUpdatesPreference(path)).toBeUndefined();
+    await saveGitHubCredentials(credentials, path);
+    await saveAutomaticUpdatesPreference(false, path);
+    expect(await automaticUpdatesPreference(path)).toBe(false);
+    expect(await listGitHubCredentials(path)).toEqual([credentials]);
+    await saveAutomaticUpdatesPreference(true, path);
+    expect(await automaticUpdatesPreference(path)).toBe(true);
   } finally {
     await Bun.file(path).delete();
   }
