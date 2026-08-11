@@ -287,6 +287,12 @@ export function monitorBuildCancellation(
   const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
   let open = true;
   let wake: (() => void) | undefined;
+  const removeRequest = async (path: string, requestId: string) => {
+    const current = (await Bun.file(path)
+      .json()
+      .catch(() => undefined)) as CancellationRequest | undefined;
+    if (current?.requestId === requestId) await rm(path, { force: true });
+  };
   const acknowledge = async (controller: AbortController, reason: string, job?: string) => {
     await buildSaves.get(id)?.catch(() => undefined);
     const path = cancellationPath(id, job);
@@ -299,28 +305,26 @@ export function monitorBuildCancellation(
       if (!current) throw new Error(`build not found: ${id}`);
       validateCancellationTarget(current, id, job);
     } catch {
-      await rm(path, { force: true });
+      await removeRequest(path, request.requestId);
       return false;
     }
     controller.abort(reason);
+    await removeRequest(path, request.requestId);
     const acknowledgement = cancellationAcknowledgementPath(id, request.requestId);
     await mkdir(dirname(acknowledgement), { recursive: true });
     await Bun.write(acknowledgement, "");
     return true;
   };
   const task = (async () => {
-    while (open && !buildController.signal.aborted) {
-      if (await acknowledge(buildController, "Cancellation requested from informant builds.")) {
-        break;
-      }
+    while (open) {
+      await acknowledge(buildController, "Cancellation requested from informant builds.");
       await Promise.all(
         [...jobControllers].map(async ([job, controller]) => {
-          if (!controller.signal.aborted)
-            await acknowledge(
-              controller,
-              `Cancellation requested for ${job} from informant builds.`,
-              job,
-            );
+          await acknowledge(
+            controller,
+            `Cancellation requested for ${job} from informant builds.`,
+            job,
+          );
         }),
       );
       await new Promise<void>((resolve) => {

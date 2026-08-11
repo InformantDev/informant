@@ -658,13 +658,14 @@ export async function runInTart(
         );
         await writes;
         await flushProgress(job);
+        const finalOutcome = executionSignal?.aborted ? "cancelled" : outcome;
         await notify(() =>
           observer.completed?.(job, {
-            outcome,
+            outcome: finalOutcome,
             log: decoder.decode(jobLogs.get(job.name)),
           }),
         );
-        return outcome === "cancelled" ? "cancelled" : execution.success;
+        return executionSignal?.aborted ? "cancelled" : execution.success;
       },
       async (job) => {
         const cancelled = signalForJob(job)?.aborted;

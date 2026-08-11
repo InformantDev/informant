@@ -155,6 +155,7 @@ test("cancellation requests target a running build or one active job", async () 
     }
     expect(monitor.jobSignal("test")?.aborted).toBe(true);
     expect(monitor.signal.aborted).toBe(false);
+    await requestBuildCancellation(record.id, "test");
     await expect(requestBuildCancellation(record.id, "lint")).rejects.toThrow(
       "job is not running or queued: lint",
     );
@@ -163,6 +164,7 @@ test("cancellation requests target a running build or one active job", async () 
     for (let attempt = 0; attempt < 50 && !monitor.signal.aborted; attempt++) await Bun.sleep(5);
     expect(monitor.signal.aborted).toBe(true);
     expect(String(monitor.signal.reason)).toContain("informant builds");
+    await requestBuildCancellation(record.id);
   } finally {
     await monitor.close();
   }
