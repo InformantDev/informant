@@ -187,10 +187,12 @@ mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back =
 ```
 
 `write_back` defaults to `false`. When enabled, Informant serializes jobs using the same writable
-source and atomically copies the resulting file back to the allowed host path. This supports files
-such as Codex's `auth.json`, whose tokens may refresh during a run. Informant redacts the original
-and refreshed file contents and JSON string values from job logs, exposes no other files from the
-source directory, and applies the same default-branch trust protections as secret-bearing jobs.
+source and atomically copies the resulting file back to the allowed host path unless the host copy
+changed during the job. This supports files such as Codex's `auth.json`, whose tokens may refresh
+during a run, without overwriting a newer host-side refresh. Mounted files are limited to 1 MiB.
+Informant redacts the original and refreshed file contents and JSON string values from job logs,
+exposes no other files from the source directory, and applies the same default-branch trust
+protections as secret-bearing jobs.
 
 Use `informant mount list` to inspect the allowlist and `informant mount remove <name>` to revoke an
 entry. Treat mounted credentials like other automation secrets: use them only on trusted private

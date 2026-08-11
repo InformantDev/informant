@@ -12,6 +12,8 @@ export interface GitHubCredentials {
   privateKeyFile: string;
 }
 
+export const MAX_ALLOWED_MOUNT_BYTES = 1024 * 1024;
+
 interface MachineConfig {
   version: 1;
   repositories: string[];
@@ -80,8 +82,11 @@ export async function allowMount(
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
     throw new Error("mount name must contain only letters, numbers, dots, underscores, and dashes");
   const canonical = await realpath(source).catch(() => undefined);
-  if (!canonical || !(await lstat(canonical)).isFile())
+  const metadata = canonical ? await lstat(canonical) : undefined;
+  if (!canonical || !metadata?.isFile())
     throw new Error(`allowed mount source must be an existing file: ${source}`);
+  if (metadata.size > MAX_ALLOWED_MOUNT_BYTES)
+    throw new Error(`allowed mount source exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes: ${source}`);
   const config = await readMachineConfig(path);
   await writeMachineConfig(
     {

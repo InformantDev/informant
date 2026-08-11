@@ -9,6 +9,7 @@ import {
   listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
+  MAX_ALLOWED_MOUNT_BYTES,
   machineConfigPath,
   removeAllowedMount,
   removeRepository,
@@ -51,6 +52,10 @@ test("allows only named existing host files for repository mounts", async () => 
     expect(await listAllowedMounts(path)).toEqual([{ name: "codex-auth", source }]);
     expect(allowMount("bad/name", source, path)).rejects.toThrow("mount name");
     expect(allowMount("missing", join(root, "missing"), path)).rejects.toThrow("existing file");
+    await Bun.write(source, Buffer.alloc(MAX_ALLOWED_MOUNT_BYTES + 1));
+    expect(allowMount("too-large", source, path)).rejects.toThrow(
+      `exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`,
+    );
     expect(await removeAllowedMount("codex-auth", path)).toBe(true);
     expect(await removeAllowedMount("codex-auth", path)).toBe(false);
   } finally {

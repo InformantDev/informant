@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   realpath,
@@ -13,7 +14,7 @@ import {
 } from "node:fs/promises";
 import { availableParallelism, totalmem } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { listAllowedMounts } from "./machine-config.ts";
+import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
@@ -28,6 +29,8 @@ interface ContainerResources {
 }
 
 const DEFAULT_CONTAINER_RESOURCES: ContainerResources = { cpu: 1, memoryMb: 1024 };
+const FILE_MOUNT_RESCAN_MS = 50;
+const MAX_PENDING_MOUNT_OUTPUT_BYTES = 256 * 1024;
 
 function containerCommandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
   return new Error(`${action}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
@@ -241,6 +244,12 @@ interface StagedFileMount {
   target: string;
   writeBack: boolean;
   mode: number;
+  originalDigest: string;
+  snapshot: MountedFileSnapshot;
+}
+
+interface MountedFileSnapshot {
+  version: string;
   values: string[];
 }
 
@@ -258,13 +267,53 @@ function credentialStrings(value: unknown): string[] {
   return Object.values(value).flatMap(credentialStrings);
 }
 
-async function mountedFileValues(path: string): Promise<string[]> {
-  const contents = await readFile(path, "utf8").catch(() => "");
-  if (!contents) return [];
+async function mountedFileSnapshot(
+  path: string,
+  previous?: MountedFileSnapshot,
+): Promise<MountedFileSnapshot> {
+  const file = await open(path, "r");
   try {
-    return [contents, ...credentialStrings(JSON.parse(contents))];
-  } catch {
-    return [contents];
+    const metadata = await file.stat({ bigint: true });
+    if (metadata.size > BigInt(MAX_ALLOWED_MOUNT_BYTES))
+      throw new Error(`mounted file exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes: ${path}`);
+    const version = `${metadata.mtimeNs}:${metadata.ctimeNs}:${metadata.size}`;
+    if (previous?.version === version) return previous;
+    const contents = (await readMountedFileHandle(file, path)).toString("utf8");
+    if (!contents) return { version, values: [] };
+    try {
+      return { version, values: [contents, ...credentialStrings(JSON.parse(contents))] };
+    } catch {
+      return { version, values: [contents] };
+    }
+  } finally {
+    await file.close();
+  }
+}
+
+async function readMountedFileHandle(
+  file: Awaited<ReturnType<typeof open>>,
+  path: string,
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  while (size <= MAX_ALLOWED_MOUNT_BYTES) {
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_ALLOWED_MOUNT_BYTES + 1 - size));
+    const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
+    if (bytesRead === 0) return Buffer.concat(chunks, size);
+    chunks.push(chunk.subarray(0, bytesRead));
+    size += bytesRead;
+  }
+  throw new Error(`mounted file exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes: ${path}`);
+}
+
+async function mountedFileDigest(path: string): Promise<string> {
+  const file = await open(path, "r");
+  try {
+    return new Bun.CryptoHasher("sha256")
+      .update(await readMountedFileHandle(file, path))
+      .digest("hex");
+  } finally {
+    await file.close();
   }
 }
 
@@ -285,6 +334,8 @@ async function resolveFileMounts(
       const source = await realpath(configuredSource);
       const metadata = await lstat(source);
       if (!metadata.isFile()) throw new Error(`allowed mount source is not a file: ${source}`);
+      if (metadata.size > MAX_ALLOWED_MOUNT_BYTES)
+        throw new Error(`allowed mount source exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes: ${source}`);
       return {
         name: mount.source,
         source,
@@ -324,7 +375,8 @@ async function stageFileMounts(
         target: mount.target,
         writeBack: mount.writeBack,
         mode,
-        values: await mountedFileValues(mount.source),
+        originalDigest: await mountedFileDigest(staged),
+        snapshot: await mountedFileSnapshot(staged),
       });
     }
     return stagedMounts;
@@ -341,10 +393,22 @@ async function persistFileMount(mount: StagedFileMount): Promise<void> {
   const staged = join(mount.directory, mount.filename);
   const metadata = await lstat(staged);
   if (!metadata.isFile()) throw new Error(`mounted file was removed: ${mount.name}`);
+  if (metadata.size > MAX_ALLOWED_MOUNT_BYTES)
+    throw new Error(`mounted file exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes: ${mount.name}`);
+  const stagedDigest = await mountedFileDigest(staged);
+  if (stagedDigest === mount.originalDigest) return;
   const temporary = `${mount.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
-  await copyFile(staged, temporary);
-  await chmod(temporary, mount.mode);
-  await rename(temporary, mount.source);
+  let replaced = false;
+  try {
+    await copyFile(staged, temporary);
+    await chmod(temporary, mount.mode);
+    if ((await mountedFileDigest(mount.source)) !== mount.originalDigest)
+      throw new Error(`allowed host file changed during mounted job: ${mount.name}`);
+    await rename(temporary, mount.source);
+    replaced = true;
+  } finally {
+    if (!replaced) await rm(temporary, { force: true });
+  }
 }
 
 const preparedContainerReferencesDirectory = (dataPath = dataDirectory()) =>
@@ -700,9 +764,6 @@ export async function runInContainer(
   let releaseSlot: (() => void) | undefined;
   try {
     executionSignal.throwIfAborted();
-    if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
-      await log(`[${job.name}] waiting for an available Apple Container slot\n`);
-    releaseSlot = await acquireContainerResources(resources, executionSignal);
     const secrets = await resolveJobSecrets(job, runtimeSecrets);
     executionSignal.throwIfAborted();
     const caches = await cacheMounts(
@@ -741,6 +802,9 @@ export async function runInContainer(
       dataPath: operations.dataPath,
     });
     const run = async (fileMounts: StagedFileMount[] = []) => {
+      if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
+        await log(`[${job.name}] waiting for an available Apple Container slot\n`);
+      releaseSlot = await acquireContainerResources(resources, executionSignal);
       const mounts = caches.mounts.map((mount) => ({
         source: mount.path,
         target: `/mnt/shared/${mount.name}`,
@@ -763,28 +827,79 @@ export async function runInContainer(
       await started();
       await log(`\n[${job.name}] $ ${job.command}\n`);
       const redactor = streamingSecretRedactor(
-        [...Object.values(secrets), ...fileMounts.flatMap((mount) => mount.values)],
+        [...Object.values(secrets), ...fileMounts.flatMap((mount) => mount.snapshot.values)],
         log,
       );
       const refreshMountedValues = async () => {
-        redactor.add(
-          (
-            await Promise.all(
-              fileMounts.map((mount) => mountedFileValues(join(mount.directory, mount.filename))),
-            )
-          ).flat(),
-        );
+        for (const mount of fileMounts) {
+          mount.snapshot = await mountedFileSnapshot(
+            join(mount.directory, mount.filename),
+            mount.snapshot,
+          );
+          redactor.add(mount.snapshot.values);
+        }
       };
-      const result = await runCommand(args, {
-        env: secrets,
-        signal: executionSignal,
-        onOutput: async (text) => {
+      let pendingOutput = "";
+      let drainTask: Promise<void> | undefined;
+      let drainError: unknown;
+      const scheduleDrain = () => {
+        if (drainTask || drainError) return;
+        drainTask = (async () => {
+          await Bun.sleep(FILE_MOUNT_RESCAN_MS);
+          const text = pendingOutput;
+          pendingOutput = "";
           await refreshMountedValues();
           await redactor.write(text);
-        },
-      });
-      await refreshMountedValues();
-      await redactor.flush();
+        })()
+          .catch((error) => {
+            drainError = error;
+          })
+          .finally(() => {
+            drainTask = undefined;
+            if (pendingOutput && !drainError) scheduleDrain();
+          });
+      };
+      let result: Awaited<ReturnType<typeof runCommand>> | undefined;
+      let commandError: unknown;
+      try {
+        result = await runCommand(args, {
+          env: secrets,
+          signal: executionSignal,
+          onOutput: async (text) => {
+            if (drainError) throw drainError;
+            pendingOutput += text;
+            scheduleDrain();
+            if (Buffer.byteLength(pendingOutput) >= MAX_PENDING_MOUNT_OUTPUT_BYTES && drainTask) {
+              await drainTask;
+              if (drainError) throw drainError;
+            }
+          },
+        });
+      } catch (error) {
+        commandError = error;
+      }
+      while (drainTask) await drainTask;
+      let redactionError = drainError;
+      if (!redactionError)
+        try {
+          if (pendingOutput) {
+            await refreshMountedValues();
+            await redactor.write(pendingOutput);
+            pendingOutput = "";
+          }
+          await refreshMountedValues();
+          await redactor.flush();
+        } catch (error) {
+          redactionError = error;
+        }
+      if (commandError && redactionError)
+        throw new AggregateError(
+          [commandError, redactionError],
+          "container command failed and mounted output could not be redacted",
+        );
+      if (commandError) throw commandError;
+      if (redactionError) throw redactionError;
+      if (!result) throw new Error("container command did not return a result");
       return result;
     };
     const lock = operations.withImageLock ?? withImageLock;
@@ -800,9 +915,16 @@ export async function runInContainer(
         runError = error;
       }
       try {
-        await Promise.all(staged.map(persistFileMount));
-      } catch (error) {
-        persistenceError = error;
+        const results = await Promise.allSettled(staged.map(persistFileMount));
+        const errors = results
+          .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+          .map((result) => result.reason);
+        if (errors.length === 1) persistenceError = errors[0];
+        else if (errors.length > 1)
+          persistenceError = new AggregateError(
+            errors,
+            "multiple mounted files could not be written back",
+          );
       } finally {
         await Promise.all(
           staged.map((mount) => rm(mount.directory, { recursive: true, force: true })),

@@ -12,6 +12,7 @@ import {
   prunePreparedContainerImages,
   runInContainer,
 } from "./container.ts";
+import { MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import { digest, shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
@@ -652,6 +653,178 @@ test("writes back a refreshed mounted file when the container job is interrupted
   }
 });
 
+test("does not overwrite a host file changed during a mounted job", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-conflict-"));
+  const source = join(root, "auth.json");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  const job: JobConfig = {
+    name: "review",
+    command: "codex exec review",
+    optional: true,
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    mounts: [{ source: "auth", target: "/mnt/auth", writeBack: true }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        job,
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { auth: source },
+          dataPath: join(root, "data"),
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const volume = args.find((arg) => arg.endsWith(":/mnt/auth"));
+              if (!volume) throw new Error("expected auth mount");
+              const staged = volume.slice(0, -":/mnt/auth".length);
+              await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "container" }));
+              await Bun.write(source, JSON.stringify({ token: "host-refresh" }));
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+        },
+      ),
+    ).rejects.toThrow("allowed host file changed during mounted job");
+    expect(await Bun.file(source).json()).toEqual({ token: "host-refresh" });
+    expect((await readdir(root)).filter((name) => name.includes(".informant-"))).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("settles every mounted-file write-back before cleaning staging", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-write-back-"));
+  const removedSource = join(root, "removed.txt");
+  const persistedSource = join(root, "persisted.txt");
+  await Bun.write(removedSource, "removed-original");
+  await Bun.write(persistedSource, "persisted-original");
+  const persistedValue = "p".repeat(128 * 1024);
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        {
+          name: "review",
+          command: "true",
+          optional: true,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          mounts: [
+            { source: "removed", target: "/mnt/removed", writeBack: true },
+            { source: "persisted", target: "/mnt/persisted", writeBack: true },
+          ],
+          needs: [],
+          runtime: { type: "container", image: "oven/bun:1" },
+        },
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { removed: removedSource, persisted: persistedSource },
+          dataPath: join(root, "data"),
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const removed = args.find((arg) => arg.endsWith(":/mnt/removed"));
+              const persisted = args.find((arg) => arg.endsWith(":/mnt/persisted"));
+              if (!removed || !persisted) throw new Error("expected mounted files");
+              await rm(join(removed.slice(0, -":/mnt/removed".length), "removed.txt"));
+              await Bun.write(
+                join(persisted.slice(0, -":/mnt/persisted".length), "persisted.txt"),
+                persistedValue,
+              );
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+        },
+      ),
+    ).rejects.toThrow();
+    expect(await Bun.file(persistedSource).text()).toBe(persistedValue);
+    expect(await readdir(join(root, "data", "file-mount-staging"))).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects mounted files that grow beyond the supported size", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-size-"));
+  const source = join(root, "credential.txt");
+  await Bun.write(source, "original");
+  try {
+    const error = await runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      {
+        name: "review",
+        command: "true",
+        optional: true,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts: [{ source: "credential", target: "/mnt/credential", writeBack: true }],
+        needs: [],
+        runtime: { type: "container", image: "oven/bun:1" },
+      },
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { credential: source },
+        dataPath: join(root, "data"),
+        withImageLock: passthroughImageLock,
+        command: async (args, options) => {
+          if (args[1] === "run") {
+            const volume = args.find((arg) => arg.endsWith(":/mnt/credential"));
+            if (!volume) throw new Error("expected credential mount");
+            const staged = volume.slice(0, -":/mnt/credential".length);
+            await Bun.write(
+              join(staged, "credential.txt"),
+              Buffer.alloc(MAX_ALLOWED_MOUNT_BYTES + 1),
+            );
+            await options?.onOutput?.("oversized mounted file output");
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    ).catch((caught) => caught);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(
+      (error as AggregateError).errors.every((nested) =>
+        String(nested).includes(`exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`),
+      ),
+    ).toBe(true);
+    expect(await Bun.file(source).text()).toBe("original");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("serializes different allowlist aliases for the same host file", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-file-alias-"));
   const source = join(root, "credential.json");
@@ -844,6 +1017,80 @@ test("prepared jobs copy source into the baked workspace before running", async 
     expect(script).toContain("rm -f /workspace/.git &&\ntrue");
   } finally {
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("waits for writable mount locks before reserving container capacity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-lock-capacity-"));
+  const source = join(root, "credential.txt");
+  await Bun.write(source, "credential");
+  const mountLockEntered = deferred<void>();
+  const releaseMountLock = deferred<void>();
+  const unrelatedStarted = deferred<void>();
+  const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
+  const runtime = {
+    type: "container" as const,
+    image: "image",
+    cpu: containerCapacity().cpu,
+    memoryMb: containerCapacity().memoryMb,
+  };
+  const run = (name: string, mounts: JobConfig["mounts"] = []) =>
+    runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "main",
+      "trusted-sha",
+      true,
+      process.cwd(),
+      {
+        name,
+        command: "true",
+        optional: false,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts,
+        needs: [],
+        runtime,
+      },
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { credential: source },
+        dataPath: join(root, "data"),
+        withImageLock: async (lockName, callback) => {
+          if (lockName.startsWith("host-file-")) {
+            mountLockEntered.resolve(undefined);
+            await releaseMountLock.promise;
+          }
+          return callback();
+        },
+        command: async (args) => {
+          if (args[1] === "run" && name === "unrelated") unrelatedStarted.resolve(undefined);
+          return result();
+        },
+      },
+    );
+
+  const mounted = run("mounted", [
+    { source: "credential", target: "/mnt/credential", writeBack: true },
+  ]);
+  try {
+    await mountLockEntered.promise;
+    const unrelated = run("unrelated");
+    await Promise.race([
+      unrelatedStarted.promise,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("unrelated job could not acquire container capacity");
+      }),
+    ]);
+    await unrelated;
+  } finally {
+    releaseMountLock.resolve(undefined);
+    await mounted;
+    await rm(root, { recursive: true, force: true });
   }
 });
 
