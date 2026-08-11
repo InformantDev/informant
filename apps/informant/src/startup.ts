@@ -23,11 +23,8 @@ export function startupServicePath(): string {
   return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 }
 
-export function linuxStartupServicePath(
-  environment: Record<string, string | undefined> = Bun.env,
-  home = homedir(),
-): string {
-  return join(xdgConfigHome(environment, home), "systemd", "user", "informant.service");
+export function linuxStartupServicePath(home = homedir()): string {
+  return join(home, ".config", "systemd", "user", "informant.service");
 }
 
 export function renderStartupService(

@@ -26,7 +26,7 @@ describe("startup service", () => {
     expect(() => parseStartupEnvironment("[]")).toThrow("invalid property list");
   });
 
-  test("preserves the Linux machine configuration location", () => {
+  test("keeps the Linux unit discoverable while preserving the machine config location", () => {
     expect(
       startupEnvironment(
         {
@@ -43,16 +43,13 @@ describe("startup service", () => {
       XDG_CONFIG_HOME: "/srv/informant/config",
       INFORMANT_CAPABILITIES: "linux-builder",
     });
-    expect(
-      linuxStartupServicePath({ XDG_CONFIG_HOME: "/srv/informant/config" }, "/home/worker"),
-    ).toBe("/srv/informant/config/systemd/user/informant.service");
+    expect(linuxStartupServicePath("/home/worker")).toBe(
+      "/home/worker/.config/systemd/user/informant.service",
+    );
   });
 
   test("uses the default Linux configuration location for invalid XDG paths", () => {
     for (const value of ["", "relative/config"]) {
-      expect(linuxStartupServicePath({ XDG_CONFIG_HOME: value }, "/home/worker")).toBe(
-        "/home/worker/.config/systemd/user/informant.service",
-      );
       expect(startupEnvironment({ XDG_CONFIG_HOME: value }, "/home/worker")).toEqual({
         HOME: "/home/worker",
         PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
