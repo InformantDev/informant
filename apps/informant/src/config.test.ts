@@ -114,6 +114,20 @@ describe("configuration", () => {
     );
   });
 
+  test("rejects unknown configuration and job fields", () => {
+    expect(() =>
+      parseConfig(configTemplate().replace("version = 1", "version = 1\nfuture_option = true")),
+    ).toThrow("contains unknown field future_option");
+    expect(() =>
+      parseConfig(
+        configTemplate().replace(
+          'command = "bun install --frozen-lockfile && bun test"',
+          'command = "bun install --frozen-lockfile && bun test"\nfuture_option = true',
+        ),
+      ),
+    ).toThrow("jobs[0] contains unknown field future_option");
+  });
+
   test("requires positive integer VM resources", () => {
     for (const [field, value] of [
       ["cpu", "-1"],

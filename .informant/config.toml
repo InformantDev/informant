@@ -22,4 +22,6 @@ curl -fsSL https://bun.sh/install | bash
 sudo mkdir -p /usr/local/bin
 sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
 brew install gh
+bun add --global @ampcode/cli-darwin-arm64@0.0.1784917055-ge644b2
+sudo ln -sf "$HOME/.bun/install/global/node_modules/@ampcode/cli-darwin-arm64/amp" /usr/local/bin/amp
 """

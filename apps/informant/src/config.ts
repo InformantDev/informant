@@ -24,6 +24,38 @@ runs_on = ["container"]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 `;
 
+const TOP_LEVEL_FIELDS = new Set([
+  "version",
+  "timeout_minutes",
+  "poll_interval_seconds",
+  "environment",
+  "cache",
+  "triggers",
+  "filters",
+  "branches",
+  "vm",
+  "container",
+  "jobs",
+]);
+
+const JOB_FIELDS = new Set([
+  "name",
+  "command",
+  "optional",
+  "timeout_minutes",
+  "environment",
+  "secrets",
+  "mounts",
+  "needs",
+  "runs_on",
+  "triggers",
+  "filters",
+  "cache",
+  "vm",
+  "container",
+  "host",
+]);
+
 export function directoryConfigTemplate(): string {
   return defaultDirectoryConfig;
 }
@@ -447,6 +479,9 @@ function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
 
 export function parseConfig(source: string, label = CONFIG_FILE): InformantConfig {
   const raw = Bun.TOML.parse(source) as Record<string, unknown>;
+  const unknownTopLevelField = Object.keys(raw).find((key) => !TOP_LEVEL_FIELDS.has(key));
+  if (unknownTopLevelField)
+    throw new Error(`${label} contains unknown field ${unknownTopLevelField}`);
   if (raw.version !== 1) {
     throw new Error(`${label} version must be 1`);
   }
@@ -479,6 +514,9 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   const defaultCache = parseCaches(raw.cache, "cache");
   const jobs: JobConfig[] = rawJobs.map((value, index) => {
     const job = value as Record<string, unknown>;
+    const unknownJobField = Object.keys(job).find((key) => !JOB_FIELDS.has(key));
+    if (unknownJobField)
+      throw new Error(`jobs[${index}] contains unknown field ${unknownJobField}`);
     if (typeof job.name !== "string" || typeof job.command !== "string") {
       throw new Error(`jobs[${index}] must have string name and command fields`);
     }
