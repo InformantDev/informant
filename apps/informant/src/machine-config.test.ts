@@ -52,6 +52,7 @@ test("allows only named existing host files for repository mounts", async () => 
     await Bun.write(source, "credential");
     await allowMount("codex-auth", source, path);
     expect(await listAllowedMounts(path)).toEqual([{ name: "codex-auth", source }]);
+    expect(allowMount("Codex-Auth", source, path)).rejects.toThrow("lowercase letters");
     expect(allowMount("bad/name", source, path)).rejects.toThrow("mount name");
     expect(allowMount("missing", join(root, "missing"), path)).rejects.toThrow("existing file");
     await Bun.write(source, Buffer.alloc(MAX_ALLOWED_MOUNT_BYTES + 1));
@@ -62,6 +63,23 @@ test("allows only named existing host files for repository mounts", async () => 
     expect(await removeAllowedMount("codex-auth", path)).toBe(false);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects uppercase mount names in machine configuration", async () => {
+  const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
+  try {
+    await Bun.write(
+      path,
+      `${JSON.stringify({
+        version: 1,
+        repositories: [],
+        allowedMounts: { "Codex-Auth": "/tmp/auth.json" },
+      })}\n`,
+    );
+    expect(listAllowedMounts(path)).rejects.toThrow("invalid allowed mounts");
+  } finally {
+    await Bun.file(path).delete();
   }
 });
 

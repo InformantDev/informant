@@ -109,14 +109,19 @@ export function resolveInformantExecutable(
   throw new Error("could not locate the installed Informant executable");
 }
 
-function updaterEnvironment(): Record<string, string> {
-  const home = homedir();
+export function updaterEnvironment(
+  source: Record<string, string | undefined> = Bun.env,
+  home = homedir(),
+): Record<string, string> {
   const environment: Record<string, string> = {
     HOME: home,
-    PATH: Bun.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    PATH: source.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
   };
-  if (Bun.env.XDG_CONFIG_HOME === xdgConfigHome(Bun.env, home)) {
-    environment.XDG_CONFIG_HOME = Bun.env.XDG_CONFIG_HOME;
+  if (source.XDG_CONFIG_HOME === xdgConfigHome(source, home)) {
+    environment.XDG_CONFIG_HOME = source.XDG_CONFIG_HOME;
+  }
+  if (source.INFORMANT_DATA_DIR !== undefined) {
+    environment.INFORMANT_DATA_DIR = source.INFORMANT_DATA_DIR;
   }
   return environment;
 }
@@ -362,7 +367,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart="${escapeSystemd(executable)}" update --automatic
 ${environmentLines}
-TimeoutStartSec=24h
+TimeoutStartSec=25h
 `;
 }
 
@@ -446,6 +451,8 @@ export async function enableAutomaticUpdates(
       existingDefinition(paths.service),
       existingDefinition(paths.timer),
     ]);
+    const previouslyEnabled =
+      (await run(["systemctl", "--user", "is-enabled", "informant-update.timer"])).exitCode === 0;
     await Bun.write(paths.service, renderLinuxAutomaticUpdateService(executable, environment));
     await Bun.write(paths.timer, renderLinuxAutomaticUpdateTimer());
     await Promise.all([chmod(paths.service, 0o600), chmod(paths.timer, 0o600)]);
@@ -461,6 +468,9 @@ export async function enableAutomaticUpdates(
       ]);
       if (enabled.exitCode === 0) return paths.timer;
       failure = enabled;
+      if (!previouslyEnabled) {
+        await run(["systemctl", "--user", "disable", "--now", "informant-update.timer"]);
+      }
     }
     await Promise.all([
       restoreDefinition(paths.service, previousService),

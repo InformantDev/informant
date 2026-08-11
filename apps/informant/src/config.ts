@@ -424,8 +424,8 @@ function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
     const raw = item as Record<string, unknown>;
     if (Object.keys(raw).some((key) => !["source", "target", "write_back"].includes(key)))
       throw new Error(`${label}[${index}] contains an unsupported field`);
-    if (typeof raw.source !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(raw.source))
-      throw new Error(`${label}[${index}].source must be an allowed mount name`);
+    if (typeof raw.source !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(raw.source))
+      throw new Error(`${label}[${index}].source must be a lowercase allowed mount name`);
     if (
       typeof raw.target !== "string" ||
       !raw.target.startsWith("/") ||

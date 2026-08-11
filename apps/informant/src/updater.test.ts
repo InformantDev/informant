@@ -17,6 +17,7 @@ import {
   renderLinuxAutomaticUpdateTimer,
   resolveInformantExecutable,
   updateInformantIfAvailable,
+  updaterEnvironment,
 } from "./updater.ts";
 
 const result = (exitCode = 0, stderr = "", stdout = ""): CommandResult => ({
@@ -309,10 +310,27 @@ describe("automatic update services", () => {
     const timer = renderLinuxAutomaticUpdateTimer();
     expect(service).toContain('ExecStart="/opt/Informant tools/informant" update --automatic');
     expect(service).toContain('Environment="HOME=/home/worker"');
-    expect(service).toContain("TimeoutStartSec=24h");
+    expect(service).toContain("TimeoutStartSec=25h");
     expect(timer).toContain("OnUnitInactiveSec=21600s");
     expect(timer).toContain("Persistent=true");
     expect(timer).toContain("WantedBy=timers.target");
+  });
+
+  test("preserves a custom data directory in the updater environment", () => {
+    expect(
+      updaterEnvironment(
+        {
+          PATH: "/usr/local/bin:/usr/bin",
+          INFORMANT_DATA_DIR: "/srv/informant/data",
+          INFORMANT_SECRET_TOKEN: "ignored",
+        },
+        "/home/worker",
+      ),
+    ).toEqual({
+      HOME: "/home/worker",
+      PATH: "/usr/local/bin:/usr/bin",
+      INFORMANT_DATA_DIR: "/srv/informant/data",
+    });
   });
 
   test("enables and disables the Linux automatic-update timer", async () => {
@@ -469,6 +487,7 @@ describe("automatic update services", () => {
     const home = await mkdtemp(join(tmpdir(), "informant-update-home-"));
     const executable = join(home, "bin", "informant");
     const environment = { HOME: home, PATH: join(home, "bin") };
+    const commands: string[][] = [];
     try {
       await mkdir(join(home, "bin"));
       await Bun.write(executable, "executable");
@@ -489,12 +508,60 @@ describe("automatic update services", () => {
           home,
           executable,
           environment: { ...environment, PATH: "/new/path" },
-          command: async (argv) =>
-            argv[2] === "enable" ? result(1, "temporary user manager failure") : result(),
+          command: async (argv) => {
+            commands.push(argv);
+            return argv[2] === "enable" ? result(1, "temporary user manager failure") : result();
+          },
         }),
       ).rejects.toThrow("temporary user manager failure");
       expect(await Bun.file(timer).text()).toBe(previousTimer);
       expect(await Bun.file(service).text()).toBe(previousService);
+      expect(commands).not.toContainEqual([
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "informant-update.timer",
+      ]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("disables a newly enabled Linux timer when starting it fails", async () => {
+    const home = await mkdtemp(join(tmpdir(), "informant-update-home-"));
+    const executable = join(home, "bin", "informant");
+    const commands: string[][] = [];
+    try {
+      await mkdir(join(home, "bin"));
+      await Bun.write(executable, "executable");
+      await expect(
+        enableAutomaticUpdates({
+          platform: "linux",
+          home,
+          executable,
+          environment: { HOME: home, PATH: join(home, "bin") },
+          command: async (argv) => {
+            commands.push(argv);
+            if (argv[2] === "is-enabled") return result(1, "disabled");
+            if (argv[2] === "enable") return result(1, "timer failed to start");
+            return result();
+          },
+        }),
+      ).rejects.toThrow("timer failed to start");
+      expect(commands).toContainEqual([
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "informant-update.timer",
+      ]);
+      expect(
+        await Bun.file(join(home, ".config/systemd/user/informant-update.timer")).exists(),
+      ).toBe(false);
+      expect(
+        await Bun.file(join(home, ".config/systemd/user/informant-update.service")).exists(),
+      ).toBe(false);
     } finally {
       await rm(home, { recursive: true, force: true });
     }

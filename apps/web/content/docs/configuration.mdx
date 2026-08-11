@@ -194,7 +194,8 @@ from that checkout while secrets are present.
 ## Allowed host file mounts
 
 Container jobs can request host files by a machine-local allowlist name. The repository never
-specifies a host path. First allow an existing file on the worker:
+specifies a host path. Mount names use lowercase letters, numbers, dots, underscores, and dashes.
+First allow an existing file on the worker:
 
 ```bash
 informant mount allow codex-auth "$HOME/.codex/auth.json"

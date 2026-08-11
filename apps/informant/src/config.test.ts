@@ -459,7 +459,10 @@ describe("configuration", () => {
     ]);
     expect(() =>
       parseConfig(configured.replace('source = "codex-auth"', 'source = "bad/name"')),
-    ).toThrow("source must be an allowed mount name");
+    ).toThrow("source must be a lowercase allowed mount name");
+    expect(() =>
+      parseConfig(configured.replace('source = "codex-auth"', 'source = "Codex-Auth"')),
+    ).toThrow("source must be a lowercase allowed mount name");
     expect(() =>
       parseConfig(configured.replace('target = "/mnt/codex"', 'target = "relative"')),
     ).toThrow("target must be an absolute container directory");

@@ -54,9 +54,7 @@ async function readMachineConfig(path = machineConfigPath()): Promise<MachineCon
       Array.isArray(value.allowedMounts) ||
       Object.entries(value.allowedMounts).some(
         ([name, source]) =>
-          !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) ||
-          typeof source !== "string" ||
-          !isAbsolute(source),
+          !/^[a-z0-9][a-z0-9._-]*$/.test(name) || typeof source !== "string" || !isAbsolute(source),
       ))
   )
     throw new Error(`invalid allowed mounts in Informant config: ${path}`);
@@ -98,8 +96,10 @@ export async function allowMount(
   source: string,
   path = machineConfigPath(),
 ): Promise<void> {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
-    throw new Error("mount name must contain only letters, numbers, dots, underscores, and dashes");
+  if (!/^[a-z0-9][a-z0-9._-]*$/.test(name))
+    throw new Error(
+      "mount name must contain only lowercase letters, numbers, dots, underscores, and dashes",
+    );
   const canonical = await realpath(source).catch(() => undefined);
   const metadata = canonical ? await lstat(canonical) : undefined;
   if (!canonical || !metadata?.isFile())
