@@ -103,7 +103,7 @@ describe("startup service", () => {
     expect(definitions).toBe(1);
     expect(invocations).toEqual([
       ["launchctl", "print", "gui/501/dev.informant.worker"],
-      ["brew", "upgrade", "informant-ci/tap/informant"],
+      ["brew", "upgrade", "informantdev/tap/informant"],
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["plutil", "-extract", "EnvironmentVariables", "json", "-o", "-", expect.any(String)],
       ["kill", "-TERM", "100"],
@@ -127,7 +127,7 @@ describe("startup service", () => {
     expect(updated).toEqual({ restarted: false });
     expect(invocations).toEqual([
       ["launchctl", "print", "gui/501/dev.informant.worker"],
-      ["brew", "upgrade", "informant-ci/tap/informant"],
+      ["brew", "upgrade", "informantdev/tap/informant"],
     ]);
   });
 

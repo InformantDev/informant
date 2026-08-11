@@ -85,7 +85,7 @@ restarts if it exits and starts again when you log in. Its output is written to 
 and `worker.stderr.log` in the Informant data directory. Run `informant startup enable` again after
 changing any `INFORMANT_*` environment-variable overrides so the service captures the new values.
 
-`informant update` upgrades `informant-ci/tap/informant` with Homebrew. If the startup LaunchAgent was
+`informant update` upgrades `informantdev/tap/informant` with Homebrew. If the startup LaunchAgent was
 already loaded, the command restarts it after the upgrade without rewriting its captured environment.
 It does not start a worker that was stopped or never enabled.
 
