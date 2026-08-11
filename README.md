@@ -10,7 +10,7 @@ Each job can select and prepare its own runtime image, keeping macOS VMs limited
 Install the standalone binary with Homebrew:
 
 ```bash
-brew install informant-ci/tap/informant
+brew install informantdev/tap/informant
 brew install gh
 gh auth login
 informant setup

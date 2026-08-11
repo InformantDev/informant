@@ -289,7 +289,7 @@ export async function updateInformant(
   const service = `${domain}/${LABEL}`;
   const initialService = await run(["launchctl", "print", service]);
   const loaded = initialService.exitCode === 0;
-  const upgraded = await run(["brew", "upgrade", "informant-ci/tap/informant"], {
+  const upgraded = await run(["brew", "upgrade", "informantdev/tap/informant"], {
     onOutput: options.onOutput,
   });
   if (upgraded.exitCode !== 0) {
