@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { GitHubClient } from "./github.ts";
+import { GitHubApiError, type GitHubClient } from "./github.ts";
 import type { PollState } from "./poll-state.ts";
 import {
   applySecretPolicy,
@@ -164,6 +164,7 @@ function dependencies(
       state.seenCommentIds = [...next.seenCommentIds];
       state.tagRefs = next.tagRefs ? [...next.tagRefs] : undefined;
       state.pendingTags = [...next.pendingTags];
+      state.missingConfigs = (next.missingConfigs ?? []).map((entry) => ({ ...entry }));
     },
     recoverInterruptedBuilds: async () => false,
     reconcilePreparedImageReferences: async () => 0,
@@ -335,6 +336,106 @@ describe("serve polling orchestration", () => {
       triggers: [{ event: "commit", tag: { patterns: ["v*"] } }],
     })),
   };
+
+  test("persists missing config for unchanged branch commits across restarts", async () => {
+    let missingConfigReads = 0;
+    let launches = 0;
+    const state: PollState = {
+      cursor: "2026-01-01T00:00:00.000Z",
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      missingConfigs: [],
+    };
+    const deps = dependencies(
+      github({
+        branches: async () => [
+          { name: "main", sha: "default-sha" },
+          { name: "legacy", sha: "legacy-sha" },
+        ],
+      }),
+      state,
+      async () => {
+        launches++;
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      missingConfigReads++;
+      throw new GitHubApiError(404, '{"message":"Not Found"}');
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(missingConfigReads).toBe(1);
+    expect(launches).toBe(2);
+    expect(state.missingConfigs?.map((entry) => entry.sha)).toEqual(["legacy-sha"]);
+  });
+
+  test("rechecks expired missing configurations", async () => {
+    let missingConfigReads = 0;
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      missingConfigs: [{ sha: "legacy-sha", checkedAt: "2020-01-01T00:00:00.000Z" }],
+    };
+    const deps = dependencies(
+      github({ branches: async () => [{ name: "legacy", sha: "legacy-sha" }] }),
+      state,
+      async () => undefined,
+    );
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      missingConfigReads++;
+      return config;
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(missingConfigReads).toBe(1);
+    expect(state.missingConfigs).toEqual([]);
+  });
+
+  test("retains all reachable missing configurations when the bounded cache is full", async () => {
+    const branches = Array.from({ length: 257 }, (_, index) => ({
+      name: `legacy-${index}`,
+      sha: `legacy-sha-${index}`,
+    }));
+    let missingConfigReads = 0;
+    const state: PollState = {
+      cursor: "2026-01-01T00:00:00.000Z",
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      missingConfigs: [],
+    };
+    const deps = dependencies(
+      github({ branches: async () => branches }),
+      state,
+      async () => undefined,
+    );
+    let pollStateWrites = 0;
+    const savePollState = deps.savePollState;
+    deps.savePollState = async (...args) => {
+      pollStateWrites++;
+      await savePollState?.(...args);
+    };
+    deps.repositoryConfig = async (_github, _repository, sha) => {
+      if (sha === "default-sha") return config;
+      missingConfigReads++;
+      throw new GitHubApiError(404, '{"message":"Not Found"}');
+    };
+
+    await serve(repository, { once: true, dependencies: deps });
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(missingConfigReads).toBe(branches.length);
+    expect(state.missingConfigs).toHaveLength(branches.length);
+    expect(pollStateWrites).toBe(5);
+  });
 
   test("job filters prevent nonmatching automatic events from being claimed", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };

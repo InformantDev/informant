@@ -34,7 +34,7 @@ directly — the same units `/staff-review` uses.
 ## Step 1 — Set up and validate the diff
 
 The CLI is optional: never stop to ask for it. Resolve the slug from a user
-argument, then `staff active --json` if available, otherwise `HEAD..WT`. With
+argument, then `staff active --json` if available, otherwise `main..WT`. With
 the CLI, run `staff diff <slug> --json`; without it, workers use Git.
 
 **Precondition — the head must be the working tree.** Resolve edits the working
