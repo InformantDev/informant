@@ -980,6 +980,29 @@ describe("serve polling orchestration", () => {
     expect(receivedSignal.aborted).toBe(false);
   });
 
+  test("passes the shutdown signal to GitHub polling requests", async () => {
+    const outer = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const client = github({});
+    client.defaultBranch = async (_repository, signal) => {
+      receivedSignal = signal;
+      outer.abort("Worker shutdown requested.");
+      signal?.throwIfAborted();
+      return "main";
+    };
+
+    await serve(repository, {
+      signal: outer.signal,
+      dependencies: dependencies(
+        client,
+        { pending: [], seenCommentIds: [], pendingTags: [] },
+        async () => undefined,
+      ),
+    });
+
+    expect(receivedSignal).toBe(outer.signal);
+  });
+
   test("does not claim automatic work when shutdown arrives during config loading", async () => {
     const outer = new AbortController();
     const pending = deferred<InformantConfig>();

@@ -27,6 +27,41 @@ const MISSING_CONFIG_LIMIT = 256;
 
 class MissingRepositoryConfigError extends Error {}
 
+async function waitForAbortableDelay(
+  milliseconds: number,
+  signal?: AbortSignal,
+  sleep?: (milliseconds: number) => Promise<void>,
+): Promise<boolean> {
+  if (signal?.aborted) return false;
+  if (!signal) {
+    await (sleep ?? Bun.sleep)(milliseconds);
+    return true;
+  }
+  if (sleep) {
+    let stopWaiting!: () => void;
+    const aborted = new Promise<false>((resolve) => {
+      stopWaiting = () => resolve(false);
+      signal.addEventListener("abort", stopWaiting, { once: true });
+    });
+    try {
+      return await Promise.race([sleep(milliseconds).then(() => true as const), aborted]);
+    } finally {
+      signal.removeEventListener("abort", stopWaiting);
+    }
+  }
+  return new Promise<boolean>((resolve) => {
+    const timeout = setTimeout(() => finish(true), milliseconds);
+    const abort = () => finish(false);
+    const finish = (elapsed: boolean) => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", abort);
+      resolve(elapsed);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
 function unexpiredMissingConfigs(
   entries: Array<{ sha: string; checkedAt: string }>,
   now = Date.now(),
@@ -49,15 +84,20 @@ function boundMissingConfigs(
   return [...stale.slice(-MISSING_CONFIG_LIMIT), ...retained];
 }
 
-async function repositoryConfig(github: GitHubClient, repository: Repository, sha: string) {
-  const source = await github.fileContent(repository, sha, CONFIG_FILE);
-  const paths = await github.directoryFiles(repository, sha, JOBS_DIRECTORY);
+async function repositoryConfig(
+  github: GitHubClient,
+  repository: Repository,
+  sha: string,
+  signal?: AbortSignal,
+) {
+  const source = await github.fileContent(repository, sha, CONFIG_FILE, signal);
+  const paths = await github.directoryFiles(repository, sha, JOBS_DIRECTORY, signal);
   return parseConfigFiles(
     source,
     await Promise.all(
       paths.map(async (path) => ({
         path,
-        source: await github.fileContent(repository, sha, path),
+        source: await github.fileContent(repository, sha, path, signal),
       })),
     ),
     `${repository.fullName}/${CONFIG_FILE}@${sha.slice(0, 7)}`,
@@ -79,6 +119,7 @@ export interface ServerDependencies {
     github: GitHubClient,
     repository: Repository,
     sha: string,
+    signal?: AbortSignal,
   ) => Promise<InformantConfig>;
   runCommit?: typeof runCommit;
   readPollState?: typeof readPollState;
@@ -208,7 +249,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   const loadPollState = dependencies.readPollState ?? readPollState;
   const persistPollState = dependencies.savePollState ?? savePollState;
   const recoverBuilds = dependencies.recoverInterruptedBuilds ?? recoverInterruptedBuilds;
-  const sleep = dependencies.sleep ?? Bun.sleep;
   let intervalSeconds = 30;
   let lastPollError: string | undefined;
   let rateLimitUntil = 0;
@@ -236,18 +276,20 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     if (missingConfigShas.has(sha)) return Promise.resolve(undefined);
     const cached = configs.get(sha);
     if (cached) return cached;
-    const pending = loadRepositoryConfig(github, repository, sha).catch(async (error) => {
-      if (error instanceof GitHubApiError && error.status === 404) {
-        state.missingConfigs = [
-          ...(state.missingConfigs ?? []).filter((entry) => entry.sha !== sha),
-          { sha, checkedAt: new Date(now).toISOString() },
-        ];
-        missingConfigShas.add(sha);
-        await onMissingConfig();
-        return undefined;
-      }
-      throw error;
-    });
+    const pending = loadRepositoryConfig(github, repository, sha, options.signal).catch(
+      async (error) => {
+        if (error instanceof GitHubApiError && error.status === 404) {
+          state.missingConfigs = [
+            ...(state.missingConfigs ?? []).filter((entry) => entry.sha !== sha),
+            { sha, checkedAt: new Date(now).toISOString() },
+          ];
+          missingConfigShas.add(sha);
+          await onMissingConfig();
+          return undefined;
+        }
+        throw error;
+      },
+    );
     configs.set(sha, pending);
     void pending.then(
       (config) => {
@@ -273,23 +315,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     shutdownControllers.clear();
     automaticLanes.clear();
   };
-  const waitForDelay = async (milliseconds: number) => {
-    if (options.signal?.aborted) return false;
-    if (!options.signal) {
-      await sleep(milliseconds);
-      return true;
-    }
-    let stopWaiting: (() => void) | undefined;
-    const aborted = new Promise<false>((resolve) => {
-      stopWaiting = () => resolve(false);
-      options.signal?.addEventListener("abort", stopWaiting, { once: true });
-    });
-    try {
-      return await Promise.race([sleep(milliseconds).then(() => true as const), aborted]);
-    } finally {
-      if (stopWaiting) options.signal.removeEventListener("abort", stopWaiting);
-    }
-  };
+  const waitForDelay = (milliseconds: number) =>
+    waitForAbortableDelay(milliseconds, options.signal, dependencies.sleep);
   const drainRuns = async () => {
     await Promise.allSettled(inFlightRuns.values());
     if (completedComments.size > 0 || completedTags.size > 0) {
@@ -326,6 +353,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       try {
         recoveryPending = await recoverBuilds(github, repository, message);
       } catch (error) {
+        if (options.signal?.aborted) {
+          await drainForShutdown();
+          return;
+        }
         message(
           `could not scan interrupted builds: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -351,8 +382,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         missingConfigsDirty = true;
         if (persistImmediately) await persistState();
       };
-      const defaultBranch = await github.defaultBranch(repository);
-      const defaultSha = await github.branchHead(repository, defaultBranch);
+      const defaultBranch = await github.defaultBranch(repository, options.signal);
+      const defaultSha = await github.branchHead(repository, defaultBranch, options.signal);
       const bootstrap = await configAt(defaultSha, state, missingConfigShas, () =>
         markMissingConfig(true),
       );
@@ -406,9 +437,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         (!state.tagsPolledAt ||
           Date.now() - new Date(state.tagsPolledAt).getTime() >= TAG_POLL_INTERVAL_MS);
       const [branches, tags, prs] = await Promise.all([
-        github.branches(repository),
-        shouldPollTags ? github.tags(repository) : undefined,
-        github.pullRequests(repository),
+        github.branches(repository, options.signal),
+        shouldPollTags ? github.tags(repository, options.signal) : undefined,
+        github.pullRequests(repository, options.signal),
       ]);
       const retainedConfigShas = new Set([
         defaultSha,
@@ -459,7 +490,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         const key = `${sha}\0${branch ?? ""}\0${label}`;
         let pending = manualTriggers.get(key);
         if (!pending) {
-          pending = github.hasPendingManualTrigger(repository, sha, branch, label);
+          pending = github.hasPendingManualTrigger(repository, sha, branch, label, options.signal);
           manualTriggers.set(key, pending);
         }
         return pending;
@@ -593,7 +624,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         for (const id of completed) completedComments.delete(id);
       }
       if (!state.cursor) {
-        const latest = await github.latestPullRequestComments(repository);
+        const latest = await github.latestPullRequestComments(repository, 100, options.signal);
         state.cursor = latest.reduce(
           (cursor, comment) => (comment.updatedAt > cursor ? comment.updatedAt : cursor),
           new Date(0).toISOString(),
@@ -605,7 +636,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         const overlap = new Date(
           new Date(previousCursor).getTime() - COMMENT_CURSOR_OVERLAP_MS,
         ).toISOString();
-        const comments = await github.pullRequestComments(repository, overlap);
+        const comments = await github.pullRequestComments(repository, overlap, options.signal);
         const known = new Set([...state.seenCommentIds, ...state.pending.map((item) => item.id)]);
         for (const comment of comments) {
           if (comment.updatedAt > state.cursor) state.cursor = comment.updatedAt;
@@ -615,7 +646,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           let pr = prs.find((item) => item.number === comment.pullRequestNumber);
           if (!pr) {
             try {
-              pr = await github.pullRequest(repository, comment.pullRequestNumber);
+              pr = await github.pullRequest(repository, comment.pullRequestNumber, options.signal);
             } catch (error) {
               if (error instanceof Error && error.message.startsWith("GitHub 404")) continue;
               throw error;
@@ -694,6 +725,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       await flushMissingConfigs();
       lastPollError = undefined;
     } catch (error) {
+      if (options.signal?.aborted) {
+        await drainForShutdown();
+        return;
+      }
       const detail = errorDetail(error);
       const pollError =
         error instanceof MissingRepositoryConfigError ||
@@ -785,31 +820,16 @@ export async function serveRepositories(
   }
 
   const loadRepositories = options.dependencies?.listRepositories ?? listRepositories;
-  const sleep = options.dependencies?.sleep ?? Bun.sleep;
   const workers = new Map<
     string,
     { repository: Repository; controller: AbortController; task: Promise<void> }
   >();
-  const waitForRefresh = async () => {
-    if (options.signal?.aborted) return false;
-    if (!options.signal) {
-      await sleep(REPOSITORY_REFRESH_INTERVAL_MS);
-      return true;
-    }
-    let stopWaiting: (() => void) | undefined;
-    const aborted = new Promise<false>((resolve) => {
-      stopWaiting = () => resolve(false);
-      options.signal?.addEventListener("abort", stopWaiting, { once: true });
-    });
-    try {
-      return await Promise.race([
-        sleep(REPOSITORY_REFRESH_INTERVAL_MS).then(() => true as const),
-        aborted,
-      ]);
-    } finally {
-      if (stopWaiting) options.signal.removeEventListener("abort", stopWaiting);
-    }
-  };
+  const waitForRefresh = () =>
+    waitForAbortableDelay(
+      REPOSITORY_REFRESH_INTERVAL_MS,
+      options.signal,
+      options.dependencies?.sleep,
+    );
   const reconcile = (configured: Repository[]) => {
     const next = new Map(
       configured.map((repository) => [repository.fullName.toLowerCase(), repository]),
