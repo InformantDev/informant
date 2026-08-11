@@ -5,11 +5,15 @@ import type { InformantConfig } from "./types.ts";
 const architectureLabel = (value: string) =>
   value === "x64" ? "x64" : value === "arm64" ? "arm64" : value;
 
-export function workerCapabilities(environment = Bun.env): string[] {
+export function mountCapability(name: string): string {
+  return `mount:${name.toLowerCase()}`;
+}
+
+export function workerCapabilities(environment = Bun.env, allowedMounts: string[] = []): string[] {
   const configured = (environment.INFORMANT_CAPABILITIES ?? "")
     .split(",")
     .map((value) => value.trim().toLowerCase())
-    .filter((value) => Boolean(value) && value !== "container");
+    .filter((value) => Boolean(value) && value !== "container" && !value.startsWith("mount:"));
   return [
     ...new Set([
       "self-hosted",
@@ -17,6 +21,7 @@ export function workerCapabilities(environment = Bun.env): string[] {
       architectureLabel(arch()),
       hostname().toLowerCase(),
       ...(containerBackendReadiness()?.ready ? ["container"] : []),
+      ...allowedMounts.map(mountCapability),
       ...configured,
     ]),
   ];

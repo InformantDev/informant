@@ -5,6 +5,7 @@ import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./
 import { refreshSelectedContainerBackend } from "./container-backend.ts";
 import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
 import type { ClaimResult, GitHubClient } from "./github.ts";
+import { listAllowedMounts } from "./machine-config.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
 import { withImageLock } from "./tart/vm.ts";
@@ -21,6 +22,7 @@ export interface CoordinatorDependencies {
   housekeepingBarrier?: <T>(callback: () => Promise<T>) => Promise<T>;
   refreshContainerBackend?: (signal?: AbortSignal) => Promise<boolean>;
   workerCapabilities?: () => string[];
+  listAllowedMounts?: typeof listAllowedMounts;
   acquireExecutionSlot?: AcquireExecutionSlot;
 }
 
@@ -209,8 +211,19 @@ export async function runCommit(
       job.runtime?.type === "host" ||
       job.runtime?.type === "container",
   );
+  const usesMountCapabilities = config.jobs.some((job) =>
+    (job.runsOn ?? []).some((label) => label.toLowerCase().startsWith("mount:")),
+  );
+  const allowedMounts =
+    usesCapabilities && usesMountCapabilities && !dependencies.workerCapabilities
+      ? await (dependencies.listAllowedMounts ?? listAllowedMounts)()
+      : [];
   const advertisedCapabilities = usesCapabilities
-    ? (dependencies.workerCapabilities ?? workerCapabilities)()
+    ? (dependencies.workerCapabilities?.() ??
+      workerCapabilities(
+        Bun.env,
+        allowedMounts.map((mount) => mount.name),
+      ))
     : [];
   const baseCapabilities = advertisedCapabilities.filter(
     (capability) => capability.toLowerCase() !== "container",

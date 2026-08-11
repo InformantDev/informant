@@ -1,6 +1,6 @@
 name = "Staff Review"
-# Route to Codex-capable workers configured with the codex-auth mount.
-runs_on = ["container", "codex"]
+# Allowed mounts automatically advertise a namespaced worker capability.
+runs_on = ["container", "mount:codex-auth"]
 optional = true
 command = """
 set -eu

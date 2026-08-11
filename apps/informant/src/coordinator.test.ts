@@ -672,6 +672,41 @@ describe("runCommit", () => {
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
   });
 
+  test("admits mount-capability jobs only when the mount is allow-listed", async () => {
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const mountConfig: InformantConfig = {
+      ...config,
+      jobs: [
+        {
+          ...baseJob,
+          name: "staff-review",
+          runsOn: ["container", "mount:codex-auth"],
+          runtime: { type: "container", image: "docker.io/oven/bun:1" },
+          mounts: [{ source: "codex-auth", target: "/mnt/informant-codex", writeBack: true }],
+        },
+      ],
+    };
+
+    const configured = harness();
+    configured.dependencies.listAllowedMounts = async () => [
+      { name: "codex-auth", source: "/home/worker/.codex/auth.json" },
+    ];
+    await runCommit(configured.github, repository, "configured", "main", mountConfig, {
+      ...configured.dependencies,
+      refreshContainerBackend: async () => true,
+    });
+    expect(configured.jobChecks).toEqual(["staff-review"]);
+
+    const unconfigured = harness();
+    unconfigured.dependencies.listAllowedMounts = async () => [];
+    await runCommit(unconfigured.github, repository, "unconfigured", "main", mountConfig, {
+      ...unconfigured.dependencies,
+      refreshContainerBackend: async () => true,
+    });
+    expect(unconfigured.jobChecks).toEqual([]);
+  });
+
   test("returns retryable before claiming selected portable container work when unavailable", async () => {
     let claims = 0;
     const github = {

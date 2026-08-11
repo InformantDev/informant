@@ -52,6 +52,10 @@ Every worker automatically provides `self-hosted`, its platform (`linux` or `dar
 (`x64` or `arm64`), and lowercase hostname. Add custom comma-separated labels with
 `INFORMANT_CAPABILITIES`, for example `INFORMANT_CAPABILITIES=gpu,large`.
 
+Allowed host mounts advertise protected `mount:<name>` capabilities automatically. These labels
+cannot be added through `INFORMANT_CAPABILITIES`; they exist only while the mount name is in the
+worker's machine-local allowlist.
+
 Workers also provide `container` only when their platform backend passes its health check. Use
 `runs_on = ["container"]` for a portable container job that can run with Apple Container on macOS or
 rootless Podman on Linux. Generated jobs use this label. Version 1 configurations that omit `runs_on`
@@ -205,7 +209,11 @@ directory containing the file under its original basename:
 ```toml
 environment = { CODEX_HOME = "/mnt/informant-codex" }
 mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back = true }]
+runs_on = ["container", "mount:codex-auth"]
 ```
+
+Using the corresponding `mount:codex-auth` capability prevents workers without that allowlist entry
+from claiming the job.
 
 `write_back` defaults to `false`. When enabled, Informant serializes jobs using the same writable
 source and atomically copies the resulting file back to the allowed host path unless the host copy

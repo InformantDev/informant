@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
+import { mountCapability, selectCapableJobs, workerCapabilities } from "./capabilities.ts";
 import {
   initializeContainerBackend,
   podmanContainerBackend,
@@ -30,6 +30,14 @@ afterEach(resetContainerBackendReadiness);
 test("worker capabilities include platform defaults and configured labels", () => {
   expect(workerCapabilities({ INFORMANT_CAPABILITIES: "gpu, large" })).toContain("gpu");
   expect(workerCapabilities({ INFORMANT_CAPABILITIES: "gpu, large" })).toContain("self-hosted");
+});
+
+test("allowed mounts advertise protected namespaced capabilities", () => {
+  expect(mountCapability("Codex-Auth")).toBe("mount:codex-auth");
+  expect(workerCapabilities({}, ["codex-auth"])).toContain("mount:codex-auth");
+  expect(workerCapabilities({ INFORMANT_CAPABILITIES: "mount:codex-auth" })).not.toContain(
+    "mount:codex-auth",
+  );
 });
 
 test("selects only jobs supported by the worker and their dependencies", () => {
