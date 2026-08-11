@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,7 +19,8 @@ import {
   podmanContainerBackend,
   resetContainerBackendReadiness,
 } from "./container-backend.ts";
-import { shellQuote } from "./tart/vm.ts";
+import { MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
+import { digest, shellQuote } from "./tart/vm.ts";
 import type { JobConfig, Repository } from "./types.ts";
 
 const temporaryDataPaths: string[] = [];
@@ -682,6 +683,444 @@ test("passes secrets through the client environment and always removes the conta
   expect(output.join("")).not.toContain("line one");
 });
 
+test("mounts, redacts, and writes back an allowed host file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-mount-"));
+  const codexHome = join(root, "codex-home");
+  await mkdir(codexHome);
+  await Bun.write(
+    join(codexHome, "auth.json"),
+    JSON.stringify({ tokens: { access_token: "access-secret", refresh_token: "refresh-secret" } }),
+  );
+  const output: string[] = [];
+  const locks: string[] = [];
+  const lockAttempts: Array<number | undefined> = [];
+  const job: JobConfig = {
+    name: "review",
+    command: "codex exec review",
+    optional: true,
+    timeoutMinutes: 1,
+    environment: { CODEX_HOME: "/mnt/informant-codex" },
+    secrets: [],
+    mounts: [{ source: "codex-auth", target: "/mnt/informant-codex", writeBack: true }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  try {
+    const result = await runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      job,
+      async (text) => {
+        output.push(text);
+      },
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { "codex-auth": join(codexHome, "auth.json") },
+        dataPath: join(root, "data"),
+        withImageLock: async (name, callback, _signal, maximumAttempts) => {
+          locks.push(name);
+          lockAttempts.push(maximumAttempts);
+          return callback();
+        },
+        command: async (args, options) => {
+          if (args[1] === "run") {
+            const volume = args.find((arg) => arg.endsWith(":/mnt/informant-codex"));
+            if (!volume) throw new Error("expected Codex auth mount");
+            const source = volume.slice(0, -":/mnt/informant-codex".length);
+            await Bun.write(
+              join(source, "auth.json"),
+              JSON.stringify({ tokens: { access_token: "refreshed-access" } }),
+            );
+            await options?.onOutput?.("access-secret refreshed-access");
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    );
+    expect(result).toEqual({ success: true, exitCode: 0, timedOut: false });
+    expect(await Bun.file(join(codexHome, "auth.json")).json()).toEqual({
+      tokens: { access_token: "refreshed-access" },
+    });
+    expect(output.join("")).toContain("[REDACTED]");
+    expect(output.join("")).not.toContain("access-secret");
+    expect(output.join("")).not.toContain("refreshed-access");
+    expect(locks).toEqual([
+      "prepared-container-image-references",
+      `host-file-${digest(join(codexHome, "auth.json"))}`,
+    ]);
+    expect(lockAttempts).toEqual([undefined, Number.POSITIVE_INFINITY]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("writes back a refreshed mounted file when the container job is interrupted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-interrupt-"));
+  const source = join(root, "auth.json");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  const job: JobConfig = {
+    name: "review",
+    command: "codex exec review",
+    optional: true,
+    timeoutMinutes: 1,
+    environment: { CODEX_HOME: "/mnt/informant-codex" },
+    secrets: [],
+    mounts: [{ source: "codex-auth", target: "/mnt/informant-codex", writeBack: true }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        job,
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { "codex-auth": source },
+          dataPath: join(root, "data"),
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] !== "run") return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+            const volume = args.find((arg) => arg.endsWith(":/mnt/informant-codex"));
+            if (!volume) throw new Error("expected Codex auth mount");
+            const staged = volume.slice(0, -":/mnt/informant-codex".length);
+            await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "refreshed" }));
+            throw new Error("interrupted");
+          },
+        },
+      ),
+    ).rejects.toThrow("interrupted");
+    expect(await Bun.file(source).json()).toEqual({ token: "refreshed" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("does not overwrite a host file changed during a mounted job", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-conflict-"));
+  const source = join(root, "auth.json");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  const job: JobConfig = {
+    name: "review",
+    command: "codex exec review",
+    optional: true,
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    mounts: [{ source: "auth", target: "/mnt/auth", writeBack: true }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        job,
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { auth: source },
+          dataPath: join(root, "data"),
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const volume = args.find((arg) => arg.endsWith(":/mnt/auth"));
+              if (!volume) throw new Error("expected auth mount");
+              const staged = volume.slice(0, -":/mnt/auth".length);
+              await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "container" }));
+              await Bun.write(source, JSON.stringify({ token: "host-refresh" }));
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+        },
+      ),
+    ).rejects.toThrow("allowed host file changed during mounted job");
+    expect(await Bun.file(source).json()).toEqual({ token: "host-refresh" });
+    expect((await readdir(root)).filter((name) => name.includes(".informant-"))).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("settles every mounted-file write-back before cleaning staging", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-write-back-"));
+  const removedSource = join(root, "removed.txt");
+  const persistedSource = join(root, "persisted.txt");
+  await Bun.write(removedSource, "removed-original");
+  await Bun.write(persistedSource, "persisted-original");
+  const persistedValue = "p".repeat(128 * 1024);
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        {
+          name: "review",
+          command: "true",
+          optional: true,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          mounts: [
+            { source: "removed", target: "/mnt/removed", writeBack: true },
+            { source: "persisted", target: "/mnt/persisted", writeBack: true },
+          ],
+          needs: [],
+          runtime: { type: "container", image: "oven/bun:1" },
+        },
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { removed: removedSource, persisted: persistedSource },
+          dataPath: join(root, "data"),
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const removed = args.find((arg) => arg.endsWith(":/mnt/removed"));
+              const persisted = args.find((arg) => arg.endsWith(":/mnt/persisted"));
+              if (!removed || !persisted) throw new Error("expected mounted files");
+              await rm(join(removed.slice(0, -":/mnt/removed".length), "removed.txt"));
+              await Bun.write(
+                join(persisted.slice(0, -":/mnt/persisted".length), "persisted.txt"),
+                persistedValue,
+              );
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+        },
+      ),
+    ).rejects.toThrow();
+    expect(await Bun.file(persistedSource).text()).toBe(persistedValue);
+    expect(await readdir(join(root, "data", "file-mount-staging"))).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects mounted files that grow beyond the supported size", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-size-"));
+  const source = join(root, "credential.txt");
+  await Bun.write(source, "original");
+  try {
+    const error = await runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      {
+        name: "review",
+        command: "true",
+        optional: true,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts: [{ source: "credential", target: "/mnt/credential", writeBack: true }],
+        needs: [],
+        runtime: { type: "container", image: "oven/bun:1" },
+      },
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { credential: source },
+        dataPath: join(root, "data"),
+        withImageLock: passthroughImageLock,
+        command: async (args, options) => {
+          if (args[1] === "run") {
+            const volume = args.find((arg) => arg.endsWith(":/mnt/credential"));
+            if (!volume) throw new Error("expected credential mount");
+            const staged = volume.slice(0, -":/mnt/credential".length);
+            await Bun.write(
+              join(staged, "credential.txt"),
+              Buffer.alloc(MAX_ALLOWED_MOUNT_BYTES + 1),
+            );
+            await options?.onOutput?.("oversized mounted file output");
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    ).catch((caught) => caught);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(
+      (error as AggregateError).errors.every((nested) =>
+        String(nested).includes(`exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`),
+      ),
+    ).toBe(true);
+    expect(await Bun.file(source).text()).toBe("original");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("serializes different allowlist aliases for the same host file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-alias-"));
+  const source = join(root, "credential.json");
+  await Bun.write(source, "credential");
+  const lockNames: string[] = [];
+  const run = (alias: string) =>
+    runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      {
+        name: `review-${alias}`,
+        command: "true",
+        optional: true,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts: [{ source: alias, target: "/mnt/credential", writeBack: true }],
+        needs: [],
+        runtime: { type: "container", image: "oven/bun:1" },
+      },
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { first: source, second: source },
+        dataPath: join(root, "data"),
+        withImageLock: async (name, callback) => {
+          if (name.startsWith("host-file-")) lockNames.push(name);
+          return callback();
+        },
+        command: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }),
+      },
+    );
+  try {
+    await run("first");
+    await run("second");
+    expect(lockNames).toEqual([`host-file-${digest(source)}`, `host-file-${digest(source)}`]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cleans staged files when a later mount fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-staging-"));
+  const first = join(root, "first.txt");
+  const second = join(root, "second.txt");
+  await Bun.write(first, "first-secret");
+  await Bun.write(second, "second-secret");
+  let hostLocks = 0;
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        {
+          name: "review",
+          command: "true",
+          optional: true,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          mounts: [
+            { source: "first", target: "/mnt/first", writeBack: true },
+            { source: "second", target: "/mnt/second", writeBack: true },
+          ],
+          needs: [],
+          runtime: { type: "container", image: "oven/bun:1" },
+        },
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { first, second },
+          dataPath: join(root, "data"),
+          withImageLock: async (name, callback) => {
+            if (name.startsWith("host-file-") && ++hostLocks === 2) await rm(second);
+            return callback();
+          },
+          command: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }),
+        },
+      ),
+    ).rejects.toThrow();
+    const staging = join(root, "data", "file-mount-staging");
+    expect(await readdir(staging)).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects repository file mounts that are not allowed by the worker", async () => {
+  const invocations: string[][] = [];
+  const job: JobConfig = {
+    name: "review",
+    command: "cat /mnt/credential/token",
+    optional: false,
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    mounts: [{ source: "credential", target: "/mnt/credential", writeBack: false }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  await expect(
+    runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      job,
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: {},
+        dataPath: temporaryContainerDataPath(),
+        withImageLock: passthroughImageLock,
+        command: async (args) => {
+          invocations.push(args);
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    ),
+  ).rejects.toThrow("mount credential is not allowed on this worker");
+  expect(invocations.some((args) => args[1] === "run")).toBe(false);
+});
+
 test("prepared jobs copy source into the baked workspace before running", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "informant-$'-prepared-run-"));
   await Bun.write(join(workspace, "package.json"), '{"name":"test"}\n');
@@ -735,6 +1174,80 @@ test("prepared jobs copy source into the baked workspace before running", async 
     expect(script).toContain("rm -f /workspace/.git &&\ntrue");
   } finally {
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("waits for writable mount locks before reserving container capacity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-lock-capacity-"));
+  const source = join(root, "credential.txt");
+  await Bun.write(source, "credential");
+  const mountLockEntered = deferred<void>();
+  const releaseMountLock = deferred<void>();
+  const unrelatedStarted = deferred<void>();
+  const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
+  const runtime = {
+    type: "container" as const,
+    image: "image",
+    cpu: containerCapacity().cpu,
+    memoryMb: containerCapacity().memoryMb,
+  };
+  const run = (name: string, mounts: JobConfig["mounts"] = []) =>
+    runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "main",
+      "trusted-sha",
+      true,
+      process.cwd(),
+      {
+        name,
+        command: "true",
+        optional: false,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts,
+        needs: [],
+        runtime,
+      },
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { credential: source },
+        dataPath: join(root, "data"),
+        withImageLock: async (lockName, callback) => {
+          if (lockName.startsWith("host-file-")) {
+            mountLockEntered.resolve(undefined);
+            await releaseMountLock.promise;
+          }
+          return callback();
+        },
+        command: async (args) => {
+          if (args[1] === "run" && name === "unrelated") unrelatedStarted.resolve(undefined);
+          return result();
+        },
+      },
+    );
+
+  const mounted = run("mounted", [
+    { source: "credential", target: "/mnt/credential", writeBack: true },
+  ]);
+  try {
+    await mountLockEntered.promise;
+    const unrelated = run("unrelated");
+    await Promise.race([
+      unrelatedStarted.promise,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("unrelated job could not acquire container capacity");
+      }),
+    ]);
+    await unrelated;
+  } finally {
+    releaseMountLock.resolve(undefined);
+    await mounted;
+    await rm(root, { recursive: true, force: true });
   }
 });
 

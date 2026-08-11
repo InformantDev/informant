@@ -75,6 +75,18 @@ test("redacts secrets split across streamed log chunks", async () => {
   expect(output).toBe("before [REDACTED] after");
 });
 
+test("redacts secrets discovered while output is streaming", async () => {
+  let output = "";
+  const redactor = streamingSecretRedactor([], async (text) => {
+    output += text;
+  });
+  redactor.add(["refreshed-token"]);
+  await redactor.write("before refreshed-");
+  await redactor.write("token after");
+  await redactor.flush();
+  expect(output).toBe("before [REDACTED] after");
+});
+
 test("ignores empty values while redacting streamed secrets", async () => {
   let output = "";
   const redactor = streamingSecretRedactor(["", "secret"], async (text) => {

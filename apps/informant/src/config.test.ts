@@ -449,6 +449,32 @@ describe("configuration", () => {
     ).toThrow("also set in environment");
   });
 
+  test("parses named file mounts only for container jobs", () => {
+    const configured = configTemplate().replace(
+      'command = "bun install --frozen-lockfile && bun test"',
+      'command = "bun install --frozen-lockfile && bun test"\nmounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
+    );
+    expect(parseConfig(configured).jobs[0]?.mounts).toEqual([
+      { source: "codex-auth", target: "/mnt/codex", writeBack: true },
+    ]);
+    expect(() =>
+      parseConfig(configured.replace('source = "codex-auth"', 'source = "bad/name"')),
+    ).toThrow("source must be an allowed mount name");
+    expect(() =>
+      parseConfig(configured.replace('target = "/mnt/codex"', 'target = "relative"')),
+    ).toThrow("target must be an absolute container directory");
+    expect(() =>
+      parseConfig(
+        configured
+          .replace(
+            'mounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
+            'mounts = [{ source = "codex-auth", target = "/mnt/codex" }]\nhost = {}\nruns_on = ["linux"]',
+          )
+          .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []"),
+      ),
+    ).toThrow("mounts is supported only for container jobs");
+  });
+
   test("parses and validates job filters", () => {
     const configured = configTemplate().replace(
       'command = "bun install --frozen-lockfile && bun test"',
