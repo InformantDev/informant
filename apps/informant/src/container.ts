@@ -12,7 +12,7 @@ import {
   rename,
   rm,
 } from "node:fs/promises";
-import { availableParallelism, totalmem } from "node:os";
+import { availableParallelism, platform, totalmem } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   appleContainerBackend,
@@ -39,6 +39,9 @@ interface ContainerResources {
 const DEFAULT_CONTAINER_RESOURCES: ContainerResources = { cpu: 1, memoryMb: 1024 };
 const FILE_MOUNT_RESCAN_MS = 50;
 const MAX_PENDING_MOUNT_OUTPUT_BYTES = 256 * 1024;
+const APPLE_CONTAINER_BUILDER_CLEANUP_TIMEOUT_MS = 30_000;
+const APPLE_CONTAINER_BUILDER_CLEANUP_PENDING = "apple-container-builder-cleanup-pending";
+const APPLE_CONTAINER_BUILDER_CLEANUP_COMPLETED = "apple-container-builder-cleanup-completed";
 
 function containerCommandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
   return new Error(
@@ -82,6 +85,82 @@ export async function startAppleContainerSystem(
   if (!(await appleContainerInstalled(runCommand, signal))) return false;
   await ensureAppleContainerSystem(runCommand, signal);
   return true;
+}
+
+interface AppleContainerBuilderCleanupOperations {
+  command?: typeof command;
+  dataPath?: string;
+  withImageLock?: typeof withImageLock;
+  hostPlatform?: NodeJS.Platform;
+}
+
+function appleContainerBuilderCleanupPath(dataPath: string, name: string): string {
+  return join(dataPath, name);
+}
+
+async function appleContainerBuilderCleanupDue(dataPath: string): Promise<boolean> {
+  if (
+    await Bun.file(
+      appleContainerBuilderCleanupPath(dataPath, APPLE_CONTAINER_BUILDER_CLEANUP_PENDING),
+    ).exists()
+  )
+    return true;
+  if (
+    await Bun.file(
+      appleContainerBuilderCleanupPath(dataPath, APPLE_CONTAINER_BUILDER_CLEANUP_COMPLETED),
+    ).exists()
+  )
+    return false;
+
+  // Existing prepared-image history means an older Informant version used the
+  // shared Apple builder before cleanup markers were introduced.
+  const entries = await readdir(preparedContainerHistoryDirectory(dataPath), {
+    withFileTypes: true,
+  }).catch(() => []);
+  return entries.some((entry) => entry.isFile());
+}
+
+async function scheduleAppleContainerBuilderCleanup(dataPath: string): Promise<void> {
+  await mkdir(dataPath, { recursive: true });
+  await Bun.write(
+    appleContainerBuilderCleanupPath(dataPath, APPLE_CONTAINER_BUILDER_CLEANUP_PENDING),
+    `${new Date().toISOString()}\n`,
+  );
+}
+
+export async function resetAppleContainerBuilder(
+  operations: AppleContainerBuilderCleanupOperations = {},
+): Promise<boolean> {
+  if ((operations.hostPlatform ?? platform()) !== "darwin") return false;
+  const dataPath = operations.dataPath ?? dataDirectory();
+  if (!(await appleContainerBuilderCleanupDue(dataPath))) return false;
+
+  const runCommand = operations.command ?? command;
+  const options = { timeoutMs: APPLE_CONTAINER_BUILDER_CLEANUP_TIMEOUT_MS };
+  const installed = await runCommand(["container", "--version"], options);
+  if (installed.exitCode !== 0 || installed.timedOut) return false;
+  const runtime = await runCommand(["container", "system", "status", "--format", "json"], options);
+  if (runtime.exitCode !== 0 || runtime.timedOut) return false;
+
+  const lock = operations.withImageLock ?? withImageLock;
+  return lock("container-builder", async () => {
+    if (!(await appleContainerBuilderCleanupDue(dataPath))) return false;
+    const stopped = await runCommand(["container", "builder", "stop"], options);
+    if (stopped.exitCode !== 0 || stopped.timedOut)
+      throw containerCommandError("could not stop the shared Apple Container builder", stopped);
+    const deleted = await runCommand(["container", "builder", "delete"], options);
+    if (deleted.exitCode !== 0 || deleted.timedOut)
+      throw containerCommandError("could not delete the shared Apple Container builder", deleted);
+
+    await rm(appleContainerBuilderCleanupPath(dataPath, APPLE_CONTAINER_BUILDER_CLEANUP_PENDING), {
+      force: true,
+    });
+    await Bun.write(
+      appleContainerBuilderCleanupPath(dataPath, APPLE_CONTAINER_BUILDER_CLEANUP_COMPLETED),
+      `${new Date().toISOString()}\n`,
+    );
+    return true;
+  });
 }
 
 export function containerJobCommand(
@@ -673,6 +752,15 @@ export async function ensurePreparedContainer(
         if (existing.exitCode === 0) return prepared;
 
         await onMessage(`Preparing container image ${prepared}`);
+        if (backend.kind === "apple" && operations.reference) {
+          await scheduleAppleContainerBuilderCleanup(operations.dataPath ?? dataDirectory()).catch(
+            async (error) => {
+              await onMessage(
+                `Could not schedule Apple Container builder cleanup: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            },
+          );
+        }
         const args = backend.buildArguments(prepared, runtime.cpu, runtime.memoryMb);
         const preparation = await runCommand(args, {
           cwd: context,
