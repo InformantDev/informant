@@ -10,6 +10,7 @@ import {
   pruneRuntimeImages,
   runInvocationType,
   runManualHousekeeping,
+  tailRemoteLog,
 } from "./cli.ts";
 import { createBuild, currentProcessOwner, saveBuild } from "./store.ts";
 import type { BuildRecord, Repository } from "./types.ts";
@@ -269,4 +270,33 @@ test("logs stops following a running record when its worker is dead", async () =
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("remote logs keep reading from their last offset until the build completes", async () => {
+  const worker = {
+    id: "worker-1",
+    hostName: "worker",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: ["owner/repo"],
+  };
+  const offsets: number[] = [];
+  const output: string[] = [];
+  let reads = 0;
+
+  expect(
+    await tailRemoteLog("remote-build", {
+      read: async (_id, options) => {
+        offsets.push(options?.offset ?? 0);
+        reads++;
+        return reads === 1
+          ? { text: "first\n", offset: 6, running: true, worker }
+          : { text: "second\n", offset: 13, running: false, worker };
+      },
+      sleep: async () => {},
+      write: (text) => output.push(text),
+    }),
+  ).toBe(true);
+  expect(offsets).toEqual([0, 6]);
+  expect(output.join("")).toBe("first\nsecond\n");
 });

@@ -37,7 +37,7 @@ import {
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
 import { setup } from "./setup.ts";
-import { disableStartup, enableStartup, updateInformant } from "./startup.ts";
+import { disableStartup, enableStartup, restartStartupWorker, updateInformant } from "./startup.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
@@ -56,6 +56,7 @@ import {
   disableTailscale,
   enableTailscale,
   listBuildsAcrossWorkers,
+  type NetworkWorker,
   networkStatus,
   remoteBuildLog,
   serveWithTailscale,
@@ -687,13 +688,42 @@ async function tailLog(
   }
 }
 
+export async function tailRemoteLog(
+  buildId: string,
+  operations: {
+    read?: typeof remoteBuildLog;
+    sleep?: (milliseconds: number) => Promise<unknown>;
+    write?: (text: string) => unknown;
+  } = {},
+): Promise<boolean> {
+  const read = operations.read ?? remoteBuildLog;
+  const sleep = operations.sleep ?? Bun.sleep;
+  const write = operations.write ?? ((text: string) => process.stdout.write(text));
+  let offset = 0;
+  let worker: NetworkWorker | undefined;
+  let found = false;
+  while (true) {
+    const chunk = await read(buildId, { offset, worker });
+    if (!chunk) {
+      if (!found) return false;
+      worker = undefined;
+      await sleep(1_000);
+      continue;
+    }
+    found = true;
+    worker = chunk.worker;
+    offset = chunk.offset;
+    if (chunk.text) write(chunk.text);
+    if (!chunk.running) return true;
+    await sleep(250);
+  }
+}
+
 async function showLogs(id?: string): Promise<void> {
   if (id) {
     const build = await getBuild(id);
     if (!build) {
-      const remote = await remoteBuildLog(id);
-      if (remote === undefined) throw new Error(`build not found: ${id}`);
-      process.stdout.write(remote);
+      if (!(await tailRemoteLog(id))) throw new Error(`build not found: ${id}`);
       return;
     }
     if (process.stdin.isTTY) return browseBuilds(true, id);
@@ -855,9 +885,12 @@ async function manageTailscale(
   }
   if (action === "disable") {
     const disabled = await disableTailscale();
+    const restarted = disabled ? await restartStartupWorker() : false;
     outro(
       disabled
-        ? "Disabled Tailscale coordination; polling will resume"
+        ? restarted
+          ? "Disabled Tailscale coordination and restarted the polling worker"
+          : "Disabled Tailscale coordination; polling will resume on the next worker start"
         : "Tailscale coordination is not enabled",
     );
     return;

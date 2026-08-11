@@ -6,9 +6,12 @@ import { join } from "node:path";
 import {
   actionableWebhook,
   configureGitHubAppWebhook,
+  DispatchRetryQueue,
   parseTailscaleStatus,
+  readWebhookBody,
   tailscaleExecutable,
   validGitHubSignature,
+  webhookForcesTagPoll,
 } from "./tailscale.ts";
 
 test("uses a Tailscale executable available on PATH", () => {
@@ -108,4 +111,71 @@ test("dispatches only webhook actions that can create trigger work", () => {
   expect(actionableWebhook("check_suite", { action: "rerequested" })).toBe(true);
   expect(actionableWebhook("check_suite", { action: "completed" })).toBe(false);
   expect(actionableWebhook("installation", { action: "created" })).toBe(false);
+});
+
+test("bounds webhook bodies with and without a content length", async () => {
+  await expect(
+    readWebhookBody(
+      new Request("https://lead.example/webhooks/github", {
+        method: "POST",
+        headers: { "Content-Length": "10" },
+        body: "small",
+      }),
+      5,
+    ),
+  ).rejects.toThrow();
+  await expect(
+    readWebhookBody(
+      new Request("https://lead.example/webhooks/github", {
+        method: "POST",
+        body: "too large",
+      }),
+      5,
+    ),
+  ).rejects.toThrow();
+  expect(
+    await readWebhookBody(
+      new Request("https://lead.example/webhooks/github", { method: "POST", body: "okay" }),
+      5,
+    ),
+  ).toBe("okay");
+});
+
+test("recognizes tag push webhooks that must bypass the tag throttle", () => {
+  expect(webhookForcesTagPoll("push", { ref: "refs/tags/v1" })).toBe(true);
+  expect(webhookForcesTagPoll("push", { ref: "refs/heads/main" })).toBe(false);
+  expect(webhookForcesTagPoll("pull_request", { ref: "refs/tags/v1" })).toBe(false);
+});
+
+test("retains failed dispatches and preserves a queued tag refresh", async () => {
+  const callbacks: Array<() => void> = [];
+  const requests: boolean[] = [];
+  let finishFirst!: (value: boolean) => void;
+  const first = new Promise<boolean>((resolve) => {
+    finishFirst = resolve;
+  });
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      requests.push(request.forceTagPoll);
+      return requests.length === 1 ? first : true;
+    },
+    () => {},
+    (callback) => {
+      callbacks.push(callback);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {},
+  );
+
+  queue.enqueue({ repository, forceTagPoll: false });
+  while (requests.length === 0) await Bun.sleep(0);
+  queue.enqueue({ repository, forceTagPoll: true });
+  finishFirst(false);
+  while (callbacks.length === 0) await Bun.sleep(0);
+  callbacks.shift()?.();
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toEqual([false, true]);
+  await queue.stop();
 });

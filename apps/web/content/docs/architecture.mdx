@@ -24,6 +24,9 @@ GitHub credentials, and secrets are never sent between workers.
 
 A connected network worker does not run a timer or poll GitHub continuously. A lead performs one
 synchronization at startup to recover events received while it was offline, then reacts to webhooks.
+Startup recovery includes repositories advertised only by remote workers. Failed deliveries remain
+queued with bounded exponential retries, and the lead refreshes peer topology so workers that join or
+reconnect receive a recovery synchronization. Tag-push notifications bypass the normal tag throttle.
 If Tailscale is not configured, `informant serve` retains the polling path. A configured worker never
 silently falls back to polling when disconnected; reconnect Tailscale or explicitly run
 `informant tailscale disable`. Funnel never exposes the private worker/build API.

@@ -15,13 +15,22 @@ import {
 } from "./machine-config.ts";
 import { type CommandResult, command } from "./process.ts";
 import { type ServerOptions, serveRepositories } from "./server.ts";
-import { getBuild, jobLogPath, listActiveBuilds, listBuilds } from "./store.ts";
+import {
+  getBuild,
+  jobLogPath,
+  listActiveBuilds,
+  listBuilds,
+  reconcileBuildLiveness,
+} from "./store.ts";
 import type { BuildRecord, Repository } from "./types.ts";
 
 const API = "https://api.github.com";
 export const DEFAULT_WORKER_PORT = 7639;
 export const DEFAULT_FUNNEL_PORT = 7640;
 const REQUEST_TIMEOUT_MS = 2_000;
+const PEER_REFRESH_INTERVAL_MS = 10_000;
+const MAX_DISPATCH_RETRY_MS = 60_000;
+export const MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024;
 const MACOS_TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 
 export interface TailscalePeer {
@@ -61,6 +70,130 @@ export interface NetworkWorker {
   repositories: string[];
   version?: string;
   local?: boolean;
+}
+
+export interface RepositoryDispatch {
+  repository: Repository;
+  forceTagPoll: boolean;
+}
+
+type RetryTimer = ReturnType<typeof setTimeout>;
+
+export class DispatchRetryQueue {
+  private readonly entries = new Map<
+    string,
+    { request: RepositoryDispatch; attempts: number; running?: Promise<void>; timer?: RetryTimer }
+  >();
+  private stopped = false;
+
+  constructor(
+    private readonly dispatch: (request: RepositoryDispatch) => Promise<boolean>,
+    private readonly onRetry: (request: RepositoryDispatch, delayMs: number) => void = () => {},
+    private readonly schedule: (callback: () => void, delayMs: number) => RetryTimer = setTimeout,
+    private readonly cancel: (timer: RetryTimer) => void = clearTimeout,
+  ) {}
+
+  enqueue(request: RepositoryDispatch): void {
+    if (this.stopped) return;
+    const key = request.repository.fullName.toLowerCase();
+    const existing = this.entries.get(key);
+    if (existing) {
+      existing.request.forceTagPoll ||= request.forceTagPoll;
+      return;
+    }
+    this.entries.set(key, { request, attempts: 0 });
+    this.run(key);
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  private run(key: string): void {
+    const entry = this.entries.get(key);
+    if (!entry || entry.running) return;
+    entry.timer = undefined;
+    const request = { ...entry.request };
+    entry.running = this.dispatch(request)
+      .then((succeeded) => {
+        const current = this.entries.get(key);
+        if (!current) return;
+        current.running = undefined;
+        if (succeeded && (!current.request.forceTagPoll || request.forceTagPoll)) {
+          this.entries.delete(key);
+          return;
+        }
+        if (this.stopped) return;
+        current.attempts++;
+        const delayMs = Math.min(1_000 * 2 ** (current.attempts - 1), MAX_DISPATCH_RETRY_MS);
+        this.onRetry(current.request, delayMs);
+        current.timer = this.schedule(() => this.run(key), delayMs);
+      })
+      .catch(() => {
+        const current = this.entries.get(key);
+        if (!current) return;
+        current.running = undefined;
+        if (this.stopped) return;
+        current.attempts++;
+        const delayMs = Math.min(1_000 * 2 ** (current.attempts - 1), MAX_DISPATCH_RETRY_MS);
+        this.onRetry(current.request, delayMs);
+        current.timer = this.schedule(() => this.run(key), delayMs);
+      });
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    const running: Promise<void>[] = [];
+    for (const entry of this.entries.values()) {
+      if (entry.timer) this.cancel(entry.timer);
+      if (entry.running) running.push(entry.running);
+    }
+    await Promise.allSettled(running);
+    this.entries.clear();
+  }
+}
+
+class WebhookBodyTooLargeError extends Error {}
+
+export async function readWebhookBody(
+  request: Request,
+  maximumBytes = MAX_WEBHOOK_BODY_BYTES,
+): Promise<string> {
+  const declared = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declared) && declared > maximumBytes) throw new WebhookBodyTooLargeError();
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maximumBytes) {
+        await reader.cancel();
+        throw new WebhookBodyTooLargeError();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
+}
+
+export function webhookForcesTagPoll(event: string | null, payload: unknown): boolean {
+  return (
+    event === "push" &&
+    typeof (payload as { ref?: unknown })?.ref === "string" &&
+    (payload as { ref: string }).ref.startsWith("refs/tags/")
+  );
 }
 
 export function tailscaleExecutable(
@@ -278,12 +411,17 @@ export function actionableWebhook(event: string | null, payload: unknown): boole
   return false;
 }
 
-function payloadRepository(payload: unknown): Repository | undefined {
-  const fullName = (payload as { repository?: { full_name?: unknown } })?.repository?.full_name;
+function repositoryFromFullName(fullName: unknown): Repository | undefined {
   if (typeof fullName !== "string") return undefined;
   const [owner, repo, ...rest] = fullName.split("/");
   if (!owner || !repo || rest.length > 0) return undefined;
   return { owner, repo, fullName: `${owner}/${repo}` };
+}
+
+function payloadRepository(payload: unknown): Repository | undefined {
+  return repositoryFromFullName(
+    (payload as { repository?: { full_name?: unknown } })?.repository?.full_name,
+  );
 }
 
 function waitForAbort(signal?: AbortSignal): Promise<void> {
@@ -315,12 +453,12 @@ export async function serveWithTailscale(
 
   let configuredRepositories = repositories;
   const scans = new Map<string, Promise<void>>();
-  const scan = (repository: Repository) => {
+  const scan = (repository: Repository, forceTagPoll = false) => {
     const key = repository.fullName.toLowerCase();
     const previous = scans.get(key) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
-      .then(() => serveRepositories([repository], { ...options, once: true }))
+      .then(() => serveRepositories([repository], { ...options, once: true, forceTagPoll }))
       .finally(() => {
         if (scans.get(key) === next) scans.delete(key);
       });
@@ -328,42 +466,70 @@ export async function serveWithTailscale(
     return next;
   };
 
-  const dispatch = async (repository: Repository) => {
-    const tasks: Promise<unknown>[] = [];
+  const knownWorkers = new Map<string, NetworkWorker>();
+  const refreshWorkers = async (): Promise<NetworkWorker[]> => {
+    const currentStatus = await tailscaleStatus();
+    if (!currentStatus?.online) return [];
+    const workers = await discoverNetworkWorkers(config, currentStatus);
+    const peers = new Set(currentStatus.peers.map((peer) => peer.id));
+    for (const id of knownWorkers.keys()) {
+      if (!peers.has(id)) knownWorkers.delete(id);
+    }
+    for (const worker of workers) knownWorkers.set(worker.id, worker);
+    return workers;
+  };
+  const dispatch = async (request: RepositoryDispatch): Promise<boolean> => {
+    await refreshWorkers();
+    const tasks: Array<{ label: string; promise: Promise<unknown> }> = [];
     const localRepository = configuredRepositories.find(
-      (candidate) => candidate.fullName.toLowerCase() === repository.fullName.toLowerCase(),
+      (candidate) => candidate.fullName.toLowerCase() === request.repository.fullName.toLowerCase(),
     );
-    if (localRepository) tasks.push(scan(localRepository));
+    if (localRepository) {
+      tasks.push({
+        label: hostname(),
+        promise: scan(localRepository, request.forceTagPoll),
+      });
+    }
     if (config.mode === "lead") {
-      const workers = await discoverNetworkWorkers(config, status);
-      for (const worker of workers) {
+      for (const worker of knownWorkers.values()) {
         if (
           !worker.repositories.some(
-            (name) => name.toLowerCase() === repository.fullName.toLowerCase(),
+            (name) => name.toLowerCase() === request.repository.fullName.toLowerCase(),
           )
         ) {
           continue;
         }
-        tasks.push(
-          fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
+        tasks.push({
+          label: worker.hostName,
+          promise: fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ repository: repository.fullName }),
+            body: JSON.stringify({
+              repository: request.repository.fullName,
+              forceTagPoll: request.forceTagPoll,
+            }),
           }).then((response) => {
-            if (!response.ok) throw new Error(`${worker.hostName} returned ${response.status}`);
+            if (!response.ok) throw new Error(`returned ${response.status}`);
           }),
-        );
+        });
       }
     }
-    const results = await Promise.allSettled(tasks);
-    for (const result of results) {
+    if (tasks.length === 0) return false;
+    const results = await Promise.allSettled(tasks.map((task) => task.promise));
+    for (const [index, result] of results.entries()) {
       if (result.status === "rejected") {
         options.onMessage?.(
-          `network dispatch failed: ${result.reason instanceof Error ? result.reason.message : result.reason}`,
+          `network dispatch to ${tasks[index]?.label ?? "worker"} failed: ${result.reason instanceof Error ? result.reason.message : result.reason}`,
         );
       }
     }
+    return results.every((result) => result.status === "fulfilled");
   };
+  const dispatchQueue = new DispatchRetryQueue(dispatch, (request, delayMs) => {
+    options.onMessage?.(
+      `retaining ${request.repository.fullName} dispatch; retrying in ${Math.ceil(delayMs / 1_000)}s`,
+    );
+  });
 
   const privateServer = Bun.serve({
     hostname: selfAddress,
@@ -386,25 +552,41 @@ export async function serveWithTailscale(
       }
       if (request.method === "GET" && url.pathname.startsWith("/v1/logs/")) {
         const id = decodeURIComponent(url.pathname.slice("/v1/logs/".length));
-        const build = await getBuild(id);
+        let build = await getBuild(id);
         if (!build) return new Response("build not found", { status: 404 });
+        if (build.status === "running") build = await reconcileBuildLiveness(build);
         const job = url.searchParams.get("job");
         const file = Bun.file(job ? jobLogPath(build, job) : build.logPath);
         if (!(await file.exists())) return new Response("log not found", { status: 404 });
-        return new Response(file);
+        const requestedOffset = Number(url.searchParams.get("offset") ?? 0);
+        const offset =
+          Number.isSafeInteger(requestedOffset) &&
+          requestedOffset >= 0 &&
+          requestedOffset <= file.size
+            ? requestedOffset
+            : 0;
+        return new Response(file.slice(offset), {
+          headers: {
+            "X-Informant-Build-Status": build.status,
+            "X-Informant-Log-Offset": String(file.size),
+          },
+        });
       }
       if (request.method === "POST" && url.pathname === "/v1/dispatch") {
         const body = (await request.json().catch(() => undefined)) as
-          | { repository?: unknown }
+          | { repository?: unknown; forceTagPoll?: unknown }
           | undefined;
-        if (typeof body?.repository !== "string")
+        if (
+          typeof body?.repository !== "string" ||
+          (body.forceTagPoll !== undefined && typeof body.forceTagPoll !== "boolean")
+        )
           return new Response("invalid repository", { status: 400 });
         const requestedRepository = body.repository;
         const repository = configuredRepositories.find(
           (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
         );
         if (!repository) return new Response("repository is not registered", { status: 404 });
-        void scan(repository);
+        void scan(repository, body.forceTagPoll === true);
         return new Response(null, { status: 202 });
       }
       return new Response("not found", { status: 404 });
@@ -414,6 +596,34 @@ export async function serveWithTailscale(
   let funnelServer: Bun.Server<undefined> | undefined;
   const deliveries = new Set<string>();
   const loadRepositories = options.dependencies?.listRepositories ?? listRepositories;
+  let advertisedRepositories = new Set<string>();
+  let refreshingTopology = false;
+  const refreshTopology = async (recoverAll = false) => {
+    if (refreshingTopology || config.mode !== "lead") return;
+    refreshingTopology = true;
+    try {
+      const workers = await refreshWorkers();
+      const next = new Set<string>();
+      for (const worker of workers) {
+        for (const fullName of worker.repositories) {
+          const repository = repositoryFromFullName(fullName);
+          if (!repository) continue;
+          const key = `${worker.id}\0${repository.fullName.toLowerCase()}`;
+          next.add(key);
+          if (recoverAll || !advertisedRepositories.has(key)) {
+            dispatchQueue.enqueue({ repository, forceTagPoll: true });
+          }
+        }
+      }
+      advertisedRepositories = next;
+    } catch (error) {
+      options.onMessage?.(
+        `could not refresh Tailscale workers: ${error instanceof Error ? error.message : error}`,
+      );
+    } finally {
+      refreshingTopology = false;
+    }
+  };
   let refreshingRepositories = false;
   const refreshRepositories = setInterval(async () => {
     if (refreshingRepositories) return;
@@ -428,6 +638,10 @@ export async function serveWithTailscale(
       refreshingRepositories = false;
     }
   }, 5_000);
+  const refreshPeerTopology =
+    config.mode === "lead"
+      ? setInterval(() => void refreshTopology(), PEER_REFRESH_INTERVAL_MS)
+      : undefined;
   try {
     if (config.mode === "lead") {
       if (!config.webhookSecret) throw new Error("lead is missing its GitHub webhook secret");
@@ -439,7 +653,15 @@ export async function serveWithTailscale(
           if (request.method !== "POST" || url.pathname !== "/webhooks/github") {
             return new Response("not found", { status: 404 });
           }
-          const body = await request.text();
+          let body: string;
+          try {
+            body = await readWebhookBody(request);
+          } catch (error) {
+            if (error instanceof WebhookBodyTooLargeError) {
+              return new Response("payload too large", { status: 413 });
+            }
+            throw error;
+          }
           if (
             !validGitHubSignature(
               body,
@@ -449,8 +671,14 @@ export async function serveWithTailscale(
           ) {
             return new Response("invalid signature", { status: 401 });
           }
-          const payload = JSON.parse(body) as unknown;
-          if (!actionableWebhook(request.headers.get("X-GitHub-Event"), payload)) {
+          let payload: unknown;
+          try {
+            payload = JSON.parse(body) as unknown;
+          } catch {
+            return new Response("invalid JSON", { status: 400 });
+          }
+          const event = request.headers.get("X-GitHub-Event");
+          if (!actionableWebhook(event, payload)) {
             return new Response(null, { status: 204 });
           }
           const delivery = request.headers.get("X-GitHub-Delivery");
@@ -461,13 +689,19 @@ export async function serveWithTailscale(
           }
           const repository = payloadRepository(payload);
           if (!repository) return new Response("invalid repository", { status: 400 });
-          void dispatch(repository);
+          dispatchQueue.enqueue({
+            repository,
+            forceTagPoll: webhookForcesTagPoll(event, payload),
+          });
           return new Response(null, { status: 202 });
         },
       });
       const funnelUrl = await prepareTailscaleFunnel(status, config.funnelPort);
       options.onMessage?.(`Tailscale Funnel listening at ${funnelUrl}/webhooks/github`);
-      for (const repository of configuredRepositories) void dispatch(repository);
+      for (const repository of configuredRepositories) {
+        dispatchQueue.enqueue({ repository, forceTagPoll: true });
+      }
+      await refreshTopology(true);
     } else {
       options.onMessage?.(
         `Tailscale worker listening on ${selfAddress}:${config.workerPort}; polling disabled`,
@@ -477,6 +711,8 @@ export async function serveWithTailscale(
     await Promise.allSettled(scans.values());
   } finally {
     clearInterval(refreshRepositories);
+    if (refreshPeerTopology) clearInterval(refreshPeerTopology);
+    await dispatchQueue.stop();
     funnelServer?.stop(true);
     privateServer.stop(true);
   }
@@ -514,17 +750,42 @@ export async function listBuildsAcrossWorkers(includeHistory: boolean): Promise<
   return [...unique.values()].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
 }
 
-export async function remoteBuildLog(id: string, job?: string): Promise<string | undefined> {
+export interface RemoteLogChunk {
+  text: string;
+  offset: number;
+  running: boolean;
+  worker: NetworkWorker;
+}
+
+export async function remoteBuildLog(
+  id: string,
+  options: { job?: string; offset?: number; worker?: NetworkWorker } = {},
+): Promise<RemoteLogChunk | undefined> {
   const config = await getTailscaleConfig();
-  const status = config && (await tailscaleStatus());
-  if (!config || !status?.online) return undefined;
-  const workers = await discoverNetworkWorkers(config, status);
+  if (!config) return undefined;
+  let workers: NetworkWorker[];
+  if (options.worker) workers = [options.worker];
+  else {
+    const status = await tailscaleStatus();
+    if (!status?.online) return undefined;
+    workers = await discoverNetworkWorkers(config, status);
+  }
   for (const worker of workers) {
-    const path = `/v1/logs/${encodeURIComponent(id)}${job ? `?job=${encodeURIComponent(job)}` : ""}`;
+    const parameters = new URLSearchParams({ offset: String(options.offset ?? 0) });
+    if (options.job) parameters.set("job", options.job);
+    const path = `/v1/logs/${encodeURIComponent(id)}?${parameters}`;
     const response = await fetchWithTimeout(peerUrl(worker.address, config.workerPort, path)).catch(
       () => undefined,
     );
-    if (response?.ok) return response.text();
+    if (!response?.ok) continue;
+    const offset = Number(response.headers.get("X-Informant-Log-Offset"));
+    if (!Number.isSafeInteger(offset) || offset < 0) continue;
+    return {
+      text: await response.text(),
+      offset,
+      running: response.headers.get("X-Informant-Build-Status") === "running",
+      worker,
+    };
   }
   return undefined;
 }

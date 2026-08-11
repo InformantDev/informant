@@ -268,6 +268,57 @@ export async function disableStartup(): Promise<{ path: string; disabled: boolea
   return { path, disabled: existed || result.exitCode === 0 };
 }
 
+export async function restartStartupWorker(
+  options: {
+    command?: typeof command;
+    platform?: string;
+    uid?: number;
+    sleep?: (milliseconds: number) => Promise<unknown>;
+    timeoutMs?: number;
+  } = {},
+): Promise<boolean> {
+  const run = options.command ?? command;
+  if ((options.platform ?? process.platform) === "linux") {
+    const active = await run(["systemctl", "--user", "is-active", "--quiet", "informant.service"]);
+    if (active.exitCode !== 0) return false;
+    const restarted = await run(["systemctl", "--user", "restart", "informant.service"]);
+    if (restarted.exitCode !== 0) {
+      throw new Error(
+        `could not restart Informant: ${restarted.stderr.trim() || "systemctl failed"}`,
+      );
+    }
+    return true;
+  }
+  if ((options.platform ?? process.platform) !== "darwin") return false;
+  const service = `${launchDomain(options.uid)}/${LABEL}`;
+  const initial = await run(["launchctl", "print", service]);
+  if (initial.exitCode !== 0) return false;
+  const previousPid = servicePid(initial.stdout);
+  const restart = await run(
+    previousPid ? ["kill", "-TERM", String(previousPid)] : ["launchctl", "kickstart", service],
+  );
+  if (restart.exitCode !== 0) {
+    throw new Error(
+      `could not restart Informant: ${restart.stderr.trim() || `exit ${restart.exitCode}`}`,
+    );
+  }
+  const timeoutMs = options.timeoutMs ?? GRACEFUL_RESTART_TIMEOUT_MS;
+  const sleep = options.sleep ?? Bun.sleep;
+  let elapsed = 0;
+  while (true) {
+    const current = await run(["launchctl", "print", service]);
+    const currentPid = current.exitCode === 0 ? servicePid(current.stdout) : undefined;
+    if (currentPid && (!previousPid || currentPid !== previousPid)) return true;
+    if (elapsed >= timeoutMs) break;
+    const delay = Math.min(RESTART_POLL_INTERVAL_MS, timeoutMs - elapsed);
+    await sleep(delay);
+    elapsed += delay;
+  }
+  throw new Error(
+    `Informant restart did not complete within ${Math.ceil(timeoutMs / 1_000)} seconds`,
+  );
+}
+
 export async function updateInformant(
   options: {
     command?: typeof command;

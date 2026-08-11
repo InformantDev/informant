@@ -68,6 +68,10 @@ informant tailscale status
 informant startup enable # restart after changing the role
 ```
 
+`tailscale disable` gracefully restarts an active managed worker so polling resumes immediately. If
+the worker is running in a terminal or another supervisor, polling begins the next time that process
+starts.
+
 Lead enablement updates every locally configured GitHub App to the Funnel URL. If an older App was
 created without webhook event subscriptions, select **Push**, **Pull request**, **Issue comment**, and
 **Check suite** under its **Permissions & events** settings once. Worker endpoints bind only to the
@@ -79,7 +83,8 @@ Local build records live under `~/.local/share/informant`; set `INFORMANT_DATA_D
 The build list shows running jobs and links each build to its GitHub pull request or commit. Pass
 `--all` to merge the 100 most recently updated records reported by each reachable worker. Retained logs contain at most the final
 1 MiB of stdout and 1 MiB of stderr from each command. Run `informant logs` interactively to select
-and follow a currently running job, or pass a build ID to follow its combined log directly. Informant
+and follow a currently running local job, or pass a local or remote build ID to tail its combined log
+directly. Informant
 timestamps job lifecycle events while leaving command output unchanged.
 
 `informant storage` breaks down the data directory into caches, builds and logs, and other files. It

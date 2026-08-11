@@ -623,6 +623,29 @@ describe("serve polling orchestration", () => {
     expect(tagPolls).toBe(0);
   });
 
+  test("a tag webhook bypasses the periodic tag enumeration throttle", async () => {
+    let tagPolls = 0;
+    const client = github({
+      tags: async () => {
+        tagPolls++;
+        return [];
+      },
+    });
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [],
+      tagsPolledAt: new Date().toISOString(),
+    };
+    const deps = dependencies(client, state, async () => undefined);
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, forceTagPoll: true, dependencies: deps });
+
+    expect(tagPolls).toBe(1);
+  });
+
   test("launches new matching tags with tag context and durable acknowledgement", async () => {
     const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [], tagRefs: [] };
     let branch = "";
