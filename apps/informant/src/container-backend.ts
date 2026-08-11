@@ -280,7 +280,7 @@ export async function refreshContainerBackend(
   }
   if (!backend) return initializeContainerBackend(backend, runCommand, now, signal);
   if (refreshInFlight?.backend === backend) return waitForReadiness(refreshInFlight.result, signal);
-  const result = initializeContainerBackend(backend, runCommand, now, signal).finally(() => {
+  const result = initializeContainerBackend(backend, runCommand, now).finally(() => {
     if (refreshInFlight?.result === result) refreshInFlight = undefined;
   });
   refreshInFlight = { backend, result };

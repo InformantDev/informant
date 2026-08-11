@@ -283,20 +283,35 @@ test("bounds and forwards cancellation to readiness commands", async () => {
   ]);
 });
 
-test("forwards job cancellation while requiring a container backend", async () => {
+test("keeps a shared readiness probe healthy when its initiating caller cancels", async () => {
+  const blocked = deferred<void>();
+  const probing = deferred<void>();
   const controller = new AbortController();
   const signals: Array<AbortSignal | undefined> = [];
-  await requireContainerBackend(
-    podmanContainerBackend,
-    async (argv, options) => {
-      signals.push(options?.signal);
-      return argv[1] === "info"
-        ? result(0, JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } }))
-        : result();
-    },
-    controller.signal,
-  );
-  expect(signals).toEqual([controller.signal, controller.signal]);
+  const runCommand = async (argv: string[], options?: { signal?: AbortSignal }) => {
+    signals.push(options?.signal);
+    if (argv[1] === "info") {
+      probing.resolve();
+      await blocked.promise;
+      return result(
+        0,
+        JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } }),
+      );
+    }
+    return result();
+  };
+  const initiating = requireContainerBackend(podmanContainerBackend, runCommand, controller.signal);
+  await probing.promise;
+  const joined = requireContainerBackend(podmanContainerBackend, runCommand);
+  controller.abort(new Error("initiating job cancelled"));
+  await expect(initiating).rejects.toThrow("initiating job cancelled");
+  blocked.resolve();
+  expect(await joined).toBe(podmanContainerBackend);
+  expect(signals).toEqual([undefined, undefined]);
+  expect(containerBackendReadiness()).toMatchObject({
+    backend: podmanContainerBackend,
+    ready: true,
+  });
 });
 
 test("bounds every Apple Container readiness and start command", async () => {
