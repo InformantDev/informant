@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseRepository } from "./config.ts";
+import { xdgConfigHome } from "./config-home.ts";
 import type { Repository } from "./types.ts";
 
 export interface GitHubCredentials {
@@ -19,9 +20,14 @@ interface MachineConfig {
   github?: GitHubCredentials;
 }
 
-export function machineConfigPath(): string {
-  const configHome = Bun.env.XDG_CONFIG_HOME ?? join(homedir(), ".config");
-  return Bun.env.INFORMANT_CONFIG_FILE ?? join(configHome, "informant", "config.json");
+export function machineConfigPath(
+  environment: Record<string, string | undefined> = Bun.env,
+  home = homedir(),
+): string {
+  return (
+    environment.INFORMANT_CONFIG_FILE ??
+    join(xdgConfigHome(environment, home), "informant", "config.json")
+  );
 }
 
 async function readMachineConfig(path = machineConfigPath()): Promise<MachineConfig> {

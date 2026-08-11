@@ -2,6 +2,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
 import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./config.ts";
+import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
 import type { GitHubClient } from "./github.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
@@ -17,53 +18,12 @@ export interface CoordinatorDependencies {
   runInTart: typeof runInTart;
   readLogTail: (path: string) => Promise<string>;
   housekeepingBarrier?: <T>(callback: () => Promise<T>) => Promise<T>;
+  acquireExecutionSlot?: AcquireExecutionSlot;
 }
 
 const CHECK_LOG_CHARACTERS = 55_000;
 const CHECK_LOG_BYTES = CHECK_LOG_CHARACTERS * 4;
 const CHECK_LOG_UPDATE_INTERVAL_MS = 10_000;
-
-interface RunSlotWaiter {
-  signal?: AbortSignal;
-  resolve: (release: (() => void) | undefined) => void;
-  abort?: () => void;
-}
-
-let runSlotHeld = false;
-const runSlotWaiters: RunSlotWaiter[] = [];
-
-function dispatchRunSlot(): void {
-  if (runSlotHeld) return;
-  const waiter = runSlotWaiters.shift();
-  if (!waiter) return;
-  if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
-  runSlotHeld = true;
-  waiter.resolve(releaseRunSlot);
-}
-
-function releaseRunSlot(): void {
-  runSlotHeld = false;
-  dispatchRunSlot();
-}
-
-async function acquireRunSlot(signal?: AbortSignal): Promise<(() => void) | undefined> {
-  if (signal?.aborted) return undefined;
-  if (!runSlotHeld && runSlotWaiters.length === 0) {
-    runSlotHeld = true;
-    return releaseRunSlot;
-  }
-  return new Promise((resolve) => {
-    const waiter: RunSlotWaiter = { signal, resolve };
-    waiter.abort = () => {
-      const index = runSlotWaiters.indexOf(waiter);
-      if (index !== -1) runSlotWaiters.splice(index, 1);
-      resolve(undefined);
-    };
-    signal?.addEventListener("abort", waiter.abort, { once: true });
-    runSlotWaiters.push(waiter);
-    if (signal?.aborted) waiter.abort();
-  });
-}
 
 export async function readLogTail(path: string): Promise<string> {
   const file = Bun.file(path);
@@ -82,6 +42,7 @@ const defaultDependencies: CoordinatorDependencies = {
   saveBuild,
   runInTart,
   readLogTail,
+  acquireExecutionSlot,
 };
 
 export function aggregatePartitionResults(
@@ -254,21 +215,31 @@ export async function runCommit(
       for (const job of jobs) {
         labelKeys.add([...(job.runsOn ?? [])].sort().join("\0"));
       }
-      const previousScopes = [...labelKeys].map((key) => {
-        const previousJobs =
-          jobsByLabels.get(key) ??
-          jobs.filter((job) => [...(job.runsOn ?? [])].sort().join("\0") === key);
-        if (!usesCapabilities) return baseScope;
-        const jobsScope = Buffer.from(
-          previousJobs
-            .map((job) => job.name)
-            .sort()
-            .join("\0"),
-        ).toString("base64url");
-        return event
-          ? `${baseScope}:jobs:${Buffer.from(key).toString("base64url")}:jobs:${jobsScope}`
-          : `${baseScope}:jobs:${jobsScope}`;
-      });
+      const componentScope = `${baseScope}:jobs:${Buffer.from(
+        jobs
+          .map((job) => job.name)
+          .sort()
+          .join("\0"),
+      ).toString("base64url")}`;
+      const previousScopes = [
+        ...(event ? [componentScope] : []),
+        ...[...labelKeys].flatMap((key) => {
+          const previousJobs =
+            jobsByLabels.get(key) ??
+            jobs.filter((job) => [...(job.runsOn ?? [])].sort().join("\0") === key);
+          if (!usesCapabilities) return [baseScope];
+          const labelsScope = `${baseScope}:jobs:${Buffer.from(key).toString("base64url")}`;
+          const jobsScope = Buffer.from(
+            previousJobs
+              .map((job) => job.name)
+              .sort()
+              .join("\0"),
+          ).toString("base64url");
+          return event
+            ? [labelsScope, `${labelsScope}:jobs:${jobsScope}`]
+            : [`${baseScope}:jobs:${jobsScope}`];
+        }),
+      ].filter((scope, index, scopes) => scopes.indexOf(scope) === index);
       return runCommitPartition(
         github,
         repository,
@@ -301,8 +272,14 @@ async function runCommitPartition(
   legacyScopes: string[] = [],
 ): Promise<BuildRecord | false | undefined> {
   if (config.jobs.length === 0) return undefined;
-  const release = requireRunSlot ? await acquireRunSlot(signal) : undefined;
+  const release = requireRunSlot
+    ? await (dependencies.acquireExecutionSlot ?? acquireExecutionSlot)(config, signal)
+    : undefined;
   if (requireRunSlot && !release) return false;
+  if (requireRunSlot && signal?.aborted) {
+    release?.();
+    return false;
+  }
   try {
     return await runCommitPartitionWithSlot(
       github,
@@ -344,7 +321,7 @@ async function runCommitPartitionWithSlot(
     event && scopeJobs
       ? {
           ...event,
-          id: `${event.id}:jobs:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
+          id: `${event.id}:job-set:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
         }
       : event;
   const claim = await github.claim(
