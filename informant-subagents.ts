@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
 	createAgentSession,
 	CustomEditor,
@@ -10,10 +11,15 @@ import {
 	SettingsManager,
 	type AgentSession,
 	type AgentSessionEvent,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type KeybindingsManager,
 	type Theme,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
@@ -42,6 +48,8 @@ const MAX_TRANSCRIPT_ITEMS = 500;
 const MAX_TRANSCRIPT_ENTRY_CHARS = 100_000;
 const MAX_TRANSCRIPT_CHARS = 1_000_000;
 const MAX_TOOL_OUTPUT_BYTES = 50 * 1024;
+const REVIEW_TOOL_NAMES = ["read", "grep", "find", "ls", "staff_files"] as const;
+const TRUSTED_SKILL_ROOT = "/opt/informant/skills";
 const DEFAULT_READ_WAIT_SECONDS = 15;
 const DETAIL_VIEW_LINES = 22;
 const USAGE_STATE_ENTRY = "vessup-subagent-usage";
@@ -88,6 +96,7 @@ type ManagedSubagent = {
 	lastReadActivity: number;
 	transcript: TranscriptItem[];
 	streamingText: string;
+	finalOutput?: string;
 	lastStreamActivityAt: number;
 	usage: Usage;
 	session?: AgentSession;
@@ -321,11 +330,131 @@ function messageError(message: unknown): string | undefined {
 }
 
 function finalAssistantText(agent: ManagedSubagent): string {
+	if (agent.finalOutput !== undefined) return agent.finalOutput;
 	for (let index = agent.transcript.length - 1; index >= 0; index--) {
 		const item = agent.transcript[index];
 		if (item?.role === "assistant") return item.text;
 	}
 	return agent.streamingText.trim();
+}
+
+function isWithin(root: string, path: string): boolean {
+	const fromRoot = relative(root, path);
+	return fromRoot === "" || (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot));
+}
+
+async function canonicalReviewPath(root: string, rawPath: string): Promise<string> {
+	const requested = resolve(root, rawPath.replace(/^@/, ""));
+	let canonical: string;
+	try {
+		canonical = await realpath(requested);
+	} catch {
+		throw new Error(`Path not found: ${requested}`);
+	}
+	if (!isWithin(root, canonical) && !isWithin(TRUSTED_SKILL_ROOT, canonical))
+		throw new Error("Staff Review tools may only access the workspace or trusted review skills.");
+	return canonical;
+}
+
+function workspaceTools(root: string, cwd = root): ToolDefinition[] {
+	const canonical = (path: string) => canonicalReviewPath(root, path);
+	return [
+		createReadToolDefinition(cwd, {
+			autoResizeImages: false,
+			operations: {
+				async access(path) {
+					await access(await canonical(path));
+				},
+				async readFile(path) {
+					return readFile(await canonical(path));
+				},
+			},
+		}),
+		createGrepToolDefinition(cwd, {
+			operations: {
+				async isDirectory(path) {
+					return (await stat(await canonical(path))).isDirectory();
+				},
+				async readFile(path) {
+					return readFile(await canonical(path), "utf8");
+				},
+			},
+		}),
+		createFindToolDefinition(cwd, {
+			operations: {
+				async exists(path) {
+					try {
+						await canonical(path);
+						return true;
+					} catch {
+						return false;
+					}
+				},
+				async glob(pattern, searchPath, { limit }) {
+					const searchRoot = await canonical(searchPath);
+					const results: string[] = [];
+					for await (const path of new Bun.Glob(pattern).scan({
+						cwd: searchRoot,
+						dot: true,
+						absolute: true,
+						followSymlinks: false,
+					})) {
+						const relativePath = relative(searchRoot, path);
+						if (relativePath.split(sep).some((part) => part === ".git" || part === "node_modules")) continue;
+						results.push(path);
+						if (results.length >= limit) break;
+					}
+					return results;
+				},
+			},
+		}),
+		createLsToolDefinition(cwd, {
+			operations: {
+				async exists(path) {
+					try {
+						await canonical(path);
+						return true;
+					} catch {
+						return false;
+					}
+				},
+				async stat(path) {
+					return stat(await canonical(path));
+				},
+				async readdir(path) {
+					return readdir(await canonical(path));
+				},
+			},
+		}),
+	];
+}
+
+function staffFilesTool() {
+	return {
+		name: "staff_files",
+		label: "Staff Review files",
+		description: "Read the immutable Staff Review diff snapshot prepared by the trusted job shell. Omit paths to list changed files; pass paths to retrieve their old and new contents.",
+		parameters: Type.Object({
+			paths: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })),
+		}),
+		async execute(_toolCallId, params) {
+			const snapshotPath = process.env.INFORMANT_STAFF_FILES ?? "/tmp/staff-review-files.json";
+			const source = JSON.parse(await readFile(snapshotPath, "utf8")) as { files?: Array<Record<string, unknown>> };
+			const files = Array.isArray(source.files) ? source.files : [];
+			const selected = params.paths
+				? params.paths.map((path) => {
+					const file = files.find((item) => item.path === path);
+					if (!file) throw new Error(`Changed file not found in Staff Review snapshot: ${path}`);
+					return file;
+				})
+				: files.map(({ path, status }) => ({ path, status }));
+			return { content: [{ type: "text" as const, text: JSON.stringify({ files: selected }) }], details: {} };
+		},
+	};
+}
+
+function reviewTools(root: string, cwd = root): ToolDefinition[] {
+	return [...workspaceTools(root, cwd), staffFilesTool()];
 }
 
 export function isFailedStopReason(stopReason: string | undefined): boolean {
@@ -616,8 +745,9 @@ class SubagentManager {
 					break;
 				}
 				case "message_end": {
-					this.addTranscript(agent, event.message);
 					const role = messageRole(event.message);
+					if (role === "assistant") agent.finalOutput = contentToText((event.message as { content?: unknown }).content).trim();
+					this.addTranscript(agent, event.message);
 					if (role === "assistant" || role === "toolResult") this.accountUsage(agent, messageUsage(event.message));
 					if (role === "assistant") {
 						agent.streamingText = "";
@@ -703,11 +833,13 @@ class SubagentManager {
 		}
 		if (signal?.aborted) throw new Error("Subagent creation was cancelled");
 
-		const cwd = resolve(ctx.cwd, options.cwd ?? ".");
+		const root = await realpath(ctx.cwd);
+		const cwd = await canonicalReviewPath(root, options.cwd ?? ".");
 		const id = this.makeId(options.name);
-		const activeTools = this.pi.getActiveTools().filter((tool) =>
-			["read", "grep", "find", "ls"].includes(tool),
-		);
+		const activeTools = this.pi
+			.getActiveTools()
+			.filter((tool) => REVIEW_TOOL_NAMES.includes(tool as (typeof REVIEW_TOOL_NAMES)[number]));
+		const childTools = reviewTools(root, cwd).filter((tool) => activeTools.includes(tool.name));
 		const effort = options.effort ?? (ctx.thinkingLevel as SubagentEffort);
 		const agent: ManagedSubagent = {
 			id,
@@ -737,12 +869,22 @@ class SubagentManager {
 			const selectedModel = await this.resolveModel(ctx, options.model);
 			const selectedEffort = options.effort ?? this.scopedEffort(ctx, selectedModel) ?? effort;
 			agent.effort = selectedEffort;
-			const settingsManager = SettingsManager.create(ctx.cwd, getAgentDir());
+			const settingsManager = SettingsManager.inMemory({}, { projectTrusted: false });
+			const workerSkill = options.prompt.includes("staff-review-verify")
+				? "staff-review-verify"
+				: options.prompt.includes("staff-review-find")
+					? "staff-review-find"
+					: undefined;
+			if (!workerSkill)
+				throw new Error("Staff Review subagents must use a trusted find or verify worker skill");
 			const resourceLoader = new DefaultResourceLoader({
 				cwd,
 				agentDir: getAgentDir(),
 				settingsManager,
+				additionalSkillPaths: [resolve(TRUSTED_SKILL_ROOT, `${workerSkill}/SKILL.md`)],
 				noExtensions: true,
+				noSkills: true,
+				noPromptTemplates: true,
 				noContextFiles: true,
 				appendSystemPrompt: [SUBAGENT_SYSTEM_PROMPT],
 			});
@@ -756,6 +898,7 @@ class SubagentManager {
 				model: selectedModel,
 				thinkingLevel: selectedEffort,
 				tools: activeTools,
+				customTools: childTools,
 				resourceLoader,
 				settingsManager,
 				sessionManager: SessionManager.inMemory(cwd),
@@ -899,7 +1042,7 @@ class SubagentManager {
 		});
 	}
 
-	read(agents: ManagedSubagent[], includeTranscript: boolean): string {
+	read(agents: ManagedSubagent[], includeTranscript: boolean, completedOutput: boolean): string {
 		if (agents.length === 0) return "No subagents are involved in this session.";
 		const now = Date.now();
 		const sections: string[] = [];
@@ -925,6 +1068,10 @@ class SubagentManager {
 			agent.lastReadActivity = agent.activity.length;
 
 			let output = `${heading}\n${metadata.join("\n")}\n\nActivity since last read:\n${activity}`;
+			if (completedOutput && agents.length === 1 && (agent.status === "completed" || agent.status === "failed")) {
+				const latest = finalAssistantText(agent);
+				return latest || `Subagent ${agent.id} finished without assistant output.`;
+			}
 			if (includeTranscript) {
 				const transcript = agent.transcript
 					.map((item) => `### ${formatClock(item.timestamp)} ${item.role}\n${item.text}`)
@@ -1428,6 +1575,7 @@ const CreateParams = Type.Object({
 
 const ReadParams = Type.Object({
 	id: Type.Optional(Type.String({ description: "Subagent id. Omit to read all subagents." })),
+	completed_output: Type.Optional(Type.Boolean({ description: "For one completed subagent, return its complete final assistant output without activity metadata or truncation." })),
 	wait_seconds: Type.Optional(
 		Type.Integer({
 			description: `Wait for meaningful new activity before returning. Default ${DEFAULT_READ_WAIT_SECONDS}, maximum 30.`,
@@ -1459,6 +1607,8 @@ const TerminateParams = Type.Object({
 });
 
 export default function subagentsExtension(pi: ExtensionAPI): void {
+	const root = resolve(process.env.INFORMANT_REVIEW_ROOT ?? process.cwd());
+	for (const tool of reviewTools(root)) pi.registerTool(tool);
 	const manager = new SubagentManager(pi);
 	let managerOpen = false;
 
@@ -1505,14 +1655,15 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent_read",
 		label: "Read subagents",
-		description: "Wait for and read meaningful subagent activity, status, output, usage, or full transcripts. Omit id to monitor all subagents.",
+		description: "Wait for and read meaningful subagent activity, status, output, usage, or full transcripts. Omit id to monitor all subagents. Use completed_output=true with one completed id to retrieve an untruncated protocol result.",
 		promptSnippet: "Read and monitor background subagent activity and output",
 		parameters: ReadParams,
 		async execute(_toolCallId, params, signal) {
+			if (params.completed_output && !params.id) throw new Error("completed_output requires one subagent id");
 			const agents = params.id ? [manager.getAgent(params.id)] : manager.list();
 			await manager.waitForUpdates(agents, params.wait_seconds ?? DEFAULT_READ_WAIT_SECONDS, signal);
 			if (signal?.aborted) throw new Error("Subagent read was cancelled");
-			return toolResult(manager, manager.read(agents, params.include_transcript ?? false));
+			return toolResult(manager, manager.read(agents, params.include_transcript ?? false, params.completed_output ?? false));
 		},
 		renderCall(args, theme) {
 			return new Text(

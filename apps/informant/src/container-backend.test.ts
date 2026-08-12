@@ -51,17 +51,6 @@ test("builds Podman run and image lifecycle commands", () => {
   expect(run).toContain("/tmp/cache:/mnt/shared/cache-0:z");
   expect(run).toContain("--cpus");
   expect(run).toContain("--memory");
-  expect(run).not.toContain("none");
-  const offline = podmanContainerBackend.runArguments({
-    name: "offline-job",
-    image: "docker.io/oven/bun:1",
-    workspace: "/tmp/workspace",
-    command: "bun test",
-    environment: {},
-    network: false,
-  });
-  expect(offline).toContain("--network");
-  expect(offline).toContain("none");
   expect(podmanContainerBackend.buildArguments("prepared", 2, 1024)).toEqual([
     "podman",
     "build",

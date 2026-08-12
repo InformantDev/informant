@@ -196,7 +196,7 @@ async function snapshotPreparedContainerInputs(
   runtime: ContainerRuntime,
   context: string,
   workspace?: string,
-): Promise<{ digest: string; paths: string[] } | undefined> {
+): Promise<{ digest: string; inputs: Array<{ source: string; path: string }> } | undefined> {
   if (!runtime.prepareInputs) return undefined;
   if (!workspace) throw new Error("container.prepareInputs requires a job workspace");
   const root = await realpath(workspace);
@@ -245,7 +245,10 @@ async function snapshotPreparedContainerInputs(
   }
   return {
     digest: new Bun.CryptoHasher("sha256").update(JSON.stringify(records)).digest("hex"),
-    paths: sorted.map((file) => file.path),
+    inputs: sorted.map((file) => ({
+      source: join("informant-prepare-inputs", file.path),
+      path: file.path,
+    })),
   };
 }
 
@@ -255,12 +258,13 @@ export interface ContainerPreparationOperations {
   reference?: string;
   dataPath?: string;
   backend?: ContainerBackend;
+  trustedWorkspace?: string;
 }
 
 type ContainerRunOperations = Pick<
   ContainerPreparationOperations,
   "command" | "withImageLock" | "dataPath" | "backend"
-> & { allowedMounts?: Record<string, string> };
+> & { allowedMounts?: Record<string, string>; trustedWorkspace?: string };
 
 interface StagedFileMount {
   name: string;
@@ -638,6 +642,11 @@ export async function ensurePreparedContainer(
   const lock = operations.withImageLock ?? withImageLock;
   const backend = operations.backend ?? appleContainerBackend;
   const preparationCommand = runtime.prepare;
+  const preparedInputWorkspace = runtime.trustedPrepareInputs
+    ? operations.trustedWorkspace
+    : workspace;
+  if (runtime.trustedPrepareInputs && !preparedInputWorkspace)
+    throw new Error("container.trustedPrepareInputs requires a trusted job workspace");
   if (!preparationCommand) {
     await activatePreparedContainerImage(
       operations.reference,
@@ -655,18 +664,21 @@ export async function ensurePreparedContainer(
   await mkdir(contextRoot, { recursive: true });
   const context = await mkdtemp(join(contextRoot, "informant-container-build-"));
   try {
-    const inputSnapshot = await snapshotPreparedContainerInputs(runtime, context, workspace);
+    const inputSnapshot = await snapshotPreparedContainerInputs(
+      runtime,
+      context,
+      preparedInputWorkspace,
+    );
     const prepared = preparedContainerImage(runtime, inputSnapshot?.digest);
     if (!prepared) return runtime.image;
     await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);
     const inputSetup = inputSnapshot
       ? backend.kind === "apple"
-        ? "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n"
-        : `${inputSnapshot.paths
-            .map(
-              (path) =>
-                `COPY ${JSON.stringify([`informant-prepare-inputs/${path}`, `/workspace/${path}`])}`,
-            )
+        ? `${inputSnapshot.inputs
+            .map(({ source, path }) => `COPY ${JSON.stringify([source, `/workspace/${path}`])}`)
+            .join("\n")}\nENV HOME=/home/root\n`
+        : `${inputSnapshot.inputs
+            .map(({ source, path }) => `COPY ${JSON.stringify([source, `/workspace/${path}`])}`)
             .join("\n")}\nENV HOME=/home/root\n`
       : "";
     const preparationLayer = inputSnapshot
@@ -797,6 +809,7 @@ export async function runInContainer(
       reference: `${repository.fullName}\0${job.name}`,
       dataPath: operations.dataPath,
       backend,
+      trustedWorkspace: operations.trustedWorkspace,
     });
     const run = async (fileMounts: StagedFileMount[] = []) => {
       if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
@@ -821,7 +834,6 @@ export async function runInContainer(
           cpu: resources.cpu,
           memoryMb: resources.memoryMb,
           preparedWorkspace: usesPreparedWorkspace,
-          network: runtime.network,
         },
         backend,
       );

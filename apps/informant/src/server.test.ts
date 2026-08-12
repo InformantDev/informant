@@ -815,6 +815,32 @@ describe("serve polling orchestration", () => {
     ).toEqual([trustedJob, setupJob]);
   });
 
+  test("pins jobs that request trusted preparation inputs", () => {
+    const configuredJob = config.jobs[0];
+    if (!configuredJob) throw new Error("expected a configured job");
+    const trustedJob = {
+      ...configuredJob,
+      name: "review",
+      runtime: {
+        type: "container" as const,
+        image: "trusted-container",
+        prepare: "install extension",
+        prepareInputs: ["extension.ts"],
+        trustedPrepareInputs: true,
+      },
+    };
+    const result = applySecretPolicy(
+      {
+        ...config,
+        jobs: [{ ...trustedJob, command: "attacker review" }],
+      },
+      { ...config, jobs: [trustedJob] },
+      "trusted-sha",
+    );
+    expect(result.jobs).toEqual([trustedJob]);
+    expect(result.trustedSha).toBe("trusted-sha");
+  });
+
   test("pins jobs that request allowed host file mounts", () => {
     const configuredJob = config.jobs[0];
     if (!configuredJob) throw new Error("expected a configured job");

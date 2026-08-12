@@ -56,7 +56,7 @@ review a ten-line change.
 Gather just enough to partition the work. Do **not** deep-read files — the
 sub-agents do that.
 
-Use `staff files --slug <slug> --json`, or the find worker's Git fallback when
+Use the available `staff_files` snapshot tool, `staff files --slug <slug> --json`, or the find worker's Git fallback when
 the CLI is absent, plus `ls .staffreview/docs/` (which may be empty).
 
 ## Step 3 — FIND: launch N find agents in the background
@@ -143,6 +143,8 @@ append that batch's confirmed survivors to an in-memory list.
 
 **3. Dedup and publish survivors after all verify chains drain.** Once every
 verify agent has returned and been reaped, dedup the collected survivors.
+When the orchestrator prompt says that a trusted outer job step handles posting,
+return only the final survivor JSON array and do not invoke comment commands.
 If two survivors are true duplicates — same `file`+`line` describing the *same*
 issue — keep the clearest/highest-severity version, including its priority, and
 drop the duplicate. In CLI mode, post only this final survivor list via the
@@ -161,8 +163,8 @@ printf '%s' "$BODY" | staff comment add \
 **P2** (should fix: real but non-blocking), **P3** (minor: nits, naming, optional
 cleanups). Be honest with the scale — if everything is P1, nothing is.
 
-Without the CLI, return the final survivors in chat instead; only UI persistence
-is unavailable.
+Without the CLI, or when a trusted outer job step handles posting, return the final
+survivors in chat instead; only direct UI persistence is unavailable to this process.
 
 **Optional top-level comment.** If a confirmed finding is genuinely
 cross-cutting (architecture, a missing migration, an overall coverage gap) with

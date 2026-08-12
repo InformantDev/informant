@@ -195,7 +195,9 @@ export function applySecretPolicy(
   trustedSha: string,
 ): InformantConfig {
   const protectedJob = (job: InformantConfig["jobs"][number]) =>
-    job.secrets.length > 0 || (job.mounts?.length ?? 0) > 0;
+    job.secrets.length > 0 ||
+    (job.mounts?.length ?? 0) > 0 ||
+    (job.runtime?.type === "container" && job.runtime.trustedPrepareInputs === true);
   const trustedSecretJobs = trusted.jobs.filter(protectedJob);
   const allTrustedByName = new Map(trusted.jobs.map((job) => [job.name, job]));
   const trustedByName = new Map<string, (typeof trusted.jobs)[number]>();

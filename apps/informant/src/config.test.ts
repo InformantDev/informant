@@ -229,14 +229,27 @@ describe("configuration", () => {
       prepare: undefined,
       prepareInputs: undefined,
     });
-    const offline = source.replace(
+    const trustedInputs = source.replace(
       'container = { image = "docker.io/oven/bun:1", cpu = 1 }',
-      'container = { image = "docker.io/oven/bun:1", cpu = 1, network = false }',
+      'container = { image = "docker.io/oven/bun:1", cpu = 1, prepare = "install", prepareInputs = ["extension.ts"], trustedPrepareInputs = true }',
     );
-    expect(parseConfig(offline).jobs[0]?.runtime).toMatchObject({ network: false });
-    expect(() => parseConfig(offline.replace("network = false", 'network = "no"'))).toThrow(
-      "jobs[0].container.network must be a boolean",
-    );
+    expect(parseConfig(trustedInputs).jobs[0]?.runtime).toMatchObject({
+      prepareInputs: ["extension.ts"],
+      trustedPrepareInputs: true,
+    });
+    expect(() =>
+      parseConfig(
+        trustedInputs.replace("trustedPrepareInputs = true", 'trustedPrepareInputs = "yes"'),
+      ),
+    ).toThrow("jobs[0].container.trustedPrepareInputs must be a boolean");
+    expect(() =>
+      parseConfig(
+        source.replace(
+          'container = { image = "docker.io/oven/bun:1", cpu = 1 }',
+          'container = { image = "docker.io/oven/bun:1", cpu = 1, trustedPrepareInputs = true }',
+        ),
+      ),
+    ).toThrow("jobs[0].container.trustedPrepareInputs requires prepareInputs");
     expect(() =>
       parseConfig(
         source.replace(

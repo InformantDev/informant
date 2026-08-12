@@ -406,8 +406,11 @@ function parseContainer(
       : undefined;
   if (normalizedPrepareInputs && rawPrepare === undefined)
     throw new Error(`${label}.prepareInputs requires prepare`);
-  const network = container.network ?? true;
-  if (typeof network !== "boolean") throw new Error(`${label}.network must be a boolean`);
+  const trustedPrepareInputs = container.trustedPrepareInputs ?? false;
+  if (typeof trustedPrepareInputs !== "boolean")
+    throw new Error(`${label}.trustedPrepareInputs must be a boolean`);
+  if (trustedPrepareInputs && !normalizedPrepareInputs)
+    throw new Error(`${label}.trustedPrepareInputs requires prepareInputs`);
   return {
     type: "container",
     image,
@@ -415,7 +418,7 @@ function parseContainer(
     memoryMb,
     prepare: typeof rawPrepare === "string" ? rawPrepare.trim() : undefined,
     prepareInputs: normalizedPrepareInputs,
-    ...(network ? {} : { network }),
+    ...(trustedPrepareInputs ? { trustedPrepareInputs } : {}),
   };
 }
 

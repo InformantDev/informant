@@ -21,8 +21,11 @@ Re-derive each finding's reasoning from the code yourself.
 
 - **Mode `diff`:** load the changed files and re-check against them.
 
+  Use the read-only `staff_files` tool when available; it returns the prepared
+  changed-file snapshot without shell access. Otherwise:
+
   ```bash
-  staff files --slug <slug> --json   # the changed files
+  staff files --slug <slug> --json
   ```
 
   Without the CLI, use the Git fallback in

@@ -74,11 +74,6 @@ daemon, socket, systemd unit, or rootful service. Informant rejects rootful Podm
 advertise the `container` capability when the selected backend is missing or unhealthy. Run
 `informant setup` to install and verify it.
 
-Set `network = false` on a container runtime to start the job with no network interface beyond
-loopback. Preparation still runs with normal build-time networking so it can install pinned tools;
-the restriction applies to the job container itself. Use it for review or analysis jobs that should
-read a prepared checkout without reaching external services.
-
 Jobs run as UID 0 inside the container with the checkout mounted at `/workspace`. With rootless
 Podman, container root maps into the unprivileged worker user's namespace; Informant also adds
 `--security-opt no-new-privileges`. On SELinux hosts, Podman privately relabels the disposable job
@@ -281,9 +276,12 @@ Container runtimes can declare repository-relative files or glob patterns with `
 Informant copies matching files into the image's `/workspace`, exposes that path as
 `$INFORMANT_PREPARE_ROOT` during preparation, and includes their paths, modes, and contents in the
 image identity. Every pattern must match at least one regular file; absolute paths, parent traversal,
-and symbolic links are rejected. Preparation output such as `node_modules` remains in the image as an
-immutable layer. At runtime, Informant copies the job checkout into this container-local workspace
-without removing prepared files, then runs the job there. A lockfile change prepares a new image;
+and symbolic links are rejected. Set `trustedPrepareInputs = true` on a protected job when those files
+are executable build inputs, such as an agent extension: Informant snapshots them from the trusted
+configuration revision instead of the commit under test. The option requires `prepareInputs` and only
+has an effect when the trusted and target revisions differ. Preparation output such as `node_modules`
+remains in the image as an immutable layer. At runtime, Informant copies the job checkout into this
+container-local workspace without removing prepared files, then runs the job there. A lockfile change prepares a new image;
 ordinary source changes reuse the installed dependencies:
 
 ```toml
