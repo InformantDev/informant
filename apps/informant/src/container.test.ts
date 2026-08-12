@@ -733,11 +733,12 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
             const volume = args.find((arg) => arg.endsWith(":/mnt/informant-codex"));
             if (!volume) throw new Error("expected Codex auth mount");
             const source = volume.slice(0, -":/mnt/informant-codex".length);
+            await options?.onOutput?.("access-secret intermediate-access refreshed-access");
+            await Bun.sleep(75);
             await Bun.write(
               join(source, "auth.json"),
               JSON.stringify({ tokens: { access_token: "refreshed-access" } }),
             );
-            await options?.onOutput?.("access-secret refreshed-access");
           }
           return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
         },
@@ -747,8 +748,9 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
     expect(await Bun.file(join(codexHome, "auth.json")).json()).toEqual({
       tokens: { access_token: "refreshed-access" },
     });
-    expect(output.join("")).toContain("[REDACTED]");
+    expect(output.join("")).toContain("child output suppressed");
     expect(output.join("")).not.toContain("access-secret");
+    expect(output.join("")).not.toContain("intermediate-access");
     expect(output.join("")).not.toContain("refreshed-access");
     expect(locks).toEqual([
       "prepared-container-image-references",
@@ -863,6 +865,116 @@ test("does not overwrite a host file changed during a mounted job", async () => 
   }
 });
 
+test("preserves the displaced original when mounted-file recovery fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-recovery-"));
+  const source = join(root, "auth.json");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        {
+          name: "review",
+          command: "true",
+          optional: false,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          mounts: [{ source: "auth", target: "/mnt/auth", writeBack: true }],
+          needs: [],
+          runtime: { type: "container", image: "oven/bun:1" },
+        },
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { auth: source },
+          dataPath: join(root, "data"),
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const volume = args.find((arg) => arg.endsWith(":/mnt/auth"));
+              if (!volume) throw new Error("expected auth mount");
+              const staged = volume.slice(0, -":/mnt/auth".length);
+              await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "rotated" }));
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+          link: async () => {
+            const error = new Error("injected link failure") as NodeJS.ErrnoException;
+            error.code = "EIO";
+            throw error;
+          },
+        },
+      ),
+    ).rejects.toThrow("mounted file could not be safely written back");
+    expect(await Bun.file(source).exists()).toBe(false);
+    const recoveryCopies = (await readdir(root)).filter((name) => name.endsWith(".original"));
+    expect(recoveryCopies).toHaveLength(1);
+    expect(await Bun.file(join(root, recoveryCopies[0] ?? "missing")).json()).toEqual({
+      token: "original",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("bounds spooled output for read-only credential mounts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-output-"));
+  const source = join(root, "credential.txt");
+  await Bun.write(source, "secret-value");
+  const output: string[] = [];
+  try {
+    await runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      {
+        name: "review",
+        command: "true",
+        optional: false,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts: [{ source: "credential", target: "/mnt/credential", writeBack: false }],
+        needs: [],
+        runtime: { type: "container", image: "oven/bun:1" },
+      },
+      async (text) => {
+        output.push(text);
+      },
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { credential: source },
+        dataPath: join(root, "data"),
+        withImageLock: passthroughImageLock,
+        command: async (args, options) => {
+          if (args[1] === "run") {
+            expect(args.some((arg) => arg.endsWith(":/mnt/credential:ro"))).toBe(true);
+            await options?.onOutput?.("x".repeat(10 * 1024 * 1024 + 1024));
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    );
+    expect(output.join("")).toContain("mounted job output truncated at 10 MiB");
+    expect(Buffer.byteLength(output.join(""))).toBeLessThan(10 * 1024 * 1024 + 1024);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("settles every mounted-file write-back before cleaning staging", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-file-write-back-"));
   const removedSource = join(root, "removed.txt");
@@ -970,12 +1082,7 @@ test("rejects mounted files that grow beyond the supported size", async () => {
         },
       },
     ).catch((caught) => caught);
-    expect(error).toBeInstanceOf(AggregateError);
-    expect(
-      (error as AggregateError).errors.every((nested) =>
-        String(nested).includes(`exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`),
-      ),
-    ).toBe(true);
+    expect(String(error)).toContain(`exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`);
     expect(await Bun.file(source).text()).toBe("original");
   } finally {
     await rm(root, { recursive: true, force: true });

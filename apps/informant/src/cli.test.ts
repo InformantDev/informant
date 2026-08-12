@@ -51,6 +51,15 @@ test("local and reported trigger flags cannot be mixed", async () => {
   await expect(main(["trigger", "--local"])).rejects.toThrow("trigger does not accept --local");
 });
 
+test("automatic-update commands reject trailing positional arguments", async () => {
+  await expect(main(["auto-update", "enable", "disable"])).rejects.toThrow(
+    "auto-update enable does not accept arguments",
+  );
+  await expect(main(["auto-update", "disable", "enable"])).rejects.toThrow(
+    "auto-update disable does not accept arguments",
+  );
+});
+
 test("orphan cleanup does not block worker startup", async () => {
   let finishCleanup: ((removed: number) => void) | undefined;
   const cleanup = new Promise<number>((resolve) => {

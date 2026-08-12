@@ -457,6 +457,15 @@ describe("configuration", () => {
     expect(parseConfig(configured).jobs[0]?.mounts).toEqual([
       { source: "codex-auth", target: "/mnt/codex", writeBack: true },
     ]);
+    const equivalentTargets = configured.replace(
+      'mounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
+      'mounts = [{ source = "codex-auth", target = "/mnt/auth" }, { source = "other", target = "/mnt/./auth/" }]',
+    );
+    expect(() => parseConfig(equivalentTargets)).toThrow("must not contain duplicate targets");
+    expect(
+      parseConfig(configured.replace('target = "/mnt/codex"', 'target = "/mnt//codex/"')).jobs[0]
+        ?.mounts,
+    ).toEqual([{ source: "codex-auth", target: "/mnt/codex", writeBack: true }]);
     expect(() =>
       parseConfig(configured.replace('source = "codex-auth"', 'source = "bad/name"')),
     ).toThrow("source must be a lowercase allowed mount name");

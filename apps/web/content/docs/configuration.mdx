@@ -235,6 +235,17 @@ A comment rule can only use the optional pull-request filter and means a newly c
 comment—not an edit or line-level review comment. With no branch or pull-request table, a commit
 matches branches and active same-repository PR heads.
 
+Tag builds are opt-in commit triggers. Put one or more glob patterns in a `tag` table:
+
+```toml
+triggers = [{ event = "commit", tag = { patterns = ["v*", "release/*"] } }]
+```
+
+A trigger may use only one context table: `branch`, `tag`, or `pull_request`. `tag` is valid only
+with `event = "commit"`. Patterns match the entire tag name, are case-sensitive, and let `*` and `?`
+match across `/`; for example, `release/*` matches `release/v2` but not `Release/v2`. Untagged commit
+rules do not run for tags.
+
 Pull-request `state` is `open`, `closed`, or `all`; `draft` and exact `base_branches` are optional.
 Closed PRs are resolved when a new conversation comment arrives, so `state = "closed"` is useful for
 comment triggers. Commit polling considers active PR heads rather than replaying every historical

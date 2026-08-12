@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { installPrivilegedPackages, prepareAppleContainer, preparePodman } from "./setup.ts";
+import {
+  configureAutomaticUpdatesDuringSetup,
+  installPrivilegedPackages,
+  prepareAppleContainer,
+  preparePodman,
+} from "./setup.ts";
 
 const success = (stdout = "") => ({
   exitCode: 0,
@@ -9,6 +14,28 @@ const success = (stdout = "") => ({
 });
 const rootlessPodmanInfo = JSON.stringify({
   host: { security: { rootless: true }, cgroupVersion: "v2" },
+});
+
+test("records automatic updates as disabled when setup has no systemd user manager", async () => {
+  const preferences: boolean[] = [];
+  const warnings: string[] = [];
+
+  await configureAutomaticUpdatesDuringSetup({
+    preference: async () => undefined,
+    prompt: async () => true,
+    enable: async () => {
+      throw new Error("Linux requires a running systemd user manager");
+    },
+    savePreference: async (enabled) => {
+      preferences.push(enabled);
+    },
+    warn: (message) => warnings.push(message),
+  });
+
+  expect(preferences).toEqual([false]);
+  expect(warnings).toEqual([
+    expect.stringContaining("Run informant auto-update enable after resolving the service-manager"),
+  ]);
 });
 
 async function completePodmanSmoke(args: string[]): Promise<void> {

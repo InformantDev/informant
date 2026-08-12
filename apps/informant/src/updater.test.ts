@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CommandResult } from "./process.ts";
@@ -73,10 +73,32 @@ describe("release updates", () => {
     );
   });
 
+  test("uses a stable PATH symlink for the running Linux executable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-path-test-"));
+    const cellar = join(directory, "Cellar", "informant", "0.2.0", "bin");
+    const bin = join(directory, "bin");
+    const running = join(cellar, "informant");
+    const stable = join(bin, "informant");
+    try {
+      await Promise.all([mkdir(cellar, { recursive: true }), mkdir(bin)]);
+      await Bun.write(running, "executable");
+      await symlink(running, stable);
+      expect(
+        resolveInformantExecutable("linux", undefined, {
+          processExecutable: running,
+          which: () => stable,
+        }),
+      ).toBe(stable);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("does nothing when the installed version is current", async () => {
     let commands = 0;
     expect(
       await updateInformantIfAvailable("0.2.0", {
+        pendingRestartFile: join(tmpdir(), `informant-update-${crypto.randomUUID()}`),
         fetch: async () => releaseResponse("0.2.0"),
         command: async () => {
           commands++;
@@ -93,6 +115,7 @@ describe("release updates", () => {
     expect(
       await updateInformantIfAvailable("0.1.2", {
         platform: "linux",
+        pendingRestartFile: join(tmpdir(), `informant-update-${crypto.randomUUID()}`),
         fetch: async () => releaseResponse("0.2.0"),
         installLinux: async (release) => {
           installed = release.version;
@@ -113,6 +136,7 @@ describe("release updates", () => {
       await updateInformantIfAvailable("0.1.2", {
         platform: "darwin",
         uid: 501,
+        pendingRestartFile: join(tmpdir(), `informant-update-${crypto.randomUUID()}`),
         fetch: async () => releaseResponse("0.2.0"),
         command: async (argv) => {
           commands.push(argv);
@@ -130,19 +154,65 @@ describe("release updates", () => {
   });
 
   test("waits for the Homebrew formula when it still installs the old version", async () => {
-    await expect(
-      updateInformantIfAvailable("0.1.2", {
-        platform: "darwin",
-        uid: 501,
-        fetch: async () => releaseResponse("0.2.0"),
-        command: async (argv) =>
-          argv[1] === "print"
-            ? result(113)
-            : argv[0] === "informant"
-              ? result(0, "", "0.1.2\n")
-              : result(),
-      }),
-    ).rejects.toThrow("formula may still be updating");
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    try {
+      await expect(
+        updateInformantIfAvailable("0.1.2", {
+          platform: "darwin",
+          uid: 501,
+          pendingRestartFile: join(directory, "pending-restart"),
+          fetch: async () => releaseResponse("0.2.0"),
+          command: async (argv) =>
+            argv[1] === "print"
+              ? result(113)
+              : argv[0] === "informant"
+                ? result(0, "", "0.1.2\n")
+                : result(),
+        }),
+      ).rejects.toThrow("formula may still be updating");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("updates a Linux Homebrew installation through Homebrew", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    const cellar = join(directory, "Cellar", "informant", "0.1.2");
+    const prefix = join(directory, "opt", "informant");
+    const executable = join(cellar, "bin", "informant");
+    const stableExecutable = join(prefix, "bin", "informant");
+    const pendingRestartFile = join(directory, "pending-restart");
+    const commands: string[][] = [];
+    try {
+      await mkdir(join(cellar, "bin"), { recursive: true });
+      await mkdir(join(directory, "opt"), { recursive: true });
+      await Bun.write(executable, "Homebrew-managed executable");
+      await symlink(cellar, prefix);
+
+      expect(
+        await updateInformantIfAvailable("0.1.2", {
+          platform: "linux",
+          executable,
+          pendingRestartFile,
+          fetch: async () => releaseResponse("0.2.0"),
+          command: async (argv) => {
+            commands.push(argv);
+            if (argv[0] === "systemctl") return result(3, "inactive");
+            if (argv[0] === "brew" && argv[1] === "--prefix") {
+              return result(0, "", `${prefix}\n`);
+            }
+            if (argv[0] === stableExecutable) return result(0, "", "0.2.0\n");
+            return result();
+          },
+        }),
+      ).toEqual({ updated: true, restarted: false, version: "0.2.0" });
+      expect(commands).toContainEqual(["brew", "--prefix", "informantdev/tap/informant"]);
+      expect(commands).toContainEqual(["brew", "upgrade", "informantdev/tap/informant"]);
+      expect(commands).toContainEqual([stableExecutable, "--version"]);
+      expect(await Bun.file(executable).text()).toBe("Homebrew-managed executable");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   test("verifies and atomically installs a published Linux binary", async () => {
@@ -258,6 +328,44 @@ describe("release updates", () => {
     }
   });
 
+  test("records a pending restart before installing the replacement", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    const pendingRestartFile = join(directory, "pending-restart");
+    let replacementInstalled = false;
+    try {
+      await expect(
+        updateInformantIfAvailable("0.1.2", {
+          platform: "linux",
+          pendingRestartFile,
+          fetch: async () => releaseResponse("0.2.0"),
+          installLinux: async () => {
+            replacementInstalled = true;
+            expect(await Bun.file(pendingRestartFile).text()).toBe("0.2.0\n");
+            throw new Error("simulated crash after replacement");
+          },
+          command: async () => result(3, "inactive"),
+        }),
+      ).rejects.toThrow("simulated crash after replacement");
+      expect(replacementInstalled).toBe(true);
+      expect(await Bun.file(pendingRestartFile).text()).toBe("0.2.0\n");
+
+      expect(
+        await updateInformantIfAvailable("0.2.0", {
+          platform: "linux",
+          pendingRestartFile,
+          fetch: async () => releaseResponse("0.2.0"),
+          installLinux: async () => {
+            throw new Error("must not reinstall while retrying the restart");
+          },
+          command: async () => result(3, "inactive"),
+        }),
+      ).toEqual({ updated: false, restarted: false, version: "0.2.0" });
+      expect(await Bun.file(pendingRestartFile).exists()).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a Linux binary that does not match the release checksum", async () => {
     const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
     const executable = join(directory, "informant");
@@ -314,6 +422,16 @@ describe("automatic update services", () => {
     expect(timer).toContain("OnUnitInactiveSec=21600s");
     expect(timer).toContain("Persistent=true");
     expect(timer).toContain("WantedBy=timers.target");
+  });
+
+  test("escapes control characters in automatic-update systemd values", () => {
+    const service = renderLinuxAutomaticUpdateService("/opt/Informant\n tools\t/informant", {
+      VALUE: "line one\nline two\r\ttail",
+    });
+    expect(service).toContain(
+      'ExecStart="/opt/Informant\\n tools\\t/informant" update --automatic',
+    );
+    expect(service).toContain('Environment="VALUE=line one\\nline two\\r\\ttail"');
   });
 
   test("preserves a custom data directory in the updater environment", () => {

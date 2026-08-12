@@ -960,12 +960,14 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   if (subcommand === "auto-update" && action === "enable") {
+    if (id) throw new Error("auto-update enable does not accept arguments");
     const path = await enableAutomaticUpdates();
     await saveAutomaticUpdatesPreference(true);
     outro(`Enabled automatic Informant updates at ${path}`);
     return;
   }
   if (subcommand === "auto-update" && action === "disable") {
+    if (id) throw new Error("auto-update disable does not accept arguments");
     const disabled = await disableAutomaticUpdates();
     await saveAutomaticUpdatesPreference(false);
     outro(disabled ? "Disabled automatic Informant updates" : "Automatic updates are not enabled");

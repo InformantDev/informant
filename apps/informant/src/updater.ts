@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { constants, existsSync } from "node:fs";
-import { access, chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { constants, existsSync, realpathSync } from "node:fs";
+import { access, chmod, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { arch, homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { xdgConfigHome } from "./config-home.ts";
@@ -9,6 +9,7 @@ import { updateInformant } from "./startup.ts";
 import { dataDirectory } from "./store.ts";
 
 const RELEASES_API = "https://api.github.com/repos/InformantDev/informant/releases/latest";
+const HOMEBREW_FORMULA = "informantdev/tap/informant";
 const UPDATE_LABEL = "dev.informant.updater";
 const UPDATE_INTERVAL_SECONDS = 6 * 60 * 60;
 
@@ -103,6 +104,13 @@ export function resolveInformantExecutable(
   if (configured) return configured;
   const running = operations.processExecutable ?? process.execPath;
   const executable = (operations.which ?? Bun.which)("informant");
+  if (executable) {
+    try {
+      if (realpathSync(running) === realpathSync(executable)) return executable;
+    } catch {
+      // Missing or inaccessible candidates fall through to the platform defaults below.
+    }
+  }
   if (platform === "darwin" && executable) return executable;
   if (basename(running) === "informant") return running;
   if (executable) return executable;
@@ -189,18 +197,34 @@ export async function installLinuxRelease(
   }
 }
 
-async function installMacRelease(
+async function homebrewInformantExecutable(
+  executable: string,
+  run: typeof command,
+): Promise<string | undefined> {
+  const prefixResult = await run(["brew", "--prefix", HOMEBREW_FORMULA]);
+  const prefix = prefixResult.stdout.trim();
+  if (prefixResult.exitCode !== 0 || !prefix) return undefined;
+  const homebrewExecutable = join(prefix, "bin", "informant");
+  const [installed, candidate] = await Promise.all([
+    realpath(executable).catch(() => undefined),
+    realpath(homebrewExecutable).catch(() => undefined),
+  ]);
+  return installed && installed === candidate ? homebrewExecutable : undefined;
+}
+
+async function installHomebrewRelease(
   release: InformantRelease,
   run: typeof command,
   onOutput?: (text: string) => Promise<void> | void,
+  executable = "informant",
 ): Promise<void> {
-  const upgraded = await run(["brew", "upgrade", "informantdev/tap/informant"], { onOutput });
+  const upgraded = await run(["brew", "upgrade", HOMEBREW_FORMULA], { onOutput });
   if (upgraded.exitCode !== 0) {
     throw new Error(
       `could not update Informant with Homebrew: ${upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
     );
   }
-  const installed = await run(["informant", "--version"]);
+  const installed = await run([executable, "--version"]);
   if (
     installed.exitCode !== 0 ||
     !versionParts(installed.stdout.trim()) ||
@@ -244,26 +268,29 @@ export async function updateInformantIfAvailable(
   const install = retryRestart
     ? async () => {}
     : currentPlatform === "linux"
-      ? () =>
-          options.installLinux?.(release) ??
-          installLinuxRelease(release, {
+      ? async () => {
+          if (options.installLinux) return options.installLinux(release);
+          const executable = resolveInformantExecutable("linux", options.executable);
+          const homebrewExecutable = await homebrewInformantExecutable(executable, run);
+          if (homebrewExecutable) {
+            return installHomebrewRelease(release, run, options.onOutput, homebrewExecutable);
+          }
+          return installLinuxRelease(release, {
             command: run,
-            executable: options.executable,
+            executable,
             fetch: options.fetch,
-          })
+          });
+        }
       : currentPlatform === "darwin"
-        ? () => installMacRelease(release, run, options.onOutput)
+        ? () => installHomebrewRelease(release, run, options.onOutput)
         : undefined;
-  const installAndMarkRestart = async () => {
-    await install?.();
-    if (!retryRestart) {
-      await mkdir(dirname(pendingRestartFile), { recursive: true });
-      await Bun.write(pendingRestartFile, `${release.version}\n`);
-    }
-  };
+  if (!retryRestart) {
+    await mkdir(dirname(pendingRestartFile), { recursive: true });
+    await Bun.write(pendingRestartFile, `${release.version}\n`);
+  }
   const result = await updateInformant({
     command: run,
-    install: installAndMarkRestart,
+    install,
     onOutput: options.onOutput,
     platform: currentPlatform,
     restartTimeoutMs: options.restartTimeoutMs,
@@ -288,7 +315,13 @@ function escapeXml(value: string): string {
 }
 
 function escapeSystemd(value: string): string {
-  return value.replaceAll("%", "%%").replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+  return value
+    .replaceAll("%", "%%")
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replaceAll("\n", "\\n")
+    .replaceAll("\r", "\\r")
+    .replaceAll("\t", "\\t");
 }
 
 export function automaticUpdateServicePath(home = homedir()): string {

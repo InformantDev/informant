@@ -505,9 +505,15 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               state.pendingTags.push(tag);
               pending.add(key);
             }
+            if (!previous.has(key)) {
+              state.tagRefs.push(tag);
+              previous.add(key);
+            }
           }
+        } else {
+          // The first complete poll establishes durable history without replaying existing tags.
+          state.tagRefs = tags;
         }
-        state.tagRefs = tags;
         state.tagsPolledAt = new Date().toISOString();
       }
       await persistState();
@@ -608,6 +614,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             return;
           }
           const controller = new AbortController();
+          const shutdownController = new AbortController();
           const admissionController = new AbortController();
           admissionControllers.add(admissionController);
           if (!("tag" in target)) {
@@ -626,8 +633,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             },
             controller.signal,
             admissionSignal(admissionController),
+            shutdownController.signal,
           );
-          shutdownControllers.add(controller);
+          shutdownControllers.add(shutdownController);
           const run = result
             .then((build) => {
               if (build)
@@ -645,7 +653,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(target.eventId);
-              shutdownControllers.delete(controller);
+              shutdownControllers.delete(shutdownController);
               admissionControllers.delete(admissionController);
               if (
                 !("tag" in target) &&
@@ -739,6 +747,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             return;
           }
           const controller = new AbortController();
+          const shutdownController = new AbortController();
           const admissionController = new AbortController();
           admissionControllers.add(admissionController);
           const result = executeCommit(
@@ -751,8 +760,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             context,
             controller.signal,
             admissionSignal(admissionController),
+            shutdownController.signal,
           );
-          shutdownControllers.add(controller);
+          shutdownControllers.add(shutdownController);
           const run = result
             .then((result) => {
               if (result !== false) completedComments.add(pending.id);
@@ -762,7 +772,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             })
             .finally(() => {
               inFlightRuns.delete(eventId);
-              shutdownControllers.delete(controller);
+              shutdownControllers.delete(shutdownController);
               admissionControllers.delete(admissionController);
               idle();
             });

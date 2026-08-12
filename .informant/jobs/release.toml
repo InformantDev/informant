@@ -1,6 +1,6 @@
 name = "release"
 runs_on = ["container"]
-needs = ["build"]
+needs = ["release-build"]
 timeout_minutes = 45
 triggers = [{ event = "commit", tag = { patterns = ["v*"] } }]
 secrets = ["RELEASE_GITHUB_TOKEN"]
@@ -8,43 +8,36 @@ command = """
 set -eu
 
 tag="$INFORMANT_BRANCH"
-if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
   echo "release tags must use semantic versions such as v0.2.0" >&2
   exit 1
 fi
 version=${tag#v}
-package_version=$(bun -e 'console.log((await Bun.file("apps/informant/package.json").json()).version)')
-if [ "$version" != "$package_version" ]; then
-  echo "tag $tag does not match package version $package_version" >&2
+artifacts="$HOME/.cache/informant-release/$INFORMANT_SHA"
+tap_directory=
+cleanup() {
+  rm -rf "$artifacts"
+  if [ -n "$tap_directory" ]; then
+    rm -rf "$tap_directory"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+if [ ! -f "$artifacts/VERSION" ] || [ -L "$artifacts/VERSION" ] || \
+   [ "$(cat "$artifacts/VERSION")" != "$version" ]; then
+  echo "release artifacts do not match tag $tag" >&2
   exit 1
 fi
+for artifact in \
+  informant-darwin-arm64 informant-darwin-x64 \
+  informant-linux-arm64 informant-linux-x64 informant.rb SHA256SUMS; do
+  if [ ! -f "$artifacts/$artifact" ] || [ -L "$artifacts/$artifact" ]; then
+    echo "release artifact is missing or is not a regular file: $artifact" >&2
+    exit 1
+  fi
+done
+(cd "$artifacts" && sha256sum -c SHA256SUMS)
 
-release_token=$RELEASE_GITHUB_TOKEN
-unset RELEASE_GITHUB_TOKEN
-
-bun install --frozen-lockfile --ignore-scripts
-bun run --cwd apps/informant build:all
-
-artifacts="$PWD/artifacts"
-mkdir -p "$artifacts"
-cp apps/informant/dist/informant-darwin-arm64 "$artifacts/"
-cp apps/informant/dist/informant-darwin-x64 "$artifacts/"
-cp apps/informant/dist/informant-linux-arm64 "$artifacts/"
-cp apps/informant/dist/informant-linux-x64 "$artifacts/"
-(
-  cd "$artifacts"
-  sha256sum informant-* > SHA256SUMS
-)
-scripts/render-homebrew-formula.sh "$tag" "$artifacts/SHA256SUMS" "$artifacts/informant.rb"
-
-case "$(uname -m)" in
-  x86_64 | amd64) native_asset=informant-linux-x64 ;;
-  aarch64 | arm64) native_asset=informant-linux-arm64 ;;
-  *) echo "cannot smoke-test binaries on $(uname -m)" >&2; exit 1 ;;
-esac
-"$artifacts/$native_asset" --version
-
-export GH_TOKEN="$release_token"
+export GH_TOKEN="$RELEASE_GITHUB_TOKEN"
 if gh release view "$tag" --repo "$INFORMANT_REPOSITORY" >/dev/null 2>&1; then
   gh release upload "$tag" \
     "$artifacts"/informant-* \
@@ -64,7 +57,6 @@ else
 fi
 
 tap_directory=$(mktemp -d)
-trap 'rm -rf "$tap_directory"' EXIT HUP INT TERM
 gh auth setup-git
 gh repo clone InformantDev/homebrew-tap "$tap_directory"
 cp "$artifacts/informant.rb" "$tap_directory/Formula/informant.rb"
@@ -98,11 +90,11 @@ else
     --body "Automated by the Informant release job for InformantDev/informant@$tag."
 fi
 """
-container = { image = "docker.io/oven/bun:1", cpu = 4, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = """
+cache = [{ paths = ["~/.cache/informant-release"], shared = true }]
+container = { image = "debian:bookworm-slim", cpu = 1, memory_mb = 1024, prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates gh git grep
+apt-get install -y --no-install-recommends ca-certificates gh git
 rm -rf /var/lib/apt/lists/*
-bun install --frozen-lockfile --ignore-scripts
 """ }

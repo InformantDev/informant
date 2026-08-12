@@ -1,7 +1,9 @@
 import type { Dirent } from "node:fs";
 import {
+  appendFile,
   chmod,
   copyFile,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -26,7 +28,12 @@ import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts"
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
-import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
+import {
+  boundedLogWriter,
+  type RuntimeSecrets,
+  resolveJobSecrets,
+  streamingSecretRedactor,
+} from "./tart/index.ts";
 import { bunCopyfileBackend, raiseFileDescriptorLimit } from "./tart/layout.ts";
 import { digest, shellQuote, withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
@@ -37,9 +44,10 @@ interface ContainerResources {
 }
 
 const DEFAULT_CONTAINER_RESOURCES: ContainerResources = { cpu: 1, memoryMb: 1024 };
-const FILE_MOUNT_RESCAN_MS = 50;
-const MAX_PENDING_MOUNT_OUTPUT_BYTES = 256 * 1024;
-
+const MOUNT_OUTPUT_SPOOL_BYTES = 10 * 1024 * 1024;
+const MOUNT_OUTPUT_TRUNCATION_MARKER = "\n[informant: mounted job output truncated at 10 MiB]\n";
+const WRITABLE_MOUNT_OUTPUT_MARKER =
+  "[informant: child output suppressed because a writable credential mount may rotate secrets]\n";
 function containerCommandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
   return new Error(
     `${action}: ${result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.exitCode}`}`,
@@ -257,7 +265,7 @@ export interface ContainerPreparationOperations {
 type ContainerRunOperations = Pick<
   ContainerPreparationOperations,
   "command" | "withImageLock" | "dataPath" | "backend"
-> & { allowedMounts?: Record<string, string> };
+> & { allowedMounts?: Record<string, string>; link?: typeof link };
 
 interface StagedFileMount {
   name: string;
@@ -411,7 +419,10 @@ async function stageFileMounts(
   }
 }
 
-async function persistFileMount(mount: StagedFileMount): Promise<void> {
+async function persistFileMount(
+  mount: StagedFileMount,
+  linkFile: typeof link = link,
+): Promise<void> {
   if (!mount.writeBack) return;
   const staged = join(mount.directory, mount.filename);
   const metadata = await lstat(staged);
@@ -421,17 +432,66 @@ async function persistFileMount(mount: StagedFileMount): Promise<void> {
   const stagedDigest = await mountedFileDigest(staged);
   if (stagedDigest === mount.originalDigest) return;
   const temporary = `${mount.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
-  let replaced = false;
+  const displaced = `${temporary}.original`;
+  let claimed = false;
+  let installed = false;
+  let recovered = false;
+  let operationError: unknown;
   try {
     await copyFile(staged, temporary);
     await chmod(temporary, mount.mode);
-    if ((await mountedFileDigest(mount.source)) !== mount.originalDigest)
+    // Atomically claim the pathname before comparing it. Creating the replacement with link(2)
+    // is exclusive, so a host refresher that recreates the path always wins instead of being
+    // overwritten between a digest check and rename.
+    await rename(mount.source, displaced);
+    claimed = true;
+    if ((await mountedFileDigest(displaced)) !== mount.originalDigest)
       throw new Error(`allowed host file changed during mounted job: ${mount.name}`);
-    await rename(temporary, mount.source);
-    replaced = true;
-  } finally {
-    if (!replaced) await rm(temporary, { force: true });
+    try {
+      await linkFile(temporary, mount.source);
+      installed = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`allowed host file changed during mounted job: ${mount.name}`);
+      }
+      throw error;
+    }
+  } catch (error) {
+    operationError = error;
   }
+  let recoveryError: unknown;
+  if (claimed && !installed) {
+    try {
+      await linkFile(displaced, mount.source);
+      recovered = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        try {
+          recovered = (await mountedFileDigest(mount.source)) === mount.originalDigest;
+        } catch {
+          recovered = false;
+        }
+      }
+      if (!recovered) recoveryError = error;
+    }
+  }
+  const cleanup = [rm(temporary, { force: true })];
+  // Keep the displaced original as a recovery copy unless a replacement was installed or the
+  // original pathname was positively restored. Removing it after a failed recovery could delete
+  // the only confirmed copy of the credential.
+  if (!claimed || installed || recovered) cleanup.push(rm(displaced, { force: true }));
+  const cleanupErrors = (await Promise.allSettled(cleanup))
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason);
+  const errors = [operationError, recoveryError, ...cleanupErrors].filter(
+    (error) => error !== undefined,
+  );
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1)
+    throw new AggregateError(
+      errors,
+      `mounted file could not be safely written back: ${mount.name}`,
+    );
 }
 
 const preparedContainerReferencesDirectory = (dataPath = dataDirectory()) =>
@@ -792,12 +852,16 @@ export async function runInContainer(
       if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
         await log(`[${job.name}] waiting for an available container slot\n`);
       releaseSlot = await acquireContainerResources(resources, executionSignal);
-      const mounts = caches.mounts.map((mount) => ({
+      const mounts: NonNullable<ContainerRunOptions["mounts"]> = caches.mounts.map((mount) => ({
         source: mount.path,
         target: `/mnt/shared/${mount.name}`,
       }));
       mounts.push(
-        ...fileMounts.map((mount) => ({ source: mount.directory, target: mount.target })),
+        ...fileMounts.map((mount) => ({
+          source: mount.directory,
+          target: mount.target,
+          readOnly: !mount.writeBack,
+        })),
       );
       const args = containerRunArguments(
         {
@@ -829,26 +893,24 @@ export async function runInContainer(
           redactor.add(mount.snapshot.values);
         }
       };
-      let pendingOutput = "";
-      let drainTask: Promise<void> | undefined;
-      let drainError: unknown;
-      const scheduleDrain = () => {
-        if (drainTask || drainError) return;
-        drainTask = (async () => {
-          await Bun.sleep(FILE_MOUNT_RESCAN_MS);
-          const text = pendingOutput;
-          pendingOutput = "";
-          await refreshMountedValues();
-          await redactor.write(text);
-        })()
-          .catch((error) => {
-            drainError = error;
-          })
-          .finally(() => {
-            drainTask = undefined;
-            if (pendingOutput && !drainError) scheduleDrain();
-          });
-      };
+      const suppressChildOutput = fileMounts.some((mount) => mount.writeBack);
+      const spoolDirectory =
+        fileMounts.length > 0 && !suppressChildOutput
+          ? await (async () => {
+              const parent = join(operations.dataPath ?? dataDirectory(), "container-output-spool");
+              await mkdir(parent, { recursive: true, mode: 0o700 });
+              return mkdtemp(join(parent, "job-"));
+            })()
+          : undefined;
+      const spoolPath = spoolDirectory ? join(spoolDirectory, "output.log") : undefined;
+      const writeSpool = spoolPath
+        ? boundedLogWriter(
+            (text) => appendFile(spoolPath, text, { mode: 0o600 }),
+            MOUNT_OUTPUT_SPOOL_BYTES,
+            MOUNT_OUTPUT_TRUNCATION_MARKER,
+          )
+        : undefined;
+      let suppressedOutput = false;
       let result: Awaited<ReturnType<typeof runCommand>> | undefined;
       let commandError: unknown;
       try {
@@ -856,32 +918,40 @@ export async function runInContainer(
           env: secrets,
           signal: executionSignal,
           onOutput: async (text) => {
-            if (drainError) throw drainError;
-            pendingOutput += text;
-            scheduleDrain();
-            if (Buffer.byteLength(pendingOutput) >= MAX_PENDING_MOUNT_OUTPUT_BYTES && drainTask) {
-              await drainTask;
-              if (drainError) throw drainError;
-            }
+            if (suppressChildOutput) suppressedOutput ||= text.length > 0;
+            else if (writeSpool) await writeSpool(text);
+            else await redactor.write(text);
           },
         });
       } catch (error) {
         commandError = error;
       }
-      while (drainTask) await drainTask;
-      let redactionError = drainError;
-      if (!redactionError)
-        try {
-          if (pendingOutput) {
-            await refreshMountedValues();
-            await redactor.write(pendingOutput);
-            pendingOutput = "";
-          }
+      let redactionError: unknown;
+      try {
+        if (spoolPath) {
+          // Mounted credentials may be refreshed immediately after being printed. Do not publish
+          // any child output until the process exits and the final credential values are known.
           await refreshMountedValues();
-          await redactor.flush();
-        } catch (error) {
-          redactionError = error;
+          const file = Bun.file(spoolPath);
+          if (await file.exists()) {
+            const reader = file.stream().getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              await redactor.write(decoder.decode(value, { stream: true }));
+            }
+            await redactor.write(decoder.decode());
+          }
+        } else if (suppressedOutput) {
+          await redactor.write(WRITABLE_MOUNT_OUTPUT_MARKER);
         }
+        await redactor.flush();
+      } catch (error) {
+        redactionError = error;
+      } finally {
+        if (spoolDirectory) await rm(spoolDirectory, { recursive: true, force: true });
+      }
       if (commandError && redactionError)
         throw new AggregateError(
           [commandError, redactionError],
@@ -905,7 +975,9 @@ export async function runInContainer(
         runError = error;
       }
       try {
-        const results = await Promise.allSettled(staged.map(persistFileMount));
+        const results = await Promise.allSettled(
+          staged.map((mount) => persistFileMount(mount, operations.link)),
+        );
         const errors = results
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
           .map((result) => result.reason);

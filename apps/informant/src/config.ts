@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { resolve } from "node:path";
+import { posix, resolve } from "node:path";
 import type { InformantConfig, JobConfig, JobRuntime, Repository, TriggerRule } from "./types.ts";
 
 export const CONFIG_DIRECTORY = ".informant";
@@ -436,7 +436,12 @@ function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
     const writeBack = raw.write_back ?? false;
     if (typeof writeBack !== "boolean")
       throw new Error(`${label}[${index}].write_back must be a boolean`);
-    return { source: raw.source, target: raw.target, writeBack };
+    const target = posix.normalize(raw.target);
+    return {
+      source: raw.source,
+      target: target === "/" ? target : target.replace(/\/$/, ""),
+      writeBack,
+    };
   });
   if (new Set(mounts.map((mount) => mount.source)).size !== mounts.length)
     throw new Error(`${label} must not contain duplicate sources`);

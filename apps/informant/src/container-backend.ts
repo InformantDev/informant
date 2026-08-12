@@ -11,7 +11,7 @@ export interface ContainerRunOptions {
   workspace: string;
   command: string;
   environment: Record<string, string>;
-  mounts?: Array<{ source: string; target: string }>;
+  mounts?: Array<{ source: string; target: string; readOnly?: boolean }>;
   secretNames?: string[];
   cpu?: number;
   memoryMb?: number;
@@ -40,10 +40,17 @@ function commandError(action: string, result: CommandResult): Error {
   );
 }
 
-function volume(source: string, target: string, runtime: string, label?: "Z" | "z"): string {
+function volume(
+  source: string,
+  target: string,
+  runtime: string,
+  label?: "Z" | "z",
+  readOnly = false,
+): string {
   if (source.includes(":"))
     throw new Error(`${runtime} cannot mount a host path containing a colon: ${source}`);
-  return `${source}:${target}${label ? `:${label}` : ""}`;
+  const options = [label, readOnly ? "ro" : undefined].filter(Boolean).join(",");
+  return `${source}:${target}${options ? `:${options}` : ""}`;
 }
 
 function commonRunArguments(
@@ -78,7 +85,10 @@ function commonRunArguments(
     ),
   );
   for (const mount of options.mounts ?? [])
-    args.push("--volume", volume(mount.source, mount.target, runtime, labels?.mount));
+    args.push(
+      "--volume",
+      volume(mount.source, mount.target, runtime, labels?.mount, mount.readOnly),
+    );
   for (const [key, value] of Object.entries(options.environment))
     args.push("--env", `${key}=${value}`);
   for (const name of options.secretNames ?? []) args.push("--env", name);
@@ -308,7 +318,14 @@ export async function refreshContainerBackend(
     return readiness.error === undefined;
   }
   if (!backend) return initializeContainerBackend(backend, runCommand, now, signal);
-  if (refreshInFlight?.backend === backend) return waitForReadiness(refreshInFlight, signal);
+  if (
+    refreshInFlight?.backend === backend &&
+    !refreshInFlight.settled &&
+    !refreshInFlight.controller.signal.aborted
+  ) {
+    return waitForReadiness(refreshInFlight, signal);
+  }
+  if (refreshInFlight?.backend === backend) refreshInFlight = undefined;
   signal?.throwIfAborted();
   const controller = new AbortController();
   let refresh!: ReadinessRefresh;

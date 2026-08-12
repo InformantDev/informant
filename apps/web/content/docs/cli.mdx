@@ -100,10 +100,11 @@ and `worker.stderr.log` in the Informant data directory. Run `informant startup 
 changing any `INFORMANT_*` environment-variable overrides so the service captures the new values.
 
 `informant update` checks GitHub's latest stable release before making changes. On macOS it upgrades
-`informantdev/tap/informant` with Homebrew. On Linux it downloads the matching release binary and
-verifies it against the release's `SHA256SUMS` before atomically replacing the installed executable;
-the executable and its parent directory must be writable by the worker user. If the startup worker
-was already running, the command gracefully stops it and waits for launchd or systemd to start the new
+`informantdev/tap/informant` with Homebrew. Linux Homebrew installations use that same formula
+upgrade path. For standalone Linux installations, it downloads the matching release binary, verifies
+it against the release's `SHA256SUMS`, and atomically replaces the installed executable; the
+executable and its parent directory must be writable by the worker user. If the startup worker was
+already running, the command gracefully stops it and waits for launchd or systemd to start the new
 version. It does not start a worker that was stopped or never enabled.
 
 The first-run automatic-update choice in `informant setup` installs a launchd agent or persistent

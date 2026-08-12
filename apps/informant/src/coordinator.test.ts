@@ -1948,4 +1948,105 @@ describe("runCommit", () => {
     expect(record.status).toBe("success");
     expect(record.event?.type).toBe("manual_trigger");
   });
+
+  test("forwards forced shutdown to automatic and manual claim bookkeeping", async () => {
+    const automatic = harness();
+    const automaticLane = new AbortController();
+    const automaticAdmission = new AbortController();
+    const automaticShutdown = new AbortController();
+    let automaticClaimAdmission: AbortSignal | undefined;
+    let automaticClaimExecution: AbortSignal | undefined;
+    automatic.github.claim = async (...args) => {
+      automaticClaimAdmission = args[8];
+      automaticClaimExecution = args[9];
+      return undefined;
+    };
+
+    await runCommit(
+      automatic.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      automatic.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+      automaticLane.signal,
+      automaticAdmission.signal,
+      automaticShutdown.signal,
+    );
+
+    expect(automaticClaimAdmission?.aborted).toBeFalse();
+    expect(automaticClaimExecution?.aborted).toBeFalse();
+    automaticShutdown.abort("Graceful worker shutdown timed out.");
+    expect(automaticClaimExecution?.aborted).toBeTrue();
+    expect(automaticClaimAdmission?.aborted).toBeFalse();
+
+    const manual = harness({ manualTrigger: true });
+    const manualLane = new AbortController();
+    const manualAdmission = new AbortController();
+    const manualShutdown = new AbortController();
+    let manualClaimAdmission: AbortSignal | undefined;
+    let manualClaimExecution: AbortSignal | undefined;
+    manual.github.claim = async (...args) => {
+      manualClaimAdmission = args[8];
+      manualClaimExecution = args[9];
+      return undefined;
+    };
+
+    await runCommit(
+      manual.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      manual.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+      manualLane.signal,
+      manualAdmission.signal,
+      manualShutdown.signal,
+    );
+
+    expect(manualClaimAdmission).toBe(manualAdmission.signal);
+    expect(manualClaimExecution).toBe(manualShutdown.signal);
+  });
+
+  test("cancels a manually triggered build after forced worker shutdown", async () => {
+    const context = harness({ manualTrigger: true });
+    const supersession = new AbortController();
+    const forcedShutdown = new AbortController();
+    let runtimeSignal: AbortSignal | undefined;
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      _config,
+      _record,
+      observer,
+      signal,
+    ) => {
+      runtimeSignal = signal;
+      const job = config.jobs[0];
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      forcedShutdown.abort("Graceful worker shutdown timed out.");
+      await observer?.completed?.(job, { outcome: "cancelled", log: "cancelled" });
+      return false;
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+      supersession.signal,
+      undefined,
+      forcedShutdown.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(runtimeSignal).toBe(forcedShutdown.signal);
+    expect(record.status).toBe("cancelled");
+  });
 });

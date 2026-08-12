@@ -332,6 +332,61 @@ test("uncertain candidate creation is reconciled after forced shutdown", async (
   });
 });
 
+test("an abandoned pre-election candidate expires after its short lease", async () => {
+  const oldCandidate: CheckRun = {
+    id: 1,
+    name: "Informant CI",
+    status: "queued",
+    external_id: `old-worker:candidate:${(Date.now() - 61_000).toString(36)}:deadbeef:event:commit:branch:main:abc123`,
+  };
+  const checks: CheckRun[] = [oldCandidate];
+  let nextId = 2;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const check = { id: nextId++, ...body } as CheckRun;
+      checks.push(check);
+      return Response.json(check);
+    }
+    if (init?.method === "PATCH") return Response.json({});
+    return Response.json({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "candidate-lease", repo: "widgets", fullName: "candidate-lease/widgets" },
+    "abc123",
+    "new-worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+  );
+
+  expect(claim?.check?.id).toBe(2);
+  expect(claim?.check?.external_id).toBe("new-worker:event:commit:branch:main:abc123");
+});
+
+test("an abandoned recent candidate blocks only for its short lease", async () => {
+  const candidate: CheckRun = {
+    id: 1,
+    name: "Informant CI",
+    status: "queued",
+    external_id: `old-worker:candidate:${Date.now().toString(36)}:deadbeef:event:commit:branch:main:abc123`,
+  };
+  let posted = false;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") posted = true;
+    return Response.json({ check_runs: [candidate] });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "candidate-lease", repo: "widgets", fullName: "candidate-lease/widgets" },
+    "abc123",
+    "new-worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+  );
+
+  expect(claim).toEqual({ requestedJobs: [], manualTrigger: false, retry: true });
+  expect(posted).toBe(false);
+});
+
 test("stale cleanup finishes before admission cancellation is honored", async () => {
   const stale: CheckRun = {
     id: 1,
@@ -503,7 +558,7 @@ test("claim elects the oldest active check using the full check history", async 
 
   expect(claim?.check?.id).toBe(10);
   expect(claim?.requestedJobs).toEqual([]);
-  expect(urls.filter((url) => url.includes("check-runs"))).toHaveLength(4);
+  expect(urls.filter((url) => url.includes("check-runs"))).toHaveLength(5);
   expect(urls.some((url) => url.includes("filter=all") && url.includes("per_page=100"))).toBe(true);
 });
 
@@ -553,6 +608,33 @@ test("tags paginate and map dereferenced commit SHAs", async () => {
   expect(tags).toHaveLength(101);
   expect(tags[100]).toEqual({ name: "v100", sha: "commit-2-0" });
   expect(pages).toEqual([1, 2]);
+});
+
+test("tag polling reads every page so bursts beyond two hundred refs are not missed", async () => {
+  const pages: number[] = [];
+  const fetch = (async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    const page = Number(url.searchParams.get("page"));
+    pages.push(page);
+    const count = page < 3 ? 100 : 50;
+    return Response.json(
+      Array.from({ length: count }, (_, index) => ({
+        name: page === 1 && index === 0 ? "v-moved" : `v${page}-${index}`,
+        commit: { sha: page === 1 && index === 0 ? "new-target" : `sha-${page}-${index}` },
+      })),
+    );
+  }) as typeof globalThis.fetch;
+
+  const tags = await new GitHubClient({ token: "installation-token", fetch }).tags({
+    owner: "acme",
+    repo: "widgets",
+    fullName: "acme/widgets",
+  });
+
+  expect(tags).toHaveLength(250);
+  expect(tags[0]).toEqual({ name: "v-moved", sha: "new-target" });
+  expect(tags[249]).toEqual({ name: "v3-49", sha: "sha-3-49" });
+  expect(pages).toEqual([1, 2, 3]);
 });
 
 test("queued checks encode selected jobs in the request", async () => {
@@ -1236,10 +1318,8 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
   expect(claim?.requestedJobs).toEqual(["deploy", "cleanup", "lint"]);
   expect(claim?.originalPullRequest).toBe(43);
   const eligibleScope = Buffer.from("cleanup\0deploy\0lint").toString("base64url");
-  expect(checks.at(-1)?.external_id).toBe(
-    `machine:event:commit:pr:43:abc123:jobs:${eligibleScope}`,
-  );
-  expect(jobCheckReads).toBe(1);
+  expect(claim?.check?.external_id).toBe(`machine:event:commit:pr:43:abc123:jobs:${eligibleScope}`);
+  expect(jobCheckReads).toBe(2);
 });
 
 test("claim falls back to all jobs when a queued suite has no failed job history", async () => {
@@ -1276,7 +1356,7 @@ test("claim falls back to all jobs when a queued suite has no failed job history
   expect(claim?.requestedJobs).toEqual([]);
   expect(claim?.originalPullRequest).toBeUndefined();
   expect(claim?.manualTriggerBranch).toBe("release");
-  expect(checks.at(-1)?.external_id).toContain("machine:event:manual:abc123:context:");
+  expect(claim?.check?.external_id).toContain("machine:event:manual:abc123:context:");
 });
 
 test("a tag suite rerun recovers its branchless context and execution label", async () => {

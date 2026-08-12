@@ -668,6 +668,41 @@ describe("serve polling orchestration", () => {
     expect(state.pendingTags).toEqual([]);
   });
 
+  test("retains durable tag history when refs leave and later reenter the listing", async () => {
+    const historical = { name: "v1", sha: "old-sha" };
+    const current = { name: "v2", sha: "new-sha" };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [historical],
+    };
+    let polls = 0;
+    const events: string[] = [];
+    const deps = dependencies(
+      github({
+        tags: async () => {
+          polls++;
+          return polls === 1 ? [current] : [historical, current];
+        },
+      }),
+      state,
+      async (_github, _repository, _sha, _branch, _config, _deps, event) => {
+        events.push(event?.id ?? "");
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, dependencies: deps });
+    state.tagsPolledAt = undefined;
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(events).toEqual(["tag:v2:new-sha"]);
+    expect(state.tagRefs).toEqual([historical, current]);
+    expect(state.pendingTags).toEqual([]);
+  });
+
   test("acknowledges nonmatching tags and retains false or rejected matching tags", async () => {
     const nonmatching: PollState = {
       pending: [],
@@ -1007,10 +1042,10 @@ describe("serve polling orchestration", () => {
       dependencies: dependencies(
         client,
         { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
-        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
-          receivedSignal = signal;
+        async (...args) => {
+          receivedSignal = args[9];
           return new Promise((resolve) =>
-            signal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+            receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
           );
         },
         async () => outer.abort(),
@@ -1289,7 +1324,7 @@ describe("serve polling orchestration", () => {
         github({}),
         state,
         async (...args) => {
-          receivedSignal = args[7];
+          receivedSignal = args[9];
           return new Promise((resolve) =>
             receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
           );

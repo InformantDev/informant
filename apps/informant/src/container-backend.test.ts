@@ -39,7 +39,10 @@ test("builds Podman run and image lifecycle commands", () => {
     name: "informant-job",
     image: "docker.io/oven/bun:1",
     workspace: "/tmp/workspace",
-    mounts: [{ source: "/tmp/cache", target: "/mnt/shared/cache-0" }],
+    mounts: [
+      { source: "/tmp/cache", target: "/mnt/shared/cache-0" },
+      { source: "/tmp/credential", target: "/mnt/credential", readOnly: true },
+    ],
     command: "bun test",
     environment: { CI: "true" },
     cpu: 2,
@@ -49,6 +52,7 @@ test("builds Podman run and image lifecycle commands", () => {
   expect(run).not.toContain("label=disable");
   expect(run).toContain("/tmp/workspace:/workspace:Z");
   expect(run).toContain("/tmp/cache:/mnt/shared/cache-0:z");
+  expect(run).toContain("/tmp/credential:/mnt/credential:z,ro");
   expect(run).toContain("--cpus");
   expect(run).toContain("--memory");
   expect(podmanContainerBackend.buildArguments("prepared", 2, 1024)).toEqual([
@@ -161,6 +165,39 @@ test("cancels a caller that joins an in-flight readiness probe", async () => {
   await expect(joined).rejects.toThrow("job cancelled");
   blocked.resolve();
   expect(await probe).toBe(true);
+});
+
+test("starts a fresh probe instead of joining an aborted unsettled refresh", async () => {
+  const firstProbe = deferred<void>();
+  let probes = 0;
+  const runCommand = async (argv: string[]) => {
+    if (argv[1] === "info") {
+      probes++;
+      if (probes === 1) await firstProbe.promise;
+      return result(
+        0,
+        JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } }),
+      );
+    }
+    return result();
+  };
+  const controller = new AbortController();
+  const abandoned = refreshContainerBackend(
+    30_000,
+    podmanContainerBackend,
+    runCommand,
+    1_000,
+    controller.signal,
+  );
+  while (probes === 0) await Bun.sleep(0);
+  controller.abort(new Error("caller left"));
+  await expect(abandoned).rejects.toThrow("caller left");
+
+  expect(await refreshContainerBackend(30_000, podmanContainerBackend, runCommand, 1_000)).toBe(
+    true,
+  );
+  expect(probes).toBe(2);
+  firstProbe.resolve();
 });
 
 test("re-probes stale success and allows stale failure to recover", async () => {

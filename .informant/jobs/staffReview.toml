@@ -1,6 +1,6 @@
 name = "Staff Review"
 # Allowed mounts automatically advertise a namespaced worker capability.
-runs_on = ["container", "mount:codex-auth"]
+runs_on = ["container", "arm64", "mount:codex-auth"]
 optional = true
 command = """
 set -eu
