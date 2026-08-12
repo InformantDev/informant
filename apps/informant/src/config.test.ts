@@ -59,9 +59,7 @@ describe("configuration", () => {
           },
         ],
         filters: [{ branch: { names: ["main"] } }],
-        cache: [
-          { paths: ["~/.bun/install/cache"], keyFiles: [], shared: true },
-        ],
+        cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
         runtime: {
           type: "container",
           image: "docker.io/oven/bun:1",
@@ -84,36 +82,26 @@ describe("configuration", () => {
       },
     ]);
     expect(config.jobs.map((job) => job.name)).toEqual(["test", "build"]);
-    expect(config.jobs[0]?.command).toBe(
-      "bun install --frozen-lockfile && bun test",
-    );
+    expect(config.jobs[0]?.command).toBe("bun install --frozen-lockfile && bun test");
     expect(config.jobs[1]?.needs).toEqual(["test"]);
     expect(config.jobs.every((job) => job.timeoutMinutes === 60)).toBe(true);
   });
 
   test("parses GitHub repository forms", () => {
-    expect(
-      parseRepository("https://github.com/acme/widgets.git").fullName,
-    ).toBe("acme/widgets");
-    expect(parseRepository("git@github.com:acme/widgets.git").fullName).toBe(
-      "acme/widgets",
-    );
-    expect(
-      parseRepository("ssh://git@github.com/acme/widgets.git").fullName,
-    ).toBe("acme/widgets");
+    expect(parseRepository("https://github.com/acme/widgets.git").fullName).toBe("acme/widgets");
+    expect(parseRepository("git@github.com:acme/widgets.git").fullName).toBe("acme/widgets");
+    expect(parseRepository("ssh://git@github.com/acme/widgets.git").fullName).toBe("acme/widgets");
     expect(parseRepository("acme/widgets").fullName).toBe("acme/widgets");
   });
 
   test("requires jobs", () => {
-    expect(() => parseConfig('version = 1\n[vm]\nimage = "vm"')).toThrow(
-      "at least one",
-    );
+    expect(() => parseConfig('version = 1\n[vm]\nimage = "vm"')).toThrow("at least one");
   });
 
   test("requires non-empty job names and commands", () => {
-    expect(() =>
-      parseConfig(configTemplate().replace('name = "test"', 'name = "   "')),
-    ).toThrow("name and command fields must be non-empty");
+    expect(() => parseConfig(configTemplate().replace('name = "test"', 'name = "   "'))).toThrow(
+      "name and command fields must be non-empty",
+    );
     expect(() =>
       parseConfig(
         configTemplate().replace(
@@ -126,13 +114,11 @@ describe("configuration", () => {
 
   test("requires configuration version 1", () => {
     expect(() =>
-      parseConfig(
-        configTemplate().replace("version = 1", 'version = "invalid"'),
-      ),
+      parseConfig(configTemplate().replace("version = 1", 'version = "invalid"')),
     ).toThrow("version must be 1");
-    expect(() =>
-      parseConfig(configTemplate().replace("version = 1", "version = 2")),
-    ).toThrow("version must be 1");
+    expect(() => parseConfig(configTemplate().replace("version = 1", "version = 2"))).toThrow(
+      "version must be 1",
+    );
   });
 
   test("requires positive integer VM resources", () => {
@@ -143,9 +129,7 @@ describe("configuration", () => {
       ["memory_mb", "0"],
     ]) {
       expect(() =>
-        parseConfig(
-          vmConfigTemplate().replace("[vm]", `[vm]\n${field} = ${value}`),
-        ),
+        parseConfig(vmConfigTemplate().replace("[vm]", `[vm]\n${field} = ${value}`)),
       ).toThrow(`vm.${field} must be a positive integer`);
     }
   });
@@ -162,16 +146,13 @@ describe("configuration", () => {
   });
 
   test("defaults the guest OS to macOS and accepts Linux", () => {
-    expect(
-      parseConfig(vmConfigTemplate().replace('os = "macos"\n', "")).vm.guestOs,
-    ).toBe("macos");
-    expect(
-      parseConfig(vmConfigTemplate().replace('os = "macos"', 'os = "linux"')).vm
-        .guestOs,
-    ).toBe("linux");
-    expect(() =>
-      parseConfig(vmConfigTemplate().replace('os = "macos"', 'os = "windows"')),
-    ).toThrow('vm.os must be "macos" or "linux"');
+    expect(parseConfig(vmConfigTemplate().replace('os = "macos"\n', "")).vm.guestOs).toBe("macos");
+    expect(parseConfig(vmConfigTemplate().replace('os = "macos"', 'os = "linux"')).vm.guestOs).toBe(
+      "linux",
+    );
+    expect(() => parseConfig(vmConfigTemplate().replace('os = "macos"', 'os = "windows"'))).toThrow(
+      'vm.os must be "macos" or "linux"',
+    );
   });
 
   test("validates VM credentials while allowing an explicitly empty password", () => {
@@ -184,31 +165,19 @@ describe("configuration", () => {
       ).vm,
     ).toMatchObject({ user: "builder", password: "" });
     expect(() =>
-      parseConfig(
-        vmConfigTemplate().replace(
-          'user = "admin"',
-          'user = "-oProxyCommand=bad"',
-        ),
-      ),
+      parseConfig(vmConfigTemplate().replace('user = "admin"', 'user = "-oProxyCommand=bad"')),
     ).toThrow("vm.user must be a valid account name");
+    expect(() => parseConfig(vmConfigTemplate().replace('user = "admin"', "user = [1]"))).toThrow(
+      "vm.user must be a valid account name",
+    );
     expect(() =>
-      parseConfig(vmConfigTemplate().replace('user = "admin"', "user = [1]")),
-    ).toThrow("vm.user must be a valid account name");
-    expect(() =>
-      parseConfig(
-        vmConfigTemplate().replace(
-          'password = "admin"',
-          "password = { value = 1 }",
-        ),
-      ),
+      parseConfig(vmConfigTemplate().replace('password = "admin"', "password = { value = 1 }")),
     ).toThrow("vm.password must be a string");
   });
 
   test("requires a non-empty VM preparation command", () => {
     expect(() =>
-      parseConfig(
-        vmConfigTemplate().replace(/prepare = """[\s\S]*?"""/, 'prepare = ""'),
-      ),
+      parseConfig(vmConfigTemplate().replace(/prepare = """[\s\S]*?"""/, 'prepare = ""')),
     ).toThrow("vm.prepare must be a non-empty string");
   });
 
@@ -250,9 +219,7 @@ describe("configuration", () => {
       prepareInputs: undefined,
     });
     expect(() =>
-      parseConfig(
-        containerOnly.replace('image = "docker.io/oven/bun:1"', 'image = ""'),
-      ),
+      parseConfig(containerOnly.replace('image = "docker.io/oven/bun:1"', 'image = ""')),
     ).toThrow("container.image must be a non-empty string");
   });
 
@@ -288,18 +255,15 @@ describe("configuration", () => {
       runsOn: ["linux", "x64"],
       runtime: { type: "host" },
     });
-    expect(() =>
-      parseConfig(source.replace("host = {}", 'host = { image = "bad" }')),
-    ).toThrow("jobs[0].host must be an empty table");
-    expect(() =>
-      parseConfig(source.replace('runs_on = ["linux", "x64"]\n', "")),
-    ).toThrow("jobs[0].runs_on is required for host jobs");
+    expect(() => parseConfig(source.replace("host = {}", 'host = { image = "bad" }'))).toThrow(
+      "jobs[0].host must be an empty table",
+    );
+    expect(() => parseConfig(source.replace('runs_on = ["linux", "x64"]\n', ""))).toThrow(
+      "jobs[0].runs_on is required for host jobs",
+    );
     expect(() =>
       parseConfig(
-        source.replace(
-          "cache = []",
-          'cache = [{ paths = ["~/.cache/tool"], shared = true }]',
-        ),
+        source.replace("cache = []", 'cache = [{ paths = ["~/.cache/tool"], shared = true }]'),
       ),
     ).toThrow("jobs[0].cache is not supported for host jobs");
     expect(() =>
@@ -309,10 +273,7 @@ describe("configuration", () => {
             '[container]\nimage = "docker.io/oven/bun:1"',
             'cache = [{ paths = ["~/.cache/tool"], shared = true }]\n[container]\nimage = "docker.io/oven/bun:1"',
           )
-          .replace(
-            'command = "bun install --frozen-lockfile && bun test"',
-            'command = "test"',
-          )
+          .replace('command = "bun install --frozen-lockfile && bun test"', 'command = "test"')
           .replace('name = "test"', 'name = "host-test"')
           .replace(
             'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
@@ -341,9 +302,7 @@ describe("configuration", () => {
       prepareInputs: undefined,
     });
     expect(() =>
-      parseConfig(
-        source.replace('prepare = "install job tools"', 'prepare = ""'),
-      ),
+      parseConfig(source.replace('prepare = "install job tools"', 'prepare = ""')),
     ).toThrow("jobs[0].container.prepare must be a non-empty string");
   });
 
@@ -362,9 +321,7 @@ describe("configuration", () => {
       prepare: "seed cache",
       prepareInputs: ["package.json"],
     });
-    expect(() =>
-      parseConfig(source.replace('["package.json"]', '["../package.json"]')),
-    ).toThrow(
+    expect(() => parseConfig(source.replace('["package.json"]', '["../package.json"]'))).toThrow(
       "jobs[0].container.prepareInputs must contain relative paths or glob patterns without ..",
     );
     expect(() =>
@@ -375,9 +332,7 @@ describe("configuration", () => {
         ),
       ),
     ).toThrow("jobs[0].container.prepareInputs requires prepare");
-    expect(
-      parseConfig(source.replace('["package.json"]', "[]")).jobs[0]?.runtime,
-    ).toMatchObject({
+    expect(parseConfig(source.replace('["package.json"]', "[]")).jobs[0]?.runtime).toMatchObject({
       prepare: "seed cache",
       prepareInputs: undefined,
     });
@@ -385,12 +340,8 @@ describe("configuration", () => {
 
   test("jobs inherit and can override the top-level timeout", () => {
     expect(
-      parseConfig(
-        configTemplate().replace(
-          "timeout_minutes = 60",
-          "timeout_minutes = 12",
-        ),
-      ).jobs[0]?.timeoutMinutes,
+      parseConfig(configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 12")).jobs[0]
+        ?.timeoutMinutes,
     ).toBe(12);
     expect(
       parseConfig(
@@ -401,29 +352,18 @@ describe("configuration", () => {
       ).jobs[0]?.timeoutMinutes,
     ).toBe(5);
     expect(() =>
-      parseConfig(
-        configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 0"),
-      ),
+      parseConfig(configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 0")),
     ).toThrow("timeout_minutes must be a positive number");
   });
 
   test("jobs are required by default and can be optional", () => {
     expect(parseConfig(configTemplate()).jobs[0]?.optional).toBe(false);
     expect(
-      parseConfig(
-        configTemplate().replace(
-          'name = "test"',
-          'name = "test"\noptional = true',
-        ),
-      ).jobs[0]?.optional,
+      parseConfig(configTemplate().replace('name = "test"', 'name = "test"\noptional = true'))
+        .jobs[0]?.optional,
     ).toBe(true);
     expect(() =>
-      parseConfig(
-        configTemplate().replace(
-          'name = "test"',
-          'name = "test"\noptional = "yes"',
-        ),
-      ),
+      parseConfig(configTemplate().replace('name = "test"', 'name = "test"\noptional = "yes"')),
     ).toThrow("jobs[0].optional must be a boolean");
   });
 
@@ -437,15 +377,10 @@ describe("configuration", () => {
         'command = "bun install --frozen-lockfile && bun test"',
         'command = "bun install --frozen-lockfile && bun test"\nenvironment = { SHARED = "job" }',
       )
-      .replace(
-        'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]\n',
-        "",
-      );
+      .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]\n', "");
     const parsed = parseConfig(source).jobs[0];
     expect(parsed?.environment).toEqual({ CI: "true", SHARED: "job" });
-    expect(parsed?.cache).toEqual([
-      { paths: ["~/.cache/turbo"], keyFiles: [], shared: true },
-    ]);
+    expect(parsed?.cache).toEqual([{ paths: ["~/.cache/turbo"], keyFiles: [], shared: true }]);
   });
 
   test("an explicit empty job cache opts out of inherited caches", () => {
@@ -454,10 +389,7 @@ describe("configuration", () => {
         "timeout_minutes = 60",
         'timeout_minutes = 30\ncache = [{ paths = ["~/.cache/turbo"], shared = true }]',
       )
-      .replace(
-        'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
-        "cache = []",
-      );
+      .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []");
     expect(parseConfig(source).jobs[0]?.cache).toEqual([]);
   });
 
@@ -473,10 +405,7 @@ describe("configuration", () => {
     });
     expect(() =>
       parseConfig(
-        configTemplate().replace(
-          'name = "test"',
-          'name = "test"\nenvironment = ["bad"]',
-        ),
+        configTemplate().replace('name = "test"', 'name = "test"\nenvironment = ["bad"]'),
       ),
     ).toThrow("environment must be a table of scalar values");
     expect(() =>
@@ -513,22 +442,16 @@ describe("configuration", () => {
       'command = "bun install --frozen-lockfile && bun test"',
       'command = "bun install --frozen-lockfile && bun test"\nsecrets = ["AMP_API_KEY", "GITHUB_TOKEN"]',
     );
-    expect(parseConfig(configured).jobs[0]?.secrets).toEqual([
-      "AMP_API_KEY",
-      "GITHUB_TOKEN",
-    ]);
-    expect(() =>
-      parseConfig(configured.replace("GITHUB_TOKEN", "BAD KEY")),
-    ).toThrow("secrets must contain shell variable names");
-    expect(() =>
-      parseConfig(configured.replace('"GITHUB_TOKEN"', '"AMP_API_KEY"')),
-    ).toThrow("secrets must not contain duplicates");
+    expect(parseConfig(configured).jobs[0]?.secrets).toEqual(["AMP_API_KEY", "GITHUB_TOKEN"]);
+    expect(() => parseConfig(configured.replace("GITHUB_TOKEN", "BAD KEY"))).toThrow(
+      "secrets must contain shell variable names",
+    );
+    expect(() => parseConfig(configured.replace('"GITHUB_TOKEN"', '"AMP_API_KEY"'))).toThrow(
+      "secrets must not contain duplicates",
+    );
     expect(() =>
       parseConfig(
-        configured.replace(
-          "secrets =",
-          'environment = { AMP_API_KEY = "bad" }\nsecrets =',
-        ),
+        configured.replace("secrets =", 'environment = { AMP_API_KEY = "bad" }\nsecrets ='),
       ),
     ).toThrow("also set in environment");
   });
@@ -545,32 +468,20 @@ describe("configuration", () => {
       'mounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
       'mounts = [{ source = "codex-auth", target = "/mnt/auth" }, { source = "other", target = "/mnt/./auth/" }]',
     );
-    expect(() => parseConfig(equivalentTargets)).toThrow(
-      "must not contain duplicate targets",
-    );
+    expect(() => parseConfig(equivalentTargets)).toThrow("must not contain duplicate targets");
     expect(
-      parseConfig(
-        configured.replace('target = "/mnt/codex"', 'target = "/mnt//codex/"'),
-      ).jobs[0]?.mounts,
-    ).toEqual([
-      { source: "codex-auth", target: "/mnt/codex", writeBack: true },
-    ]);
+      parseConfig(configured.replace('target = "/mnt/codex"', 'target = "/mnt//codex/"')).jobs[0]
+        ?.mounts,
+    ).toEqual([{ source: "codex-auth", target: "/mnt/codex", writeBack: true }]);
     expect(() =>
-      parseConfig(
-        configured.replace('source = "codex-auth"', 'source = "bad/name"'),
-      ),
+      parseConfig(configured.replace('source = "codex-auth"', 'source = "bad/name"')),
     ).toThrow("source must be an allowed mount name");
     expect(
-      parseConfig(
-        configured.replace('source = "codex-auth"', 'source = "Codex-Auth"'),
-      ).jobs[0]?.mounts,
-    ).toEqual([
-      { source: "Codex-Auth", target: "/mnt/codex", writeBack: true },
-    ]);
+      parseConfig(configured.replace('source = "codex-auth"', 'source = "Codex-Auth"')).jobs[0]
+        ?.mounts,
+    ).toEqual([{ source: "Codex-Auth", target: "/mnt/codex", writeBack: true }]);
     expect(() =>
-      parseConfig(
-        configured.replace('target = "/mnt/codex"', 'target = "relative"'),
-      ),
+      parseConfig(configured.replace('target = "/mnt/codex"', 'target = "relative"')),
     ).toThrow("target must be an absolute container directory");
     expect(() =>
       parseConfig(
@@ -579,10 +490,7 @@ describe("configuration", () => {
             'mounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
             'mounts = [{ source = "codex-auth", target = "/mnt/codex" }]\nhost = {}\nruns_on = ["linux"]',
           )
-          .replace(
-            'cache = [{ paths = ["~/.bun/install/cache"], shared = true }]',
-            "cache = []",
-          ),
+          .replace('cache = [{ paths = ["~/.bun/install/cache"], shared = true }]', "cache = []"),
       ),
     ).toThrow("mounts is supported only for container jobs");
   });
@@ -595,13 +503,11 @@ describe("configuration", () => {
     expect(parseConfig(configured).jobs[0]?.filters).toEqual([
       { branch: { names: ["main", "release"] } },
     ]);
+    expect(() => parseConfig(configured.replace('["main", "release"]', "[]"))).toThrow(
+      "filters[0].branch.names must contain non-empty strings",
+    );
     expect(() =>
-      parseConfig(configured.replace('["main", "release"]', "[]")),
-    ).toThrow("filters[0].branch.names must contain non-empty strings");
-    expect(() =>
-      parseConfig(
-        configured.replace("filters = [{ branch =", "filters = [{ tag ="),
-      ),
+      parseConfig(configured.replace("filters = [{ branch =", "filters = [{ tag =")),
     ).toThrow("filters[0] must contain only branch");
     const overridden = `${configured}
 [[jobs]]
@@ -617,15 +523,15 @@ filters = []
       'triggers = [{ event = "commit" }]',
       'branches = ["main"]',
     );
-    expect(() =>
-      parseConfig(legacy.replace('branches = ["main"]', "branches = []")),
-    ).toThrow("branch.names must contain non-empty strings");
-    expect(() =>
-      parseConfig(legacy.replace('branches = ["main"]', 'branches = [""]')),
-    ).toThrow("branch.names must contain non-empty strings");
-    expect(() =>
-      parseConfig(legacy.replace('branches = ["main"]', 'branches = ["   "]')),
-    ).toThrow("branch.names must contain non-empty strings");
+    expect(() => parseConfig(legacy.replace('branches = ["main"]', "branches = []"))).toThrow(
+      "branch.names must contain non-empty strings",
+    );
+    expect(() => parseConfig(legacy.replace('branches = ["main"]', 'branches = [""]'))).toThrow(
+      "branch.names must contain non-empty strings",
+    );
+    expect(() => parseConfig(legacy.replace('branches = ["main"]', 'branches = ["   "]'))).toThrow(
+      "branch.names must contain non-empty strings",
+    );
   });
 
   test("parses and validates persistent job caches", () => {
@@ -651,13 +557,11 @@ filters = []
         shared: false,
       },
     ]);
+    expect(() => parseConfig(configTemplate().replace('"~/.bun/install/cache"', '"/tmp"'))).toThrow(
+      "paths must contain paths starting with ~/",
+    );
     expect(() =>
-      parseConfig(configTemplate().replace('"~/.bun/install/cache"', '"/tmp"')),
-    ).toThrow("paths must contain paths starting with ~/");
-    expect(() =>
-      parseConfig(
-        configTemplate().replace("shared = true", 'key_files = ["../secret"]'),
-      ),
+      parseConfig(configTemplate().replace("shared = true", 'key_files = ["../secret"]')),
     ).toThrow("key_files must be relative paths");
     expect(() =>
       parseConfig(
@@ -668,13 +572,11 @@ filters = []
       ),
     ).toThrow("must be a table");
     expect(() =>
-      parseConfig(
-        configTemplate().replace("shared = true", 'key_files = "bun.lock"'),
-      ),
+      parseConfig(configTemplate().replace("shared = true", 'key_files = "bun.lock"')),
     ).toThrow("key_files must be relative paths");
-    expect(() =>
-      parseConfig(configTemplate().replace("shared = true", 'shared = "yes"')),
-    ).toThrow("shared must be a boolean");
+    expect(() => parseConfig(configTemplate().replace("shared = true", 'shared = "yes"'))).toThrow(
+      "shared must be a boolean",
+    );
     expect(
       parseConfig(
         configTemplate().replace(
@@ -694,23 +596,15 @@ filters = []
     ]);
     expect(() =>
       parseConfig(
-        configTemplate().replace(
-          "shared = true",
-          'shared = true, key_files = ["bun.lock"]',
-        ),
+        configTemplate().replace("shared = true", 'shared = true, key_files = ["bun.lock"]'),
       ),
     ).toThrow("cannot combine shared and key_files");
     expect(() =>
-      parseConfig(
-        configTemplate().replace("shared = true", "build_scoped = true"),
-      ),
+      parseConfig(configTemplate().replace("shared = true", "build_scoped = true")),
     ).toThrow("build_scoped requires shared = true");
     expect(() =>
       parseConfig(
-        configTemplate().replace(
-          "shared = true",
-          "shared = true, protected_channel = true",
-        ),
+        configTemplate().replace("shared = true", "shared = true, protected_channel = true"),
       ),
     ).toThrow("protected_channel requires build_scoped = true");
     expect(() =>
@@ -723,34 +617,24 @@ filters = []
     ).toThrow("read_only requires protected_channel = true");
     expect(() =>
       parseConfig(
-        configTemplate().replace(
-          "timeout_minutes = 60",
-          "timeout_minutes = 30\ncache = []",
-        ),
+        configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 30\ncache = []"),
       ),
     ).toThrow("cache must be a non-empty array");
     expect(() =>
-      parseConfig(
-        configTemplate().replace(
-          'paths = ["~/.bun/install/cache"]',
-          "paths = []",
-        ),
-      ),
+      parseConfig(configTemplate().replace('paths = ["~/.bun/install/cache"]', "paths = []")),
     ).toThrow("paths must contain paths starting with ~/");
-    expect(() =>
-      parseConfig(configTemplate().replace(/cache = .+/, "cache = {}")),
-    ).toThrow("cache must be a non-empty array");
+    expect(() => parseConfig(configTemplate().replace(/cache = .+/, "cache = {}"))).toThrow(
+      "cache must be a non-empty array",
+    );
   });
 
   test("parses and validates job dependencies", () => {
     const source = `${configTemplate()}\n[[jobs]]\nname = "build"\ncommand = "bun run build"\nneeds = ["test"]\n`;
     expect(parseConfig(source).jobs[1]?.needs).toEqual(["test"]);
-    expect(() =>
-      parseConfig(source.replace('["test"]', '["missing"]')),
-    ).toThrow("unknown job");
-    expect(() =>
-      parseConfig(source.replace('needs = ["test"]', 'needs = ["build"]')),
-    ).toThrow("dependency cycle");
+    expect(() => parseConfig(source.replace('["test"]', '["missing"]'))).toThrow("unknown job");
+    expect(() => parseConfig(source.replace('needs = ["test"]', 'needs = ["build"]'))).toThrow(
+      "dependency cycle",
+    );
     expect(() =>
       parseConfig(
         source.replace(
@@ -783,11 +667,10 @@ needs = ["build"]
       "build",
       "deploy",
     ]);
-    expect(
-      selectJobs(config, ["test", "lint"]).jobs.map((job) => job.name),
-    ).toEqual(["test", "lint"]);
-    expect(() => selectJobs(config, ["missing"])).toThrow(
-      "unknown job: missing",
-    );
+    expect(selectJobs(config, ["test", "lint"]).jobs.map((job) => job.name)).toEqual([
+      "test",
+      "lint",
+    ]);
+    expect(() => selectJobs(config, ["missing"])).toThrow("unknown job: missing");
   });
 });

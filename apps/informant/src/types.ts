@@ -126,8 +126,7 @@ export interface BuildRecord {
   runningJobs?: string[];
   jobs?: Array<{
     name: string;
-    status:
-      "queued" | "running" | "success" | "failure" | "skipped" | "cancelled";
+    status: "queued" | "running" | "success" | "failure" | "skipped" | "cancelled";
   }>;
   owner?: { pid: number; startedAt: string };
   pullRequest?: number;

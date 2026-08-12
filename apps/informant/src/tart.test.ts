@@ -1,13 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  stat,
-} from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { requireCommand } from "./process.ts";
@@ -124,15 +116,9 @@ test("prepares and cleans up a restricted secret mount", async () => {
     const environment = join(mount.directory, "environment");
     expect((await stat(mount.directory)).mode & 0o777).toBe(0o700);
     expect((await stat(environment)).mode & 0o777).toBe(0o600);
-    expect(await readFile(environment, "utf8")).toBe(
-      "export TOKEN='top secret'\n",
-    );
-    expect(mount.args).toEqual([
-      `--dir=secrets:${await realpath(mount.directory)}`,
-    ]);
-    expect(mount.source).toContain(
-      "/Volumes/My Shared Files/secrets/environment",
-    );
+    expect(await readFile(environment, "utf8")).toBe("export TOKEN='top secret'\n");
+    expect(mount.args).toEqual([`--dir=secrets:${await realpath(mount.directory)}`]);
+    expect(mount.source).toContain("/Volumes/My Shared Files/secrets/environment");
     expect(mount.source).toContain("|| exit; rm -f");
     expect(mount.source).toEndWith("|| exit;");
 
@@ -143,8 +129,7 @@ test("prepares and cleans up a restricted secret mount", async () => {
       "linux",
     );
     expect(linuxMount.source).toContain("/mnt/shared/secrets/environment");
-    if (linuxMount.directory)
-      await rm(linuxMount.directory, { recursive: true, force: true });
+    if (linuxMount.directory) await rm(linuxMount.directory, { recursive: true, force: true });
 
     await rm(mount.directory, { recursive: true, force: true });
     expect(await Bun.file(environment).exists()).toBe(false);
@@ -167,9 +152,7 @@ test("removes plaintext secrets when mount preparation fails", async () => {
         { realpath: async () => Promise.reject(new Error("realpath failed")) },
       ),
     ).rejects.toThrow("realpath failed");
-    expect(
-      (await Array.fromAsync(new Bun.Glob("secrets-*").scan(root))).length,
-    ).toBe(0);
+    expect((await Array.fromAsync(new Bun.Glob("secrets-*").scan(root))).length).toBe(0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -184,54 +167,26 @@ test("isolated workspaces fetch commits that only have remote-tracking refs", as
   try {
     await requireCommand(["git", "init", "--quiet", "--bare", remote]);
     await requireCommand(["git", "init", "--quiet", seed]);
-    await requireCommand(
-      ["git", "config", "user.email", "informant@example.com"],
-      undefined,
-      {
-        cwd: seed,
-      },
-    );
-    await requireCommand(
-      ["git", "config", "user.name", "Informant"],
-      undefined,
-      { cwd: seed },
-    );
+    await requireCommand(["git", "config", "user.email", "informant@example.com"], undefined, {
+      cwd: seed,
+    });
+    await requireCommand(["git", "config", "user.name", "Informant"], undefined, { cwd: seed });
     await Bun.write(join(seed, "README.md"), "main\n");
     await requireCommand(["git", "add", "README.md"], undefined, { cwd: seed });
-    await requireCommand(
-      ["git", "commit", "--quiet", "-m", "main"],
-      undefined,
-      { cwd: seed },
-    );
+    await requireCommand(["git", "commit", "--quiet", "-m", "main"], undefined, { cwd: seed });
     await requireCommand(["git", "branch", "-M", "main"], undefined, {
       cwd: seed,
     });
-    await requireCommand(
-      ["git", "remote", "add", "origin", remote],
-      undefined,
-      { cwd: seed },
-    );
-    await requireCommand(
-      ["git", "push", "--quiet", "origin", "main"],
-      undefined,
-      { cwd: seed },
-    );
-    await requireCommand(
-      ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
-      undefined,
-      {
-        cwd: remote,
-      },
-    );
+    await requireCommand(["git", "remote", "add", "origin", remote], undefined, { cwd: seed });
+    await requireCommand(["git", "push", "--quiet", "origin", "main"], undefined, { cwd: seed });
+    await requireCommand(["git", "symbolic-ref", "HEAD", "refs/heads/main"], undefined, {
+      cwd: remote,
+    });
     await Bun.write(join(seed, "feature.txt"), "feature\n");
     await requireCommand(["git", "add", "feature.txt"], undefined, {
       cwd: seed,
     });
-    await requireCommand(
-      ["git", "commit", "--quiet", "-m", "feature"],
-      undefined,
-      { cwd: seed },
-    );
+    await requireCommand(["git", "commit", "--quiet", "-m", "feature"], undefined, { cwd: seed });
     const sha = await requireCommand(["git", "rev-parse", "HEAD"], undefined, {
       cwd: seed,
     });
@@ -242,26 +197,12 @@ test("isolated workspaces fetch commits that only have remote-tracking refs", as
         cwd: seed,
       },
     );
-    await requireCommand([
-      "git",
-      "clone",
-      "--quiet",
-      "--no-checkout",
-      remote,
-      repository,
-    ]);
+    await requireCommand(["git", "clone", "--quiet", "--no-checkout", remote, repository]);
 
-    const checkout = await checkoutBuildWorkspace(
-      repository,
-      workspace,
-      sha,
-      true,
-    );
+    const checkout = await checkoutBuildWorkspace(repository, workspace, sha, true);
 
     expect(checkout.exitCode).toBe(0);
-    expect(await Bun.file(join(workspace, "feature.txt")).text()).toBe(
-      "feature\n",
-    );
+    expect(await Bun.file(join(workspace, "feature.txt")).text()).toBe("feature\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -310,10 +251,7 @@ test("prepared image identity changes with its source or preparation", () => {
 test("SSH authentication retries share one cumulative timeout", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-ssh-timeout-"));
   const sshpass = join(root, "sshpass");
-  await Bun.write(
-    sshpass,
-    "#!/bin/sh\necho 'Permission denied' >&2\nexit 255\n",
-  );
+  await Bun.write(sshpass, "#!/bin/sh\necho 'Permission denied' >&2\nexit 255\n");
   await chmod(sshpass, 0o755);
   const originalPath = Bun.env.PATH;
   Bun.env.PATH = `${root}:${originalPath}`;
@@ -368,10 +306,7 @@ fi
     expect((await Bun.file(deleted).text()).trim()).toBe(first);
 
     expect(await prunePreparedImages()).toBe(1);
-    expect((await Bun.file(deleted).text()).trim().split("\n")).toEqual([
-      first,
-      first,
-    ]);
+    expect((await Bun.file(deleted).text()).trim().split("\n")).toEqual([first, first]);
   } finally {
     if (originalPath === undefined) delete Bun.env.PATH;
     else Bun.env.PATH = originalPath;
@@ -426,9 +361,7 @@ fi
       "owner/repository",
     );
 
-    expect(messages).toEqual([
-      `Could not delete superseded Tart image ${first}; will retry later`,
-    ]);
+    expect(messages).toEqual([`Could not delete superseded Tart image ${first}; will retry later`]);
     expect(await prunePreparedImages()).toBe(1);
     expect((await Bun.file(deleted).text()).trim()).toBe(first);
   } finally {
@@ -457,9 +390,7 @@ test("reconciles removed VM job references and the legacy repository reference",
     await Bun.write(removed, "removed-image\n");
     await Bun.write(legacy, "legacy-image\n");
 
-    expect(await reconcilePreparedImageReferences(repository, ["active"])).toBe(
-      1,
-    );
+    expect(await reconcilePreparedImageReferences(repository, ["active"])).toBe(1);
 
     expect(await Bun.file(active).text()).toBe("active-image\n");
     expect(await Bun.file(removed).exists()).toBe(false);
@@ -526,9 +457,7 @@ test("cache destinations have distinct storage identities", () => {
   expect(cachePathIdentity("admin", "~/.bun/install/cache")).not.toBe(
     cachePathIdentity("admin", "~/.npm"),
   );
-  expect(cachePathIdentity("admin", "~/.npm")).not.toBe(
-    cachePathIdentity("builder", "~/.npm"),
-  );
+  expect(cachePathIdentity("admin", "~/.npm")).not.toBe(cachePathIdentity("builder", "~/.npm"));
 });
 
 test("shared caches use one direct host mount across repositories and jobs", async () => {
@@ -659,9 +588,7 @@ test("build-scoped shared caches remain isolated for trusted commits", async () 
     expect(second.writablePaths).toEqual([]);
     expect(first.mounts[0]?.path).not.toBe(unprotectedSibling.mounts[0]?.path);
     expect(first.mounts[0]?.path).not.toBe(otherBuild.mounts[0]?.path);
-    expect(first.mounts[0]?.path).not.toContain(
-      join(root, "data", "caches", "linux", "shared"),
-    );
+    expect(first.mounts[0]?.path).not.toContain(join(root, "data", "caches", "linux", "shared"));
   } finally {
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
@@ -691,13 +618,7 @@ test("keyed caches cross builds only for trusted commits", async () => {
       "macos",
       true,
     );
-    const untrusted = await cacheMounts(
-      repository,
-      untrustedWorkspace,
-      keyedJob,
-      "admin",
-      "macos",
-    );
+    const untrusted = await cacheMounts(repository, untrustedWorkspace, keyedJob, "admin", "macos");
 
     expect(trusted.args[0]).toContain(join(root, "data", "caches"));
     expect(untrusted.args[0]).toContain(join(root, "keyed-caches"));
@@ -722,22 +643,8 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
   };
   const repository = { owner: "one", repo: "repo", fullName: "one/repo" };
   try {
-    const macos = await cacheMounts(
-      repository,
-      workspace,
-      cachedJob,
-      "admin",
-      "macos",
-      true,
-    );
-    const linux = await cacheMounts(
-      repository,
-      workspace,
-      cachedJob,
-      "admin",
-      "linux",
-      true,
-    );
+    const macos = await cacheMounts(repository, workspace, cachedJob, "admin", "macos", true);
+    const linux = await cacheMounts(repository, workspace, cachedJob, "admin", "linux", true);
     const readOnlyMacos = await cacheMounts(
       repository,
       workspace,
@@ -782,9 +689,7 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(linux.args[0]).toContain(join("caches", "linux"));
     expect(macos.restore).toContain("/Users/admin/.bun/install/cache");
     expect(macos.restore).toContain("/Volumes/My Shared Files/cache-0");
-    expect(macos.installLock).toBe(
-      "/Volumes/My Shared Files/cache-0/.informant-install-lock",
-    );
+    expect(macos.installLock).toBe("/Volumes/My Shared Files/cache-0/.informant-install-lock");
     expect(readOnlyMacos.mounts[0]?.readOnly).toBe(true);
     expect(readOnlyMacos.installLock).toBeUndefined();
     expect(linux.restore).toContain("/home/admin/.bun/install/cache");
@@ -801,9 +706,7 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(readOnlyLinux.installLock).toBeUndefined();
     expect(linux.writablePaths).toHaveLength(1);
     expect(linux.args[0]).toEndWith(linux.writablePaths[0] ?? "");
-    expect(linux.installLock).toBe(
-      "/mnt/shared/cache-0/.informant-install-lock",
-    );
+    expect(linux.installLock).toBe("/mnt/shared/cache-0/.informant-install-lock");
   } finally {
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
@@ -833,10 +736,7 @@ test("Bun package commands use the copyfile backend", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-linux-bun-"));
   const bun = join(root, "bun");
   const calls = join(root, "calls");
-  await Bun.write(
-    bun,
-    `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(calls)}\n`,
-  );
+  await Bun.write(bun, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(calls)}\n`);
   await chmod(bun, 0o755);
   const result = Bun.spawnSync(
     [
@@ -849,11 +749,7 @@ test("Bun package commands use the copyfile backend", async () => {
   try {
     expect(result.exitCode).toBe(0);
     const locked = Bun.spawnSync(
-      [
-        "/bin/bash",
-        "-c",
-        `${bunCopyfileBackend(join(root, "lock"))} bun install`,
-      ],
+      ["/bin/bash", "-c", `${bunCopyfileBackend(join(root, "lock"))} bun install`],
       { env: { ...Bun.env, PATH: `${root}:${Bun.env.PATH}` } },
     );
     expect(locked.exitCode).toBe(0);
@@ -867,15 +763,9 @@ test("Bun package commands use the copyfile backend", async () => {
 });
 
 test("Linux Bun package commands lease a shared snapshot cache", () => {
-  const setup = bunCopyfileBackend(
-    "/mnt/shared/cache-0/.informant-install-lock",
-  );
-  expect(setup).toContain(
-    'while ! mkdir "/mnt/shared/cache-0/.informant-install-lock"',
-  );
-  expect(setup).toContain(
-    'rmdir "/mnt/shared/cache-0/.informant-install-lock"',
-  );
+  const setup = bunCopyfileBackend("/mnt/shared/cache-0/.informant-install-lock");
+  expect(setup).toContain('while ! mkdir "/mnt/shared/cache-0/.informant-install-lock"');
+  expect(setup).toContain('rmdir "/mnt/shared/cache-0/.informant-install-lock"');
 });
 
 test("retries SSH only when authentication failed before the command started", () => {
@@ -1037,10 +927,7 @@ test("stale image lock reclamation recovers an orphaned reclaim lease", async ()
   Bun.env.INFORMANT_DATA_DIR = root;
   await mkdir(join(root, "locks"), { recursive: true });
   await Bun.write(join(root, "locks", "shared.lock"), "999999999:stale\n");
-  await Bun.write(
-    join(root, "locks", "shared.lock.reclaim"),
-    "999999998:orphaned\n",
-  );
+  await Bun.write(join(root, "locks", "shared.lock.reclaim"), "999999998:orphaned\n");
   let entered = false;
   try {
     await withImageLock("shared", async () => {
@@ -1109,13 +996,10 @@ describe("job scheduler", () => {
   test("optional failures do not fail the build or block dependent jobs", async () => {
     const executed: string[] = [];
     expect(
-      await scheduleJobs(
-        [job("review", [], true), job("publish", ["review"])],
-        async (current) => {
-          executed.push(current.name);
-          return current.name !== "review";
-        },
-      ),
+      await scheduleJobs([job("review", [], true), job("publish", ["review"])], async (current) => {
+        executed.push(current.name);
+        return current.name !== "review";
+      }),
     ).toBe(true);
     expect(executed).toEqual(["review", "publish"]);
   });

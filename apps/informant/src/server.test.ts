@@ -8,13 +8,7 @@ import {
   serve,
   serveRepositories,
 } from "./server.ts";
-import type {
-  BuildRecord,
-  InformantConfig,
-  JobConfig,
-  PullRequest,
-  Repository,
-} from "./types.ts";
+import type { BuildRecord, InformantConfig, JobConfig, PullRequest, Repository } from "./types.ts";
 
 const repository: Repository = {
   owner: "owner",
@@ -156,8 +150,7 @@ test("refreshes repository registrations without restarting the worker", async (
         if (!signal) throw new Error("expected a repository abort signal");
         await new Promise<void>((resolve) => {
           if (signal.aborted) resolve();
-          else
-            signal.addEventListener("abort", () => resolve(), { once: true });
+          else signal.addEventListener("abort", () => resolve(), { once: true });
         });
         stopped.push(current.fullName);
       },
@@ -298,9 +291,7 @@ test("serveRepositories reruns housekeeping requested while the current run sett
   while (cleanups < 2) await Bun.sleep(1);
   settling.resolve(summary);
   const late = new Promise<void>((resolve, reject) => {
-    queueMicrotask(() =>
-      Promise.resolve(idle?.()).then(() => resolve(), reject),
-    );
+    queueMicrotask(() => Promise.resolve(idle?.()).then(() => resolve(), reject));
   });
   await Promise.all([first, late]);
 
@@ -380,9 +371,7 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
   expect(saved[0]).toMatchObject({ checkId: 123 });
   expect(saved[0]?.checksCompletedAt).toBeDefined();
   expect(messages).toContain("recovered interrupted build interrupted");
-  expect(messages.some((message) => message.includes("temporary outage"))).toBe(
-    true,
-  );
+  expect(messages.some((message) => message.includes("temporary outage"))).toBe(true);
   expect(builds[1]?.checksCompletedAt).toBeUndefined();
 });
 
@@ -430,9 +419,7 @@ describe("serve polling orchestration", () => {
 
     expect(missingConfigReads).toBe(1);
     expect(launches).toBe(2);
-    expect(state.missingConfigs?.map((entry) => entry.sha)).toEqual([
-      "legacy-sha",
-    ]);
+    expect(state.missingConfigs?.map((entry) => entry.sha)).toEqual(["legacy-sha"]);
   });
 
   test("rechecks expired missing configurations", async () => {
@@ -441,9 +428,7 @@ describe("serve polling orchestration", () => {
       pending: [],
       seenCommentIds: [],
       pendingTags: [],
-      missingConfigs: [
-        { sha: "legacy-sha", checkedAt: "2020-01-01T00:00:00.000Z" },
-      ],
+      missingConfigs: [{ sha: "legacy-sha", checkedAt: "2020-01-01T00:00:00.000Z" }],
     };
     const deps = dependencies(
       github({ branches: async () => [{ name: "legacy", sha: "legacy-sha" }] }),
@@ -599,10 +584,7 @@ describe("serve polling orchestration", () => {
       vmJobs = jobs;
       return 0;
     };
-    deps.reconcilePreparedContainerImageReferences = async (
-      _repository,
-      jobs,
-    ) => {
+    deps.reconcilePreparedContainerImageReferences = async (_repository, jobs) => {
       containerJobs = jobs;
       return 0;
     };
@@ -709,15 +691,7 @@ describe("serve polling orchestration", () => {
     const deps = dependencies(
       github({ tags: async () => [{ name: "v2/release", sha: "new-sha" }] }),
       state,
-      async (
-        _github,
-        _repository,
-        _sha,
-        displayBranch,
-        _config,
-        _deps,
-        receivedEvent,
-      ) => {
+      async (_github, _repository, _sha, displayBranch, _config, _deps, receivedEvent) => {
         branch = displayBranch;
         event = receivedEvent;
         return undefined;
@@ -842,11 +816,7 @@ describe("serve polling orchestration", () => {
     };
     await serve(repository, {
       once: true,
-      dependencies: dependencies(
-        github({}),
-        nonmatching,
-        async () => undefined,
-      ),
+      dependencies: dependencies(github({}), nonmatching, async () => undefined),
     });
     expect(nonmatching.pendingTags).toEqual([]);
 
@@ -875,17 +845,13 @@ describe("serve polling orchestration", () => {
       pendingTags: [{ name: "notes", sha: "sha" }],
     };
     let launches = 0;
-    const deps = dependencies(
-      github({ manual: async () => true }),
-      state,
-      async () => {
-        launches++;
-        return {
-          event: { type: "manual_trigger", id: "manual" },
-          status: "success",
-        } as BuildRecord;
-      },
-    );
+    const deps = dependencies(github({ manual: async () => true }), state, async () => {
+      launches++;
+      return {
+        event: { type: "manual_trigger", id: "manual" },
+        status: "success",
+      } as BuildRecord;
+    });
 
     await serve(repository, { once: true, dependencies: deps });
 
@@ -928,16 +894,7 @@ describe("serve polling orchestration", () => {
     const deps = dependencies(
       github({ tags: async () => [{ name: "v4", sha: "new" }] }),
       state,
-      async (
-        _github,
-        _repository,
-        _sha,
-        _branch,
-        _config,
-        _deps,
-        event,
-        signal,
-      ) => {
+      async (_github, _repository, _sha, _branch, _config, _deps, event, signal) => {
         signals.push(signal);
         events.push(event?.id ?? "");
         return undefined;
@@ -1000,11 +957,7 @@ describe("serve polling orchestration", () => {
       ],
     });
     expect(
-      applySecretPolicy(
-        { ...untrusted, jobs: [trustedJob] },
-        trusted,
-        "trusted-sha",
-      ).jobs,
+      applySecretPolicy({ ...untrusted, jobs: [trustedJob] }, trusted, "trusted-sha").jobs,
     ).toEqual([trustedJob, setupJob]);
   });
 
@@ -1151,9 +1104,7 @@ describe("serve polling orchestration", () => {
     let poll = 0;
     const client = github({
       branchHead: async () => (poll === 0 ? "sha-one" : "sha-two"),
-      branches: async () => [
-        { name: "main", sha: poll++ === 0 ? "sha-one" : "sha-two" },
-      ],
+      branches: async () => [{ name: "main", sha: poll++ === 0 ? "sha-one" : "sha-two" }],
     });
     let sleeps = 0;
     const server = serve(repository, {
@@ -1166,16 +1117,7 @@ describe("serve polling orchestration", () => {
           seenCommentIds: [],
           pendingTags: [],
         },
-        async (
-          _github,
-          _repository,
-          _sha,
-          _branch,
-          _config,
-          _deps,
-          _event,
-          signal,
-        ) => {
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           signals.push(signal as AbortSignal);
           return signals.length === 1 ? first.promise : second.promise;
         },
@@ -1217,25 +1159,14 @@ describe("serve polling orchestration", () => {
           seenCommentIds: [],
           pendingTags: [],
         },
-        async (
-          _github,
-          _repository,
-          _sha,
-          _branch,
-          _config,
-          _deps,
-          _event,
-          signal,
-        ) => {
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
           return run.promise;
         },
         async () => {
           if (poll !== 2) return;
           expect(receivedSignal?.aborted).toBe(true);
-          expect(receivedSignal?.reason).toBe(
-            "Pull request #7 is no longer open.",
-          );
+          expect(receivedSignal?.reason).toBe("Pull request #7 is no longer open.");
           run.resolve(undefined);
           outer.abort();
         },
@@ -1251,8 +1182,7 @@ describe("serve polling orchestration", () => {
     let poll = 0;
     let receivedSignal: AbortSignal | undefined;
     const client = github({
-      branches: async () =>
-        poll++ === 0 ? [{ name: "topic", sha: "sha" }] : [],
+      branches: async () => (poll++ === 0 ? [{ name: "topic", sha: "sha" }] : []),
     });
 
     await serve(repository, {
@@ -1265,16 +1195,7 @@ describe("serve polling orchestration", () => {
           seenCommentIds: [],
           pendingTags: [],
         },
-        async (
-          _github,
-          _repository,
-          _sha,
-          _branch,
-          _config,
-          _deps,
-          _event,
-          signal,
-        ) => {
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
           return run.promise;
         },
@@ -1309,16 +1230,7 @@ describe("serve polling orchestration", () => {
           seenCommentIds: [],
           pendingTags: [],
         },
-        async (
-          _github,
-          _repository,
-          _sha,
-          _branch,
-          _config,
-          _deps,
-          _event,
-          signal,
-        ) => {
+        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
           return run.promise;
         },
@@ -1355,11 +1267,7 @@ describe("serve polling orchestration", () => {
         async (...args) => {
           receivedSignal = args[9];
           return new Promise((resolve) =>
-            receivedSignal?.addEventListener(
-              "abort",
-              () => resolve(undefined),
-              { once: true },
-            ),
+            receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
           );
         },
         async () => outer.abort(),
@@ -1458,13 +1366,9 @@ describe("serve polling orchestration", () => {
           admissionSignal,
         ) => {
           receivedAdmissionSignal = admissionSignal;
-          admissionSignal?.addEventListener(
-            "abort",
-            () => admissionAborted.resolve(),
-            {
-              once: true,
-            },
-          );
+          admissionSignal?.addEventListener("abort", () => admissionAborted.resolve(), {
+            once: true,
+          });
           return admissionAborted.promise.then(() => false);
         },
       ),
@@ -1679,11 +1583,7 @@ describe("serve polling orchestration", () => {
         async (...args) => {
           receivedSignal = args[9];
           return new Promise((resolve) =>
-            receivedSignal?.addEventListener(
-              "abort",
-              () => resolve(undefined),
-              { once: true },
-            ),
+            receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
           );
         },
         async () => outer.abort(),

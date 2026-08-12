@@ -28,10 +28,7 @@ const result = (exitCode = 0, stderr = "", stdout = ""): CommandResult => ({
   timedOut: false,
 });
 
-function releaseResponse(
-  version: string,
-  assets: InformantRelease["assets"] = [],
-): Response {
+function releaseResponse(version: string, assets: InformantRelease["assets"] = []): Response {
   return Response.json({
     tag_name: `v${version}`,
     draft: false,
@@ -52,9 +49,7 @@ describe("release updates", () => {
 
   test("reads the latest stable GitHub release", async () => {
     const current = await latestInformantRelease(async () =>
-      releaseResponse("0.2.0", [
-        { name: "informant-linux-x64", url: "https://release/binary" },
-      ]),
+      releaseResponse("0.2.0", [{ name: "informant-linux-x64", url: "https://release/binary" }]),
     );
     expect(current).toEqual({
       tag: "v0.2.0",
@@ -73,9 +68,9 @@ describe("release updates", () => {
   });
 
   test("rejects suffix-tagged releases even when GitHub does not mark them prerelease", async () => {
-    await expect(
-      latestInformantRelease(async () => releaseResponse("0.2.0-beta")),
-    ).rejects.toThrow("invalid stable release version");
+    await expect(latestInformantRelease(async () => releaseResponse("0.2.0-beta"))).rejects.toThrow(
+      "invalid stable release version",
+    );
   });
 
   test("uses Homebrew's stable path on macOS and the running binary on Linux", () => {
@@ -116,10 +111,7 @@ describe("release updates", () => {
     let commands = 0;
     expect(
       await updateInformantIfAvailable("0.2.0", {
-        pendingRestartFile: join(
-          tmpdir(),
-          `informant-update-${crypto.randomUUID()}`,
-        ),
+        pendingRestartFile: join(tmpdir(), `informant-update-${crypto.randomUUID()}`),
         fetch: async () => releaseResponse("0.2.0"),
         command: async () => {
           commands++;
@@ -136,10 +128,7 @@ describe("release updates", () => {
     expect(
       await updateInformantIfAvailable("0.1.2", {
         platform: "linux",
-        pendingRestartFile: join(
-          tmpdir(),
-          `informant-update-${crypto.randomUUID()}`,
-        ),
+        pendingRestartFile: join(tmpdir(), `informant-update-${crypto.randomUUID()}`),
         fetch: async () => releaseResponse("0.2.0"),
         installLinux: async (release) => {
           installed = release.version;
@@ -153,14 +142,7 @@ describe("release updates", () => {
     expect(installed).toBe("0.2.0");
     expect(commands).toEqual([
       ["systemctl", "--user", "is-active", "informant.service"],
-      [
-        "systemctl",
-        "--user",
-        "show",
-        "--property=MainPID",
-        "--value",
-        "informant.service",
-      ],
+      ["systemctl", "--user", "show", "--property=MainPID", "--value", "informant.service"],
     ]);
   });
 
@@ -171,10 +153,7 @@ describe("release updates", () => {
       await updateInformantIfAvailable("0.1.2", {
         platform: "darwin",
         uid: 501,
-        pendingRestartFile: join(
-          tmpdir(),
-          `informant-update-${crypto.randomUUID()}`,
-        ),
+        pendingRestartFile: join(tmpdir(), `informant-update-${crypto.randomUUID()}`),
         fetch: async () => releaseResponse("0.2.0"),
         command: async (argv, options) => {
           commands.push(argv);
@@ -199,10 +178,7 @@ describe("release updates", () => {
       updateInformantIfAvailable("0.1.2", {
         platform: "darwin",
         uid: 501,
-        pendingRestartFile: join(
-          tmpdir(),
-          `informant-update-${crypto.randomUUID()}`,
-        ),
+        pendingRestartFile: join(tmpdir(), `informant-update-${crypto.randomUUID()}`),
         fetch: async () => releaseResponse("0.2.0"),
         command: async (argv) =>
           argv[1] === "print"
@@ -267,20 +243,10 @@ describe("release updates", () => {
           },
         }),
       ).toEqual({ updated: true, restarted: false, version: "0.2.0" });
-      expect(commands).toContainEqual([
-        "brew",
-        "--prefix",
-        "informantdev/tap/informant",
-      ]);
-      expect(commands).toContainEqual([
-        "brew",
-        "upgrade",
-        "informantdev/tap/informant",
-      ]);
+      expect(commands).toContainEqual(["brew", "--prefix", "informantdev/tap/informant"]);
+      expect(commands).toContainEqual(["brew", "upgrade", "informantdev/tap/informant"]);
       expect(commands).toContainEqual([stableExecutable, "--version"]);
-      expect(await Bun.file(executable).text()).toBe(
-        "Homebrew-managed executable",
-      );
+      expect(await Bun.file(executable).text()).toBe("Homebrew-managed executable");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -288,14 +254,7 @@ describe("release updates", () => {
 
   test("does not replace a Homebrew-managed binary when its probe fails", async () => {
     const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
-    const executable = join(
-      directory,
-      "Cellar",
-      "informant",
-      "0.1.2",
-      "bin",
-      "informant",
-    );
+    const executable = join(directory, "Cellar", "informant", "0.1.2", "bin", "informant");
     try {
       await mkdir(dirname(executable), { recursive: true });
       await Bun.write(executable, "Homebrew-managed executable");
@@ -306,14 +265,10 @@ describe("release updates", () => {
           pendingRestartFile: join(directory, "pending-restart"),
           fetch: async () => releaseResponse("0.2.0"),
           command: async (argv) =>
-            argv[0] === "brew"
-              ? result(1, "temporary Homebrew failure")
-              : result(3, "inactive"),
+            argv[0] === "brew" ? result(1, "temporary Homebrew failure") : result(3, "inactive"),
         }),
       ).rejects.toThrow("temporary Homebrew failure");
-      expect(await Bun.file(executable).text()).toBe(
-        "Homebrew-managed executable",
-      );
+      expect(await Bun.file(executable).text()).toBe("Homebrew-managed executable");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -362,9 +317,7 @@ describe("release updates", () => {
 
   test("serializes updates across different data directories with one per-user lock", async () => {
     const firstData = await mkdtemp(join(tmpdir(), "informant-update-data-a-"));
-    const secondData = await mkdtemp(
-      join(tmpdir(), "informant-update-data-b-"),
-    );
+    const secondData = await mkdtemp(join(tmpdir(), "informant-update-data-b-"));
     const lock = join(tmpdir(), `informant-update-${crypto.randomUUID()}.lock`);
     let requests = 0;
     let releaseFirst!: () => void;
@@ -525,9 +478,7 @@ describe("release updates", () => {
               ? new Response(binary)
               : new Response(`${checksum}  informant-linux-x64\n`),
         }),
-      ).rejects.toThrow(
-        "downloaded binary reported cannot execute instead of 0.2.0",
-      );
+      ).rejects.toThrow("downloaded binary reported cannot execute instead of 0.2.0");
       expect(await Bun.file(executable).text()).toBe("old executable");
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -544,14 +495,9 @@ describe("release updates", () => {
       if (argv[0] === "systemctl" && argv[2] === "is-active") return result();
       if (argv[0] === "systemctl" && argv[2] === "show") {
         if (phase === "retry") retryServiceChecks++;
-        return result(
-          0,
-          "",
-          phase === "retry" && retryServiceChecks > 1 ? "200\n" : "100\n",
-        );
+        return result(0, "", phase === "retry" && retryServiceChecks > 1 ? "200\n" : "100\n");
       }
-      if (argv[0] === "kill" && phase === "install")
-        return result(1, "temporary restart failure");
+      if (argv[0] === "kill" && phase === "install") return result(1, "temporary restart failure");
       return result();
     };
     try {
@@ -664,28 +610,19 @@ describe("automatic update services", () => {
       "/tmp/informant logs",
     );
     expect(service).toContain("<string>dev.informant.updater</string>");
-    expect(service).toContain(
-      "<string>/opt/Informant &amp; tools/informant</string>",
-    );
+    expect(service).toContain("<string>/opt/Informant &amp; tools/informant</string>");
     expect(service).toContain("<string>--automatic</string>");
-    expect(service).toContain(
-      "<key>StartInterval</key>\n  <integer>21600</integer>",
-    );
+    expect(service).toContain("<key>StartInterval</key>\n  <integer>21600</integer>");
     expect(service).toContain("/tmp/informant logs/updater.stderr.log");
   });
 
   test("renders a persistent six-hour systemd timer and oneshot updater", () => {
-    const service = renderLinuxAutomaticUpdateService(
-      "/opt/Informant tools/informant",
-      {
-        HOME: "/home/worker",
-        PATH: "/usr/local/bin:/usr/bin",
-      },
-    );
+    const service = renderLinuxAutomaticUpdateService("/opt/Informant tools/informant", {
+      HOME: "/home/worker",
+      PATH: "/usr/local/bin:/usr/bin",
+    });
     const timer = renderLinuxAutomaticUpdateTimer();
-    expect(service).toContain(
-      'ExecStart="/opt/Informant tools/informant" update --automatic',
-    );
+    expect(service).toContain('ExecStart="/opt/Informant tools/informant" update --automatic');
     expect(service).toContain('Environment="HOME=/home/worker"');
     expect(service).toContain("TimeoutStartSec=25h");
     expect(timer).toContain("OnUnitInactiveSec=21600s");
@@ -703,9 +640,7 @@ describe("automatic update services", () => {
     expect(service).toContain(
       'ExecStart="/opt/$$worker/Informant\\n tools\\t/informant" update --automatic',
     );
-    expect(service).toContain(
-      'Environment="VALUE=$worker\\nline two\\r\\ttail"',
-    );
+    expect(service).toContain('Environment="VALUE=$worker\\nline two\\r\\ttail"');
   });
 
   test("preserves a custom data directory in the updater environment", () => {
@@ -743,12 +678,8 @@ describe("automatic update services", () => {
         environment: { HOME: home, PATH: join(home, "bin") },
         command: run,
       });
-      expect(timer).toBe(
-        join(home, ".config/systemd/user/informant-update.timer"),
-      );
-      expect(await Bun.file(timer).text()).toContain(
-        "OnUnitInactiveSec=21600s",
-      );
+      expect(timer).toBe(join(home, ".config/systemd/user/informant-update.timer"));
+      expect(await Bun.file(timer).text()).toContain("OnUnitInactiveSec=21600s");
       expect(commands).toContainEqual([
         "systemctl",
         "--user",
@@ -797,18 +728,9 @@ describe("automatic update services", () => {
         environment: { HOME: home, PATH: home },
         command: run,
       });
-      expect(path).toBe(
-        join(home, "Library/LaunchAgents/dev.informant.updater.plist"),
-      );
-      expect(await Bun.file(path).text()).toContain(
-        "<string>--automatic</string>",
-      );
-      expect(commands).toContainEqual([
-        "launchctl",
-        "bootstrap",
-        "gui/501",
-        path,
-      ]);
+      expect(path).toBe(join(home, "Library/LaunchAgents/dev.informant.updater.plist"));
+      expect(await Bun.file(path).text()).toContain("<string>--automatic</string>");
+      expect(commands).toContainEqual(["launchctl", "bootstrap", "gui/501", path]);
 
       expect(
         await disableAutomaticUpdates({
@@ -819,12 +741,7 @@ describe("automatic update services", () => {
         }),
       ).toBe(true);
       expect(await Bun.file(path).exists()).toBe(false);
-      expect(commands).toContainEqual([
-        "launchctl",
-        "bootout",
-        "gui/501",
-        path,
-      ]);
+      expect(commands).toContainEqual(["launchctl", "bootout", "gui/501", path]);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -873,9 +790,7 @@ describe("automatic update services", () => {
       ).rejects.toThrow("timer is still active");
       expect(await Bun.file(timer).exists()).toBe(true);
       expect(
-        await Bun.file(
-          join(home, ".config/systemd/user/informant-update.service"),
-        ).exists(),
+        await Bun.file(join(home, ".config/systemd/user/informant-update.service")).exists(),
       ).toBe(true);
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -956,9 +871,7 @@ describe("automatic update services", () => {
           environment: { ...environment, PATH: "/new/path" },
           command: async (argv) => {
             commands.push(argv);
-            return argv[2] === "enable"
-              ? result(1, "temporary user manager failure")
-              : result();
+            return argv[2] === "enable" ? result(1, "temporary user manager failure") : result();
           },
         }),
       ).rejects.toThrow("temporary user manager failure");
@@ -1005,14 +918,10 @@ describe("automatic update services", () => {
         "informant-update.timer",
       ]);
       expect(
-        await Bun.file(
-          join(home, ".config/systemd/user/informant-update.timer"),
-        ).exists(),
+        await Bun.file(join(home, ".config/systemd/user/informant-update.timer")).exists(),
       ).toBe(false);
       expect(
-        await Bun.file(
-          join(home, ".config/systemd/user/informant-update.service"),
-        ).exists(),
+        await Bun.file(join(home, ".config/systemd/user/informant-update.service")).exists(),
       ).toBe(false);
     } finally {
       await rm(home, { recursive: true, force: true });

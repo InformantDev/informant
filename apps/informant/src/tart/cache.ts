@@ -1,12 +1,4 @@
-import {
-  mkdir,
-  readdir,
-  readFile,
-  realpath,
-  rm,
-  stat,
-  utimes,
-} from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, rm, stat, utimes } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { dataDirectory } from "../store.ts";
 import type { InformantConfig, Repository } from "../types.ts";
@@ -19,21 +11,13 @@ export function cachePathIdentity(user: string, path: string): string {
 
 const CACHE_VERSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 
-async function pruneCacheVersions(
-  parent: string,
-  current: string,
-): Promise<void> {
-  const entries = await readdir(parent, { withFileTypes: true }).catch(
-    () => [],
-  );
+async function pruneCacheVersions(parent: string, current: string): Promise<void> {
+  const entries = await readdir(parent, { withFileTypes: true }).catch(() => []);
   const versions: Array<{ name: string; modifiedAt: number }> = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name === current) continue;
-    const metadata = await stat(join(parent, entry.name)).catch(
-      () => undefined,
-    );
-    if (metadata)
-      versions.push({ name: entry.name, modifiedAt: metadata.mtimeMs });
+    const metadata = await stat(join(parent, entry.name)).catch(() => undefined);
+    if (metadata) versions.push({ name: entry.name, modifiedAt: metadata.mtimeMs });
   }
   versions.sort((a, b) => b.modifiedAt - a.modifiedAt);
   const cutoff = Date.now() - CACHE_VERSION_RETENTION_MS;
@@ -41,9 +25,7 @@ async function pruneCacheVersions(
     versions
       .slice(1)
       .filter((version) => version.modifiedAt < cutoff)
-      .map((version) =>
-        rm(join(parent, version.name), { recursive: true, force: true }),
-      ),
+      .map((version) => rm(join(parent, version.name), { recursive: true, force: true })),
   );
 }
 
@@ -66,11 +48,7 @@ export async function cacheMounts(
       installLock: undefined as string | undefined,
     };
   const workspaceRoot = await realpath(workspace);
-  const persistentRoot = join(
-    dataDirectory(),
-    "caches",
-    ...(guestOs === "linux" ? ["linux"] : []),
-  );
+  const persistentRoot = join(dataDirectory(), "caches", ...(guestOs === "linux" ? ["linux"] : []));
   const root = join(
     persistentRoot,
     digest(repository.fullName).slice(0, 16),
@@ -98,33 +76,22 @@ export async function cacheMounts(
         throw error;
       }
       const location = relative(workspaceRoot, resolved);
-      if (
-        location === ".." ||
-        location.startsWith(`..${sep}`) ||
-        isAbsolute(location)
-      ) {
+      if (location === ".." || location.startsWith(`..${sep}`) || isAbsolute(location)) {
         throw new Error(`cache key file escapes the workspace: ${keyFile}`);
       }
       const metadata = await stat(resolved);
       if (!metadata.isFile() || metadata.size > 16 * 1024 * 1024) {
-        throw new Error(
-          `cache key file must be a regular file no larger than 16 MiB: ${keyFile}`,
-        );
+        throw new Error(`cache key file must be a regular file no larger than 16 MiB: ${keyFile}`);
       }
       key.update(await readFile(resolved));
       key.update("\0");
     }
-    const cacheKey =
-      cache.keyFiles.length > 0 ? key.digest("hex").slice(0, 24) : "default";
+    const cacheKey = cache.keyFiles.length > 0 ? key.digest("hex").slice(0, 24) : "default";
     for (const path of cache.paths) {
       const direct =
         cache.shared &&
         (guestOs !== "linux" || directShared) &&
-        !(
-          directShared &&
-          guestOs === "linux" &&
-          path === "~/.bun/install/cache"
-        );
+        !(directShared && guestOs === "linux" && path === "~/.bun/install/cache");
       if (direct) {
         const host =
           trusted && !cache.buildScoped
@@ -132,9 +99,7 @@ export async function cacheMounts(
             : join(
                 workspace,
                 "..",
-                cache.protectedChannel
-                  ? "protected-shared-caches"
-                  : "shared-caches",
+                cache.protectedChannel ? "protected-shared-caches" : "shared-caches",
                 cachePathIdentity(user, path),
               );
         await mkdir(host, { recursive: true });
@@ -163,19 +128,12 @@ export async function cacheMounts(
           : join(
               workspace,
               "..",
-              cache.protectedChannel
-                ? "protected-shared-caches"
-                : "shared-caches",
+              cache.protectedChannel ? "protected-shared-caches" : "shared-caches",
               cachePathIdentity(user, path),
             )
         : trusted
           ? join(root, cachePathIdentity(user, path))
-          : join(
-              workspace,
-              "..",
-              "keyed-caches",
-              cachePathIdentity(user, path),
-            );
+          : join(workspace, "..", "keyed-caches", cachePathIdentity(user, path));
       const host = join(parent, cacheKey);
       await mkdir(host, { recursive: true });
       const now = new Date();
@@ -191,12 +149,7 @@ export async function cacheMounts(
       if (!cache.readOnly) writablePaths.push(resolvedHost);
       const guest = `${guestHome(guestOs, user)}/${path.slice(2)}`;
       const shared = `${guestSharedRoot(guestOs)}/cache-${mountIndex}`;
-      if (
-        cache.shared &&
-        !cache.readOnly &&
-        guestOs === "linux" &&
-        path === "~/.bun/install/cache"
-      )
+      if (cache.shared && !cache.readOnly && guestOs === "linux" && path === "~/.bun/install/cache")
         installLock = `${shared}/.informant-install-lock`;
       const temporary = `${shared}/cache-${crypto.randomUUID().slice(0, 8)}.tar.gz.tmp`;
       restore.push(
