@@ -48,7 +48,10 @@ const job = (
 });
 
 test("resolves only explicitly requested host secrets", async () => {
-  const configured = { ...job("review"), secrets: ["AMP_API_KEY", "GITHUB_TOKEN"] };
+  const configured = {
+    ...job("review"),
+    secrets: ["AMP_API_KEY", "GITHUB_TOKEN"],
+  };
   expect(
     await resolveJobSecrets(
       configured,
@@ -171,16 +174,22 @@ test("isolated workspaces fetch commits that only have remote-tracking refs", as
     await Bun.write(join(seed, "README.md"), "main\n");
     await requireCommand(["git", "add", "README.md"], undefined, { cwd: seed });
     await requireCommand(["git", "commit", "--quiet", "-m", "main"], undefined, { cwd: seed });
-    await requireCommand(["git", "branch", "-M", "main"], undefined, { cwd: seed });
+    await requireCommand(["git", "branch", "-M", "main"], undefined, {
+      cwd: seed,
+    });
     await requireCommand(["git", "remote", "add", "origin", remote], undefined, { cwd: seed });
     await requireCommand(["git", "push", "--quiet", "origin", "main"], undefined, { cwd: seed });
     await requireCommand(["git", "symbolic-ref", "HEAD", "refs/heads/main"], undefined, {
       cwd: remote,
     });
     await Bun.write(join(seed, "feature.txt"), "feature\n");
-    await requireCommand(["git", "add", "feature.txt"], undefined, { cwd: seed });
+    await requireCommand(["git", "add", "feature.txt"], undefined, {
+      cwd: seed,
+    });
     await requireCommand(["git", "commit", "--quiet", "-m", "feature"], undefined, { cwd: seed });
-    const sha = await requireCommand(["git", "rev-parse", "HEAD"], undefined, { cwd: seed });
+    const sha = await requireCommand(["git", "rev-parse", "HEAD"], undefined, {
+      cwd: seed,
+    });
     await requireCommand(
       ["git", "push", "--quiet", "origin", `HEAD:refs/heads/feature`],
       undefined,
@@ -497,6 +506,96 @@ test("shared caches use one direct host mount across repositories and jobs", asy
   }
 });
 
+test("build-scoped shared caches remain isolated for trusted commits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-build-scoped-cache-"));
+  const firstWorkspace = join(root, "first-build", "workspace", "job-0");
+  const secondWorkspace = join(root, "first-build", "workspace", "job-1");
+  const otherBuildWorkspace = join(root, "second-build", "workspace", "job-0");
+  await Promise.all([
+    mkdir(firstWorkspace, { recursive: true }),
+    mkdir(secondWorkspace, { recursive: true }),
+    mkdir(otherBuildWorkspace, { recursive: true }),
+  ]);
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  const scopedJob = {
+    ...job("release-build"),
+    cache: [
+      {
+        paths: ["~/.cache/release-artifacts"],
+        keyFiles: [],
+        shared: true,
+        buildScoped: true,
+        protectedChannel: true,
+      },
+    ],
+  };
+  const repository = { owner: "one", repo: "repo", fullName: "one/repo" };
+  try {
+    const first = await cacheMounts(
+      repository,
+      firstWorkspace,
+      scopedJob,
+      "root",
+      "linux",
+      true,
+      true,
+    );
+    const second = await cacheMounts(
+      repository,
+      secondWorkspace,
+      {
+        ...scopedJob,
+        name: "release",
+        cache: scopedJob.cache.map((cache) => ({ ...cache, readOnly: true })),
+      },
+      "root",
+      "linux",
+      true,
+      true,
+    );
+    const otherBuild = await cacheMounts(
+      repository,
+      otherBuildWorkspace,
+      scopedJob,
+      "root",
+      "linux",
+      true,
+      true,
+    );
+    const unprotectedSibling = await cacheMounts(
+      repository,
+      secondWorkspace,
+      {
+        ...scopedJob,
+        name: "sibling",
+        cache: scopedJob.cache.map((cache) => ({
+          ...cache,
+          buildScoped: false,
+          protectedChannel: false,
+        })),
+      },
+      "root",
+      "linux",
+      false,
+      true,
+    );
+    expect(first.mounts[0]?.path).toContain(
+      join(root, "first-build", "workspace", "protected-shared-caches"),
+    );
+    expect(first.mounts[0]?.path).toBe(second.mounts[0]?.path);
+    expect(second.mounts[0]?.readOnly).toBe(true);
+    expect(second.writablePaths).toEqual([]);
+    expect(first.mounts[0]?.path).not.toBe(unprotectedSibling.mounts[0]?.path);
+    expect(first.mounts[0]?.path).not.toBe(otherBuild.mounts[0]?.path);
+    expect(first.mounts[0]?.path).not.toContain(join(root, "data", "caches", "linux", "shared"));
+  } finally {
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("keyed caches cross builds only for trusted commits", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-keyed-cache-"));
   const trustedWorkspace = join(root, "trusted-workspace");
@@ -546,10 +645,41 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
   try {
     const macos = await cacheMounts(repository, workspace, cachedJob, "admin", "macos", true);
     const linux = await cacheMounts(repository, workspace, cachedJob, "admin", "linux", true);
+    const readOnlyMacos = await cacheMounts(
+      repository,
+      workspace,
+      {
+        ...cachedJob,
+        cache: cachedJob.cache.map((cache) => ({
+          ...cache,
+          protectedChannel: true,
+          readOnly: true,
+        })),
+      },
+      "admin",
+      "macos",
+      false,
+    );
     const directLinux = await cacheMounts(
       repository,
       workspace,
       cachedJob,
+      "root",
+      "linux",
+      true,
+      true,
+    );
+    const readOnlyLinux = await cacheMounts(
+      repository,
+      workspace,
+      {
+        ...cachedJob,
+        cache: cachedJob.cache.map((cache) => ({
+          ...cache,
+          buildScoped: true,
+          readOnly: true,
+        })),
+      },
       "root",
       "linux",
       true,
@@ -560,6 +690,8 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(macos.restore).toContain("/Users/admin/.bun/install/cache");
     expect(macos.restore).toContain("/Volumes/My Shared Files/cache-0");
     expect(macos.installLock).toBe("/Volumes/My Shared Files/cache-0/.informant-install-lock");
+    expect(readOnlyMacos.mounts[0]?.readOnly).toBe(true);
+    expect(readOnlyMacos.installLock).toBeUndefined();
     expect(linux.restore).toContain("/home/admin/.bun/install/cache");
     expect(linux.restore).toContain("/mnt/shared/cache-0");
     expect(linux.restore).not.toContain("ln -s");
@@ -567,6 +699,11 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(directLinux.restore).not.toContain("ln -s");
     expect(directLinux.restore).toContain("cache.tar.gz");
     expect(directLinux.save).toContain("cache.tar.gz");
+    expect(readOnlyLinux.restore).toContain("cache.tar.gz");
+    expect(readOnlyLinux.save).toBe(":");
+    expect(readOnlyLinux.mounts[0]?.readOnly).toBe(true);
+    expect(readOnlyLinux.writablePaths).toEqual([]);
+    expect(readOnlyLinux.installLock).toBeUndefined();
     expect(linux.writablePaths).toHaveLength(1);
     expect(linux.args[0]).toEndWith(linux.writablePaths[0] ?? "");
     expect(linux.installLock).toBe("/mnt/shared/cache-0/.informant-install-lock");

@@ -6,13 +6,16 @@ import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/p
 import { appleContainerInstalled, ensureAppleContainerSystem } from "./container.ts";
 import { podmanContainerBackend } from "./container-backend.ts";
 import {
+  automaticUpdatesPreference,
   listGitHubCredentials,
   listRepositories,
   machineConfigPath,
+  saveAutomaticUpdatesPreference,
   saveGitHubCredentials,
 } from "./machine-config.ts";
 import { command } from "./process.ts";
 import { serveRepositories } from "./server.ts";
+import { disableAutomaticUpdates, enableAutomaticUpdates } from "./updater.ts";
 
 const API = "https://api.github.com";
 const APP_URL = "https://github.com/InformantDev/informant";
@@ -417,8 +420,46 @@ async function connectExistingApp(): Promise<string | undefined> {
   return current.account.login;
 }
 
+export async function configureAutomaticUpdatesDuringSetup(
+  operations: {
+    disable?: () => Promise<unknown>;
+    enable?: () => Promise<unknown>;
+    preference?: () => Promise<boolean | undefined>;
+    prompt?: (options: { message: string; initialValue: boolean }) => Promise<boolean | symbol>;
+    promptCancelled?: (value: boolean | symbol) => boolean;
+    savePreference?: (enabled: boolean) => Promise<unknown>;
+    warn?: (message: string) => void;
+  } = {},
+): Promise<void> {
+  const preference = operations.preference ?? automaticUpdatesPreference;
+  if ((await preference()) !== undefined) return;
+  const prompt = operations.prompt ?? ((options) => confirm(options));
+  const automaticUpdates = await prompt({
+    message: "Automatically install new Informant versions and restart the startup worker?",
+    initialValue: true,
+  });
+  if ((operations.promptCancelled ?? isCancel)(automaticUpdates)) return;
+  const savePreference = operations.savePreference ?? saveAutomaticUpdatesPreference;
+  if (!automaticUpdates) {
+    await (operations.disable ?? disableAutomaticUpdates)();
+    await savePreference(false);
+    return;
+  }
+  try {
+    await (operations.enable ?? enableAutomaticUpdates)();
+  } catch (error) {
+    await savePreference(false);
+    (operations.warn ?? console.warn)(
+      `Automatic updates were not enabled: ${error instanceof Error ? error.message : String(error)}. Run informant auto-update enable after resolving the service-manager issue.`,
+    );
+    return;
+  }
+  await savePreference(true);
+}
+
 async function finishSetup(account: string): Promise<void> {
   const repositories = await listRepositories();
+  await configureAutomaticUpdatesDuringSetup();
   const start = await confirm({ message: "Start the worker now?", initialValue: true });
   outro(`GitHub App configured for ${account}.`);
   if (!isCancel(start) && start) {

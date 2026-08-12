@@ -52,6 +52,12 @@ Every worker automatically provides `self-hosted`, its platform (`linux` or `dar
 (`x64` or `arm64`), and lowercase hostname. Add custom comma-separated labels with
 `INFORMANT_CAPABILITIES`, for example `INFORMANT_CAPABILITIES=gpu,large`.
 
+Allowed host mounts advertise protected `mount:<name>` capabilities automatically. These labels
+cannot be added through `INFORMANT_CAPABILITIES`; they exist only while the mount is in the worker's
+machine-local allowlist **and** its source currently resolves to a regular file no larger than 1 MiB.
+An unusable allowlist source is omitted from the worker's capabilities and emits a
+`Not advertising mount:<name>` diagnostic with the reason.
+
 Workers also provide `container` only when their platform backend passes its health check. Use
 `runs_on = ["container"]` for a portable container job that can run with Apple Container on macOS or
 rootless Podman on Linux. Generated jobs use this label. Version 1 configurations that omit `runs_on`
@@ -190,7 +196,8 @@ from that checkout while secrets are present.
 ## Allowed host file mounts
 
 Container jobs can request host files by a machine-local allowlist name. The repository never
-specifies a host path. First allow an existing file on the worker:
+specifies a host path. Mount names use lowercase letters, numbers, dots, underscores, and dashes.
+First allow an existing file on the worker:
 
 ```bash
 informant mount allow codex-auth "$HOME/.codex/auth.json"
@@ -205,7 +212,11 @@ directory containing the file under its original basename:
 ```toml
 environment = { CODEX_HOME = "/mnt/informant-codex" }
 mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back = true }]
+runs_on = ["container", "mount:codex-auth"]
 ```
+
+Using the corresponding `mount:codex-auth` capability prevents workers without that allowlist entry
+from claiming the job.
 
 `write_back` defaults to `false`. When enabled, Informant serializes jobs using the same writable
 source and atomically copies the resulting file back to the allowed host path unless the host copy
@@ -213,7 +224,9 @@ changed during the job. This supports files such as Codex's `auth.json`, whose t
 during a run, without overwriting a newer host-side refresh. Mounted files are limited to 1 MiB.
 Informant redacts the original and refreshed file contents and JSON string values from job logs,
 exposes no other files from the source directory, and applies the same default-branch trust
-protections as secret-bearing jobs.
+protections as secret-bearing jobs. Because a writable credential may rotate to a value that was
+already printed, jobs with `write_back = true` suppress all child stdout and stderr and emit a
+suppression marker instead. Read-only mounts retain non-secret output after delayed redaction.
 
 Use `informant mount list` to inspect the allowlist and `informant mount remove <name>` to revoke an
 entry. Treat mounted credentials like other automation secrets: use them only on trusted private
@@ -225,6 +238,17 @@ Events are `commit` and `comment`. A commit rule can filter either exact branch 
 A comment rule can only use the optional pull-request filter and means a newly created PR conversation
 comment—not an edit or line-level review comment. With no branch or pull-request table, a commit
 matches branches and active same-repository PR heads.
+
+Tag builds are opt-in commit triggers. Put one or more glob patterns in a `tag` table:
+
+```toml
+triggers = [{ event = "commit", tag = { patterns = ["v*", "release/*"] } }]
+```
+
+A trigger may use only one context table: `branch`, `tag`, or `pull_request`. `tag` is valid only
+with `event = "commit"`. Patterns match the entire tag name, are case-sensitive, and let `*` and `?`
+match across `/`; for example, `release/*` matches `release/v2` but not `Release/v2`. Untagged commit
+rules do not run for tags.
 
 Pull-request `state` is `open`, `closed`, or `all`; `draft` and exact `base_branches` are optional.
 Closed PRs are resolved when a new conversation comment arrives, so `state = "closed"` is useful for
@@ -318,8 +342,13 @@ cache = [
 content-addressed package cache such as `~/.bun/install/cache`. Jobs in the same build mount one
 Informant-owned host directory directly. A default-branch build uses the persistent machine-wide
 cache; pull requests and other commits receive a build-scoped cache that is deleted afterward, so
-untrusted code cannot poison a later trusted build. Shared caches cannot use `key_files`. The host's
-personal cache is never exposed to CI code.
+untrusted code cannot poison a later trusted build. Set `build_scoped = true` alongside
+`shared = true` to force this per-build isolation for trusted builds too, such as when handing
+ordinary per-build caches. For a credential-free producer-to-publisher artifact channel, also set
+`protected_channel = true`; jobs requesting that dedicated channel are pinned to the trusted
+configuration. A container-job consumer can additionally set `read_only = true`, and receives the
+channel mount read-only. Shared caches cannot use `key_files`. The
+host's personal cache is never exposed to CI code.
 
 Without `shared`, each group associates one or more guest `paths` with its `key_files`. Informant
 restores those paths from persistent host storage before the job and saves them afterward, isolated

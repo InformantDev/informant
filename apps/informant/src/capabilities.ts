@@ -5,11 +5,17 @@ import type { InformantConfig } from "./types.ts";
 const architectureLabel = (value: string) =>
   value === "x64" ? "x64" : value === "arm64" ? "arm64" : value;
 
-export function workerCapabilities(environment = Bun.env): string[] {
+export function mountCapability(name: string): string {
+  return name === name.toLowerCase()
+    ? `mount:${name}`
+    : `mount:legacy:${Buffer.from(name).toString("hex")}`;
+}
+
+export function workerCapabilities(environment = Bun.env, allowedMounts: string[] = []): string[] {
   const configured = (environment.INFORMANT_CAPABILITIES ?? "")
     .split(",")
     .map((value) => value.trim().toLowerCase())
-    .filter((value) => Boolean(value) && value !== "container");
+    .filter((value) => Boolean(value) && value !== "container" && !value.startsWith("mount:"));
   return [
     ...new Set([
       "self-hosted",
@@ -17,6 +23,7 @@ export function workerCapabilities(environment = Bun.env): string[] {
       architectureLabel(arch()),
       hostname().toLowerCase(),
       ...(containerBackendReadiness()?.ready ? ["container"] : []),
+      ...allowedMounts.map(mountCapability),
       ...configured,
     ]),
   ];
@@ -32,7 +39,15 @@ export function selectCapableJobs(
       .filter(
         (job) =>
           (job.runtime?.type !== "container" || available.has("container")) &&
-          (job.runsOn ?? []).every((label) => available.has(label.toLowerCase())),
+          (job.runsOn ?? []).every((label) => {
+            const normalized = label.toLowerCase();
+            const matchingMounts = (job.mounts ?? []).filter(
+              (mount) => `mount:${mount.source.toLowerCase()}` === normalized,
+            );
+            return matchingMounts.length > 0
+              ? matchingMounts.every((mount) => available.has(mountCapability(mount.source)))
+              : available.has(normalized);
+          }),
       )
       .map((job) => job.name),
   );
