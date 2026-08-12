@@ -16,7 +16,7 @@ export interface ContainerRuntime {
   memoryMb?: number;
   prepare?: string;
   prepareInputs?: string[];
-  nestedNamespaces?: boolean;
+  network?: boolean;
 }
 
 export interface HostRuntime {

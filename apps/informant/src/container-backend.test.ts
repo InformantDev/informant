@@ -51,19 +51,17 @@ test("builds Podman run and image lifecycle commands", () => {
   expect(run).toContain("/tmp/cache:/mnt/shared/cache-0:z");
   expect(run).toContain("--cpus");
   expect(run).toContain("--memory");
-  expect(run).not.toContain("SYS_ADMIN");
-  expect(run).not.toContain("seccomp=unconfined");
-  const nested = podmanContainerBackend.runArguments({
-    name: "sandboxed-job",
+  expect(run).not.toContain("none");
+  const offline = podmanContainerBackend.runArguments({
+    name: "offline-job",
     image: "docker.io/oven/bun:1",
     workspace: "/tmp/workspace",
-    command: "bwrap --unshare-all true",
+    command: "bun test",
     environment: {},
-    nestedNamespaces: true,
+    network: false,
   });
-  expect(nested).toContain("SYS_ADMIN");
-  expect(nested).toContain("seccomp=unconfined");
-  expect(nested).toContain("no-new-privileges");
+  expect(offline).toContain("--network");
+  expect(offline).toContain("none");
   expect(podmanContainerBackend.buildArguments("prepared", 2, 1024)).toEqual([
     "podman",
     "build",

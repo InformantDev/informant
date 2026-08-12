@@ -34,7 +34,7 @@ import {
 	FOOTER_CONTRIBUTION_EVENT,
 	type FooterContribution,
 	type FooterUsage,
-} from "./footer-events.js";
+} from "./informant-footer-events.js";
 
 const MAX_SUBAGENTS = 8;
 const MAX_ACTIVITY_ITEMS = 500;
@@ -706,7 +706,7 @@ class SubagentManager {
 		const cwd = resolve(ctx.cwd, options.cwd ?? ".");
 		const id = this.makeId(options.name);
 		const activeTools = this.pi.getActiveTools().filter((tool) =>
-			["read", "bash", "grep", "find", "ls"].includes(tool),
+			["read", "grep", "find", "ls"].includes(tool),
 		);
 		const effort = options.effort ?? (ctx.thinkingLevel as SubagentEffort);
 		const agent: ManagedSubagent = {
@@ -743,6 +743,7 @@ class SubagentManager {
 				agentDir: getAgentDir(),
 				settingsManager,
 				noExtensions: true,
+				noContextFiles: true,
 				appendSystemPrompt: [SUBAGENT_SYSTEM_PROMPT],
 			});
 			await resourceLoader.reload();

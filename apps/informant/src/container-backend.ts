@@ -16,7 +16,7 @@ export interface ContainerRunOptions {
   cpu?: number;
   memoryMb?: number;
   preparedWorkspace?: boolean;
-  nestedNamespaces?: boolean;
+  network?: boolean;
 }
 
 export interface ContainerBackend {
@@ -83,6 +83,7 @@ function commonRunArguments(
   for (const [key, value] of Object.entries(options.environment))
     args.push("--env", `${key}=${value}`);
   for (const name of options.secretNames ?? []) args.push("--env", name);
+  if (options.network === false) args.push("--network", "none");
   if (options.cpu) args.push("--cpus", String(options.cpu));
   if (options.memoryMb) args.push("--memory", `${options.memoryMb}M`);
   return args;
@@ -190,11 +191,7 @@ export const podmanContainerBackend: ContainerBackend = {
       workspace: "Z",
       mount: "z",
     });
-    args.push("--security-opt", "no-new-privileges");
-    if (options.nestedNamespaces) {
-      args.push("--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined");
-    }
-    args.push(options.image, "-lc", options.command);
+    args.push("--security-opt", "no-new-privileges", options.image, "-lc", options.command);
     return args;
   },
   buildArguments(image, cpu, memoryMb) {

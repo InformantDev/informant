@@ -196,7 +196,7 @@ async function snapshotPreparedContainerInputs(
   runtime: ContainerRuntime,
   context: string,
   workspace?: string,
-): Promise<string | undefined> {
+): Promise<{ digest: string; paths: string[] } | undefined> {
   if (!runtime.prepareInputs) return undefined;
   if (!workspace) throw new Error("container.prepareInputs requires a job workspace");
   const root = await realpath(workspace);
@@ -243,7 +243,10 @@ async function snapshotPreparedContainerInputs(
         .digest("hex"),
     ]);
   }
-  return new Bun.CryptoHasher("sha256").update(JSON.stringify(records)).digest("hex");
+  return {
+    digest: new Bun.CryptoHasher("sha256").update(JSON.stringify(records)).digest("hex"),
+    paths: sorted.map((file) => file.path),
+  };
 }
 
 export interface ContainerPreparationOperations {
@@ -652,14 +655,21 @@ export async function ensurePreparedContainer(
   await mkdir(contextRoot, { recursive: true });
   const context = await mkdtemp(join(contextRoot, "informant-container-build-"));
   try {
-    const inputDigest = await snapshotPreparedContainerInputs(runtime, context, workspace);
-    const prepared = preparedContainerImage(runtime, inputDigest);
+    const inputSnapshot = await snapshotPreparedContainerInputs(runtime, context, workspace);
+    const prepared = preparedContainerImage(runtime, inputSnapshot?.digest);
     if (!prepared) return runtime.image;
     await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);
-    const inputSetup = inputDigest
-      ? "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n"
+    const inputSetup = inputSnapshot
+      ? backend.kind === "apple"
+        ? "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n"
+        : `${inputSnapshot.paths
+            .map(
+              (path) =>
+                `COPY ${JSON.stringify([`informant-prepare-inputs/${path}`, `/workspace/${path}`])}`,
+            )
+            .join("\n")}\nENV HOME=/home/root\n`
       : "";
-    const preparationLayer = inputDigest
+    const preparationLayer = inputSnapshot
       ? `RUN INFORMANT_PREPARE_ROOT=/workspace /bin/sh -lc 'cd "$INFORMANT_PREPARE_ROOT" && . /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n`
       : "RUN /bin/sh -lc '. /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n";
     await Bun.write(
@@ -811,7 +821,7 @@ export async function runInContainer(
           cpu: resources.cpu,
           memoryMb: resources.memoryMb,
           preparedWorkspace: usesPreparedWorkspace,
-          nestedNamespaces: runtime.nestedNamespaces,
+          network: runtime.network,
         },
         backend,
       );

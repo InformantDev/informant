@@ -421,7 +421,10 @@ test("copies preparation inputs and includes their contents in the image identit
       ).toBe('{"name":"shared"}\n');
       const dockerfile = await Bun.file(join(context, "Dockerfile")).text();
       expect(dockerfile).toContain(
-        "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n",
+        'COPY ["informant-prepare-inputs/bun.lock","/workspace/bun.lock"]\n',
+      );
+      expect(dockerfile).toContain(
+        'COPY ["informant-prepare-inputs/packages/shared/package.json","/workspace/packages/shared/package.json"]\n',
       );
       expect(dockerfile).not.toContain("ENV INFORMANT_PREPARE_ROOT");
       expect(dockerfile).toContain('cd "$INFORMANT_PREPARE_ROOT"');
@@ -432,6 +435,7 @@ test("copies preparation inputs and includes their contents in the image identit
   const operations = {
     withImageLock: async <T>(_image: string, callback: () => Promise<T>): Promise<T> => callback(),
     command: build,
+    backend: podmanContainerBackend,
   };
 
   try {
@@ -752,7 +756,7 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
     expect(output.join("")).not.toContain("refreshed-access");
     expect(locks).toEqual([
       "prepared-container-image-references",
-      `host-file-${digest(join(codexHome, "auth.json"))}`,
+      `host-file-${digest(await realpath(join(codexHome, "auth.json")))}`,
     ]);
     expect(lockAttempts).toEqual([undefined, Number.POSITIVE_INFINITY]);
   } finally {
@@ -1023,7 +1027,11 @@ test("serializes different allowlist aliases for the same host file", async () =
   try {
     await run("first");
     await run("second");
-    expect(lockNames).toEqual([`host-file-${digest(source)}`, `host-file-${digest(source)}`]);
+    const canonicalSource = await realpath(source);
+    expect(lockNames).toEqual([
+      `host-file-${digest(canonicalSource)}`,
+      `host-file-${digest(canonicalSource)}`,
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

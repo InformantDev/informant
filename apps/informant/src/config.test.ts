@@ -229,14 +229,14 @@ describe("configuration", () => {
       prepare: undefined,
       prepareInputs: undefined,
     });
-    const nested = source.replace(
+    const offline = source.replace(
       'container = { image = "docker.io/oven/bun:1", cpu = 1 }',
-      'container = { image = "docker.io/oven/bun:1", cpu = 1, nestedNamespaces = true }',
+      'container = { image = "docker.io/oven/bun:1", cpu = 1, network = false }',
     );
-    expect(parseConfig(nested).jobs[0]?.runtime).toMatchObject({ nestedNamespaces: true });
-    expect(() =>
-      parseConfig(nested.replace("nestedNamespaces = true", 'nestedNamespaces = "yes"')),
-    ).toThrow("jobs[0].container.nestedNamespaces must be a boolean");
+    expect(parseConfig(offline).jobs[0]?.runtime).toMatchObject({ network: false });
+    expect(() => parseConfig(offline.replace("network = false", 'network = "no"'))).toThrow(
+      "jobs[0].container.network must be a boolean",
+    );
     expect(() =>
       parseConfig(
         source.replace(
