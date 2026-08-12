@@ -289,6 +289,7 @@ export async function initializeContainerBackend(
   }
   try {
     await backend.initialize(runCommand, signal);
+    signal?.throwIfAborted();
     readiness = { backend, checkedAt: now };
     return true;
   } catch (error) {

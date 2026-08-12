@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exchangeFilePaths } from "./atomic-rename.ts";
@@ -872,6 +872,7 @@ test("recovers an interrupted atomic mounted-file exchange on startup", async ()
   const source = join(root, "auth.json");
   const dataPath = join(root, "data");
   await Bun.write(source, JSON.stringify({ token: "original" }));
+  let recordedBeforeTemporary = false;
   let exchanged = false;
   try {
     await expect(
@@ -910,6 +911,17 @@ test("recovers an interrupted atomic mounted-file exchange on startup", async ()
             }
             return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
           },
+          copyMountedFile: async (staged, temporary) => {
+            const records = await readdir(join(dataPath, "file-mount-recovery"));
+            expect(records).toHaveLength(1);
+            expect(await Bun.file(String(temporary)).exists()).toBe(false);
+            const record = await Bun.file(
+              join(dataPath, "file-mount-recovery", records[0] as string),
+            ).json();
+            expect(record.temporary).toBe(temporary);
+            recordedBeforeTemporary = true;
+            await copyFile(staged, temporary);
+          },
           exchange: (left, right) => {
             expect(Bun.file(source).size).toBeGreaterThan(0);
             exchangeFilePaths(left, right);
@@ -919,6 +931,7 @@ test("recovers an interrupted atomic mounted-file exchange on startup", async ()
         },
       ),
     ).rejects.toThrow("simulated interruption after exchange");
+    expect(recordedBeforeTemporary).toBe(true);
     expect(exchanged).toBe(true);
     expect(await Bun.file(source).json()).toEqual({ token: "rotated" });
     expect(await recoverMountedFileWrites(dataPath)).toBe(1);

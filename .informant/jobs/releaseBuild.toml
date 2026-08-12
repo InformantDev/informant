@@ -47,7 +47,7 @@ esac
 "$artifacts/$native_asset" --version
 chmod a-w "$artifacts"/*
 """
-cache = [{ paths = ["~/.cache/informant-release"], shared = true, build_scoped = true }]
+cache = [{ paths = ["~/.cache/informant-release"], shared = true, build_scoped = true, protected_channel = true }]
 container = { image = "docker.io/oven/bun:1", cpu = 4, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive

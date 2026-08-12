@@ -266,6 +266,7 @@ type ContainerRunOperations = Pick<
   "command" | "withImageLock" | "dataPath" | "backend"
 > & {
   allowedMounts?: Record<string, string>;
+  copyMountedFile?: typeof copyFile;
   exchange?: (left: string, right: string) => Promise<void> | void;
 };
 
@@ -592,6 +593,7 @@ export async function recoverMountedFileWrites(
 async function persistFileMount(
   mount: StagedFileMount,
   exchange: ExchangeFilePaths = exchangeFilePaths,
+  copyMountedFile: typeof copyFile = copyFile,
 ): Promise<void> {
   if (!mount.writeBack) return;
   const staged = join(mount.directory, mount.filename);
@@ -608,24 +610,31 @@ async function persistFileMount(
   }
 
   const temporary = `${mount.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
-  await copyFile(staged, temporary);
-  await chmod(temporary, mount.mode);
-  const temporaryFile = await open(temporary, "r+");
+  await writeMountedFileRecoveryRecord(recoveryPath, {
+    version: 1,
+    source: mount.source,
+    temporary,
+    originalDigest: mount.originalDigest,
+    replacementDigest: stagedDigest,
+  });
   try {
-    await temporaryFile.sync();
-  } finally {
-    await temporaryFile.close();
-  }
-  try {
-    await writeMountedFileRecoveryRecord(recoveryPath, {
-      version: 1,
-      source: mount.source,
-      temporary,
-      originalDigest: mount.originalDigest,
-      replacementDigest: stagedDigest,
-    });
+    await copyMountedFile(staged, temporary);
+    await chmod(temporary, mount.mode);
+    const temporaryFile = await open(temporary, "r+");
+    try {
+      await temporaryFile.sync();
+    } finally {
+      await temporaryFile.close();
+    }
   } catch (error) {
-    await rm(temporary, { force: true });
+    try {
+      await removeMountedFileRecoveryRecord(recoveryPath, temporary);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `mounted-file temporary could not be safely cleaned up: ${mount.name}`,
+      );
+    }
     throw error;
   }
 
@@ -1008,6 +1017,7 @@ export async function runInContainer(
       const mounts: NonNullable<ContainerRunOptions["mounts"]> = caches.mounts.map((mount) => ({
         source: mount.path,
         target: `/mnt/shared/${mount.name}`,
+        readOnly: mount.readOnly,
       }));
       mounts.push(
         ...fileMounts.map((mount) => ({
@@ -1114,7 +1124,9 @@ export async function runInContainer(
       }
       try {
         const results = await Promise.allSettled(
-          staged.map((mount) => persistFileMount(mount, operations.exchange)),
+          staged.map((mount) =>
+            persistFileMount(mount, operations.exchange, operations.copyMountedFile),
+          ),
         );
         const errors = results
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")

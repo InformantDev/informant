@@ -50,6 +50,8 @@ export interface JobConfig {
     keyFiles: string[];
     shared: boolean;
     buildScoped?: boolean;
+    protectedChannel?: boolean;
+    readOnly?: boolean;
   }>;
 }
 
@@ -124,7 +126,8 @@ export interface BuildRecord {
   runningJobs?: string[];
   jobs?: Array<{
     name: string;
-    status: "queued" | "running" | "success" | "failure" | "skipped" | "cancelled";
+    status:
+      "queued" | "running" | "success" | "failure" | "skipped" | "cancelled";
   }>;
   owner?: { pid: number; startedAt: string };
   pullRequest?: number;
@@ -132,5 +135,8 @@ export interface BuildRecord {
   checkId?: number;
   checkUrl?: string;
   checksCompletedAt?: string;
-  event?: { type: TriggerEvent | "manual" | "manual_trigger" | "manual_run"; id: string };
+  event?: {
+    type: TriggerEvent | "manual" | "manual_trigger" | "manual_run";
+    id: string;
+  };
 }

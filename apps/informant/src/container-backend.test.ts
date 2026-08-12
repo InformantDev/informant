@@ -200,6 +200,37 @@ test("starts a fresh probe instead of joining an aborted unsettled refresh", asy
   firstProbe.resolve();
 });
 
+test("an abandoned probe cannot overwrite a newer readiness result", async () => {
+  const firstProbe = deferred<void>();
+  let probes = 0;
+  const backend = {
+    ...podmanContainerBackend,
+    async initialize() {
+      probes++;
+      if (probes === 1) {
+        await firstProbe.promise;
+        return;
+      }
+      throw new Error("replacement probe failed");
+    },
+  };
+  const controller = new AbortController();
+  const abandoned = refreshContainerBackend(30_000, backend, undefined, 1_000, controller.signal);
+  while (probes === 0) await Bun.sleep(0);
+  controller.abort(new Error("caller left"));
+  await expect(abandoned).rejects.toThrow("caller left");
+
+  expect(await refreshContainerBackend(30_000, backend, undefined, 2_000)).toBe(false);
+  firstProbe.resolve();
+  await Bun.sleep(0);
+
+  expect(containerBackendReadiness()).toMatchObject({
+    backend,
+    ready: false,
+    error: new Error("replacement probe failed"),
+  });
+});
+
 test("re-probes stale success and allows stale failure to recover", async () => {
   let rootless = true;
   const runCommand = async (argv: string[]) =>

@@ -16,7 +16,6 @@ version=${tag#v}
 artifacts="$HOME/.cache/informant-release/$INFORMANT_SHA"
 tap_directory=
 cleanup() {
-  rm -rf "$artifacts"
   if [ -n "$tap_directory" ]; then
     rm -rf "$tap_directory"
   fi
@@ -85,7 +84,7 @@ else
     --body "Automated by the Informant release job for InformantDev/informant@$tag."
 fi
 """
-cache = [{ paths = ["~/.cache/informant-release"], shared = true, build_scoped = true }]
+cache = [{ paths = ["~/.cache/informant-release"], shared = true, build_scoped = true, protected_channel = true, read_only = true }]
 container = { image = "debian:bookworm-slim", cpu = 1, memory_mb = 1024, prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive

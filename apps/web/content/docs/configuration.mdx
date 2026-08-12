@@ -344,9 +344,11 @@ Informant-owned host directory directly. A default-branch build uses the persist
 cache; pull requests and other commits receive a build-scoped cache that is deleted afterward, so
 untrusted code cannot poison a later trusted build. Set `build_scoped = true` alongside
 `shared = true` to force this per-build isolation for trusted builds too, such as when handing
-release artifacts between a credential-free producer and publisher. Shared caches cannot use
-`key_files`. The host's
-personal cache is never exposed to CI code.
+ordinary per-build caches. For a credential-free producer-to-publisher artifact channel, also set
+`protected_channel = true`; jobs requesting that dedicated channel are pinned to the trusted
+configuration. A container-job consumer can additionally set `read_only = true`, and receives the
+channel mount read-only. Shared caches cannot use `key_files`. The
+host's personal cache is never exposed to CI code.
 
 Without `shared`, each group associates one or more guest `paths` with its `key_files`. Informant
 restores those paths from persistent host storage before the job and saves them afterward, isolated

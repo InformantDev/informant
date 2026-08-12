@@ -1,7 +1,13 @@
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { posix, resolve } from "node:path";
-import type { InformantConfig, JobConfig, JobRuntime, Repository, TriggerRule } from "./types.ts";
+import type {
+  InformantConfig,
+  JobConfig,
+  JobRuntime,
+  Repository,
+  TriggerRule,
+} from "./types.ts";
 
 export const CONFIG_DIRECTORY = ".informant";
 export const CONFIG_FILE = `${CONFIG_DIRECTORY}/config.toml`;
@@ -32,7 +38,10 @@ export function jobTemplate(): string {
   return defaultJob;
 }
 
-export function selectJobs(config: InformantConfig, requested: string[]): InformantConfig {
+export function selectJobs(
+  config: InformantConfig,
+  requested: string[],
+): InformantConfig {
   if (requested.length === 0) return config;
   const jobsByName = new Map(config.jobs.map((job) => [job.name, job]));
   const selected = new Set<string>();
@@ -44,7 +53,10 @@ export function selectJobs(config: InformantConfig, requested: string[]): Inform
     for (const dependency of job.needs) include(dependency);
   };
   for (const name of requested) include(name);
-  return { ...config, jobs: config.jobs.filter((job) => selected.has(job.name)) };
+  return {
+    ...config,
+    jobs: config.jobs.filter((job) => selected.has(job.name)),
+  };
 }
 
 function filtersMatch(job: JobConfig, branch: string | undefined): boolean {
@@ -68,7 +80,9 @@ export function selectManuallyTriggeredJobs(
       return (
         triggers.length === 0 ||
         triggers.some(
-          (rule) => !rule.branch || (branch !== undefined && rule.branch.names.includes(branch)),
+          (rule) =>
+            !rule.branch ||
+            (branch !== undefined && rule.branch.names.includes(branch)),
         )
       );
     })
@@ -97,7 +111,9 @@ function parseFilters(value: unknown, label: string): JobConfig["filters"] {
     const raw = item as Record<string, unknown>;
     if (Object.keys(raw).length !== 1 || raw.branch === undefined)
       throw new Error(`${label}[${index}] must contain only branch`);
-    return { branch: parseBranchFilter(raw.branch, `${label}[${index}].branch`) };
+    return {
+      branch: parseBranchFilter(raw.branch, `${label}[${index}].branch`),
+    };
   });
 }
 
@@ -130,7 +146,9 @@ function parseTriggers(value: unknown, label: string): TriggerRule[] {
     const allowed = new Set(["event", "branch", "tag", "pull_request"]);
     if (Object.keys(raw).some((key) => !allowed.has(key)))
       throw new Error(`${label}[${index}] contains an unknown field`);
-    const contexts = [raw.branch, raw.tag, raw.pull_request].filter((value) => value !== undefined);
+    const contexts = [raw.branch, raw.tag, raw.pull_request].filter(
+      (value) => value !== undefined,
+    );
     if (contexts.length > 1)
       throw new Error(
         `${label}[${index}] cannot use more than one of branch, tag, and pull_request`,
@@ -156,9 +174,13 @@ function parseTriggers(value: unknown, label: string): TriggerRule[] {
       if (
         !Array.isArray(table.patterns) ||
         table.patterns.length === 0 ||
-        table.patterns.some((pattern) => typeof pattern !== "string" || !pattern.trim())
+        table.patterns.some(
+          (pattern) => typeof pattern !== "string" || !pattern.trim(),
+        )
       )
-        throw new Error(`${label}[${index}].tag.patterns must contain non-empty strings`);
+        throw new Error(
+          `${label}[${index}].tag.patterns must contain non-empty strings`,
+        );
       tag = { patterns: table.patterns as string[] };
     }
     let pullRequest: TriggerRule["pullRequest"];
@@ -168,18 +190,29 @@ function parseTriggers(value: unknown, label: string): TriggerRule[] {
         !table ||
         typeof table !== "object" ||
         Array.isArray(table) ||
-        Object.keys(table).some((key) => !["state", "draft", "base_branches"].includes(key))
+        Object.keys(table).some(
+          (key) => !["state", "draft", "base_branches"].includes(key),
+        )
       )
         throw new Error(`${label}[${index}].pull_request is invalid`);
-      if (table.state !== undefined && !["open", "closed", "all"].includes(String(table.state)))
-        throw new Error(`${label}[${index}].pull_request.state must be open, closed, or all`);
+      if (
+        table.state !== undefined &&
+        !["open", "closed", "all"].includes(String(table.state))
+      )
+        throw new Error(
+          `${label}[${index}].pull_request.state must be open, closed, or all`,
+        );
       if (table.draft !== undefined && typeof table.draft !== "boolean")
-        throw new Error(`${label}[${index}].pull_request.draft must be boolean`);
+        throw new Error(
+          `${label}[${index}].pull_request.draft must be boolean`,
+        );
       if (
         table.base_branches !== undefined &&
         (!Array.isArray(table.base_branches) ||
           table.base_branches.length === 0 ||
-          table.base_branches.some((name) => typeof name !== "string" || !name.trim()))
+          table.base_branches.some(
+            (name) => typeof name !== "string" || !name.trim(),
+          ))
       )
         throw new Error(
           `${label}[${index}].pull_request.base_branches must contain non-empty strings`,
@@ -202,7 +235,8 @@ export function parseRepository(value: string): Repository {
     .replace(/^ssh:\/\/(?:git@)?github\.com\//, "")
     .replace(/\.git$/, "");
   const [owner, repo, ...rest] = normalized.split("/");
-  if (!owner || !repo || rest.length > 0) throw new Error(`invalid GitHub repository: ${value}`);
+  if (!owner || !repo || rest.length > 0)
+    throw new Error(`invalid GitHub repository: ${value}`);
   return { owner, repo, fullName: `${owner}/${repo}` };
 }
 
@@ -215,7 +249,9 @@ export function findConfig(start = process.cwd()): string {
     if (parent === directory) break;
     directory = parent;
   }
-  throw new Error(`could not find ${CONFIG_FILE}; run informant init in the repository`);
+  throw new Error(
+    `could not find ${CONFIG_FILE}; run informant init in the repository`,
+  );
 }
 
 export function parseConfigFiles(
@@ -223,27 +259,49 @@ export function parseConfigFiles(
   jobs: Array<{ path: string; source: string }>,
   label = CONFIG_FILE,
 ): InformantConfig {
-  const combined = [source, ...jobs.map((job) => `\n[[jobs]]\n${job.source}`)].join("\n");
+  const combined = [
+    source,
+    ...jobs.map((job) => `\n[[jobs]]\n${job.source}`),
+  ].join("\n");
   return parseConfig(combined, label);
 }
 
-function parseEnvironment(value: unknown, label: string): Record<string, string> {
+function parseEnvironment(
+  value: unknown,
+  label: string,
+): Record<string, string> {
   const environment = value ?? {};
-  if (typeof environment !== "object" || environment === null || Array.isArray(environment)) {
+  if (
+    typeof environment !== "object" ||
+    environment === null ||
+    Array.isArray(environment)
+  ) {
     throw new Error(`${label} must be a table of scalar values`);
   }
   for (const [key, item] of Object.entries(environment)) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
-      throw new Error(`${label} key ${JSON.stringify(key)} is not a shell variable`);
+      throw new Error(
+        `${label} key ${JSON.stringify(key)} is not a shell variable`,
+      );
     }
-    if (typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") {
+    if (
+      typeof item !== "string" &&
+      typeof item !== "number" &&
+      typeof item !== "boolean"
+    ) {
       throw new Error(`${label} must be a table of scalar values`);
     }
   }
-  return Object.fromEntries(Object.entries(environment).map(([key, item]) => [key, String(item)]));
+  return Object.fromEntries(
+    Object.entries(environment).map(([key, item]) => [key, String(item)]),
+  );
 }
 
-function parseCaches(value: unknown, label: string, allowEmpty = false): JobConfig["cache"] {
+function parseCaches(
+  value: unknown,
+  label: string,
+  allowEmpty = false,
+): JobConfig["cache"] {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) {
     throw new Error(`${label} must be a non-empty array of tables`);
@@ -280,7 +338,9 @@ function parseCaches(value: unknown, label: string, allowEmpty = false): JobConf
           keyFile.split("/").includes(".."),
       )
     ) {
-      throw new Error(`${label}[${cacheIndex}].key_files must be relative paths`);
+      throw new Error(
+        `${label}[${cacheIndex}].key_files must be relative paths`,
+      );
     }
     const shared = entry.shared ?? false;
     if (typeof shared !== "boolean") {
@@ -290,13 +350,44 @@ function parseCaches(value: unknown, label: string, allowEmpty = false): JobConf
     if (typeof buildScoped !== "boolean") {
       throw new Error(`${label}[${cacheIndex}].build_scoped must be a boolean`);
     }
+    const protectedChannel = entry.protected_channel ?? false;
+    if (typeof protectedChannel !== "boolean") {
+      throw new Error(
+        `${label}[${cacheIndex}].protected_channel must be a boolean`,
+      );
+    }
+    const readOnly = entry.read_only ?? false;
+    if (typeof readOnly !== "boolean") {
+      throw new Error(`${label}[${cacheIndex}].read_only must be a boolean`);
+    }
     if (shared && keyFiles.length > 0) {
-      throw new Error(`${label}[${cacheIndex}] cannot combine shared and key_files`);
+      throw new Error(
+        `${label}[${cacheIndex}] cannot combine shared and key_files`,
+      );
     }
     if (buildScoped && !shared) {
-      throw new Error(`${label}[${cacheIndex}].build_scoped requires shared = true`);
+      throw new Error(
+        `${label}[${cacheIndex}].build_scoped requires shared = true`,
+      );
     }
-    return { paths, keyFiles, shared, ...(buildScoped ? { buildScoped: true } : {}) };
+    if (protectedChannel && !buildScoped) {
+      throw new Error(
+        `${label}[${cacheIndex}].protected_channel requires build_scoped = true`,
+      );
+    }
+    if (readOnly && !protectedChannel) {
+      throw new Error(
+        `${label}[${cacheIndex}].read_only requires protected_channel = true`,
+      );
+    }
+    return {
+      paths,
+      keyFiles,
+      shared,
+      ...(buildScoped ? { buildScoped: true } : {}),
+      ...(protectedChannel ? { protectedChannel: true } : {}),
+      ...(readOnly ? { readOnly: true } : {}),
+    };
   });
 }
 
@@ -325,9 +416,13 @@ function parseVm(
   if (guestOs !== "macos" && guestOs !== "linux")
     throw new Error(`${label}.os must be "macos" or "linux"`);
   const cpu = vm.cpu === undefined ? undefined : Number(vm.cpu);
-  if (cpu !== undefined && (!Number.isFinite(cpu) || cpu <= 0 || !Number.isInteger(cpu)))
+  if (
+    cpu !== undefined &&
+    (!Number.isFinite(cpu) || cpu <= 0 || !Number.isInteger(cpu))
+  )
     throw new Error(`${label}.cpu must be a positive integer`);
-  const memoryMb = vm.memory_mb === undefined ? undefined : Number(vm.memory_mb);
+  const memoryMb =
+    vm.memory_mb === undefined ? undefined : Number(vm.memory_mb);
   if (
     memoryMb !== undefined &&
     (!Number.isFinite(memoryMb) || memoryMb <= 0 || !Number.isInteger(memoryMb))
@@ -338,7 +433,9 @@ function parseVm(
   if (typeof user !== "string" || !/^[A-Za-z_][A-Za-z0-9._-]*$/.test(user))
     throw new Error(`${label}.user must be a valid account name`);
   if (typeof password !== "string")
-    throw new Error(`${label}.password must be a string (an empty password is allowed)`);
+    throw new Error(
+      `${label}.password must be a string (an empty password is allowed)`,
+    );
   const rawPrepare = vm.prepare;
   if (
     rawPrepare !== undefined &&
@@ -374,7 +471,8 @@ function parseContainer(
   )
     throw new Error(`${label}.image must be a non-empty string`);
   const cpu = container.cpu === undefined ? undefined : Number(container.cpu);
-  const memoryMb = container.memory_mb === undefined ? undefined : Number(container.memory_mb);
+  const memoryMb =
+    container.memory_mb === undefined ? undefined : Number(container.memory_mb);
   if (cpu !== undefined && (!Number.isInteger(cpu) || cpu <= 0))
     throw new Error(`${label}.cpu must be a positive integer`);
   if (memoryMb !== undefined && (!Number.isInteger(memoryMb) || memoryMb <= 0))
@@ -418,7 +516,8 @@ function parseContainer(
 
 function parseHost(value: unknown, label: string): JobRuntime {
   const host = runtimeTable(value, label);
-  if (Object.keys(host).length > 0) throw new Error(`${label} must be an empty table`);
+  if (Object.keys(host).length > 0)
+    throw new Error(`${label} must be an empty table`);
   return { type: "host" };
 }
 
@@ -429,17 +528,28 @@ function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
     if (!item || typeof item !== "object" || Array.isArray(item))
       throw new Error(`${label}[${index}] must be a table`);
     const raw = item as Record<string, unknown>;
-    if (Object.keys(raw).some((key) => !["source", "target", "write_back"].includes(key)))
+    if (
+      Object.keys(raw).some(
+        (key) => !["source", "target", "write_back"].includes(key),
+      )
+    )
       throw new Error(`${label}[${index}] contains an unsupported field`);
-    if (typeof raw.source !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(raw.source))
-      throw new Error(`${label}[${index}].source must be an allowed mount name`);
+    if (
+      typeof raw.source !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(raw.source)
+    )
+      throw new Error(
+        `${label}[${index}].source must be an allowed mount name`,
+      );
     if (
       typeof raw.target !== "string" ||
       !raw.target.startsWith("/") ||
       raw.target.split("/").includes("..") ||
       raw.target.includes(":")
     )
-      throw new Error(`${label}[${index}].target must be an absolute container directory`);
+      throw new Error(
+        `${label}[${index}].target must be an absolute container directory`,
+      );
     const writeBack = raw.write_back ?? false;
     if (typeof writeBack !== "boolean")
       throw new Error(`${label}[${index}].write_back must be a boolean`);
@@ -457,18 +567,25 @@ function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
   return mounts;
 }
 
-export function parseConfig(source: string, label = CONFIG_FILE): InformantConfig {
+export function parseConfig(
+  source: string,
+  label = CONFIG_FILE,
+): InformantConfig {
   const raw = Bun.TOML.parse(source) as Record<string, unknown>;
   if (raw.version !== 1) {
     throw new Error(`${label} version must be 1`);
   }
   const vm = raw.vm === undefined ? fallbackVm : runtimeTable(raw.vm, "vm");
   const container =
-    raw.container === undefined ? undefined : runtimeTable(raw.container, "container");
+    raw.container === undefined
+      ? undefined
+      : runtimeTable(raw.container, "container");
   if (raw.vm !== undefined && container !== undefined)
     throw new Error("configure only one default runtime: vm or container");
   const parsedVm = parseVm(vm, "vm");
-  const defaultRuntime = container ? parseContainer(container, "container") : parsedVm;
+  const defaultRuntime = container
+    ? parseContainer(container, "container")
+    : parsedVm;
   const rawJobs = raw.jobs;
   if (raw.branches !== undefined && raw.triggers !== undefined)
     throw new Error("branches and triggers cannot both be set");
@@ -492,10 +609,14 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   const jobs: JobConfig[] = rawJobs.map((value, index) => {
     const job = value as Record<string, unknown>;
     if (typeof job.name !== "string" || typeof job.command !== "string") {
-      throw new Error(`jobs[${index}] must have string name and command fields`);
+      throw new Error(
+        `jobs[${index}] must have string name and command fields`,
+      );
     }
     if (job.name.trim().length === 0 || job.command.trim().length === 0) {
-      throw new Error(`jobs[${index}] name and command fields must be non-empty`);
+      throw new Error(
+        `jobs[${index}] name and command fields must be non-empty`,
+      );
     }
     const environment = {
       ...defaultEnvironment,
@@ -504,14 +625,21 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     const secrets = job.secrets ?? [];
     if (
       !Array.isArray(secrets) ||
-      secrets.some((name) => typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
+      secrets.some(
+        (name) =>
+          typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name),
+      )
     ) {
-      throw new Error(`jobs[${index}].secrets must contain shell variable names`);
+      throw new Error(
+        `jobs[${index}].secrets must contain shell variable names`,
+      );
     }
     if (new Set(secrets).size !== secrets.length) {
       throw new Error(`jobs[${index}].secrets must not contain duplicates`);
     }
-    const conflictingSecret = secrets.find((name) => Object.hasOwn(environment, name));
+    const conflictingSecret = secrets.find((name) =>
+      Object.hasOwn(environment, name),
+    );
     if (conflictingSecret) {
       throw new Error(
         `jobs[${index}].secrets contains ${conflictingSecret}, which is also set in environment`,
@@ -520,14 +648,18 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     const mounts = parseMounts(job.mounts, `jobs[${index}].mounts`);
     const timeoutMinutes = Number(job.timeout_minutes ?? defaultTimeoutMinutes);
     if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
-      throw new Error(`jobs[${index}].timeout_minutes must be a positive number`);
+      throw new Error(
+        `jobs[${index}].timeout_minutes must be a positive number`,
+      );
     }
     const optional = job.optional ?? false;
     if (typeof optional !== "boolean") {
       throw new Error(`jobs[${index}].optional must be a boolean`);
     }
     const cache =
-      job.cache === undefined ? defaultCache : parseCaches(job.cache, `jobs[${index}].cache`, true);
+      job.cache === undefined
+        ? defaultCache
+        : parseCaches(job.cache, `jobs[${index}].cache`, true);
     const configuredRuntimes = [job.vm, job.container, job.host].filter(
       (value) => value !== undefined,
     );
@@ -543,15 +675,31 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
               container,
             )
           : job.vm !== undefined
-            ? parseVm(runtimeTable(job.vm, `jobs[${index}].vm`), `jobs[${index}].vm`, vm)
+            ? parseVm(
+                runtimeTable(job.vm, `jobs[${index}].vm`),
+                `jobs[${index}].vm`,
+                vm,
+              )
             : defaultRuntime;
     if (runtime.type === "host" && (cache?.length ?? 0) > 0) {
       throw new Error(`jobs[${index}].cache is not supported for host jobs`);
     }
-    if ((mounts?.length ?? 0) > 0 && runtime.type !== "container") {
-      throw new Error(`jobs[${index}].mounts is supported only for container jobs`);
+    if (
+      cache?.some((entry) => entry.readOnly) &&
+      runtime.type !== "container"
+    ) {
+      throw new Error(
+        `jobs[${index}].cache read_only is supported only for container jobs`,
+      );
     }
-    const runsOn = job.runs_on ?? (runtime.type === "host" ? undefined : ["darwin", "arm64"]);
+    if ((mounts?.length ?? 0) > 0 && runtime.type !== "container") {
+      throw new Error(
+        `jobs[${index}].mounts is supported only for container jobs`,
+      );
+    }
+    const runsOn =
+      job.runs_on ??
+      (runtime.type === "host" ? undefined : ["darwin", "arm64"]);
     if (runtime.type === "host" && runsOn === undefined) {
       throw new Error(`jobs[${index}].runs_on is required for host jobs`);
     }
@@ -574,7 +722,11 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
           ? []
           : [String(job.needs)],
       runsOn: runsOn
-        ? [...new Set((runsOn as string[]).map((label) => label.trim().toLowerCase()))]
+        ? [
+            ...new Set(
+              (runsOn as string[]).map((label) => label.trim().toLowerCase()),
+            ),
+          ]
         : undefined,
       environment,
       secrets,
@@ -592,7 +744,8 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
     };
   });
   const jobNames = new Set(jobs.map((job) => job.name));
-  if (jobNames.size !== jobs.length) throw new Error("job names must be unique");
+  if (jobNames.size !== jobs.length)
+    throw new Error("job names must be unique");
   for (const job of jobs) {
     for (const dependency of job.needs) {
       if (!jobNames.has(dependency)) {
@@ -601,19 +754,24 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
       const required = jobs.find((candidate) => candidate.name === dependency);
       if (
         required &&
-        [...(job.runsOn ?? [])].sort().join("\0") !== [...(required.runsOn ?? [])].sort().join("\0")
+        [...(job.runsOn ?? [])].sort().join("\0") !==
+          [...(required.runsOn ?? [])].sort().join("\0")
       ) {
-        throw new Error(`job ${job.name} and dependency ${dependency} must use the same runs_on`);
+        throw new Error(
+          `job ${job.name} and dependency ${dependency} must use the same runs_on`,
+        );
       }
     }
   }
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const visit = (name: string) => {
-    if (visiting.has(name)) throw new Error(`job dependency cycle includes ${name}`);
+    if (visiting.has(name))
+      throw new Error(`job dependency cycle includes ${name}`);
     if (visited.has(name)) return;
     visiting.add(name);
-    for (const dependency of jobs.find((job) => job.name === name)?.needs ?? []) visit(dependency);
+    for (const dependency of jobs.find((job) => job.name === name)?.needs ?? [])
+      visit(dependency);
     visiting.delete(name);
     visited.add(name);
   };
@@ -632,7 +790,9 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
   };
 }
 
-export async function readConfig(path = findConfig()): Promise<InformantConfig> {
+export async function readConfig(
+  path = findConfig(),
+): Promise<InformantConfig> {
   const jobsDirectory = resolve(path, "..", "jobs");
   const entries = (await readdir(jobsDirectory).catch(() => []))
     .filter((entry) => entry.endsWith(".toml"))
