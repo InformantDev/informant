@@ -74,6 +74,13 @@ daemon, socket, systemd unit, or rootful service. Informant rejects rootful Podm
 advertise the `container` capability when the selected backend is missing or unhealthy. Run
 `informant setup` to install and verify it.
 
+Set `nestedNamespaces = true` on a container runtime only when the job creates its own isolation
+boundary with a tool such as Bubblewrap. On Linux, Informant then grants the container `SYS_ADMIN`
+and relaxes its seccomp profile so the nested user, mount, PID, and network namespaces can be
+created; `no-new-privileges` remains enabled. The option has no effect on Apple Container. Because
+these Podman permissions are broader than the defaults, keep model- or repository-controlled
+commands inside the nested sandbox rather than running them directly in the outer job container.
+
 Jobs run as UID 0 inside the container with the checkout mounted at `/workspace`. With rootless
 Podman, container root maps into the unprivileged worker user's namespace; Informant also adds
 `--security-opt no-new-privileges`. On SELinux hosts, Podman privately relabels the disposable job

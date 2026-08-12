@@ -406,6 +406,9 @@ function parseContainer(
       : undefined;
   if (normalizedPrepareInputs && rawPrepare === undefined)
     throw new Error(`${label}.prepareInputs requires prepare`);
+  const nestedNamespaces = container.nestedNamespaces ?? false;
+  if (typeof nestedNamespaces !== "boolean")
+    throw new Error(`${label}.nestedNamespaces must be a boolean`);
   return {
     type: "container",
     image,
@@ -413,6 +416,7 @@ function parseContainer(
     memoryMb,
     prepare: typeof rawPrepare === "string" ? rawPrepare.trim() : undefined,
     prepareInputs: normalizedPrepareInputs,
+    ...(nestedNamespaces ? { nestedNamespaces } : {}),
   };
 }
 

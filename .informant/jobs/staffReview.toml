@@ -32,16 +32,18 @@ unset GITHUB_TOKEN
 unset GH_TOKEN
 export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
+export INFORMANT_REVIEW_ROOT="$review_root"
 cd "$review_root"
 pi --print \
   --no-session \
   --approve \
   --no-extensions \
   --extension /opt/informant/staff-review-pi.ts \
+  --extension /root/.bun/install/global/node_modules/pi-subagents/index.ts \
   --no-prompt-templates \
   --no-context-files \
   --tools read,bash,grep,find,ls,staff_agent \
-  --append-system-prompt 'Use the staff_agent tool whenever the Staff Review skill asks you to spawn a find or verify sub-agent. Make one tool call per agent, issue independent calls together for parallel execution, pass the complete worker prompt as task, and use role=find or role=verify as appropriate. The tool waits for the child and returns its final output, so no separate stop call is needed. Never launch Pi through bash.' \
+  --append-system-prompt 'Use staff_agent whenever the Staff Review skill asks for a find or verify sub-agent. Make one tool call per agent, issue independent calls together for parallel execution, pass the complete worker prompt as task, and set role=find or role=verify. The trusted adapter delegates through pi-subagents, waits for completion, and returns validated JSON; do not launch Pi through bash or call subagent management commands.' \
   "/skill:staff-review $slug"
 
 export GH_TOKEN="$github_token"
@@ -49,25 +51,64 @@ staff review post
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["GITHUB_TOKEN"]
-environment = { PI_CODING_AGENT_DIR = "/mnt/informant-pi", PI_OFFLINE = "1" }
+environment = { PI_CODING_AGENT_DIR = "/mnt/informant-pi", PI_OFFLINE = "1", PI_SUBAGENT_EXTRA_AGENT_DIRS = "/opt/informant/staff-review-agents", PI_SUBAGENT_CAPABILITY_CEILING_V1 = "eyJ2ZXJzaW9uIjoxLCJhbGxvd2VkVG9vbHMiOlsiYmFzaCIsImZpbmQiLCJncmVwIiwibHMiLCJyZWFkIl0sImFsbG93ZWRBZ2VudHMiOlsic3RhZmYtcmV2aWV3LWZpbmQiLCJzdGFmZi1yZXZpZXctdmVyaWZ5Il0sImRlbnlFeHRlbnNpb25zIjpmYWxzZSwic291cmNlcyI6WyJJbmZvcm1hbnQgU3RhZmYgUmV2aWV3Il19" }
 mounts = [{ source = "pi-auth", target = "/mnt/informant-pi", write_back = true }]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
-container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
+container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, nestedNamespaces = true, prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends bubblewrap ca-certificates curl git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
-mkdir -p "$HOME/.bun/install/global" "$HOME/.bun/bin" /opt/informant
+mkdir -p \
+  "$HOME/.bun/install/global" \
+  "$HOME/.bun/bin" \
+  /opt/informant/staff-review-agents \
+  /opt/informant/staff-review-cwd
 BUN_INSTALL_BIN="$HOME/.bun/bin" bun add --global --ignore-scripts \
-  @earendil-works/pi-coding-agent@0.84.1
+  @earendil-works/pi-coding-agent@0.84.1 \
+  pi-subagents@0.47.0
 ln -sf "$HOME/.bun/bin/pi" /usr/local/bin/pi
 ln -sf "$(command -v bun)" /usr/local/bin/node
+ln -s "$HOME/.bun/install/global/node_modules" /opt/informant/node_modules
+cat > /opt/informant/staff-review-agents/staff-review-find.md <<'FIND_AGENT'
+---
+name: staff-review-find
+description: Find candidate issues for one assigned Staff Review slice
+tools: read, bash, grep, find, ls
+extensions: /opt/informant/staff-review-pi.ts
+systemPromptMode: replace
+inheritProjectContext: false
+inheritSkills: false
+defaultContext: fresh
+acceptance: { level: "none", reason: "Read-only Staff Review analysis" }
+---
+
+Follow the task exactly. Read the named Staff Review skill and return only its JSON result. Never modify files, post comments, commit, or delegate further.
+FIND_AGENT
+cat > /opt/informant/staff-review-agents/staff-review-verify.md <<'VERIFY_AGENT'
+---
+name: staff-review-verify
+description: Independently verify one batch of Staff Review findings
+tools: read, bash, grep, find, ls
+extensions: /opt/informant/staff-review-pi.ts
+systemPromptMode: replace
+inheritProjectContext: false
+inheritSkills: false
+defaultContext: fresh
+acceptance: { level: "none", reason: "Read-only Staff Review verification" }
+---
+
+Follow the task exactly. Read the named Staff Review skill and return only its JSON result. Never modify files, post comments, commit, or delegate further.
+VERIFY_AGENT
+chmod 0555 /opt/informant/staff-review-cwd
+chmod 0444 /opt/informant/staff-review-agents/*.md
 cat > /opt/informant/staff-review-pi.ts <<'PI_EXTENSION'
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { relative, resolve, sep } from "node:path";
+import { basename, relative, resolve, sep } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   DEFAULT_MAX_BYTES,
@@ -83,12 +124,17 @@ import {
   type LsOperations,
   type ReadOperations,
 } from "@earendil-works/pi-coding-agent";
+import {
+  SUBAGENT_DELEGATION_CANCEL_EVENT,
+  SUBAGENT_DELEGATION_REQUEST_EVENT,
+  SUBAGENT_DELEGATION_RESPONSE_EVENT,
+  type SubagentDelegationRequest,
+  type SubagentDelegationResponse,
+} from "pi-subagents/delegation";
 import { Type } from "typebox";
 
-const workspace = realpathSync(process.cwd());
+const workspace = realpathSync(process.env.INFORMANT_REVIEW_ROOT ?? process.cwd());
 const authRoot = realpathSync(process.env.PI_CODING_AGENT_DIR ?? "/mnt/informant-pi");
-const extensionPath = "/opt/informant/staff-review-pi.ts";
-const childOutputLimit = 1024 * 1024;
 const fileOutputLimit = 10 * 1024 * 1024;
 
 function isWithin(root: string, path: string): boolean {
@@ -266,7 +312,11 @@ const lsOperations: LsOperations = {
       ["-H", path, "-mindepth", "1", "-maxdepth", "1", "-print0"],
     );
     if (result.exitCode !== 0) throw sandboxError(`could not list ${path}`, result);
-    return result.stdout.toString().split(String.fromCharCode(0)).filter(Boolean);
+    return result.stdout
+      .toString()
+      .split(String.fromCharCode(0))
+      .filter(Boolean)
+      .map((entry) => basename(entry));
   },
 };
 
@@ -318,54 +368,78 @@ function sandboxedBashOperations(): BashOperations {
   };
 }
 
-function runChild(task: string, role: "find" | "verify", signal?: AbortSignal): Promise<string> {
-  const args = [
-    "--print",
-    "--no-session",
-    "--approve",
-    "--no-extensions",
-    "--extension",
-    extensionPath,
-    "--no-prompt-templates",
-    "--no-context-files",
-    "--tools",
-    "read,bash,grep,find,ls",
+function runChild(
+  pi: ExtensionAPI,
+  task: string,
+  role: "find" | "verify",
+  signal?: AbortSignal,
+): Promise<string> {
+  const request: SubagentDelegationRequest = {
+    requestId: randomUUID(),
+    ownerRunId: `informant-staff-review-${process.pid}`,
+    nodeId: randomUUID(),
+    agent: `staff-review-${role}`,
     task,
-  ];
+    context: "fresh",
+    cwd: "/opt/informant/staff-review-cwd",
+    artifacts: false,
+    result: { kind: "text" },
+  };
+
   return new Promise((done, reject) => {
-    const child = spawn("/usr/local/bin/pi", args, {
-      cwd: workspace,
-      detached: true,
-      env: { ...process.env, PI_STAFF_REVIEW_CHILD: role },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    const append = (current: string, chunk: Buffer) =>
-      (current + chunk.toString()).slice(-childOutputLimit);
-    const stop = () => {
-      if (!child.pid) return;
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    };
-    const abort = () => stop();
-    signal?.addEventListener("abort", abort, { once: true });
-    child.stdout.on("data", (chunk) => {
-      stdout = append(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr = append(stderr, chunk);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
+    let settled = false;
+    let unsubscribe: (() => void) | undefined;
+    const cleanup = () => {
+      unsubscribe?.();
       signal?.removeEventListener("abort", abort);
-      if (signal?.aborted) reject(new Error("sub-agent aborted"));
-      else if (code !== 0) reject(new Error(stderr.trim() || `sub-agent exited ${code}`));
-      else done(stdout.trim() || "[]");
+    };
+    const finish = (error?: Error, output?: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else done(output ?? "[]");
+    };
+    const abort = () => {
+      pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, {
+        requestId: request.requestId,
+        ownerRunId: request.ownerRunId,
+        nodeId: request.nodeId,
+      });
+      finish(new Error("sub-agent aborted"));
+    };
+    const subscription = pi.events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => {
+      const response = payload as SubagentDelegationResponse;
+      if (
+        response.requestId !== request.requestId ||
+        response.ownerRunId !== request.ownerRunId ||
+        response.nodeId !== request.nodeId
+      )
+        return;
+      if (response.status !== "completed") {
+        finish(new Error(response.error || `sub-agent ${response.status}`));
+        return;
+      }
+      if (response.result?.kind !== "text") {
+        finish(new Error("sub-agent returned no text result"));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(response.result.text);
+        if (!Array.isArray(parsed)) throw new Error("result is not an array");
+        finish(undefined, JSON.stringify(parsed));
+      } catch (error) {
+        finish(
+          new Error(
+            `sub-agent returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+      }
     });
+    if (typeof subscription === "function") unsubscribe = subscription;
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    else pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
   });
 }
 
@@ -398,7 +472,14 @@ export default function (pi: ExtensionAPI) {
       const searchPath = resolve(workspace, (params.path ?? ".").replace(/^@/, ""));
       const effectiveLimit = Math.max(1, params.limit ?? 100);
       const context = params.context && params.context > 0 ? params.context : 0;
-      const args = ["--json", "--line-number", "--color=never", "--hidden"];
+      const args = [
+        "--json",
+        "--line-number",
+        "--color=never",
+        "--hidden",
+        "--glob",
+        "!**/.git/**",
+      ];
       if (params.ignoreCase) args.push("--ignore-case");
       if (params.literal) args.push("--fixed-strings");
       if (params.glob) args.push("--glob", params.glob);
@@ -493,7 +574,6 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  if (process.env.PI_STAFF_REVIEW_CHILD) return;
   pi.registerTool({
     name: "staff_agent",
     label: "Staff Review sub-agent",
@@ -503,7 +583,7 @@ export default function (pi: ExtensionAPI) {
       task: Type.String(),
     }),
     async execute(_id, params, signal) {
-      const output = await runChild(params.task, params.role, signal);
+      const output = await runChild(pi, params.task, params.role, signal);
       return { content: [{ type: "text", text: output }], details: { role: params.role } };
     },
   });

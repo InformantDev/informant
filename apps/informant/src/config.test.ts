@@ -229,6 +229,14 @@ describe("configuration", () => {
       prepare: undefined,
       prepareInputs: undefined,
     });
+    const nested = source.replace(
+      'container = { image = "docker.io/oven/bun:1", cpu = 1 }',
+      'container = { image = "docker.io/oven/bun:1", cpu = 1, nestedNamespaces = true }',
+    );
+    expect(parseConfig(nested).jobs[0]?.runtime).toMatchObject({ nestedNamespaces: true });
+    expect(() =>
+      parseConfig(nested.replace("nestedNamespaces = true", 'nestedNamespaces = "yes"')),
+    ).toThrow("jobs[0].container.nestedNamespaces must be a boolean");
     expect(() =>
       parseConfig(
         source.replace(

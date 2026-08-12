@@ -16,6 +16,7 @@ export interface ContainerRunOptions {
   cpu?: number;
   memoryMb?: number;
   preparedWorkspace?: boolean;
+  nestedNamespaces?: boolean;
 }
 
 export interface ContainerBackend {
@@ -189,7 +190,11 @@ export const podmanContainerBackend: ContainerBackend = {
       workspace: "Z",
       mount: "z",
     });
-    args.push("--security-opt", "no-new-privileges", options.image, "-lc", options.command);
+    args.push("--security-opt", "no-new-privileges");
+    if (options.nestedNamespaces) {
+      args.push("--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined");
+    }
+    args.push(options.image, "-lc", options.command);
     return args;
   },
   buildArguments(image, cpu, memoryMb) {

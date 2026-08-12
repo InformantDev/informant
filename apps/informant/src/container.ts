@@ -811,6 +811,7 @@ export async function runInContainer(
           cpu: resources.cpu,
           memoryMb: resources.memoryMb,
           preparedWorkspace: usesPreparedWorkspace,
+          nestedNamespaces: runtime.nestedNamespaces,
         },
         backend,
       );
