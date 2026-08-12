@@ -397,18 +397,69 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, signal) {
       const searchPath = resolve(workspace, (params.path ?? ".").replace(/^@/, ""));
       const effectiveLimit = Math.max(1, params.limit ?? 100);
-      const args = ["--line-number", "--color=never", "--hidden"];
+      const context = params.context && params.context > 0 ? params.context : 0;
+      const args = ["--json", "--line-number", "--color=never", "--hidden"];
       if (params.ignoreCase) args.push("--ignore-case");
       if (params.literal) args.push("--fixed-strings");
       if (params.glob) args.push("--glob", params.glob);
-      if (params.context && params.context > 0) args.push("--context", String(params.context));
+      if (context) args.push("--context", String(context));
       args.push("--", params.pattern, searchPath);
       const result = await runSandboxed("/usr/bin/rg", args, workspace, signal);
       if (result.exitCode !== 0 && result.exitCode !== 1 && !result.outputLimitReached)
         throw sandboxError(`could not search ${searchPath}`, result);
-      const matches = result.stdout.toString().split("\\n");
-      const matchLimitReached = matches.length > effectiveLimit;
-      const rawOutput = matches.slice(0, effectiveLimit).join("\\n").trim();
+
+      interface RipgrepEvent {
+        type: string;
+        data?: {
+          path?: { text?: string };
+          lines?: { text?: string };
+          line_number?: number;
+        };
+      }
+      const events: RipgrepEvent[] = [];
+      for (const line of result.stdout.toString().split("\\n")) {
+        if (!line) continue;
+        try {
+          events.push(JSON.parse(line) as RipgrepEvent);
+        } catch {
+          // An output-limit kill can leave one partial JSON record at the end.
+        }
+      }
+
+      let matchCount = 0;
+      const selectedMatches = new Map<string, Set<number>>();
+      for (const event of events) {
+        const file = event.data?.path?.text;
+        const line = event.data?.line_number;
+        if (event.type !== "match" || !file || typeof line !== "number") continue;
+        matchCount += 1;
+        if (matchCount > effectiveLimit) continue;
+        const fileMatches = selectedMatches.get(file) ?? new Set<number>();
+        fileMatches.add(line);
+        selectedMatches.set(file, fileMatches);
+      }
+
+      const matchLimitReached = matchCount > effectiveLimit;
+      const outputLines: string[] = [];
+      let previous: { file: string; line: number } | undefined;
+      for (const event of events) {
+        if (event.type !== "match" && event.type !== "context") continue;
+        const file = event.data?.path?.text;
+        const line = event.data?.line_number;
+        if (!file || typeof line !== "number") continue;
+        const fileMatches = selectedMatches.get(file);
+        if (!fileMatches) continue;
+        const selectedMatch = event.type === "match" && fileMatches.has(line);
+        const selectedContext =
+          context > 0 && [...fileMatches].some((matchLine) => Math.abs(matchLine - line) <= context);
+        if (!selectedMatch && !selectedContext) continue;
+        if (previous && (previous.file !== file || previous.line + 1 < line)) outputLines.push("--");
+        const separator = selectedMatch ? ":" : "-";
+        const text = (event.data?.lines?.text ?? "").replace(/\\r?\\n$/, "");
+        outputLines.push(`${file}${separator}${line}${separator}${text}`);
+        previous = { file, line };
+      }
+      const rawOutput = outputLines.join("\\n").trim();
       if (!rawOutput)
         return { content: [{ type: "text", text: "No matches found" }], details: undefined };
       const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
