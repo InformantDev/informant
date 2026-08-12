@@ -1,5 +1,5 @@
 name = "Staff Review"
-# Workers advertise this label only after allowing the codex-auth mount.
+# Workers advertise this label only after allowing the pi-auth mount.
 runs_on = ["container", "staff-review"]
 optional = true
 command = """
@@ -33,24 +33,22 @@ unset GH_TOKEN
 export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
 cd "$review_root"
-printf '$staff-review %s\n' "$slug" | codex exec \
-  --ephemeral \
-  --sandbox workspace-write \
-  --ignore-user-config \
-  --ignore-rules \
-  -c 'web_search="disabled"' \
-  -c sandbox_workspace_write.network_access=false \
-  -c shell_environment_policy.ignore_default_excludes=false \
-  -c "projects.\"$review_root\".trust_level=\"untrusted\"" \
-  -
+pi --print \
+  --no-session \
+  --approve \
+  --no-extensions \
+  --no-prompt-templates \
+  --no-context-files \
+  --append-system-prompt 'When a Staff Review skill asks you to spawn or stop sub-agents, use the bash tool to launch and manage independent nested `pi --print --no-session --approve --no-extensions --no-prompt-templates --no-context-files` processes in this same working directory. Run requested parallel agents concurrently, collect each process output, and treat it as that sub-agent result.' \
+  "/skill:staff-review $slug"
 
 export GH_TOKEN="$github_token"
 staff review post
 """
 triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["GITHUB_TOKEN"]
-environment = { CODEX_HOME = "/mnt/informant-codex" }
-mounts = [{ source = "codex-auth", target = "/mnt/informant-codex", write_back = true }]
+environment = { PI_CODING_AGENT_DIR = "/mnt/informant-pi", PI_OFFLINE = "1" }
+mounts = [{ source = "pi-auth", target = "/mnt/informant-pi", write_back = true }]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
 container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepare = """
 set -eu
@@ -60,8 +58,8 @@ apt-get install -y --no-install-recommends ca-certificates curl git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
 mkdir -p "$HOME/.bun/install/global"
-bun add --global @openai/codex@0.147.0-linux-arm64
-ln -sf "$HOME/.bun/install/global/node_modules/@openai/codex/vendor/aarch64-unknown-linux-musl/bin/codex" /usr/local/bin/codex
+bun add --global --ignore-scripts @earendil-works/pi-coding-agent@0.84.1
+ln -sf "$(command -v bun)" /usr/local/bin/node
 curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.10.3/staff-linux-arm64 \
   -o /usr/local/bin/staff
 chmod +x /usr/local/bin/staff
