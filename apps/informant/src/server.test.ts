@@ -8,9 +8,13 @@ import {
   serve,
   serveRepositories,
 } from "./server.ts";
-import type { BuildRecord, InformantConfig, PullRequest, Repository } from "./types.ts";
+import type { BuildRecord, InformantConfig, JobConfig, PullRequest, Repository } from "./types.ts";
 
-const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+const repository: Repository = {
+  owner: "owner",
+  repo: "repo",
+  fullName: "owner/repo",
+};
 const pullRequest: PullRequest = {
   number: 7,
   state: "open",
@@ -23,7 +27,13 @@ const config: InformantConfig = {
   version: 1,
   pollIntervalSeconds: 0,
   triggers: [{ event: "commit" }, { event: "comment" }],
-  vm: { type: "vm", image: "image", guestOs: "macos", user: "user", password: "password" },
+  vm: {
+    type: "vm",
+    image: "image",
+    guestOs: "macos",
+    user: "user",
+    password: "password",
+  },
   jobs: [
     {
       name: "test",
@@ -102,7 +112,11 @@ test("continues serving host jobs when container backend initialization fails", 
 
 test("refreshes repository registrations without restarting the worker", async () => {
   const outer = new AbortController();
-  const added: Repository = { owner: "owner", repo: "added", fullName: "owner/added" };
+  const added: Repository = {
+    owner: "owner",
+    repo: "added",
+    fullName: "owner/added",
+  };
   const started: string[] = [];
   const stopped: string[] = [];
   let refreshes = 0;
@@ -196,7 +210,9 @@ function dependencies(
       state.seenCommentIds = [...next.seenCommentIds];
       state.tagRefs = next.tagRefs ? [...next.tagRefs] : undefined;
       state.pendingTags = [...next.pendingTags];
-      state.missingConfigs = (next.missingConfigs ?? []).map((entry) => ({ ...entry }));
+      state.missingConfigs = (next.missingConfigs ?? []).map((entry) => ({
+        ...entry,
+      }));
     },
     recoverInterruptedBuilds: async () => false,
     reconcilePreparedImageReferences: async () => 0,
@@ -470,7 +486,11 @@ describe("serve polling orchestration", () => {
   });
 
   test("job filters prevent nonmatching automatic events from being claimed", async () => {
-    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+    };
     const launched: string[] = [];
     const deps = dependencies(
       github({
@@ -499,7 +519,11 @@ describe("serve polling orchestration", () => {
   });
 
   test("offers open pull requests before branch work", async () => {
-    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+    };
     const launched: string[] = [];
     const deps = dependencies(
       github({
@@ -519,7 +543,11 @@ describe("serve polling orchestration", () => {
   });
 
   test("reconciles only configured caches and prepared runtime jobs", async () => {
-    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+    };
     const deps = dependencies(github({}), state, async () => undefined);
     const baseJob = config.jobs[0];
     if (!baseJob) throw new Error("expected a job");
@@ -531,7 +559,11 @@ describe("serve polling orchestration", () => {
         {
           ...baseJob,
           name: "container",
-          runtime: { type: "container", image: "base", prepare: "install container tools" },
+          runtime: {
+            type: "container",
+            image: "base",
+            prepare: "install container tools",
+          },
         },
         {
           ...baseJob,
@@ -569,7 +601,11 @@ describe("serve polling orchestration", () => {
   });
 
   test("baselines existing tags on the first poll without launching them", async () => {
-    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+    };
     let launches = 0;
     const deps = dependencies(
       github({ tags: async () => [{ name: "v1", sha: "old" }] }),
@@ -644,7 +680,12 @@ describe("serve polling orchestration", () => {
   });
 
   test("launches new matching tags with tag context and durable acknowledgement", async () => {
-    const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [], tagRefs: [] };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [],
+    };
     let branch = "";
     let event: unknown;
     const deps = dependencies(
@@ -666,6 +707,104 @@ describe("serve polling orchestration", () => {
       id: "tag:v2/release:new-sha",
     });
     expect(state.pendingTags).toEqual([]);
+  });
+
+  test("retains durable tag history when refs leave and later reenter the listing", async () => {
+    const historical = { name: "v1", sha: "old-sha" };
+    const current = { name: "v2", sha: "new-sha" };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [historical],
+    };
+    let polls = 0;
+    const events: string[] = [];
+    const deps = dependencies(
+      github({
+        tags: async () => {
+          polls++;
+          return polls === 1 ? [current] : [historical, current];
+        },
+      }),
+      state,
+      async (_github, _repository, _sha, _branch, _config, _deps, event) => {
+        events.push(event?.id ?? "");
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, dependencies: deps });
+    state.tagsPolledAt = undefined;
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(events).toEqual(["tag:v2:new-sha"]);
+    expect(state.tagRefs).toEqual([historical, current]);
+    expect(state.pendingTags).toEqual([]);
+  });
+
+  test("retains prior identities when a tag moves and does not replay a move back", async () => {
+    const old = { name: "v1", sha: "old-sha" };
+    const moved = { name: "v1", sha: "new-sha" };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [old],
+    };
+    let polls = 0;
+    const events: string[] = [];
+    const deps = dependencies(
+      github({
+        tags: async () => {
+          polls++;
+          return polls === 1 ? [moved] : [old];
+        },
+      }),
+      state,
+      async (_github, _repository, _sha, _branch, _config, _deps, event) => {
+        events.push(event?.id ?? "");
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, dependencies: deps });
+    expect(state.tagRefs).toEqual([old, moved]);
+    state.tagsPolledAt = undefined;
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(events).toEqual(["tag:v1:new-sha"]);
+    expect(state.tagRefs).toEqual([moved, old]);
+    expect(state.pendingTags).toEqual([]);
+  });
+
+  test("bounds deleted tag acknowledgement history while retaining current refs", async () => {
+    const deleted = Array.from({ length: 2_100 }, (_, index) => ({
+      name: `deleted-${index}`,
+      sha: `sha-${index}`,
+    }));
+    const current = { name: "v-current", sha: "current-sha" };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [...deleted, current],
+    };
+    const deps = dependencies(
+      github({ tags: async () => [current] }),
+      state,
+      async () => undefined,
+    );
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(state.tagRefs).toHaveLength(2_049);
+    expect(state.tagRefs).not.toContainEqual(deleted[0]);
+    expect(state.tagRefs).toContainEqual(deleted.at(-1));
+    expect(state.tagRefs).toContainEqual(current);
   });
 
   test("acknowledges nonmatching tags and retains false or rejected matching tags", async () => {
@@ -708,7 +847,10 @@ describe("serve polling orchestration", () => {
     let launches = 0;
     const deps = dependencies(github({ manual: async () => true }), state, async () => {
       launches++;
-      return { event: { type: "manual_trigger", id: "manual" }, status: "success" } as BuildRecord;
+      return {
+        event: { type: "manual_trigger", id: "manual" },
+        status: "success",
+      } as BuildRecord;
     });
 
     await serve(repository, { once: true, dependencies: deps });
@@ -769,7 +911,11 @@ describe("serve polling orchestration", () => {
   test("pins secret-bearing jobs and VM configuration to the default branch", () => {
     const configuredJob = config.jobs[0];
     if (!configuredJob) throw new Error("expected a configured job");
-    const setupJob = { ...configuredJob, name: "setup", command: "trusted setup" };
+    const setupJob = {
+      ...configuredJob,
+      name: "setup",
+      command: "trusted setup",
+    };
     const trustedJob = {
       ...configuredJob,
       name: "review",
@@ -863,25 +1009,107 @@ describe("serve polling orchestration", () => {
     expect(result.trustedSha).toBe("trusted-sha");
   });
 
+  test("pins build-scoped cache channels and omits unauthorized sibling consumers", () => {
+    const configuredJob = config.jobs[0];
+    if (!configuredJob) throw new Error("expected a configured job");
+    const channel: NonNullable<JobConfig["cache"]>[number] = {
+      paths: ["~/.cache/release"],
+      keyFiles: [],
+      shared: true,
+      buildScoped: true,
+      protectedChannel: true,
+    };
+    const producer = {
+      ...configuredJob,
+      name: "release-build",
+      cache: [channel],
+    };
+    const publisher = {
+      ...configuredJob,
+      name: "release",
+      secrets: ["GITHUB_TOKEN"],
+      needs: ["release-build"],
+      cache: [{ ...channel, readOnly: true }],
+    };
+    const attacker = {
+      ...configuredJob,
+      name: "steal-artifacts",
+      cache: producer.cache,
+    };
+    const result = applySecretPolicy(
+      { ...config, jobs: [producer, publisher, attacker] },
+      { ...config, jobs: [producer, publisher] },
+      "trusted-sha",
+    );
+    expect(result.jobs).toEqual([producer, publisher]);
+  });
+
+  test("does not pin ordinary build-scoped caches", () => {
+    const configuredJob = config.jobs[0];
+    if (!configuredJob) throw new Error("expected a configured job");
+    const trustedJob = {
+      ...configuredJob,
+      command: "trusted command",
+      cache: [
+        {
+          paths: ["~/.cache/build"],
+          keyFiles: [],
+          shared: true,
+          buildScoped: true,
+        },
+      ],
+    };
+    const untrustedJob = { ...trustedJob, command: "commit-local command" };
+    expect(
+      applySecretPolicy(
+        { ...config, jobs: [untrustedJob] },
+        { ...config, jobs: [trustedJob] },
+        "trusted-sha",
+      ).jobs,
+    ).toEqual([untrustedJob]);
+  });
+
   test("pins or omits unauthorized secret jobs without blocking independent jobs", () => {
     const configuredJob = config.jobs[0];
     if (!configuredJob) throw new Error("expected a configured job");
-    const trustedCoverage = { ...configuredJob, name: "coverage", command: "trusted coverage" };
-    const lint = { ...configuredJob, name: "lint", command: "lint pull request" };
+    const trustedCoverage = {
+      ...configuredJob,
+      name: "coverage",
+      command: "trusted coverage",
+    };
+    const lint = {
+      ...configuredJob,
+      name: "lint",
+      command: "lint pull request",
+    };
     const publish = {
       ...configuredJob,
       name: "publish",
       command: "publish",
       secrets: ["GITHUB_TOKEN"],
     };
-    const report = { ...configuredJob, name: "report", command: "report", needs: ["publish"] };
-    const summary = { ...configuredJob, name: "summary", command: "summary", needs: ["report"] };
+    const report = {
+      ...configuredJob,
+      name: "report",
+      command: "report",
+      needs: ["publish"],
+    };
+    const summary = {
+      ...configuredJob,
+      name: "summary",
+      command: "summary",
+      needs: ["report"],
+    };
     const result = applySecretPolicy(
       {
         ...config,
         jobs: [
           lint,
-          { ...trustedCoverage, command: "post coverage", secrets: ["GITHUB_TOKEN"] },
+          {
+            ...trustedCoverage,
+            command: "post coverage",
+            secrets: ["GITHUB_TOKEN"],
+          },
           publish,
           report,
           summary,
@@ -909,7 +1137,12 @@ describe("serve polling orchestration", () => {
       signal: outer.signal,
       dependencies: dependencies(
         client,
-        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           signals.push(signal as AbortSignal);
           return signals.length === 1 ? first.promise : second.promise;
@@ -946,7 +1179,12 @@ describe("serve polling orchestration", () => {
       signal: outer.signal,
       dependencies: dependencies(
         client,
-        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
           return run.promise;
@@ -977,7 +1215,12 @@ describe("serve polling orchestration", () => {
       signal: outer.signal,
       dependencies: dependencies(
         client,
-        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
           return run.promise;
@@ -999,13 +1242,20 @@ describe("serve polling orchestration", () => {
     const outer = new AbortController();
     const run = deferred<BuildRecord | false | undefined>();
     let receivedSignal: AbortSignal | undefined;
-    const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
+    const client = github({
+      branches: async () => [{ name: "main", sha: "sha" }],
+    });
 
     await serve(repository, {
       signal: outer.signal,
       dependencies: dependencies(
         client,
-        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
         async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
           receivedSignal = signal;
           return run.promise;
@@ -1025,18 +1275,25 @@ describe("serve polling orchestration", () => {
   test("cancels automatic runs that exceed the graceful shutdown deadline", async () => {
     const outer = new AbortController();
     let receivedSignal: AbortSignal | undefined;
-    const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
+    const client = github({
+      branches: async () => [{ name: "main", sha: "sha" }],
+    });
 
     await serve(repository, {
       signal: outer.signal,
       shutdownTimeoutMs: 0,
       dependencies: dependencies(
         client,
-        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
-        async (_github, _repository, _sha, _branch, _config, _deps, _event, signal) => {
-          receivedSignal = signal;
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
+        async (...args) => {
+          receivedSignal = args[9];
           return new Promise((resolve) =>
-            signal?.addEventListener("abort", () => resolve(undefined), { once: true }),
+            receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
           );
         },
         async () => outer.abort(),
@@ -1060,7 +1317,12 @@ describe("serve polling orchestration", () => {
       signal: outer.signal,
       dependencies: dependencies(
         github({ branches: async () => [{ name: "main", sha: "sha" }] }),
-        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
         async (
           _github,
           _repository,
@@ -1100,7 +1362,9 @@ describe("serve polling orchestration", () => {
     const releaseComments = deferred<void>();
     const admissionAborted = deferred<void>();
     let receivedAdmissionSignal: AbortSignal | undefined;
-    const client = github({ branches: async () => [{ name: "main", sha: "sha" }] });
+    const client = github({
+      branches: async () => [{ name: "main", sha: "sha" }],
+    });
     client.pullRequestComments = async () => {
       commentsStarted.resolve();
       await releaseComments.promise;
@@ -1156,7 +1420,12 @@ describe("serve polling orchestration", () => {
       signal: outer.signal,
       dependencies: dependencies(
         github({ branches: async () => [{ name: "main", sha: "sha" }] }),
-        { cursor: "2026-01-01T00:00:00.000Z", pending: [], seenCommentIds: [], pendingTags: [] },
+        {
+          cursor: "2026-01-01T00:00:00.000Z",
+          pending: [],
+          seenCommentIds: [],
+          pendingTags: [],
+        },
         async (
           _github,
           _repository,
@@ -1173,7 +1442,10 @@ describe("serve polling orchestration", () => {
           enteredRun.resolve();
           return new Promise((resolve) => {
             if (admissionSignal?.aborted) resolve(false);
-            else admissionSignal?.addEventListener("abort", () => resolve(false), { once: true });
+            else
+              admissionSignal?.addEventListener("abort", () => resolve(false), {
+                once: true,
+              });
           });
         },
       ),
@@ -1230,7 +1502,10 @@ describe("serve polling orchestration", () => {
       return pending.promise;
     };
 
-    const running = serve(repository, { signal: outer.signal, dependencies: deps });
+    const running = serve(repository, {
+      signal: outer.signal,
+      dependencies: deps,
+    });
     await loading.promise;
     outer.abort();
     pending.resolve(config);
@@ -1269,7 +1544,10 @@ describe("serve polling orchestration", () => {
       return pendingConfig.promise;
     };
 
-    const running = serve(repository, { signal: outer.signal, dependencies: deps });
+    const running = serve(repository, {
+      signal: outer.signal,
+      dependencies: deps,
+    });
     await loading.promise;
     outer.abort();
     pendingConfig.resolve(config);
@@ -1281,7 +1559,14 @@ describe("serve polling orchestration", () => {
   test("does not cancel comment runs during normal draining", async () => {
     const state: PollState = {
       cursor: "2026-01-01T00:00:00.000Z",
-      pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
+      pending: [
+        {
+          id: 42,
+          sha: pullRequest.headSha,
+          createdAt: "2026-01-01",
+          pullRequest,
+        },
+      ],
       seenCommentIds: [42],
       pendingTags: [],
     };
@@ -1302,7 +1587,14 @@ describe("serve polling orchestration", () => {
     const outer = new AbortController();
     const state: PollState = {
       cursor: "2026-01-01T00:00:00.000Z",
-      pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
+      pending: [
+        {
+          id: 42,
+          sha: pullRequest.headSha,
+          createdAt: "2026-01-01",
+          pullRequest,
+        },
+      ],
       seenCommentIds: [42],
       pendingTags: [],
     };
@@ -1315,7 +1607,7 @@ describe("serve polling orchestration", () => {
         github({}),
         state,
         async (...args) => {
-          receivedSignal = args[7];
+          receivedSignal = args[9];
           return new Promise((resolve) =>
             receivedSignal?.addEventListener("abort", () => resolve(undefined), { once: true }),
           );
@@ -1335,7 +1627,14 @@ describe("serve polling orchestration", () => {
     ] as const) {
       const state: PollState = {
         cursor: "2026-01-01T00:00:00.000Z",
-        pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
+        pending: [
+          {
+            id: 42,
+            sha: pullRequest.headSha,
+            createdAt: "2026-01-01",
+            pullRequest,
+          },
+        ],
         seenCommentIds: [42],
         pendingTags: [],
       };
@@ -1352,7 +1651,14 @@ describe("serve polling orchestration", () => {
     const run = deferred<BuildRecord | false | undefined>();
     const state: PollState = {
       cursor: "2026-01-01T00:00:00.000Z",
-      pending: [{ id: 42, sha: pullRequest.headSha, createdAt: "2026-01-01", pullRequest }],
+      pending: [
+        {
+          id: 42,
+          sha: pullRequest.headSha,
+          createdAt: "2026-01-01",
+          pullRequest,
+        },
+      ],
       seenCommentIds: [42],
       pendingTags: [],
     };

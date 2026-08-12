@@ -50,6 +50,9 @@ export interface JobConfig {
     paths: string[];
     keyFiles: string[];
     shared: boolean;
+    buildScoped?: boolean;
+    protectedChannel?: boolean;
+    readOnly?: boolean;
   }>;
 }
 
@@ -132,5 +135,8 @@ export interface BuildRecord {
   checkId?: number;
   checkUrl?: string;
   checksCompletedAt?: string;
-  event?: { type: TriggerEvent | "manual" | "manual_trigger" | "manual_run"; id: string };
+  event?: {
+    type: TriggerEvent | "manual" | "manual_trigger" | "manual_run";
+    id: string;
+  };
 }

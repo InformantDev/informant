@@ -11,7 +11,12 @@ afterEach(async () => {
 });
 
 async function fixture(
-  options: { architecture?: string; runnable?: boolean; validChecksum?: boolean } = {},
+  options: {
+    architecture?: string;
+    runnable?: boolean;
+    validChecksum?: boolean;
+    version?: string;
+  } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "informant-installer-test-"));
   roots.push(root);
@@ -23,7 +28,9 @@ async function fixture(
   const target = ["aarch64", "arm64"].includes(options.architecture ?? "") ? "arm64" : "x64";
   const asset = `informant-linux-${target}`;
   const binary =
-    options.runnable === false ? "#!/bin/sh\nexit 1\n" : "#!/bin/sh\nprintf '9.9.9\\n'\n";
+    options.runnable === false
+      ? "#!/bin/sh\nexit 1\n"
+      : `#!/bin/sh\nprintf '${options.version ?? "9.9.9"}\\n'\n`;
   await writeFile(join(release, asset), binary);
   await chmod(join(release, asset), 0o755);
   const digest = new Bun.CryptoHasher("sha256").update(binary).digest("hex");
@@ -105,6 +112,28 @@ describe("Linux installer", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr.toString()).toContain("the downloaded binary could not run");
     expect(await readFile(installed, "utf8")).toBe("existing installation");
+  });
+
+  test("does not install a binary that differs from the explicitly requested version", async () => {
+    const paths = await fixture({ version: "9.9.9" });
+    const installed = join(paths.install, "informant");
+    await writeFile(installed, "existing installation");
+
+    const result = await runInstaller(paths, { INFORMANT_VERSION: "v0.1.2" });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain(
+      "the downloaded binary reports version 9.9.9 instead of 0.1.2",
+    );
+    expect(await readFile(installed, "utf8")).toBe("existing installation");
+  });
+
+  test("normalizes the v prefix when verifying an explicitly requested version", async () => {
+    const paths = await fixture({ version: "0.1.2" });
+    const result = await runInstaller(paths, { INFORMANT_VERSION: "v0.1.2" });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain("Installed Informant 0.1.2");
   });
 
   test("restarts an active systemd user service after installing", async () => {

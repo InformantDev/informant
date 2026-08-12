@@ -50,7 +50,14 @@ describe("configuration", () => {
         secrets: [],
         needs: [],
         runsOn: ["container"],
-        triggers: [{ event: "commit", branch: undefined, tag: undefined, pullRequest: undefined }],
+        triggers: [
+          {
+            event: "commit",
+            branch: undefined,
+            tag: undefined,
+            pullRequest: undefined,
+          },
+        ],
         filters: [{ branch: { names: ["main"] } }],
         cache: [{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true }],
         runtime: {
@@ -478,9 +485,22 @@ describe("configuration", () => {
     expect(parseConfig(configured).jobs[0]?.mounts).toEqual([
       { source: "codex-auth", target: "/mnt/codex", writeBack: true },
     ]);
+    const equivalentTargets = configured.replace(
+      'mounts = [{ source = "codex-auth", target = "/mnt/codex", write_back = true }]',
+      'mounts = [{ source = "codex-auth", target = "/mnt/auth" }, { source = "other", target = "/mnt/./auth/" }]',
+    );
+    expect(() => parseConfig(equivalentTargets)).toThrow("must not contain duplicate targets");
+    expect(
+      parseConfig(configured.replace('target = "/mnt/codex"', 'target = "/mnt//codex/"')).jobs[0]
+        ?.mounts,
+    ).toEqual([{ source: "codex-auth", target: "/mnt/codex", writeBack: true }]);
     expect(() =>
       parseConfig(configured.replace('source = "codex-auth"', 'source = "bad/name"')),
     ).toThrow("source must be an allowed mount name");
+    expect(
+      parseConfig(configured.replace('source = "codex-auth"', 'source = "Codex-Auth"')).jobs[0]
+        ?.mounts,
+    ).toEqual([{ source: "Codex-Auth", target: "/mnt/codex", writeBack: true }]);
     expect(() =>
       parseConfig(configured.replace('target = "/mnt/codex"', 'target = "relative"')),
     ).toThrow("target must be an absolute container directory");
@@ -552,7 +572,11 @@ filters = []
         keyFiles: ["bun.lock"],
         shared: false,
       },
-      { paths: ["~/.cache/toolchain"], keyFiles: ["toolchain.toml"], shared: false },
+      {
+        paths: ["~/.cache/toolchain"],
+        keyFiles: ["toolchain.toml"],
+        shared: false,
+      },
     ]);
     expect(() => parseConfig(configTemplate().replace('"~/.bun/install/cache"', '"/tmp"'))).toThrow(
       "paths must contain paths starting with ~/",
@@ -574,11 +598,44 @@ filters = []
     expect(() => parseConfig(configTemplate().replace("shared = true", 'shared = "yes"'))).toThrow(
       "shared must be a boolean",
     );
+    expect(
+      parseConfig(
+        configTemplate().replace(
+          "shared = true",
+          "shared = true, build_scoped = true, protected_channel = true, read_only = true",
+        ),
+      ).jobs[0]?.cache,
+    ).toEqual([
+      {
+        paths: ["~/.bun/install/cache"],
+        keyFiles: [],
+        shared: true,
+        buildScoped: true,
+        protectedChannel: true,
+        readOnly: true,
+      },
+    ]);
     expect(() =>
       parseConfig(
         configTemplate().replace("shared = true", 'shared = true, key_files = ["bun.lock"]'),
       ),
     ).toThrow("cannot combine shared and key_files");
+    expect(() =>
+      parseConfig(configTemplate().replace("shared = true", "build_scoped = true")),
+    ).toThrow("build_scoped requires shared = true");
+    expect(() =>
+      parseConfig(
+        configTemplate().replace("shared = true", "shared = true, protected_channel = true"),
+      ),
+    ).toThrow("protected_channel requires build_scoped = true");
+    expect(() =>
+      parseConfig(
+        configTemplate().replace(
+          "shared = true",
+          "shared = true, build_scoped = true, read_only = true",
+        ),
+      ),
+    ).toThrow("read_only requires protected_channel = true");
     expect(() =>
       parseConfig(
         configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 30\ncache = []"),

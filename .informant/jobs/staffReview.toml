@@ -1,6 +1,6 @@
 name = "Staff Review"
-# Workers advertise this label only after allowing the pi-auth mount.
-runs_on = ["container", "staff-review"]
+# Allowed mounts automatically advertise a namespaced worker capability.
+runs_on = ["container", "arm64", "mount:pi-auth"]
 optional = true
 command = """
 set -eu

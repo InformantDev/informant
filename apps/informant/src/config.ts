@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { resolve } from "node:path";
+import { posix, resolve } from "node:path";
 import type { InformantConfig, JobConfig, JobRuntime, Repository, TriggerRule } from "./types.ts";
 
 export const CONFIG_DIRECTORY = ".informant";
@@ -44,7 +44,10 @@ export function selectJobs(config: InformantConfig, requested: string[]): Inform
     for (const dependency of job.needs) include(dependency);
   };
   for (const name of requested) include(name);
-  return { ...config, jobs: config.jobs.filter((job) => selected.has(job.name)) };
+  return {
+    ...config,
+    jobs: config.jobs.filter((job) => selected.has(job.name)),
+  };
 }
 
 function filtersMatch(job: JobConfig, branch: string | undefined): boolean {
@@ -104,7 +107,9 @@ function parseFilters(value: unknown, label: string): JobConfig["filters"] {
     const raw = item as Record<string, unknown>;
     if (Object.keys(raw).length !== 1 || raw.branch === undefined)
       throw new Error(`${label}[${index}] must contain only branch`);
-    return { branch: parseBranchFilter(raw.branch, `${label}[${index}].branch`) };
+    return {
+      branch: parseBranchFilter(raw.branch, `${label}[${index}].branch`),
+    };
   });
 }
 
@@ -293,10 +298,38 @@ function parseCaches(value: unknown, label: string, allowEmpty = false): JobConf
     if (typeof shared !== "boolean") {
       throw new Error(`${label}[${cacheIndex}].shared must be a boolean`);
     }
+    const buildScoped = entry.build_scoped ?? false;
+    if (typeof buildScoped !== "boolean") {
+      throw new Error(`${label}[${cacheIndex}].build_scoped must be a boolean`);
+    }
+    const protectedChannel = entry.protected_channel ?? false;
+    if (typeof protectedChannel !== "boolean") {
+      throw new Error(`${label}[${cacheIndex}].protected_channel must be a boolean`);
+    }
+    const readOnly = entry.read_only ?? false;
+    if (typeof readOnly !== "boolean") {
+      throw new Error(`${label}[${cacheIndex}].read_only must be a boolean`);
+    }
     if (shared && keyFiles.length > 0) {
       throw new Error(`${label}[${cacheIndex}] cannot combine shared and key_files`);
     }
-    return { paths, keyFiles, shared };
+    if (buildScoped && !shared) {
+      throw new Error(`${label}[${cacheIndex}].build_scoped requires shared = true`);
+    }
+    if (protectedChannel && !buildScoped) {
+      throw new Error(`${label}[${cacheIndex}].protected_channel requires build_scoped = true`);
+    }
+    if (readOnly && !protectedChannel) {
+      throw new Error(`${label}[${cacheIndex}].read_only requires protected_channel = true`);
+    }
+    return {
+      paths,
+      keyFiles,
+      shared,
+      ...(buildScoped ? { buildScoped: true } : {}),
+      ...(protectedChannel ? { protectedChannel: true } : {}),
+      ...(readOnly ? { readOnly: true } : {}),
+    };
   });
 }
 
@@ -449,7 +482,12 @@ function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
     const writeBack = raw.write_back ?? false;
     if (typeof writeBack !== "boolean")
       throw new Error(`${label}[${index}].write_back must be a boolean`);
-    return { source: raw.source, target: raw.target, writeBack };
+    const target = posix.normalize(raw.target);
+    return {
+      source: raw.source,
+      target: target === "/" ? target : target.replace(/\/$/, ""),
+      writeBack,
+    };
   });
   if (new Set(mounts.map((mount) => mount.source)).size !== mounts.length)
     throw new Error(`${label} must not contain duplicate sources`);
@@ -548,6 +586,9 @@ export function parseConfig(source: string, label = CONFIG_FILE): InformantConfi
             : defaultRuntime;
     if (runtime.type === "host" && (cache?.length ?? 0) > 0) {
       throw new Error(`jobs[${index}].cache is not supported for host jobs`);
+    }
+    if (cache?.some((entry) => entry.readOnly) && runtime.type !== "container") {
+      throw new Error(`jobs[${index}].cache read_only is supported only for container jobs`);
     }
     if ((mounts?.length ?? 0) > 0 && runtime.type !== "container") {
       throw new Error(`jobs[${index}].mounts is supported only for container jobs`);
