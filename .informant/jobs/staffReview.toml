@@ -70,10 +70,18 @@ import { realpathSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
+  DEFAULT_MAX_BYTES,
   createBashTool,
+  createFindTool,
+  createLsTool,
+  createReadTool,
   isToolCallEventType,
+  truncateHead,
   type BashOperations,
   type ExtensionAPI,
+  type FindOperations,
+  type LsOperations,
+  type ReadOperations,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -81,48 +89,192 @@ const workspace = realpathSync(process.cwd());
 const authRoot = realpathSync(process.env.PI_CODING_AGENT_DIR ?? "/mnt/informant-pi");
 const extensionPath = "/opt/informant/staff-review-pi.ts";
 const childOutputLimit = 1024 * 1024;
+const fileOutputLimit = 10 * 1024 * 1024;
 
 function isWithin(root: string, path: string): boolean {
   const fromRoot = relative(root, path);
   return fromRoot === "" || (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`));
 }
 
-function canonicalPath(path: string): string {
-  const absolute = resolve(workspace, path.replace(/^@/, ""));
-  try {
-    return realpathSync(absolute);
-  } catch {
-    return absolute;
-  }
+function sandboxArguments(cwd: string): string[] {
+  return [
+    "--unshare-all",
+    "--die-with-parent",
+    "--new-session",
+    "--uid",
+    "0",
+    "--gid",
+    "0",
+    "--ro-bind",
+    "/",
+    "/",
+    "--dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--bind",
+    workspace,
+    workspace,
+    "--tmpfs",
+    "/tmp",
+    "--tmpfs",
+    authRoot,
+    "--chdir",
+    cwd,
+  ];
 }
+
+interface SandboxResult {
+  stdout: Buffer;
+  stderr: Buffer;
+  exitCode: number | null;
+  outputLimitReached: boolean;
+}
+
+function runSandboxed(
+  executable: string,
+  args: string[],
+  cwd = workspace,
+  signal?: AbortSignal,
+  outputLimit = fileOutputLimit,
+): Promise<SandboxResult> {
+  return new Promise((done, reject) => {
+    const child = spawn("bwrap", [...sandboxArguments(cwd), executable, ...args], {
+      cwd,
+      detached: true,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let outputBytes = 0;
+    let outputLimitReached = false;
+    let settled = false;
+    const stop = () => {
+      if (!child.pid) return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
+    const append = (target: Buffer[], chunk: Buffer) => {
+      if (outputLimitReached) return;
+      const remaining = outputLimit - outputBytes;
+      if (remaining <= 0) {
+        outputLimitReached = true;
+        stop();
+        return;
+      }
+      const kept = chunk.subarray(0, remaining);
+      target.push(kept);
+      outputBytes += kept.length;
+      if (kept.length < chunk.length || outputBytes >= outputLimit) {
+        outputLimitReached = true;
+        stop();
+      }
+    };
+    const abort = () => stop();
+    signal?.addEventListener("abort", abort, { once: true });
+    child.stdout.on("data", (chunk: Buffer) => append(stdout, chunk));
+    child.stderr.on("data", (chunk: Buffer) => append(stderr, chunk));
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) reject(new Error("operation aborted"));
+      else
+        done({
+          stdout: Buffer.concat(stdout),
+          stderr: Buffer.concat(stderr),
+          exitCode: code,
+          outputLimitReached,
+        });
+    });
+  });
+}
+
+function sandboxError(action: string, result: SandboxResult): Error {
+  return new Error(
+    `${action}: ${result.stderr.toString().trim() || `exit ${result.exitCode ?? "unknown"}`}`,
+  );
+}
+
+async function sandboxTest(flag: string, path: string): Promise<boolean> {
+  const result = await runSandboxed("/usr/bin/test", [flag, path]);
+  if (result.exitCode === 0) return true;
+  if (result.exitCode === 1) return false;
+  throw sandboxError(`could not inspect ${path}`, result);
+}
+
+const readOperations: ReadOperations = {
+  async access(path) {
+    if (!(await sandboxTest("-r", path))) throw new Error(`Cannot read file: ${path}`);
+  },
+  async readFile(path) {
+    const result = await runSandboxed("/bin/cat", ["--", path]);
+    if (result.outputLimitReached) throw new Error(`File exceeds ${fileOutputLimit} bytes: ${path}`);
+    if (result.exitCode !== 0) throw sandboxError(`could not read ${path}`, result);
+    return result.stdout;
+  },
+};
+
+const findOperations: FindOperations = {
+  exists: (path) => sandboxTest("-e", path),
+  async glob(pattern, cwd, { limit }) {
+    const result = await runSandboxed(
+      "/usr/bin/rg",
+      [
+        "--files",
+        "--hidden",
+        "--glob",
+        "!node_modules/**",
+        "--glob",
+        "!.git/**",
+        "--glob",
+        pattern,
+        "--",
+        ".",
+      ],
+      cwd,
+    );
+    if (result.exitCode !== 0 && result.exitCode !== 1 && !result.outputLimitReached)
+      throw sandboxError(`could not search ${cwd}`, result);
+    return result.stdout
+      .toString()
+      .split("\\n")
+      .filter(Boolean)
+      .slice(0, limit);
+  },
+};
+
+const lsOperations: LsOperations = {
+  exists: (path) => sandboxTest("-e", path),
+  async stat(path) {
+    const directory = await sandboxTest("-d", path);
+    return { isDirectory: () => directory };
+  },
+  async readdir(path) {
+    const result = await runSandboxed(
+      "/usr/bin/find",
+      ["-H", path, "-mindepth", "1", "-maxdepth", "1", "-print0"],
+    );
+    if (result.exitCode !== 0) throw sandboxError(`could not list ${path}`, result);
+    return result.stdout.toString().split(String.fromCharCode(0)).filter(Boolean);
+  },
+};
 
 function sandboxedBashOperations(): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout }) {
       const args = [
-        "--unshare-all",
-        "--die-with-parent",
-        "--new-session",
-        "--uid",
-        "0",
-        "--gid",
-        "0",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--bind",
-        workspace,
-        workspace,
-        "--tmpfs",
-        "/tmp",
-        "--tmpfs",
-        authRoot,
-        "--chdir",
-        cwd,
+        ...sandboxArguments(cwd),
         "/bin/bash",
         "-lc",
         `export HOME=/tmp/tool-home XDG_CONFIG_HOME=/tmp/tool-home/.config PI_CODING_AGENT_DIR=/tmp/pi-agent-unavailable; mkdir -p "$HOME" "$XDG_CONFIG_HOME"; ${command}`,
@@ -223,6 +375,58 @@ export default function (pi: ExtensionAPI) {
     operations: sandboxedBashOperations(),
   });
   pi.registerTool({ ...bash, label: "bash (isolated)" });
+  pi.registerTool({
+    ...createReadTool(workspace, { autoResizeImages: false, operations: readOperations }),
+    label: "read (isolated)",
+  });
+  pi.registerTool({ ...createFindTool(workspace, { operations: findOperations }), label: "find (isolated)" });
+  pi.registerTool({ ...createLsTool(workspace, { operations: lsOperations }), label: "ls (isolated)" });
+  pi.registerTool({
+    name: "grep",
+    label: "grep (isolated)",
+    description: `Search workspace file contents with ripgrep. Output is limited to 100 matches or ${DEFAULT_MAX_BYTES / 1024}KB.`,
+    parameters: Type.Object({
+      pattern: Type.String(),
+      path: Type.Optional(Type.String()),
+      glob: Type.Optional(Type.String()),
+      ignoreCase: Type.Optional(Type.Boolean()),
+      literal: Type.Optional(Type.Boolean()),
+      context: Type.Optional(Type.Number()),
+      limit: Type.Optional(Type.Number()),
+    }),
+    async execute(_id, params, signal) {
+      const searchPath = resolve(workspace, (params.path ?? ".").replace(/^@/, ""));
+      const effectiveLimit = Math.max(1, params.limit ?? 100);
+      const args = ["--line-number", "--color=never", "--hidden"];
+      if (params.ignoreCase) args.push("--ignore-case");
+      if (params.literal) args.push("--fixed-strings");
+      if (params.glob) args.push("--glob", params.glob);
+      if (params.context && params.context > 0) args.push("--context", String(params.context));
+      args.push("--", params.pattern, searchPath);
+      const result = await runSandboxed("/usr/bin/rg", args, workspace, signal);
+      if (result.exitCode !== 0 && result.exitCode !== 1 && !result.outputLimitReached)
+        throw sandboxError(`could not search ${searchPath}`, result);
+      const matches = result.stdout.toString().split("\\n");
+      const matchLimitReached = matches.length > effectiveLimit;
+      const rawOutput = matches.slice(0, effectiveLimit).join("\\n").trim();
+      if (!rawOutput)
+        return { content: [{ type: "text", text: "No matches found" }], details: undefined };
+      const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+      let output = truncation.content;
+      const notices = [];
+      if (matchLimitReached) notices.push(`${effectiveLimit} matches limit reached`);
+      if (truncation.truncated || result.outputLimitReached)
+        notices.push(`${DEFAULT_MAX_BYTES / 1024}KB limit reached`);
+      if (notices.length) output += `\\n\\n[${notices.join(". ")}]`;
+      return {
+        content: [{ type: "text", text: output }],
+        details: {
+          ...(matchLimitReached ? { matchLimitReached: effectiveLimit } : {}),
+          ...(truncation.truncated ? { truncation } : {}),
+        },
+      };
+    },
+  });
 
   pi.on("tool_call", (event) => {
     if (
@@ -232,7 +436,7 @@ export default function (pi: ExtensionAPI) {
       isToolCallEventType("ls", event)
     ) {
       const path = "path" in event.input && event.input.path ? event.input.path : ".";
-      if (!isWithin(workspace, canonicalPath(path))) {
+      if (!isWithin(workspace, resolve(workspace, path.replace(/^@/, "")))) {
         return { block: true, reason: "Staff Review tools may only access the workspace." };
       }
     }
