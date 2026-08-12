@@ -51,15 +51,21 @@ function claimCandidateScope(check: CheckRun): string | undefined {
   return compactClaimCandidate(check)?.scope;
 }
 
+function legacyClaimCandidateCreatedAt(check: CheckRun): number | undefined {
+  const encoded = check.external_id?.match(/:candidate:([a-z0-9]+):[^:]+:event:/)?.[1];
+  if (!encoded) return undefined;
+  const createdAt = Number.parseInt(encoded, 36);
+  return Number.isSafeInteger(createdAt) ? createdAt : undefined;
+}
+
 function isClaimCandidate(check: CheckRun): boolean {
   return (
-    compactClaimCandidate(check) !== undefined ||
-    /:candidate:[a-z0-9]+:[^:]+:event:/.test(check.external_id ?? "")
+    compactClaimCandidate(check) !== undefined || legacyClaimCandidateCreatedAt(check) !== undefined
   );
 }
 
 function claimCandidateCreatedAt(check: CheckRun): number | undefined {
-  return compactClaimCandidate(check)?.createdAt;
+  return compactClaimCandidate(check)?.createdAt ?? legacyClaimCandidateCreatedAt(check);
 }
 
 function promotedClaim(check: CheckRun, externalId: string): CheckRun {
@@ -427,8 +433,13 @@ export class GitHubClient {
       : serverTime - createdAt <= CLAIM_CANDIDATE_LEASE_MS;
   }
 
-  private async api<T>(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<T> {
-    const requestSignal = signal ?? init.signal ?? undefined;
+  private async api<T>(
+    path: string,
+    init: RequestInit | (() => RequestInit) = {},
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const requestSignal =
+      signal ?? (typeof init === "function" ? undefined : init.signal) ?? undefined;
     await this.authenticate(requestSignal);
     for (let attempt = 0; ; attempt++) {
       requestSignal?.throwIfAborted();
@@ -437,15 +448,17 @@ export class GitHubClient {
         await abortableSleep(blockedUntil - Date.now(), requestSignal);
       }
 
+      // Build time-sensitive request bodies only after any shared rate-limit gate.
+      const requestInit = typeof init === "function" ? init() : init;
       const response = await this.request(`${API}${path}`, {
-        ...init,
+        ...requestInit,
         signal: requestSignal,
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${this.token}`,
           "X-GitHub-Api-Version": "2022-11-28",
           "Content-Type": "application/json",
-          ...init.headers,
+          ...requestInit.headers,
         },
       });
       this.observeGitHubClock(response);
@@ -833,36 +846,39 @@ export class GitHubClient {
   async createCheck(
     repository: Repository,
     sha: string,
-    externalId: string,
+    externalId: string | (() => string),
     status: "queued" | "in_progress" = "in_progress",
     requestedJobs: string[] = [],
     name = CLAIM_NAME,
     metadata?: string,
     signal?: AbortSignal,
   ): Promise<CheckRun> {
-    const requestId =
-      status === "queued" &&
-      metadata === undefined &&
-      !externalId.includes(":candidate:") &&
-      !externalId.startsWith("informant-candidate:")
-        ? `${externalId}:jobs:${Buffer.from(JSON.stringify(requestedJobs)).toString("base64url")}`
-        : externalId;
     const check = await this.api<CheckRun>(
       `/repos/${repository.fullName}/check-runs`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          name: githubText(name),
-          head_sha: sha,
-          status,
-          external_id: requestId,
-          started_at: status === "in_progress" ? new Date().toISOString() : undefined,
-          output: {
-            title: "Informant CI",
-            summary: githubText(`Claimed by ${hostname()}`),
-            text: metadata,
-          },
-        }),
+      () => {
+        const resolvedExternalId = typeof externalId === "function" ? externalId() : externalId;
+        const requestId =
+          status === "queued" &&
+          metadata === undefined &&
+          !resolvedExternalId.includes(":candidate:") &&
+          !resolvedExternalId.startsWith("informant-candidate:")
+            ? `${resolvedExternalId}:jobs:${Buffer.from(JSON.stringify(requestedJobs)).toString("base64url")}`
+            : resolvedExternalId;
+        return {
+          method: "POST",
+          body: JSON.stringify({
+            name: githubText(name),
+            head_sha: sha,
+            status,
+            external_id: requestId,
+            started_at: status === "in_progress" ? new Date().toISOString() : undefined,
+            output: {
+              title: "Informant CI",
+              summary: githubText(`Claimed by ${hostname()}`),
+              text: metadata,
+            },
+          }),
+        };
       },
       signal,
     );
@@ -1219,17 +1235,22 @@ export class GitHubClient {
 
     signal?.throwIfAborted();
     const candidateExternalId = `${machineId}:event:${scope}`;
-    const candidateCreatedAt = this.githubServerTime();
-    if (candidateCreatedAt === undefined) {
+    if (this.githubServerTime() === undefined) {
       return { requestedJobs: [], manualTrigger, retry: true };
     }
-    const candidateAttemptExternalId = `informant-candidate:${candidateScope}:${Math.floor(candidateCreatedAt).toString(36)}:${crypto.randomUUID()}`;
+    let candidateAttemptExternalId = "";
+    const candidateAttempt = () => {
+      const candidateCreatedAt = this.githubServerTime();
+      if (candidateCreatedAt === undefined) throw new Error("GitHub server time is unavailable");
+      candidateAttemptExternalId = `informant-candidate:${candidateScope}:${Math.floor(candidateCreatedAt).toString(36)}:${crypto.randomUUID()}`;
+      return candidateAttemptExternalId;
+    };
     let candidate: CheckRun | undefined;
     try {
       candidate = await this.createCheck(
         repository,
         sha,
-        candidateAttemptExternalId,
+        candidateAttempt,
         "queued",
         [],
         name,

@@ -545,6 +545,7 @@ async function recoverMountedFileWrite(
     await exchange(record.source, record.temporary);
     await syncDirectory(dirname(record.source));
   } else if (
+    sourceDigest !== record.originalDigest &&
     temporaryDigest !== record.replacementDigest &&
     temporaryDigest !== record.originalDigest
   ) {
@@ -601,10 +602,10 @@ async function persistFileMount(
   if (!metadata.isFile()) throw new Error(`mounted file was removed: ${mount.name}`);
   if (metadata.size > MAX_ALLOWED_MOUNT_BYTES)
     throw new Error(`mounted file exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes: ${mount.name}`);
-  const stagedDigest = await mountedFileDigest(staged);
-  if (stagedDigest === mount.originalDigest) return;
   const recoveryPath = mountedFileRecoveryPath(mount.source, mount.dataPath);
   await recoverMountedFileWrite(recoveryPath, exchange);
+  const stagedDigest = await mountedFileDigest(staged);
+  if (stagedDigest === mount.originalDigest) return;
   if ((await mountedFileDigest(mount.source)) !== mount.originalDigest) {
     throw new Error(`allowed host file changed during mounted job: ${mount.name}`);
   }

@@ -770,6 +770,42 @@ describe("serve polling orchestration", () => {
     expect(state.pendingTags).toEqual([]);
   });
 
+  test("retains prior identities when a tag moves and does not replay a move back", async () => {
+    const old = { name: "v1", sha: "old-sha" };
+    const moved = { name: "v1", sha: "new-sha" };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [old],
+    };
+    let polls = 0;
+    const events: string[] = [];
+    const deps = dependencies(
+      github({
+        tags: async () => {
+          polls++;
+          return polls === 1 ? [moved] : [old];
+        },
+      }),
+      state,
+      async (_github, _repository, _sha, _branch, _config, _deps, event) => {
+        events.push(event?.id ?? "");
+        return undefined;
+      },
+    );
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, dependencies: deps });
+    expect(state.tagRefs).toEqual([old, moved]);
+    state.tagsPolledAt = undefined;
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(events).toEqual(["tag:v1:new-sha"]);
+    expect(state.tagRefs).toEqual([moved, old]);
+    expect(state.pendingTags).toEqual([]);
+  });
+
   test("bounds deleted tag acknowledgement history while retaining current refs", async () => {
     const deleted = Array.from({ length: 2_100 }, (_, index) => ({
       name: `deleted-${index}`,

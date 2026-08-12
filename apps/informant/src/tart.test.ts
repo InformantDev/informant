@@ -738,6 +738,21 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
       "linux",
       true,
     );
+    const readOnlyMacos = await cacheMounts(
+      repository,
+      workspace,
+      {
+        ...cachedJob,
+        cache: cachedJob.cache.map((cache) => ({
+          ...cache,
+          protectedChannel: true,
+          readOnly: true,
+        })),
+      },
+      "admin",
+      "macos",
+      false,
+    );
     const directLinux = await cacheMounts(
       repository,
       workspace,
@@ -770,6 +785,8 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(macos.installLock).toBe(
       "/Volumes/My Shared Files/cache-0/.informant-install-lock",
     );
+    expect(readOnlyMacos.mounts[0]?.readOnly).toBe(true);
+    expect(readOnlyMacos.installLock).toBeUndefined();
     expect(linux.restore).toContain("/home/admin/.bun/install/cache");
     expect(linux.restore).toContain("/mnt/shared/cache-0");
     expect(linux.restore).not.toContain("ln -s");
@@ -781,6 +798,7 @@ test("Linux caches use Linux guest paths and separate persistent host storage", 
     expect(readOnlyLinux.save).toBe(":");
     expect(readOnlyLinux.mounts[0]?.readOnly).toBe(true);
     expect(readOnlyLinux.writablePaths).toEqual([]);
+    expect(readOnlyLinux.installLock).toBeUndefined();
     expect(linux.writablePaths).toHaveLength(1);
     expect(linux.args[0]).toEndWith(linux.writablePaths[0] ?? "");
     expect(linux.installLock).toBe(

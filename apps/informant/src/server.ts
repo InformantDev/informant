@@ -91,17 +91,15 @@ function compactTagRefs(
   previous: Array<{ name: string; sha: string }>,
   current: Array<{ name: string; sha: string }>,
 ): Array<{ name: string; sha: string }> {
-  const currentNames = new Set(current.map((tag) => tag.name));
   const currentKeys = new Set(current.map((tag) => `${tag.name}\0${tag.sha}`));
   const seen = new Set<string>();
-  const deleted = previous.filter((tag) => {
+  const historical = previous.filter((tag) => {
     const key = `${tag.name}\0${tag.sha}`;
-    if (currentNames.has(tag.name) || currentKeys.has(key) || seen.has(key))
-      return false;
+    if (currentKeys.has(key) || seen.has(key)) return false;
     seen.add(key);
     return true;
   });
-  return [...deleted.slice(-DELETED_TAG_HISTORY_LIMIT), ...current];
+  return [...historical.slice(-DELETED_TAG_HISTORY_LIMIT), ...current];
 }
 
 function boundMissingConfigs(

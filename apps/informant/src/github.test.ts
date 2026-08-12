@@ -85,6 +85,65 @@ test("rate limited requests wait and retry once", async () => {
   expect(requests).toBe(2);
 });
 
+test("candidate leases refresh when a rate-limit retry advances GitHub time", async () => {
+  const initialServerTime = new Date("2026-01-01T00:00:00.000Z");
+  const creationServerTime = new Date("2026-01-01T00:02:00.000Z");
+  const attemptedExternalIds: string[] = [];
+  let candidate: CheckRun | undefined;
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      attemptedExternalIds.push(body.external_id);
+      if (attemptedExternalIds.length === 1) {
+        return new Response('{"message":"API rate limit exceeded"}', {
+          status: 403,
+          headers: { Date: creationServerTime.toUTCString(), "retry-after": "0" },
+        });
+      }
+      candidate = { id: 1, ...body } as CheckRun;
+      return githubResponse(candidate, { headers: { Date: creationServerTime.toUTCString() } });
+    }
+    if (init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body));
+      if (candidate) Object.assign(candidate, body);
+      return githubResponse(candidate ?? {}, {
+        headers: { Date: creationServerTime.toUTCString() },
+      });
+    }
+    const checks =
+      url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME
+        ? []
+        : candidate
+          ? [candidate]
+          : [];
+    return githubResponse(
+      { check_runs: checks },
+      {
+        headers: {
+          Date: (candidate ? creationServerTime : initialServerTime).toUTCString(),
+        },
+      },
+    );
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "candidate-rate-limit", repo: "widgets", fullName: "candidate-rate-limit/widgets" },
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+  );
+
+  const candidateTimes = attemptedExternalIds.map((externalId) =>
+    Number.parseInt(externalId.split(":")[2] ?? "", 36),
+  );
+  expect(attemptedExternalIds).toHaveLength(2);
+  const firstAttempt = candidateTimes[0] ?? Number.POSITIVE_INFINITY;
+  const secondAttempt = candidateTimes[1] ?? Number.NEGATIVE_INFINITY;
+  expect(secondAttempt - firstAttempt).toBeGreaterThanOrEqual(120_000);
+  expect(claim?.check?.id).toBe(1);
+});
+
 test("shutdown interrupts a rate limit wait before retrying", async () => {
   const shutdown = new AbortController();
   let requests = 0;
@@ -400,6 +459,55 @@ test("an expired compact candidate is cancelled and retried in its automatic sco
   });
   expect(candidateExternalId).toMatch(/^informant-candidate:[a-f\d]{32}:[a-z\d]+:[a-f\d-]{36}$/);
   expect(candidateExternalId.length).toBeLessThan(255);
+});
+
+test("an expired legacy candidate is cancelled instead of blocking election forever", async () => {
+  const serverTime = new Date("2026-01-01T00:02:00.000Z");
+  const scope = "commit:branch:main:abc123";
+  const expiredAt = new Date("2026-01-01T00:00:59.000Z").getTime().toString(36);
+  const legacyCandidate: CheckRun = {
+    id: 1,
+    name: "Informant CI",
+    status: "queued",
+    external_id: `old-worker:candidate:${expiredAt}:deadbeef:event:${scope}`,
+  };
+  const checks = [legacyCandidate];
+  const updates: Array<{ id: number; body: Record<string, unknown> }> = [];
+  const response = (value: unknown) =>
+    githubResponse(value, { headers: { Date: serverTime.toUTCString() } });
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      const check = { id: 2, ...JSON.parse(String(init.body)) } as CheckRun;
+      checks.push(check);
+      return response(check);
+    }
+    if (init?.method === "PATCH") {
+      const id = Number(url.pathname.split("/").at(-1));
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      updates.push({ id, body });
+      const check = checks.find((candidate) => candidate.id === id);
+      if (check) Object.assign(check, body);
+      return response(check ?? {});
+    }
+    if (url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME)
+      return response({ check_runs: [] });
+    return response({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "legacy-candidate", repo: "widgets", fullName: "legacy-candidate/widgets" },
+    "abc123",
+    "new-worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+  );
+
+  expect(claim?.check?.id).toBe(2);
+  expect(updates.find((update) => update.id === 1)?.body).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+    output: { title: "Expired claim candidate" },
+  });
 });
 
 test("compact election candidates are not pending manual triggers", async () => {
