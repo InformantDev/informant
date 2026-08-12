@@ -33,11 +33,34 @@ test("worker capabilities include platform defaults and configured labels", () =
 });
 
 test("allowed mounts advertise protected namespaced capabilities", () => {
-  expect(mountCapability("Codex-Auth")).toBe("mount:codex-auth");
+  expect(mountCapability("Codex-Auth")).toBe("mount:legacy:436f6465782d41757468");
   expect(workerCapabilities({}, ["codex-auth"])).toContain("mount:codex-auth");
   expect(workerCapabilities({ INFORMANT_CAPABILITIES: "mount:codex-auth" })).not.toContain(
     "mount:codex-auth",
   );
+});
+
+test("keeps case-sensitive legacy mount capabilities distinct across workers", () => {
+  const base = config.jobs[0];
+  if (!base) throw new Error("expected base job");
+  const legacyConfig: InformantConfig = {
+    ...config,
+    jobs: [
+      {
+        ...base,
+        name: "legacy-mount",
+        runsOn: ["mount:codex-auth"],
+        mounts: [{ source: "Codex-Auth", target: "/mnt/auth", writeBack: false }],
+      },
+    ],
+  };
+
+  expect(selectCapableJobs(legacyConfig, workerCapabilities({}, ["codex-auth"])).jobs).toEqual([]);
+  expect(
+    selectCapableJobs(legacyConfig, workerCapabilities({}, ["Codex-Auth"])).jobs.map(
+      (job) => job.name,
+    ),
+  ).toEqual(["legacy-mount"]);
 });
 
 test("selects only jobs supported by the worker and their dependencies", () => {

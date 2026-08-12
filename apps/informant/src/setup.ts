@@ -426,6 +426,7 @@ export async function configureAutomaticUpdatesDuringSetup(
     enable?: () => Promise<unknown>;
     preference?: () => Promise<boolean | undefined>;
     prompt?: (options: { message: string; initialValue: boolean }) => Promise<boolean | symbol>;
+    promptCancelled?: (value: boolean | symbol) => boolean;
     savePreference?: (enabled: boolean) => Promise<unknown>;
     warn?: (message: string) => void;
   } = {},
@@ -437,7 +438,7 @@ export async function configureAutomaticUpdatesDuringSetup(
     message: "Automatically install new Informant versions and restart the startup worker?",
     initialValue: true,
   });
-  if (isCancel(automaticUpdates)) return;
+  if ((operations.promptCancelled ?? isCancel)(automaticUpdates)) return;
   const savePreference = operations.savePreference ?? saveAutomaticUpdatesPreference;
   if (!automaticUpdates) {
     await (operations.disable ?? disableAutomaticUpdates)();

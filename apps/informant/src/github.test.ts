@@ -1,7 +1,17 @@
 import { expect, test } from "bun:test";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { GitHubApiError, GitHubClient, MANUAL_TRIGGER_REQUEST_NAME } from "./github.ts";
 import type { CheckRun } from "./types.ts";
+
+function githubResponse(
+  value: unknown,
+  init: { status?: number; statusText?: string; headers?: Record<string, string> } = {},
+): Response {
+  return Response.json(value, {
+    ...init,
+    headers: { Date: new Date().toUTCString(), ...init.headers },
+  });
+}
 
 test("job access tokens are freshly minted and downscoped to one repository", async () => {
   const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({
@@ -11,7 +21,7 @@ test("job access tokens are freshly minted and downscoped to one repository", as
   let requestBody: Record<string, unknown> | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     requestBody = JSON.parse(String(init?.body));
-    return Response.json({ token: "job-token", expires_at: "2099-01-01T00:00:00Z" });
+    return githubResponse({ token: "job-token", expires_at: "2099-01-01T00:00:00Z" });
   }) as typeof globalThis.fetch;
   const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
   const github = new GitHubClient({
@@ -62,7 +72,7 @@ test("rate limited requests wait and retry once", async () => {
         headers: { "retry-after": "0" },
       });
     }
-    return Response.json({ default_branch: "main" });
+    return githubResponse({ default_branch: "main" });
   }) as unknown as typeof globalThis.fetch;
 
   const branch = await new GitHubClient({ token: "installation-token", fetch }).defaultBranch({
@@ -105,10 +115,10 @@ test("suite rerun detection forwards its cancellation signal", async () => {
     const url = new URL(String(input));
     if (url.pathname.endsWith("/check-suites")) {
       suiteSignal = init?.signal;
-      return Response.json({ check_suites: [{ status: "queued" }] });
+      return githubResponse({ check_suites: [{ status: "queued" }] });
     }
     const name = url.searchParams.get("check_name");
-    return Response.json({
+    return githubResponse({
       check_runs:
         name === MANUAL_TRIGGER_REQUEST_NAME
           ? []
@@ -146,11 +156,11 @@ test("post-claim election ignores admission cancellation but honors forced shutd
     if (init?.method === "PATCH") {
       cleanupSignal = init.signal;
       cleanupBody = JSON.parse(String(init.body));
-      return Response.json({ id: 1, name: "Informant CI", status: "completed" });
+      return githubResponse({ id: 1, name: "Informant CI", status: "completed" });
     }
     if (init?.method === "POST") {
       candidateSignal = init.signal;
-      return Response.json({
+      return githubResponse({
         id: 1,
         name: "Informant CI",
         status: "in_progress",
@@ -158,7 +168,7 @@ test("post-claim election ignores admission cancellation but honors forced shutd
       });
     }
     reads++;
-    if (reads <= 2) return Response.json({ check_runs: [] });
+    if (reads <= 2) return githubResponse({ check_runs: [] });
     electionSignal = init?.signal;
     enterElection();
     return new Promise<Response>((_resolve, reject) => {
@@ -221,14 +231,14 @@ test("candidate creation finishes before honoring admission cancellation", async
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "PATCH") {
       cleanupBody = JSON.parse(String(init.body));
-      return Response.json({ id: 1, name: "Informant CI", status: "completed" });
+      return githubResponse({ id: 1, name: "Informant CI", status: "completed" });
     }
     if (init?.method === "POST") {
       candidateSignal = init.signal;
       enterCandidate();
       return candidateResponse;
     }
-    return Response.json({ check_runs: [] });
+    return githubResponse({ check_runs: [] });
   }) as typeof globalThis.fetch;
   const repository = {
     owner: "candidate-signal",
@@ -254,7 +264,7 @@ test("candidate creation finishes before honoring admission cancellation", async
   expect(candidateSignal).toBe(execution.signal);
   admission.abort("Worker shutdown requested.");
   resolveCandidate(
-    Response.json({
+    githubResponse({
       id: 1,
       name: "Informant CI",
       status: "in_progress",
@@ -288,7 +298,7 @@ test("uncertain candidate creation is reconciled after forced shutdown", async (
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "PATCH") {
       cleanupBody = JSON.parse(String(init.body));
-      return Response.json({ ...candidate, status: "completed" });
+      return githubResponse({ ...candidate, status: "completed" });
     }
     if (init?.method === "POST") {
       enteredCandidate();
@@ -299,7 +309,7 @@ test("uncertain candidate creation is reconciled after forced shutdown", async (
         signal.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
     }
-    return Response.json({ check_runs: [candidate] });
+    return githubResponse({ check_runs: [candidate] });
   }) as typeof globalThis.fetch;
   const repository = {
     owner: "candidate-reconcile",
@@ -332,24 +342,45 @@ test("uncertain candidate creation is reconciled after forced shutdown", async (
   });
 });
 
-test("an abandoned pre-election candidate expires after its short lease", async () => {
-  const oldCandidate: CheckRun = {
-    id: 1,
-    name: "Informant CI",
-    status: "queued",
-    external_id: `old-worker:candidate:${(Date.now() - 61_000).toString(36)}:deadbeef:event:commit:branch:main:abc123`,
-  };
-  const checks: CheckRun[] = [oldCandidate];
+test("an expired compact candidate is cancelled and retried in its automatic scope", async () => {
+  const serverTime = new Date("2026-01-01T00:02:00.000Z");
+  const scope = "commit:branch:main:abc123";
+  const candidateScope = createHash("sha256").update(scope).digest("hex").slice(0, 32);
+  const expiredAt = new Date("2026-01-01T00:00:59.000Z").getTime().toString(36);
+  const checks: CheckRun[] = [
+    {
+      id: 1,
+      name: "Informant CI",
+      status: "queued",
+      external_id: `informant-candidate:${candidateScope}:${expiredAt}:${crypto.randomUUID()}`,
+    },
+  ];
+  const updates: Array<{ id: number; body: Record<string, unknown> }> = [];
   let nextId = 2;
-  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+  let candidateExternalId = "";
+  const response = (value: unknown) =>
+    githubResponse(value, { headers: { Date: serverTime.toUTCString() } });
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
+      candidateExternalId = body.external_id;
       const check = { id: nextId++, ...body } as CheckRun;
       checks.push(check);
-      return Response.json(check);
+      return response(check);
     }
-    if (init?.method === "PATCH") return Response.json({});
-    return Response.json({ check_runs: checks });
+    if (init?.method === "PATCH") {
+      const id = Number(url.pathname.split("/").at(-1));
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      updates.push({ id, body });
+      const check = checks.find((candidate) => candidate.id === id);
+      if (check) Object.assign(check, body);
+      return response(check ?? {});
+    }
+    if (url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME) {
+      return response({ check_runs: [] });
+    }
+    return response({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -359,21 +390,59 @@ test("an abandoned pre-election candidate expires after its short lease", async 
     { type: "commit", id: "branch:main:abc123", branch: "main" },
   );
 
+  expect(claim?.manualTrigger).toBe(false);
   expect(claim?.check?.id).toBe(2);
   expect(claim?.check?.external_id).toBe("new-worker:event:commit:branch:main:abc123");
+  expect(updates.find((update) => update.id === 1)?.body).toMatchObject({
+    status: "completed",
+    conclusion: "cancelled",
+    output: { title: "Expired claim candidate" },
+  });
+  expect(candidateExternalId).toMatch(/^informant-candidate:[a-f\d]{32}:[a-z\d]+:[a-f\d-]{36}$/);
+  expect(candidateExternalId.length).toBeLessThan(255);
 });
 
-test("an abandoned recent candidate blocks only for its short lease", async () => {
+test("compact election candidates are not pending manual triggers", async () => {
+  const scope = createHash("sha256").update("commit:branch:main:abc123").digest("hex").slice(0, 32);
   const candidate: CheckRun = {
     id: 1,
     name: "Informant CI",
     status: "queued",
-    external_id: `old-worker:candidate:${Date.now().toString(36)}:deadbeef:event:commit:branch:main:abc123`,
+    external_id: `informant-candidate:${scope}:${Date.now().toString(36)}:${crypto.randomUUID()}`,
+  };
+  const fetch = (async (input: string | URL | Request) => {
+    const name = new URL(String(input)).searchParams.get("check_name");
+    return githubResponse({ check_runs: name === MANUAL_TRIGGER_REQUEST_NAME ? [] : [candidate] });
+  }) as typeof globalThis.fetch;
+
+  expect(
+    await new GitHubClient({ token: "installation-token", fetch }).hasPendingManualTrigger(
+      { owner: "candidate-trigger", repo: "widgets", fullName: "candidate-trigger/widgets" },
+      "abc123",
+      "main",
+      "main",
+    ),
+  ).toBe(false);
+});
+
+test("an abandoned recent candidate blocks only for its GitHub-timed lease", async () => {
+  const serverTime = new Date("2026-01-01T00:02:00.000Z");
+  const scope = "commit:branch:main:abc123";
+  const candidateScope = createHash("sha256").update(scope).digest("hex").slice(0, 32);
+  const createdAt = new Date("2026-01-01T00:01:30.000Z").getTime().toString(36);
+  const candidate: CheckRun = {
+    id: 1,
+    name: "Informant CI",
+    status: "queued",
+    external_id: `informant-candidate:${candidateScope}:${createdAt}:${crypto.randomUUID()}`,
   };
   let posted = false;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "POST") posted = true;
-    return Response.json({ check_runs: [candidate] });
+    return githubResponse(
+      { check_runs: [candidate] },
+      { headers: { Date: serverTime.toUTCString() } },
+    );
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -409,7 +478,7 @@ test("stale cleanup finishes before admission cancellation is honored", async ()
     const url = new URL(String(input));
     if (init?.method === "POST") {
       candidateCreated = true;
-      return Response.json({});
+      return githubResponse({});
     }
     if (init?.method === "PATCH") {
       cleanupSignal = init.signal;
@@ -417,10 +486,10 @@ test("stale cleanup finishes before admission cancellation is honored", async ()
       return cleanupResponse;
     }
     if (url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME) {
-      return Response.json({ check_runs: [] });
+      return githubResponse({ check_runs: [] });
     }
-    if (url.searchParams.has("check_name")) return Response.json({ check_runs: [stale] });
-    return Response.json({ check_runs: [] });
+    if (url.searchParams.has("check_name")) return githubResponse({ check_runs: [stale] });
+    return githubResponse({ check_runs: [] });
   }) as typeof globalThis.fetch;
   const admission = new AbortController();
   const execution = new AbortController();
@@ -440,7 +509,7 @@ test("stale cleanup finishes before admission cancellation is honored", async ()
   await cleanupStarted;
   expect(cleanupSignal).toBe(execution.signal);
   admission.abort("Worker shutdown requested.");
-  resolveCleanup(Response.json({ ...stale, status: "completed", conclusion: "cancelled" }));
+  resolveCleanup(githubResponse({ ...stale, status: "completed", conclusion: "cancelled" }));
 
   expect(await pending.catch((error) => error)).toBe("Worker shutdown requested.");
   expect(candidateCreated).toBe(false);
@@ -463,15 +532,15 @@ test("claim bookkeeping completions do not suppress a later retry", async () => 
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       candidate = { id: 4, ...body } as CheckRun;
-      return Response.json(candidate);
+      return githubResponse(candidate);
     }
     if (url.pathname.endsWith("/check-suites")) {
-      return Response.json({ check_suites: [{ status: "completed" }] });
+      return githubResponse({ check_suites: [{ status: "completed" }] });
     }
     if (url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME) {
-      return Response.json({ check_runs: [] });
+      return githubResponse({ check_runs: [] });
     }
-    return Response.json({ check_runs: [...bookkeeping, ...(candidate ? [candidate] : [])] });
+    return githubResponse({ check_runs: [...bookkeeping, ...(candidate ? [candidate] : [])] });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -488,7 +557,7 @@ test("check output strips terminal control sequences", async () => {
   let requestBody: { output?: { text?: string } } | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     requestBody = JSON.parse(String(init?.body));
-    return Response.json({ id: 1, name: "Informant / test", status: "in_progress" });
+    return githubResponse({ id: 1, name: "Informant / test", status: "in_progress" });
   }) as typeof globalThis.fetch;
 
   await new GitHubClient({ token: "installation-token", fetch }).updateCheck(
@@ -509,7 +578,7 @@ test("directory files returns sorted TOML files only", async () => {
   let requested = "";
   const fetch = (async (input: string | URL | Request) => {
     requested = String(input);
-    return Response.json([
+    return githubResponse([
       { name: "test.toml", path: ".informant/jobs/test.toml", type: "file" },
       { name: "notes.md", path: ".informant/jobs/notes.md", type: "file" },
       { name: "build.toml", path: ".informant/jobs/build.toml", type: "file" },
@@ -533,7 +602,7 @@ test("claim elects the oldest active check using the full check history", async 
     const url = String(input);
     urls.push(url);
     if (init?.method === "POST") {
-      return Response.json({
+      return githubResponse({
         id: 10,
         name: "Informant CI",
         status: "in_progress",
@@ -541,7 +610,7 @@ test("claim elects the oldest active check using the full check history", async 
       });
     }
     reads++;
-    return Response.json({
+    return githubResponse({
       check_runs:
         reads === 1
           ? []
@@ -568,7 +637,7 @@ test("checks paginates through the complete check history", async () => {
     const page = Number(new URL(String(input)).searchParams.get("page"));
     pages.push(page);
     const count = page === 1 ? 100 : 1;
-    return Response.json({
+    return githubResponse({
       check_runs: Array.from({ length: count }, (_, index) => ({
         id: (page - 1) * 100 + index,
         name: "Informant CI",
@@ -592,7 +661,7 @@ test("tags paginate and map dereferenced commit SHAs", async () => {
     const page = Number(new URL(String(input)).searchParams.get("page"));
     pages.push(page);
     const count = page === 1 ? 100 : 1;
-    return Response.json(
+    return githubResponse(
       Array.from({ length: count }, (_, index) => ({
         name: `v${(page - 1) * 100 + index}`,
         commit: { sha: `commit-${page}-${index}` },
@@ -617,7 +686,7 @@ test("tag polling reads every page so bursts beyond two hundred refs are not mis
     const page = Number(url.searchParams.get("page"));
     pages.push(page);
     const count = page < 3 ? 100 : 50;
-    return Response.json(
+    return githubResponse(
       Array.from({ length: count }, (_, index) => ({
         name: page === 1 && index === 0 ? "v-moved" : `v${page}-${index}`,
         commit: { sha: page === 1 && index === 0 ? "new-target" : `sha-${page}-${index}` },
@@ -641,7 +710,7 @@ test("queued checks encode selected jobs in the request", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     requestBody = JSON.parse(String(init?.body));
-    return Response.json({ id: 1, name: "Informant CI", status: "queued" });
+    return githubResponse({ id: 1, name: "Informant CI", status: "queued" });
   }) as typeof globalThis.fetch;
   await new GitHubClient({ token: "installation-token", fetch }).createCheck(
     { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
@@ -660,21 +729,21 @@ test("manual trigger context and jobs stay within GitHub's external ID limit", a
   const checks: CheckRun[] = [];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (String(input).includes("check-suites")) {
-      return Response.json({ check_suites: [{ status: "queued" }] });
+      return githubResponse({ check_suites: [{ status: "queued" }] });
     }
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       const check = { id: nextId++, ...body } as CheckRun;
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (init?.method === "PATCH") {
       const id = Number(String(input).split("/").at(-1));
       const check = checks.find((item) => item.id === id);
       if (check) Object.assign(check, JSON.parse(String(init.body)));
-      return Response.json(check ?? {});
+      return githubResponse(check ?? {});
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
   const github = new GitHubClient({ token: "installation-token", fetch });
   const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
@@ -717,7 +786,7 @@ test("claim does not fall back to automatic work when manual mode is required", 
   let posts = 0;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "POST") posts++;
-    return Response.json({ check_runs: [] });
+    return githubResponse({ check_runs: [] });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -739,7 +808,7 @@ test("job checks are separate queued runs correlated to the aggregate claim", as
   let requestBody: Record<string, unknown> | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     requestBody = JSON.parse(String(init?.body));
-    return Response.json({ id: 2, name: "Informant / test", status: "queued" });
+    return githubResponse({ id: 2, name: "Informant / test", status: "queued" });
   }) as typeof globalThis.fetch;
 
   await new GitHubClient({ token: "installation-token", fetch }).createJobCheck(
@@ -777,10 +846,10 @@ test("claim unions targeted requests unless an all-jobs request takes precedence
           external_id: body.external_id,
         };
         checks.push(check);
-        return Response.json(check);
+        return githubResponse(check);
       }
-      if (init?.method === "PATCH") return Response.json({});
-      return Response.json({ check_runs: checks });
+      if (init?.method === "PATCH") return githubResponse({});
+      return githubResponse({ check_runs: checks });
     }) as typeof globalThis.fetch;
     return new GitHubClient({ token: "installation-token", fetch }).claim(
       { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
@@ -815,10 +884,10 @@ test("workers ignore manual requests for jobs outside their capabilities", async
           external_id: body.external_id,
         };
         checks.push(check);
-        return Response.json(check);
+        return githubResponse(check);
       }
-      if (init?.method === "PATCH") return Response.json({});
-      return Response.json({ check_runs: checks });
+      if (init?.method === "PATCH") return githubResponse({});
+      return githubResponse({ check_runs: checks });
     }) as typeof globalThis.fetch;
     const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
       { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
@@ -855,7 +924,7 @@ test("manual claims defer to an active old-worker eligible-job scope", async () 
   ];
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "POST") posts++;
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -893,11 +962,11 @@ test("suite reruns defer to an active old-worker eligible-job scope", async () =
     const url = String(input);
     if (init?.method === "POST") posts++;
     if (url.includes("check-suites"))
-      return Response.json({ check_suites: [{ status: "queued" }] });
+      return githubResponse({ check_suites: [{ status: "queued" }] });
     const checkName = new URL(url).searchParams.get("check_name");
-    if (checkName === MANUAL_TRIGGER_REQUEST_NAME) return Response.json({ check_runs: [] });
-    if (checkName) return Response.json({ check_runs: aggregates });
-    return Response.json({
+    if (checkName === MANUAL_TRIGGER_REQUEST_NAME) return githubResponse({ check_runs: [] });
+    if (checkName) return githubResponse({ check_runs: aggregates });
+    return githubResponse({
       check_runs: [
         {
           id: 10,
@@ -945,17 +1014,17 @@ test("completed old-worker eligible-job scopes suppress election duplicates", as
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       candidate = { id: 3, ...body } as CheckRun;
-      return Response.json(candidate);
+      return githubResponse(candidate);
     }
     if (init?.method === "PATCH") {
       updates.push({
         id: Number(String(input).split("/").at(-1)),
         conclusion: JSON.parse(String(init.body)).conclusion,
       });
-      return Response.json({});
+      return githubResponse({});
     }
     reads++;
-    return Response.json({
+    return githubResponse({
       check_runs: reads >= 3 ? [request, historical, ...(candidate ? [candidate] : [])] : [request],
     });
   }) as typeof globalThis.fetch;
@@ -987,10 +1056,10 @@ test("manual eligible-job claim IDs retain the historical jobs namespace", async
       const body = JSON.parse(String(init.body));
       const check = { id: 2, ...body } as CheckRun;
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
-    if (init?.method === "PATCH") return Response.json({});
-    return Response.json({ check_runs: checks });
+    if (init?.method === "PATCH") return githubResponse({});
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1024,14 +1093,14 @@ test("automatic job claims do not consume a manual suite request", async () => {
         external_id: body.external_id,
       };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (init?.method === "PATCH") {
       const id = Number(String(_input).match(/check-runs\/(\d+)/)?.[1]);
       updates.push(id);
-      return Response.json({});
+      return githubResponse({});
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1063,7 +1132,7 @@ test("job-set claims honor completed and active legacy component scopes", async 
     ];
     const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
       if (init?.method === "POST") posted = true;
-      return Response.json({ check_runs: checks });
+      return githubResponse({ check_runs: checks });
     }) as typeof globalThis.fetch;
     const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
       { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
@@ -1100,7 +1169,7 @@ test("claim replaces a stale claim after its accepted request was completed", as
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (String(input).includes("check-suites")) {
-      return Response.json({ check_suites: [{ status: "completed" }] });
+      return githubResponse({ check_suites: [{ status: "completed" }] });
     }
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
@@ -1111,15 +1180,15 @@ test("claim replaces a stale claim after its accepted request was completed", as
         external_id: body.external_id,
       };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (init?.method === "PATCH") {
       const id = Number(String(input).split("/").at(-1));
       const check = checks.find((item) => item.id === id);
       if (check) Object.assign(check, JSON.parse(String(init.body)));
-      return Response.json(check ?? {});
+      return githubResponse(check ?? {});
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1159,7 +1228,7 @@ test("stale recovery leaves the aggregate active when a child cannot be cancelle
       if (id === 2) aggregateCancelled = true;
       if (id === 3) return new Response("unavailable", { status: 503 });
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   await expect(
@@ -1198,10 +1267,10 @@ test("interrupted build recovery cancels only correlated children before the agg
       updates.push(id);
       const check = checks.find((item) => item.id === id);
       if (check) Object.assign(check, JSON.parse(String(init.body)));
-      return Response.json(check ?? {});
+      return githubResponse(check ?? {});
     }
-    if (/\/check-runs\/2$/.test(url)) return Response.json(checks[0]);
-    return Response.json({ check_runs: checks });
+    if (/\/check-runs\/2$/.test(url)) return githubResponse(checks[0]);
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
   const github = new GitHubClient({ token: "installation-token", fetch });
   const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
@@ -1256,14 +1325,14 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
         external_id: body.external_id,
       };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (url.includes("check-suites")) {
-      return Response.json({ check_suites: [{ status: "queued" }] });
+      return githubResponse({ check_suites: [{ status: "queued" }] });
     }
     if (!new URL(url).searchParams.has("check_name")) {
       jobCheckReads++;
-      return Response.json({
+      return githubResponse({
         check_runs: [
           {
             id: 10,
@@ -1303,7 +1372,7 @@ test("claim treats a queued failed check suite as a failed-jobs re-run request",
         ],
       });
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1338,12 +1407,12 @@ test("claim falls back to all jobs when a queued suite has no failed job history
       const body = JSON.parse(String(init.body));
       const check = { id: 2, name: body.name, status: body.status, external_id: body.external_id };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (url.includes("check-suites"))
-      return Response.json({ check_suites: [{ status: "queued" }] });
-    if (!new URL(url).searchParams.has("check_name")) return Response.json({ check_runs: [] });
-    return Response.json({ check_runs: checks });
+      return githubResponse({ check_suites: [{ status: "queued" }] });
+    if (!new URL(url).searchParams.has("check_name")) return githubResponse({ check_runs: [] });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1375,12 +1444,12 @@ test("a tag suite rerun recovers its branchless context and execution label", as
       const body = JSON.parse(String(init.body));
       const check = { id: 2, name: body.name, status: body.status, external_id: body.external_id };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (url.includes("check-suites"))
-      return Response.json({ check_suites: [{ status: "queued" }] });
-    if (!new URL(url).searchParams.has("check_name")) return Response.json({ check_runs: [] });
-    return Response.json({ check_runs: checks });
+      return githubResponse({ check_suites: [{ status: "queued" }] });
+    if (!new URL(url).searchParams.has("check_name")) return githubResponse({ check_runs: [] });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1399,9 +1468,9 @@ test("claim does not repeat a completed check suite", async () => {
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "POST") created = true;
     if (String(input).includes("check-suites")) {
-      return Response.json({ check_suites: [{ status: "completed" }] });
+      return githubResponse({ check_suites: [{ status: "completed" }] });
     }
-    return Response.json({
+    return githubResponse({
       check_runs: [{ id: 1, name: "Informant CI", status: "completed", conclusion: "success" }],
     });
   }) as typeof globalThis.fetch;
@@ -1426,7 +1495,7 @@ test("pre-minted installation tokens retain their App ID check filter", async ()
   let requestUrl = "";
   const fetch = (async (input: string | URL | Request) => {
     requestUrl = String(input);
-    return Response.json({ check_runs: [] });
+    return githubResponse({ check_runs: [] });
   }) as typeof globalThis.fetch;
 
   try {
@@ -1458,7 +1527,7 @@ test("event scopes match exactly and legacy checks do not suppress PR commits", 
   ];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (String(input).includes("check-suites")) {
-      return Response.json({ check_suites: [{ status: "completed" }] });
+      return githubResponse({ check_suites: [{ status: "completed" }] });
     }
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
@@ -1469,10 +1538,10 @@ test("event scopes match exactly and legacy checks do not suppress PR commits", 
         external_id: body.external_id,
       };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
-    if (init?.method === "PATCH") return Response.json({});
-    return Response.json({ check_runs: checks });
+    if (init?.method === "PATCH") return githubResponse({});
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
   const github = new GitHubClient({ token: "installation-token", fetch });
   const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
@@ -1492,6 +1561,7 @@ test("event scopes match exactly and legacy checks do not suppress PR commits", 
 
 test("queued work elects in a canonical manual scope", async () => {
   let createdExternalId = "";
+  let promotedExternalId = "";
   const context = Buffer.from(JSON.stringify({ branch: "release" })).toString("base64url");
   const otherContext = Buffer.from(JSON.stringify({ branch: "main" })).toString("base64url");
   const checks: Array<Record<string, unknown>> = [
@@ -1514,15 +1584,17 @@ test("queued work elects in a canonical manual scope", async () => {
       createdExternalId = body.external_id;
       const check = { id: 2, name: body.name, status: body.status, external_id: body.external_id };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (init?.method === "PATCH") {
       const id = Number(String(_input).split("/").at(-1));
       const check = checks.find((item) => item.id === id);
-      if (check) Object.assign(check, JSON.parse(String(init.body)));
-      return Response.json(check ?? {});
+      const body = JSON.parse(String(init.body));
+      if (typeof body.external_id === "string") promotedExternalId = body.external_id;
+      if (check) Object.assign(check, body);
+      return githubResponse(check ?? {});
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1532,7 +1604,8 @@ test("queued work elects in a canonical manual scope", async () => {
     { type: "commit", id: "branch:release:abc123", branch: "release" },
   );
 
-  expect(createdExternalId).toContain(":event:manual:abc123:context:");
+  expect(createdExternalId).toMatch(/^informant-candidate:[a-f\d]{32}:[a-z\d]+:[a-f\d-]{36}$/);
+  expect(promotedExternalId).toContain(":event:manual:abc123:context:");
   expect(claim?.manualTrigger).toBe(true);
   expect(claim?.manualTriggerBranch).toBe("release");
   expect(checks.find((check) => check.id === 1)?.status).toBe("completed");
@@ -1561,7 +1634,7 @@ test("compact claims do not race an active legacy manual claim", async () => {
   ];
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "POST") created = true;
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1598,15 +1671,15 @@ test("legacy manual requests keep a shared mixed-version election scope", async 
         started_at: new Date().toISOString(),
         external_id: `legacy-worker:event:manual:abc123:context:${context}`,
       });
-      return Response.json(candidate);
+      return githubResponse(candidate);
     }
     if (init?.method === "PATCH") {
       const id = Number(String(input).split("/").at(-1));
       const check = checks.find((item) => item.id === id);
       if (check) Object.assign(check, JSON.parse(String(init.body)));
-      return Response.json(check ?? {});
+      return githubResponse(check ?? {});
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1622,7 +1695,7 @@ test("legacy manual requests keep a shared mixed-version election scope", async 
 
 test("an active event claim is retryable rather than terminal", async () => {
   const fetch = (async (_input: string | URL | Request) =>
-    Response.json({
+    githubResponse({
       check_runs: [
         {
           id: 1,
@@ -1669,15 +1742,15 @@ test("a repeated queued manual trigger can replace historical manual completion"
         external_id: body.external_id,
       };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (init?.method === "PATCH") {
       const id = Number(String(input).split("/").at(-1));
       const check = checks.find((item) => item.id === id);
       if (check) Object.assign(check, JSON.parse(String(init.body)));
-      return Response.json(check ?? {});
+      return githubResponse(check ?? {});
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
@@ -1723,15 +1796,15 @@ test("an event-scoped stale claim and its children are replaced", async () => {
         external_id: body.external_id,
       };
       checks.push(check);
-      return Response.json(check);
+      return githubResponse(check);
     }
     if (init?.method === "PATCH") {
       const id = Number(String(input).split("/").at(-1));
       const check = checks.find((item) => item.id === id);
       if (check) Object.assign(check, JSON.parse(String(init.body)));
-      return Response.json(check ?? {});
+      return githubResponse(check ?? {});
     }
-    return Response.json({ check_runs: checks });
+    return githubResponse({ check_runs: checks });
   }) as typeof globalThis.fetch;
 
   const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(

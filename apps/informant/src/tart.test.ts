@@ -497,6 +497,71 @@ test("shared caches use one direct host mount across repositories and jobs", asy
   }
 });
 
+test("build-scoped shared caches remain isolated for trusted commits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-build-scoped-cache-"));
+  const firstWorkspace = join(root, "first-build", "workspace", "job-0");
+  const secondWorkspace = join(root, "first-build", "workspace", "job-1");
+  const otherBuildWorkspace = join(root, "second-build", "workspace", "job-0");
+  await Promise.all([
+    mkdir(firstWorkspace, { recursive: true }),
+    mkdir(secondWorkspace, { recursive: true }),
+    mkdir(otherBuildWorkspace, { recursive: true }),
+  ]);
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = join(root, "data");
+  const scopedJob = {
+    ...job("release-build"),
+    cache: [
+      {
+        paths: ["~/.cache/release-artifacts"],
+        keyFiles: [],
+        shared: true,
+        buildScoped: true,
+      },
+    ],
+  };
+  const repository = { owner: "one", repo: "repo", fullName: "one/repo" };
+  try {
+    const first = await cacheMounts(
+      repository,
+      firstWorkspace,
+      scopedJob,
+      "root",
+      "linux",
+      true,
+      true,
+    );
+    const second = await cacheMounts(
+      repository,
+      secondWorkspace,
+      { ...scopedJob, name: "release" },
+      "root",
+      "linux",
+      true,
+      true,
+    );
+    const otherBuild = await cacheMounts(
+      repository,
+      otherBuildWorkspace,
+      scopedJob,
+      "root",
+      "linux",
+      true,
+      true,
+    );
+    expect(first.mounts[0]?.path).toContain(
+      join(root, "first-build", "workspace", "shared-caches"),
+    );
+    expect(first.mounts[0]?.path).toBe(second.mounts[0]?.path);
+    expect(first.mounts[0]?.path).not.toBe(otherBuild.mounts[0]?.path);
+    expect(first.mounts[0]?.path).not.toContain(join(root, "data", "caches", "linux", "shared"));
+  } finally {
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("keyed caches cross builds only for trusted commits", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-keyed-cache-"));
   const trustedWorkspace = join(root, "trusted-workspace");

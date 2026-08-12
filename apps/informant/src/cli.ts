@@ -16,7 +16,7 @@ import {
   readConfig,
   selectJobs,
 } from "./config.ts";
-import { prunePreparedContainerImages } from "./container.ts";
+import { prunePreparedContainerImages, recoverMountedFileWrites } from "./container.ts";
 import {
   containerBackendReadiness,
   initializeContainerBackend,
@@ -924,6 +924,21 @@ async function doctor(): Promise<void> {
   if (failed) process.exitCode = 1;
 }
 
+export function updateResultMessage(result: {
+  updated: boolean;
+  restarted: boolean;
+  version: string;
+}): string {
+  if (result.restarted) {
+    return result.updated
+      ? `Updated Informant to ${result.version} and restarted the worker`
+      : `Informant ${result.version} is already current; restarted the worker after a pending update`;
+  }
+  return result.updated
+    ? `Updated Informant to ${result.version}; the startup worker is not running`
+    : `Informant ${result.version} is already current`;
+}
+
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const [subcommand, action, id, value] = positional;
@@ -950,11 +965,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
         process.stdout.write(output);
       },
     });
-    const message = !updated.updated
-      ? `Informant ${updated.version} is already current`
-      : updated.restarted
-        ? `Updated Informant to ${updated.version} and restarted the worker`
-        : `Updated Informant to ${updated.version}; the startup worker is not running`;
+    const message = updateResultMessage(updated);
     if (flags.automatic === true) console.log(message);
     else outro(message);
     return;
@@ -982,6 +993,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "cache") return manageCaches(action);
   if (subcommand === "serve") {
     if (action) throw new Error("serve does not accept a repository; use informant repo add first");
+    await recoverMountedFileWrites();
     const repositories = await listRepositories();
     if (repositories.length === 0) {
       throw new Error("no repositories registered; run informant repo add owner/repository");

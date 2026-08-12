@@ -1,3 +1,4 @@
+import { lstat, realpath } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
@@ -5,7 +6,7 @@ import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./
 import { refreshSelectedContainerBackend } from "./container-backend.ts";
 import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
 import type { ClaimResult, GitHubClient } from "./github.ts";
-import { listAllowedMounts } from "./machine-config.ts";
+import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
 import { withImageLock } from "./tart/vm.ts";
@@ -23,6 +24,7 @@ export interface CoordinatorDependencies {
   refreshContainerBackend?: (signal?: AbortSignal) => Promise<boolean>;
   workerCapabilities?: () => string[];
   listAllowedMounts?: typeof listAllowedMounts;
+  reportDiagnostic?: (message: string) => void;
   acquireExecutionSlot?: AcquireExecutionSlot;
 }
 
@@ -49,6 +51,29 @@ const defaultDependencies: CoordinatorDependencies = {
   readLogTail,
   acquireExecutionSlot,
 };
+
+async function usableAllowedMounts(
+  mounts: Array<{ name: string; source: string }>,
+  reportDiagnostic: (message: string) => void,
+): Promise<Array<{ name: string; source: string }>> {
+  const usable: Array<{ name: string; source: string }> = [];
+  for (const mount of mounts) {
+    try {
+      const source = await realpath(mount.source);
+      const metadata = await lstat(source);
+      if (!metadata.isFile()) throw new Error("source is not a regular file");
+      if (metadata.size > MAX_ALLOWED_MOUNT_BYTES) {
+        throw new Error(`source exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`);
+      }
+      usable.push({ name: mount.name, source });
+    } catch (error) {
+      reportDiagnostic(
+        `Not advertising mount:${mount.name.toLowerCase()}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return usable;
+}
 
 export function aggregatePartitionResults(
   results: Array<BuildRecord | false | undefined>,
@@ -215,10 +240,14 @@ export async function runCommit(
   const usesMountCapabilities = config.jobs.some((job) =>
     (job.runsOn ?? []).some((label) => label.toLowerCase().startsWith("mount:")),
   );
-  const allowedMounts =
+  const configuredAllowedMounts =
     usesCapabilities && usesMountCapabilities && !dependencies.workerCapabilities
       ? await (dependencies.listAllowedMounts ?? listAllowedMounts)()
       : [];
+  const allowedMounts = await usableAllowedMounts(
+    configuredAllowedMounts,
+    dependencies.reportDiagnostic ?? ((message) => console.warn(message)),
+  );
   const advertisedCapabilities = usesCapabilities
     ? (dependencies.workerCapabilities?.() ??
       workerCapabilities(

@@ -6,7 +6,9 @@ const architectureLabel = (value: string) =>
   value === "x64" ? "x64" : value === "arm64" ? "arm64" : value;
 
 export function mountCapability(name: string): string {
-  return `mount:${name.toLowerCase()}`;
+  return name === name.toLowerCase()
+    ? `mount:${name}`
+    : `mount:legacy:${Buffer.from(name).toString("hex")}`;
 }
 
 export function workerCapabilities(environment = Bun.env, allowedMounts: string[] = []): string[] {
@@ -37,7 +39,15 @@ export function selectCapableJobs(
       .filter(
         (job) =>
           (job.runtime?.type !== "container" || available.has("container")) &&
-          (job.runsOn ?? []).every((label) => available.has(label.toLowerCase())),
+          (job.runsOn ?? []).every((label) => {
+            const normalized = label.toLowerCase();
+            const matchingMounts = (job.mounts ?? []).filter(
+              (mount) => `mount:${mount.source.toLowerCase()}` === normalized,
+            );
+            return matchingMounts.length > 0
+              ? matchingMounts.every((mount) => available.has(mountCapability(mount.source)))
+              : available.has(normalized);
+          }),
       )
       .map((job) => job.name),
   );

@@ -49,6 +49,7 @@ export interface JobConfig {
     paths: string[];
     keyFiles: string[];
     shared: boolean;
+    buildScoped?: boolean;
   }>;
 }
 

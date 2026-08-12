@@ -54,7 +54,9 @@ async function readMachineConfig(path = machineConfigPath()): Promise<MachineCon
       Array.isArray(value.allowedMounts) ||
       Object.entries(value.allowedMounts).some(
         ([name, source]) =>
-          !/^[a-z0-9][a-z0-9._-]*$/.test(name) || typeof source !== "string" || !isAbsolute(source),
+          !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) ||
+          typeof source !== "string" ||
+          !isAbsolute(source),
       ))
   )
     throw new Error(`invalid allowed mounts in Informant config: ${path}`);

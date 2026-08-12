@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CommandResult } from "./process.ts";
 import {
+  automaticUpdateLockPath,
   compareVersions,
   disableAutomaticUpdates,
   enableAutomaticUpdates,
@@ -52,6 +53,15 @@ describe("release updates", () => {
       version: "0.2.0",
       assets: [{ name: "informant-linux-x64", url: "https://release/binary" }],
     });
+  });
+
+  test("bounds release metadata requests with an abort deadline", async () => {
+    let signal: AbortSignal | null | undefined;
+    await latestInformantRelease(async (_input, init) => {
+      signal = init?.signal;
+      return releaseResponse("0.2.0");
+    });
+    expect(signal).toBeInstanceOf(AbortSignal);
   });
 
   test("rejects suffix-tagged releases even when GitHub does not mark them prerelease", async () => {
@@ -127,7 +137,10 @@ describe("release updates", () => {
       }),
     ).toEqual({ updated: true, restarted: false, version: "0.2.0" });
     expect(installed).toBe("0.2.0");
-    expect(commands).toEqual([["systemctl", "--user", "is-active", "informant.service"]]);
+    expect(commands).toEqual([
+      ["systemctl", "--user", "is-active", "informant.service"],
+      ["systemctl", "--user", "show", "--property=MainPID", "--value", "informant.service"],
+    ]);
   });
 
   test("verifies that Homebrew installed the release before reporting success", async () => {
@@ -150,6 +163,7 @@ describe("release updates", () => {
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["brew", "upgrade", "informantdev/tap/informant"],
       ["informant", "--version"],
+      ["launchctl", "print", "gui/501/dev.informant.worker"],
     ]);
   });
 
@@ -215,6 +229,149 @@ describe("release updates", () => {
     }
   });
 
+  test("does not replace a Homebrew-managed binary when its probe fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    const executable = join(directory, "Cellar", "informant", "0.1.2", "bin", "informant");
+    try {
+      await mkdir(dirname(executable), { recursive: true });
+      await Bun.write(executable, "Homebrew-managed executable");
+      await expect(
+        updateInformantIfAvailable("0.1.2", {
+          platform: "linux",
+          executable,
+          pendingRestartFile: join(directory, "pending-restart"),
+          fetch: async () => releaseResponse("0.2.0"),
+          command: async (argv) =>
+            argv[0] === "brew" ? result(1, "temporary Homebrew failure") : result(3, "inactive"),
+        }),
+      ).rejects.toThrow("temporary Homebrew failure");
+      expect(await Bun.file(executable).text()).toBe("Homebrew-managed executable");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes concurrent updater transactions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-lock-"));
+    const pendingRestartFile = join(directory, "pending-restart");
+    let requests = 0;
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+    const request = async () => {
+      requests++;
+      if (requests === 1) {
+        firstEntered();
+        await firstBlocked;
+      }
+      return releaseResponse("0.2.0");
+    };
+    try {
+      const first = updateInformantIfAvailable("0.2.0", {
+        pendingRestartFile,
+        fetch: request,
+      });
+      await entered;
+      const second = updateInformantIfAvailable("0.2.0", {
+        pendingRestartFile,
+        fetch: request,
+      });
+      await Bun.sleep(25);
+      expect(requests).toBe(1);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(requests).toBe(2);
+    } finally {
+      releaseFirst();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes updates across different data directories with one per-user lock", async () => {
+    const firstData = await mkdtemp(join(tmpdir(), "informant-update-data-a-"));
+    const secondData = await mkdtemp(join(tmpdir(), "informant-update-data-b-"));
+    const lock = join(tmpdir(), `informant-update-${crypto.randomUUID()}.lock`);
+    let requests = 0;
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+    const request = async () => {
+      requests++;
+      if (requests === 1) {
+        firstEntered();
+        await firstBlocked;
+      }
+      return releaseResponse("0.2.0");
+    };
+    try {
+      const first = updateInformantIfAvailable("0.2.0", {
+        pendingRestartFile: join(firstData, "pending-restart"),
+        updateLockDirectory: lock,
+        fetch: request,
+      });
+      await entered;
+      const second = updateInformantIfAvailable("0.2.0", {
+        pendingRestartFile: join(secondData, "pending-restart"),
+        updateLockDirectory: lock,
+        fetch: request,
+      });
+      await Bun.sleep(25);
+      expect(requests).toBe(1);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(requests).toBe(2);
+    } finally {
+      releaseFirst();
+      await Promise.all([
+        rm(firstData, { recursive: true, force: true }),
+        rm(secondData, { recursive: true, force: true }),
+        rm(lock, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
+  test("uses a fixed per-user updater lock independent of the data directory", () => {
+    expect(automaticUpdateLockPath("/home/worker")).toBe(
+      "/home/worker/.cache/informant/updater.lock",
+    );
+  });
+
+  test("reclaims stale updater locks without an abandonable recovery mutex", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-lock-"));
+    const lock = join(directory, "update.lock");
+    const recovery = `${lock}.recovery`;
+    try {
+      await mkdir(lock, { mode: 0o700 });
+      await Bun.write(
+        join(lock, "owner.json"),
+        JSON.stringify({ pid: 2_147_483_647, token: "abandoned" }),
+      );
+      await mkdir(recovery, { mode: 0o700 });
+
+      expect(
+        await updateInformantIfAvailable("0.2.0", {
+          pendingRestartFile: join(directory, "pending-restart"),
+          updateLockDirectory: lock,
+          fetch: async () => releaseResponse("0.2.0"),
+        }),
+      ).toEqual({ updated: false, restarted: false, version: "0.2.0" });
+      expect(await Bun.file(lock).exists()).toBe(false);
+      expect(await Bun.file(recovery).exists()).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("verifies and atomically installs a published Linux binary", async () => {
     const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
     const executable = join(directory, "informant");
@@ -234,7 +391,8 @@ describe("release updates", () => {
         arch: "x64",
         executable,
         command: async () => result(0, "", "0.2.0\n"),
-        fetch: async (input) => {
+        fetch: async (input, init) => {
+          expect(init?.signal).toBeInstanceOf(AbortSignal);
           const url = String(input);
           return url.endsWith("binary")
             ? new Response(binary)
@@ -522,6 +680,27 @@ describe("automatic update services", () => {
       ).toBe(true);
       expect(await Bun.file(path).exists()).toBe(false);
       expect(commands).toContainEqual(["launchctl", "bootout", "gui/501", path]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("removes an already-unloaded macOS automatic-update agent", async () => {
+    const home = await mkdtemp(join(tmpdir(), "informant-update-home-"));
+    const path = join(home, "Library/LaunchAgents/dev.informant.updater.plist");
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await Bun.write(path, "plist");
+
+      expect(
+        await disableAutomaticUpdates({
+          platform: "darwin",
+          home,
+          uid: 501,
+          command: async () => result(3, "Boot-out failed: 3: No such process"),
+        }),
+      ).toBe(true);
+      expect(await Bun.file(path).exists()).toBe(false);
     } finally {
       await rm(home, { recursive: true, force: true });
     }

@@ -53,8 +53,10 @@ Every worker automatically provides `self-hosted`, its platform (`linux` or `dar
 `INFORMANT_CAPABILITIES`, for example `INFORMANT_CAPABILITIES=gpu,large`.
 
 Allowed host mounts advertise protected `mount:<name>` capabilities automatically. These labels
-cannot be added through `INFORMANT_CAPABILITIES`; they exist only while the mount name is in the
-worker's machine-local allowlist.
+cannot be added through `INFORMANT_CAPABILITIES`; they exist only while the mount is in the worker's
+machine-local allowlist **and** its source currently resolves to a regular file no larger than 1 MiB.
+An unusable allowlist source is omitted from the worker's capabilities and emits a
+`Not advertising mount:<name>` diagnostic with the reason.
 
 Workers also provide `container` only when their platform backend passes its health check. Use
 `runs_on = ["container"]` for a portable container job that can run with Apple Container on macOS or
@@ -222,7 +224,9 @@ changed during the job. This supports files such as Codex's `auth.json`, whose t
 during a run, without overwriting a newer host-side refresh. Mounted files are limited to 1 MiB.
 Informant redacts the original and refreshed file contents and JSON string values from job logs,
 exposes no other files from the source directory, and applies the same default-branch trust
-protections as secret-bearing jobs.
+protections as secret-bearing jobs. Because a writable credential may rotate to a value that was
+already printed, jobs with `write_back = true` suppress all child stdout and stderr and emit a
+suppression marker instead. Read-only mounts retain non-secret output after delayed redaction.
 
 Use `informant mount list` to inspect the allowlist and `informant mount remove <name>` to revoke an
 entry. Treat mounted credentials like other automation secrets: use them only on trusted private
@@ -338,7 +342,10 @@ cache = [
 content-addressed package cache such as `~/.bun/install/cache`. Jobs in the same build mount one
 Informant-owned host directory directly. A default-branch build uses the persistent machine-wide
 cache; pull requests and other commits receive a build-scoped cache that is deleted afterward, so
-untrusted code cannot poison a later trusted build. Shared caches cannot use `key_files`. The host's
+untrusted code cannot poison a later trusted build. Set `build_scoped = true` alongside
+`shared = true` to force this per-build isolation for trusted builds too, such as when handing
+release artifacts between a credential-free producer and publisher. Shared caches cannot use
+`key_files`. The host's
 personal cache is never exposed to CI code.
 
 Without `shared`, each group associates one or more guest `paths` with its `key_files`. Informant

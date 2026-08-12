@@ -286,10 +286,17 @@ function parseCaches(value: unknown, label: string, allowEmpty = false): JobConf
     if (typeof shared !== "boolean") {
       throw new Error(`${label}[${cacheIndex}].shared must be a boolean`);
     }
+    const buildScoped = entry.build_scoped ?? false;
+    if (typeof buildScoped !== "boolean") {
+      throw new Error(`${label}[${cacheIndex}].build_scoped must be a boolean`);
+    }
     if (shared && keyFiles.length > 0) {
       throw new Error(`${label}[${cacheIndex}] cannot combine shared and key_files`);
     }
-    return { paths, keyFiles, shared };
+    if (buildScoped && !shared) {
+      throw new Error(`${label}[${cacheIndex}].build_scoped requires shared = true`);
+    }
+    return { paths, keyFiles, shared, ...(buildScoped ? { buildScoped: true } : {}) };
   });
 }
 
@@ -424,8 +431,8 @@ function parseMounts(value: unknown, label: string): JobConfig["mounts"] {
     const raw = item as Record<string, unknown>;
     if (Object.keys(raw).some((key) => !["source", "target", "write_back"].includes(key)))
       throw new Error(`${label}[${index}] contains an unsupported field`);
-    if (typeof raw.source !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(raw.source))
-      throw new Error(`${label}[${index}].source must be a lowercase allowed mount name`);
+    if (typeof raw.source !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(raw.source))
+      throw new Error(`${label}[${index}].source must be an allowed mount name`);
     if (
       typeof raw.target !== "string" ||
       !raw.target.startsWith("/") ||

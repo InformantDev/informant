@@ -672,7 +672,11 @@ describe("runCommit", () => {
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
   });
 
-  test("admits mount-capability jobs only when the mount is allow-listed", async () => {
+  test("admits mount-capability jobs only when the mount is usable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "informant-coordinator-mount-"));
+    temporaryDirectories.push(root);
+    const source = join(root, "auth.json");
+    await Bun.write(source, "credential");
     const baseJob = config.jobs[0];
     if (!baseJob) throw new Error("expected test job");
     const mountConfig: InformantConfig = {
@@ -689,14 +693,26 @@ describe("runCommit", () => {
     };
 
     const configured = harness();
-    configured.dependencies.listAllowedMounts = async () => [
-      { name: "codex-auth", source: "/home/worker/.codex/auth.json" },
-    ];
+    configured.dependencies.listAllowedMounts = async () => [{ name: "codex-auth", source }];
     await runCommit(configured.github, repository, "configured", "main", mountConfig, {
       ...configured.dependencies,
       refreshContainerBackend: async () => true,
     });
     expect(configured.jobChecks).toEqual(["staff-review"]);
+
+    const unusable = harness();
+    const diagnostics: string[] = [];
+    unusable.dependencies.listAllowedMounts = async () => [
+      { name: "codex-auth", source: join(root, "deleted.json") },
+    ];
+    unusable.dependencies.reportDiagnostic = (message) => diagnostics.push(message);
+    await runCommit(unusable.github, repository, "unusable", "main", mountConfig, {
+      ...unusable.dependencies,
+      refreshContainerBackend: async () => true,
+    });
+    expect(unusable.jobChecks).toEqual([]);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toContain("Not advertising mount:codex-auth");
 
     const unconfigured = harness();
     unconfigured.dependencies.listAllowedMounts = async () => [];

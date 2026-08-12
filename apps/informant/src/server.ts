@@ -25,6 +25,7 @@ const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 24 * 60 * 60_000;
 const MISSING_CONFIG_TTL_MS = 24 * 60 * 60_000;
 const MISSING_CONFIG_LIMIT = 256;
+const DELETED_TAG_HISTORY_LIMIT = 2_048;
 
 class MissingRepositoryConfigError extends Error {}
 
@@ -71,6 +72,22 @@ function unexpiredMissingConfigs(
     const checkedAt = Date.parse(entry.checkedAt);
     return Number.isFinite(checkedAt) && now - checkedAt < MISSING_CONFIG_TTL_MS;
   });
+}
+
+function compactTagRefs(
+  previous: Array<{ name: string; sha: string }>,
+  current: Array<{ name: string; sha: string }>,
+): Array<{ name: string; sha: string }> {
+  const currentNames = new Set(current.map((tag) => tag.name));
+  const currentKeys = new Set(current.map((tag) => `${tag.name}\0${tag.sha}`));
+  const seen = new Set<string>();
+  const deleted = previous.filter((tag) => {
+    const key = `${tag.name}\0${tag.sha}`;
+    if (currentNames.has(tag.name) || currentKeys.has(key) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return [...deleted.slice(-DELETED_TAG_HISTORY_LIMIT), ...current];
 }
 
 function boundMissingConfigs(
@@ -505,14 +522,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               state.pendingTags.push(tag);
               pending.add(key);
             }
-            if (!previous.has(key)) {
-              state.tagRefs.push(tag);
-              previous.add(key);
-            }
           }
+          state.tagRefs = compactTagRefs(state.tagRefs, tags);
         } else {
           // The first complete poll establishes durable history without replaying existing tags.
-          state.tagRefs = tags;
+          state.tagRefs = compactTagRefs([], tags);
         }
         state.tagsPolledAt = new Date().toISOString();
       }

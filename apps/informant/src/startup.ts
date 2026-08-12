@@ -310,7 +310,6 @@ export async function updateInformant(
   } else {
     throw new Error("a Linux update installer is required");
   }
-  if (!loaded) return { restarted: false };
   const currentService = await serviceStatus();
   const previousPid =
     currentService.exitCode === 0
@@ -318,6 +317,9 @@ export async function updateInformant(
         ? servicePid(currentService.stdout)
         : Number(currentService.stdout.trim()) || undefined
       : undefined;
+  const currentlyLoaded =
+    currentPlatform === "darwin" ? currentService.exitCode === 0 : previousPid !== undefined;
+  if (!loaded && !currentlyLoaded) return { restarted: false };
   if (currentPlatform === "darwin") {
     await migrateStartupServiceDefinition(run, options.writeStartupService);
   }
@@ -335,6 +337,7 @@ export async function updateInformant(
   const timeoutMs = options.restartTimeoutMs ?? GRACEFUL_RESTART_TIMEOUT_MS;
   const sleep = options.sleep ?? Bun.sleep;
   let elapsed = 0;
+  let timedOutPid: number | undefined;
   while (true) {
     const current = await serviceStatus();
     const currentPid =
@@ -344,12 +347,21 @@ export async function updateInformant(
           : Number(current.stdout.trim()) || undefined
         : undefined;
     if (currentPid && (!previousPid || currentPid !== previousPid)) return { restarted: true };
-    if (elapsed >= timeoutMs) break;
+    if (elapsed >= timeoutMs) {
+      timedOutPid = currentPid;
+      break;
+    }
     const delay = Math.min(RESTART_POLL_INTERVAL_MS, timeoutMs - elapsed);
     await sleep(delay);
     elapsed += delay;
   }
-  if (previousPid) await run(["kill", "-KILL", String(previousPid)]);
+  if (previousPid && timedOutPid === previousPid) {
+    await run(
+      currentPlatform === "darwin"
+        ? ["launchctl", "kill", "SIGKILL", service]
+        : ["systemctl", "--user", "kill", "--kill-whom=main", "--signal=SIGKILL", service],
+    );
+  }
   throw new Error(
     `Informant was updated but its graceful restart did not complete within ${Math.ceil(timeoutMs / 1_000)} seconds`,
   );

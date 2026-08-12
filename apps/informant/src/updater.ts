@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { constants, existsSync, realpathSync } from "node:fs";
-import { access, chmod, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, open, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { arch, homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { exchangeFilePaths } from "./atomic-rename.ts";
 import { xdgConfigHome } from "./config-home.ts";
 import { command } from "./process.ts";
 import { updateInformant } from "./startup.ts";
@@ -12,6 +13,11 @@ const RELEASES_API = "https://api.github.com/repos/InformantDev/informant/releas
 const HOMEBREW_FORMULA = "informantdev/tap/informant";
 const UPDATE_LABEL = "dev.informant.updater";
 const UPDATE_INTERVAL_SECONDS = 6 * 60 * 60;
+const UPDATE_HTTP_TIMEOUT_MS = 60_000;
+const UPDATE_LOCK_RETRY_MS = 100;
+
+export const automaticUpdateLockPath = (home = homedir()) =>
+  join(home, ".cache", "informant", "updater.lock");
 
 interface ReleaseAsset {
   name: string;
@@ -19,6 +25,126 @@ interface ReleaseAsset {
 }
 
 type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+function updaterTimeoutError(action: string, cause: unknown): Error {
+  return new Error(`${action} timed out after ${UPDATE_HTTP_TIMEOUT_MS / 1_000} seconds`, {
+    cause,
+  });
+}
+
+async function boundedFetch(
+  request: Fetch,
+  input: string | URL | Request,
+  init: RequestInit,
+  action: string,
+): Promise<{ response: Response; signal: AbortSignal }> {
+  const signal = AbortSignal.timeout(UPDATE_HTTP_TIMEOUT_MS);
+  try {
+    return { response: await request(input, { ...init, signal }), signal };
+  } catch (error) {
+    if (signal.aborted) throw updaterTimeoutError(action, error);
+    throw error;
+  }
+}
+
+async function readBoundedResponse<T>(
+  signal: AbortSignal,
+  action: string,
+  read: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    if (signal.aborted) throw updaterTimeoutError(action, error);
+    throw error;
+  }
+}
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function updateLockOwner(path: string): Promise<{ pid: number; token: string } | undefined> {
+  try {
+    const value = (await Bun.file(join(path, "owner.json")).json()) as {
+      pid?: unknown;
+      token?: unknown;
+    };
+    return Number.isSafeInteger(value.pid) && typeof value.token === "string"
+      ? { pid: value.pid as number, token: value.token }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sameUpdateLockOwner(
+  left: { pid: number; token: string } | undefined,
+  right: { pid: number; token: string } | undefined,
+): boolean {
+  return left?.pid === right?.pid && left?.token === right?.token;
+}
+
+async function acquireUpdateLock(path: string): Promise<string> {
+  const token = crypto.randomUUID();
+  const candidate = `${path}.${token}`;
+  while (true) {
+    await mkdir(candidate, { mode: 0o700 });
+    try {
+      await Bun.write(join(candidate, "owner.json"), JSON.stringify({ pid: process.pid, token }));
+      try {
+        await rename(candidate, path);
+        return token;
+      } catch (error) {
+        if (!["EEXIST", "ENOTEMPTY"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+          throw error;
+        }
+      }
+
+      const expected = await updateLockOwner(path);
+      if (expected && processIsRunning(expected.pid)) {
+        await Bun.sleep(UPDATE_LOCK_RETRY_MS);
+        continue;
+      }
+
+      // Exchange keeps the lock pathname continuously occupied. If another
+      // process replaced the stale generation after it was inspected, restore
+      // that generation atomically instead of displacing its live lock.
+      try {
+        exchangeFilePaths(path, candidate);
+      } catch (error) {
+        if (sameUpdateLockOwner(await updateLockOwner(path), expected)) throw error;
+        continue;
+      }
+      const displaced = await updateLockOwner(candidate);
+      if (sameUpdateLockOwner(displaced, expected)) return token;
+      exchangeFilePaths(path, candidate);
+      await Bun.sleep(UPDATE_LOCK_RETRY_MS);
+    } finally {
+      await rm(candidate, { recursive: true, force: true });
+    }
+  }
+}
+
+async function withUpdateLock<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  await mkdir(dirname(path), { recursive: true });
+  const token = await acquireUpdateLock(path);
+  // Older versions used this bare directory as a recovery mutex. It is safe to
+  // remove after acquiring the owned lock, and it must not block new updates.
+  await rm(`${path}.recovery`, { recursive: true, force: true });
+  try {
+    return await operation();
+  } finally {
+    if ((await updateLockOwner(path))?.token === token) {
+      await rm(path, { recursive: true, force: true });
+    }
+  }
+}
 
 export interface InformantRelease {
   tag: string;
@@ -50,22 +176,32 @@ export function compareVersions(left: string, right: string): number {
 }
 
 export async function latestInformantRelease(request: Fetch = fetch): Promise<InformantRelease> {
-  const response = await request(RELEASES_API, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "Informant updater",
-      "X-GitHub-Api-Version": "2022-11-28",
+  const { response, signal } = await boundedFetch(
+    request,
+    RELEASES_API,
+    {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "Informant updater",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
     },
-  });
+    "checking for Informant updates",
+  );
   if (!response.ok) {
     throw new Error(`could not check for Informant updates: GitHub returned ${response.status}`);
   }
-  const value = (await response.json()) as {
-    tag_name?: unknown;
-    draft?: unknown;
-    prerelease?: unknown;
-    assets?: Array<{ name?: unknown; browser_download_url?: unknown }>;
-  };
+  const value = await readBoundedResponse(
+    signal,
+    "checking for Informant updates",
+    async () =>
+      (await response.json()) as {
+        tag_name?: unknown;
+        draft?: unknown;
+        prerelease?: unknown;
+        assets?: Array<{ name?: unknown; browser_download_url?: unknown }>;
+      },
+  );
   if (value.draft || value.prerelease || typeof value.tag_name !== "string") {
     throw new Error("could not check for Informant updates: invalid latest release");
   }
@@ -88,9 +224,16 @@ function releaseAsset(release: InformantRelease, name: string): ReleaseAsset {
 }
 
 async function download(asset: ReleaseAsset, request: Fetch): Promise<Uint8Array> {
-  const response = await request(asset.url, { headers: { "User-Agent": "Informant updater" } });
+  const { response, signal } = await boundedFetch(
+    request,
+    asset.url,
+    { headers: { "User-Agent": "Informant updater" } },
+    `downloading ${asset.name}`,
+  );
   if (!response.ok) throw new Error(`could not download ${asset.name}: HTTP ${response.status}`);
-  return new Uint8Array(await response.arrayBuffer());
+  return new Uint8Array(
+    await readBoundedResponse(signal, `downloading ${asset.name}`, () => response.arrayBuffer()),
+  );
 }
 
 export function resolveInformantExecutable(
@@ -174,7 +317,13 @@ export async function installLinuxRelease(
     `.${basename(executable)}.update-${crypto.randomUUID()}`,
   );
   try {
-    await writeFile(temporary, binary, { flag: "wx", mode: 0o755 });
+    const temporaryFile = await open(temporary, "wx", 0o755);
+    try {
+      await temporaryFile.writeFile(binary);
+      await temporaryFile.sync();
+    } finally {
+      await temporaryFile.close();
+    }
     const validation = await (options.command ?? command)([temporary, "--version"], {
       timeoutMs: 30_000,
     });
@@ -188,6 +337,7 @@ export async function installLinuxRelease(
       );
     }
     await rename(temporary, executable);
+    await syncDirectory(dirname(executable));
   } catch (error) {
     throw new Error(
       `could not install Informant ${release.version} at ${executable}: ${error instanceof Error ? error.message : String(error)}`,
@@ -201,15 +351,44 @@ async function homebrewInformantExecutable(
   executable: string,
   run: typeof command,
 ): Promise<string | undefined> {
+  const installed = await realpath(executable).catch((error) => {
+    throw new Error(`could not inspect the installed Informant executable at ${executable}`, {
+      cause: error,
+    });
+  });
+  const appearsHomebrewManaged = installed.split("/").includes("Cellar");
   const prefixResult = await run(["brew", "--prefix", HOMEBREW_FORMULA]);
   const prefix = prefixResult.stdout.trim();
-  if (prefixResult.exitCode !== 0 || !prefix) return undefined;
+  if (prefixResult.exitCode !== 0 || !prefix) {
+    if (appearsHomebrewManaged) {
+      throw new Error(
+        `could not inspect the Homebrew Informant installation: ${prefixResult.stderr.trim() || `brew --prefix exited ${prefixResult.exitCode}`}`,
+      );
+    }
+    return undefined;
+  }
   const homebrewExecutable = join(prefix, "bin", "informant");
-  const [installed, candidate] = await Promise.all([
-    realpath(executable).catch(() => undefined),
-    realpath(homebrewExecutable).catch(() => undefined),
-  ]);
-  return installed && installed === candidate ? homebrewExecutable : undefined;
+  const candidate = await realpath(homebrewExecutable).catch((error) => {
+    if (appearsHomebrewManaged) {
+      throw new Error(`could not inspect the Homebrew executable at ${homebrewExecutable}`, {
+        cause: error,
+      });
+    }
+    return undefined;
+  });
+  return installed === candidate ? homebrewExecutable : undefined;
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  let directory: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    directory = await open(path, "r");
+    await directory.sync();
+  } catch (error) {
+    if (!["EINVAL", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  } finally {
+    await directory?.close();
+  }
 }
 
 async function installHomebrewRelease(
@@ -249,60 +428,64 @@ export async function updateInformantIfAvailable(
     restartTimeoutMs?: number;
     sleep?: (milliseconds: number) => Promise<unknown>;
     uid?: number;
+    updateLockDirectory?: string;
   } = {},
 ): Promise<{ updated: boolean; restarted: boolean; version: string }> {
-  const release = await latestInformantRelease(options.fetch);
-  const currentPlatform = options.platform ?? process.platform;
-  const run = options.command ?? command;
   const pendingRestartFile =
     options.pendingRestartFile ?? join(dataDirectory(), "update-pending-restart");
-  const pendingRestartState = Bun.file(pendingRestartFile);
-  const pendingRestart = (await pendingRestartState.exists())
-    ? await pendingRestartState.text()
-    : undefined;
-  const updateAvailable = compareVersions(release.version, currentVersion) > 0;
-  const retryRestart = !updateAvailable && pendingRestart?.trim() === currentVersion;
-  if (!updateAvailable && !retryRestart) {
-    return { updated: false, restarted: false, version: currentVersion };
-  }
-  const install = retryRestart
-    ? async () => {}
-    : currentPlatform === "linux"
-      ? async () => {
-          if (options.installLinux) return options.installLinux(release);
-          const executable = resolveInformantExecutable("linux", options.executable);
-          const homebrewExecutable = await homebrewInformantExecutable(executable, run);
-          if (homebrewExecutable) {
-            return installHomebrewRelease(release, run, options.onOutput, homebrewExecutable);
+  const lockDirectory = options.updateLockDirectory ?? automaticUpdateLockPath();
+  return withUpdateLock(lockDirectory, async () => {
+    const release = await latestInformantRelease(options.fetch);
+    const currentPlatform = options.platform ?? process.platform;
+    const run = options.command ?? command;
+    const pendingRestartState = Bun.file(pendingRestartFile);
+    const pendingRestart = (await pendingRestartState.exists())
+      ? await pendingRestartState.text()
+      : undefined;
+    const updateAvailable = compareVersions(release.version, currentVersion) > 0;
+    const retryRestart = !updateAvailable && pendingRestart?.trim() === currentVersion;
+    if (!updateAvailable && !retryRestart) {
+      return { updated: false, restarted: false, version: currentVersion };
+    }
+    const install = retryRestart
+      ? async () => {}
+      : currentPlatform === "linux"
+        ? async () => {
+            if (options.installLinux) return options.installLinux(release);
+            const executable = resolveInformantExecutable("linux", options.executable);
+            const homebrewExecutable = await homebrewInformantExecutable(executable, run);
+            if (homebrewExecutable) {
+              return installHomebrewRelease(release, run, options.onOutput, homebrewExecutable);
+            }
+            return installLinuxRelease(release, {
+              command: run,
+              executable,
+              fetch: options.fetch,
+            });
           }
-          return installLinuxRelease(release, {
-            command: run,
-            executable,
-            fetch: options.fetch,
-          });
-        }
-      : currentPlatform === "darwin"
-        ? () => installHomebrewRelease(release, run, options.onOutput)
-        : undefined;
-  if (!retryRestart) {
-    await mkdir(dirname(pendingRestartFile), { recursive: true });
-    await Bun.write(pendingRestartFile, `${release.version}\n`);
-  }
-  const result = await updateInformant({
-    command: run,
-    install,
-    onOutput: options.onOutput,
-    platform: currentPlatform,
-    restartTimeoutMs: options.restartTimeoutMs,
-    sleep: options.sleep,
-    uid: options.uid,
+        : currentPlatform === "darwin"
+          ? () => installHomebrewRelease(release, run, options.onOutput)
+          : undefined;
+    if (!retryRestart) {
+      await mkdir(dirname(pendingRestartFile), { recursive: true });
+      await Bun.write(pendingRestartFile, `${release.version}\n`);
+    }
+    const result = await updateInformant({
+      command: run,
+      install,
+      onOutput: options.onOutput,
+      platform: currentPlatform,
+      restartTimeoutMs: options.restartTimeoutMs,
+      sleep: options.sleep,
+      uid: options.uid,
+    });
+    await rm(pendingRestartFile, { force: true });
+    return {
+      updated: !retryRestart,
+      restarted: result.restarted,
+      version: retryRestart ? currentVersion : release.version,
+    };
   });
-  await rm(pendingRestartFile, { force: true });
-  return {
-    updated: !retryRestart,
-    restarted: result.restarted,
-    version: retryRestart ? currentVersion : release.version,
-  };
 }
 
 function escapeXml(value: string): string {
@@ -537,9 +720,18 @@ export async function disableAutomaticUpdates(
     const result = await run(["launchctl", "bootout", domain, path]);
     if (result.exitCode !== 0) {
       if (!existed) return false;
-      throw new Error(
-        `could not disable automatic Informant updates: ${result.stderr.trim() || `launchctl exited ${result.exitCode}`}`,
-      );
+      const message = result.stderr.toLowerCase();
+      const alreadyUnloaded =
+        result.exitCode === 3 ||
+        message.includes("no such process") ||
+        message.includes("could not find service") ||
+        message.includes("not loaded") ||
+        message.includes("not found");
+      if (!alreadyUnloaded) {
+        throw new Error(
+          `could not disable automatic Informant updates: ${result.stderr.trim() || `launchctl exited ${result.exitCode}`}`,
+        );
+      }
     }
     await rm(path, { force: true });
     return true;

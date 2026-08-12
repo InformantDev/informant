@@ -93,9 +93,10 @@ export async function cacheMounts(
         (guestOs !== "linux" || directShared) &&
         !(directShared && guestOs === "linux" && path === "~/.bun/install/cache");
       if (direct) {
-        const host = trusted
-          ? join(persistentRoot, "shared", cachePathIdentity(user, path))
-          : join(workspace, "..", "shared-caches", cachePathIdentity(user, path));
+        const host =
+          trusted && !cache.buildScoped
+            ? join(persistentRoot, "shared", cachePathIdentity(user, path))
+            : join(workspace, "..", "shared-caches", cachePathIdentity(user, path));
         await mkdir(host, { recursive: true });
         const resolvedHost = await realpath(host);
         args.push(`--dir=cache-${mountIndex}:${resolvedHost}`);
@@ -113,7 +114,7 @@ export async function cacheMounts(
         continue;
       }
       const parent = cache.shared
-        ? trusted
+        ? trusted && !cache.buildScoped
           ? join(persistentRoot, "shared", cachePathIdentity(user, path))
           : join(workspace, "..", "shared-caches", cachePathIdentity(user, path))
         : trusted

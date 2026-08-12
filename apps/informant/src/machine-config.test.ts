@@ -66,7 +66,7 @@ test("allows only named existing host files for repository mounts", async () => 
   }
 });
 
-test("rejects uppercase mount names in machine configuration", async () => {
+test("preserves mixed-case mount names written by previous releases", async () => {
   const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
   try {
     await Bun.write(
@@ -77,7 +77,9 @@ test("rejects uppercase mount names in machine configuration", async () => {
         allowedMounts: { "Codex-Auth": "/tmp/auth.json" },
       })}\n`,
     );
-    expect(listAllowedMounts(path)).rejects.toThrow("invalid allowed mounts");
+    expect(await listAllowedMounts(path)).toEqual([
+      { name: "Codex-Auth", source: "/tmp/auth.json" },
+    ]);
   } finally {
     await Bun.file(path).delete();
   }

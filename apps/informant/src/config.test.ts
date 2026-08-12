@@ -468,10 +468,11 @@ describe("configuration", () => {
     ).toEqual([{ source: "codex-auth", target: "/mnt/codex", writeBack: true }]);
     expect(() =>
       parseConfig(configured.replace('source = "codex-auth"', 'source = "bad/name"')),
-    ).toThrow("source must be a lowercase allowed mount name");
-    expect(() =>
-      parseConfig(configured.replace('source = "codex-auth"', 'source = "Codex-Auth"')),
-    ).toThrow("source must be a lowercase allowed mount name");
+    ).toThrow("source must be an allowed mount name");
+    expect(
+      parseConfig(configured.replace('source = "codex-auth"', 'source = "Codex-Auth"')).jobs[0]
+        ?.mounts,
+    ).toEqual([{ source: "Codex-Auth", target: "/mnt/codex", writeBack: true }]);
     expect(() =>
       parseConfig(configured.replace('target = "/mnt/codex"', 'target = "relative"')),
     ).toThrow("target must be an absolute container directory");
@@ -565,11 +566,18 @@ filters = []
     expect(() => parseConfig(configTemplate().replace("shared = true", 'shared = "yes"'))).toThrow(
       "shared must be a boolean",
     );
+    expect(
+      parseConfig(configTemplate().replace("shared = true", "shared = true, build_scoped = true"))
+        .jobs[0]?.cache,
+    ).toEqual([{ paths: ["~/.bun/install/cache"], keyFiles: [], shared: true, buildScoped: true }]);
     expect(() =>
       parseConfig(
         configTemplate().replace("shared = true", 'shared = true, key_files = ["bun.lock"]'),
       ),
     ).toThrow("cannot combine shared and key_files");
+    expect(() =>
+      parseConfig(configTemplate().replace("shared = true", "build_scoped = true")),
+    ).toThrow("build_scoped requires shared = true");
     expect(() =>
       parseConfig(
         configTemplate().replace("timeout_minutes = 60", "timeout_minutes = 30\ncache = []"),

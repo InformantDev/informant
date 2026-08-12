@@ -703,6 +703,33 @@ describe("serve polling orchestration", () => {
     expect(state.pendingTags).toEqual([]);
   });
 
+  test("bounds deleted tag acknowledgement history while retaining current refs", async () => {
+    const deleted = Array.from({ length: 2_100 }, (_, index) => ({
+      name: `deleted-${index}`,
+      sha: `sha-${index}`,
+    }));
+    const current = { name: "v-current", sha: "current-sha" };
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [...deleted, current],
+    };
+    const deps = dependencies(
+      github({ tags: async () => [current] }),
+      state,
+      async () => undefined,
+    );
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, dependencies: deps });
+
+    expect(state.tagRefs).toHaveLength(2_049);
+    expect(state.tagRefs).not.toContainEqual(deleted[0]);
+    expect(state.tagRefs).toContainEqual(deleted.at(-1));
+    expect(state.tagRefs).toContainEqual(current);
+  });
+
   test("acknowledges nonmatching tags and retains false or rejected matching tags", async () => {
     const nonmatching: PollState = {
       pending: [],
