@@ -37,9 +37,11 @@ pi --print \
   --no-session \
   --approve \
   --no-extensions \
+  --extension /opt/informant/staff-review-pi.ts \
   --no-prompt-templates \
   --no-context-files \
-  --append-system-prompt 'When a Staff Review skill asks you to spawn or stop sub-agents, use the bash tool to launch and manage independent nested `pi --print --no-session --approve --no-extensions --no-prompt-templates --no-context-files` processes in this same working directory. Run requested parallel agents concurrently, collect each process output, and treat it as that sub-agent result.' \
+  --tools read,bash,grep,find,ls,staff_agent \
+  --append-system-prompt 'Use the staff_agent tool whenever the Staff Review skill asks you to spawn a find or verify sub-agent. Make one tool call per agent, issue independent calls together for parallel execution, pass the complete worker prompt as task, and use role=find or role=verify as appropriate. The tool waits for the child and returns its final output, so no separate stop call is needed. Never launch Pi through bash.' \
   "/skill:staff-review $slug"
 
 export GH_TOKEN="$github_token"
@@ -54,12 +56,205 @@ container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepare
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git jq ripgrep
+apt-get install -y --no-install-recommends bubblewrap ca-certificates curl git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
-mkdir -p "$HOME/.bun/install/global"
-bun add --global --ignore-scripts @earendil-works/pi-coding-agent@0.84.1
+mkdir -p "$HOME/.bun/install/global" "$HOME/.bun/bin" /opt/informant
+BUN_INSTALL_BIN="$HOME/.bun/bin" bun add --global --ignore-scripts \
+  @earendil-works/pi-coding-agent@0.84.1
+ln -sf "$HOME/.bun/bin/pi" /usr/local/bin/pi
 ln -sf "$(command -v bun)" /usr/local/bin/node
+cat > /opt/informant/staff-review-pi.ts <<'PI_EXTENSION'
+import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { relative, resolve, sep } from "node:path";
+import { StringEnum } from "@earendil-works/pi-ai";
+import {
+  createBashTool,
+  isToolCallEventType,
+  type BashOperations,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+const workspace = realpathSync(process.cwd());
+const authRoot = realpathSync(process.env.PI_CODING_AGENT_DIR ?? "/mnt/informant-pi");
+const extensionPath = "/opt/informant/staff-review-pi.ts";
+const childOutputLimit = 1024 * 1024;
+
+function isWithin(root: string, path: string): boolean {
+  const fromRoot = relative(root, path);
+  return fromRoot === "" || (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`));
+}
+
+function canonicalPath(path: string): string {
+  const absolute = resolve(workspace, path.replace(/^@/, ""));
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
+function sandboxedBashOperations(): BashOperations {
+  return {
+    async exec(command, cwd, { onData, signal, timeout }) {
+      const args = [
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--uid",
+        "0",
+        "--gid",
+        "0",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        workspace,
+        workspace,
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        authRoot,
+        "--chdir",
+        cwd,
+        "/bin/bash",
+        "-lc",
+        `export HOME=/tmp/tool-home XDG_CONFIG_HOME=/tmp/tool-home/.config PI_CODING_AGENT_DIR=/tmp/pi-agent-unavailable; mkdir -p "$HOME" "$XDG_CONFIG_HOME"; ${command}`,
+      ];
+      return new Promise((done, reject) => {
+        const child = spawn("bwrap", args, {
+          cwd,
+          detached: true,
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let timedOut = false;
+        const stop = () => {
+          if (!child.pid) return;
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch {
+            child.kill("SIGKILL");
+          }
+        };
+        const timer = timeout
+          ? setTimeout(() => {
+              timedOut = true;
+              stop();
+            }, timeout * 1000)
+          : undefined;
+        const abort = () => stop();
+        signal?.addEventListener("abort", abort, { once: true });
+        child.stdout.on("data", onData);
+        child.stderr.on("data", onData);
+        child.on("error", reject);
+        child.on("close", (code) => {
+          if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          if (signal?.aborted) reject(new Error("aborted"));
+          else if (timedOut) reject(new Error(`timeout:${timeout}`));
+          else done({ exitCode: code });
+        });
+      });
+    },
+  };
+}
+
+function runChild(task: string, role: "find" | "verify", signal?: AbortSignal): Promise<string> {
+  const args = [
+    "--print",
+    "--no-session",
+    "--approve",
+    "--no-extensions",
+    "--extension",
+    extensionPath,
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--tools",
+    "read,bash,grep,find,ls",
+    task,
+  ];
+  return new Promise((done, reject) => {
+    const child = spawn("/usr/local/bin/pi", args, {
+      cwd: workspace,
+      detached: true,
+      env: { ...process.env, PI_STAFF_REVIEW_CHILD: role },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const append = (current: string, chunk: Buffer) =>
+      (current + chunk.toString()).slice(-childOutputLimit);
+    const stop = () => {
+      if (!child.pid) return;
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
+    const abort = () => stop();
+    signal?.addEventListener("abort", abort, { once: true });
+    child.stdout.on("data", (chunk) => {
+      stdout = append(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = append(stderr, chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) reject(new Error("sub-agent aborted"));
+      else if (code !== 0) reject(new Error(stderr.trim() || `sub-agent exited ${code}`));
+      else done(stdout.trim() || "[]");
+    });
+  });
+}
+
+export default function (pi: ExtensionAPI) {
+  const bash = createBashTool(workspace, {
+    exposeSessionEnvironment: false,
+    operations: sandboxedBashOperations(),
+  });
+  pi.registerTool({ ...bash, label: "bash (isolated)" });
+
+  pi.on("tool_call", (event) => {
+    if (
+      isToolCallEventType("read", event) ||
+      isToolCallEventType("grep", event) ||
+      isToolCallEventType("find", event) ||
+      isToolCallEventType("ls", event)
+    ) {
+      const path = "path" in event.input && event.input.path ? event.input.path : ".";
+      if (!isWithin(workspace, canonicalPath(path))) {
+        return { block: true, reason: "Staff Review tools may only access the workspace." };
+      }
+    }
+  });
+
+  if (process.env.PI_STAFF_REVIEW_CHILD) return;
+  pi.registerTool({
+    name: "staff_agent",
+    label: "Staff Review sub-agent",
+    description: "Run one isolated Staff Review find or verify sub-agent and return its final output.",
+    parameters: Type.Object({
+      role: StringEnum(["find", "verify"] as const),
+      task: Type.String(),
+    }),
+    async execute(_id, params, signal) {
+      const output = await runChild(params.task, params.role, signal);
+      return { content: [{ type: "text", text: output }], details: { role: params.role } };
+    },
+  });
+}
+PI_EXTENSION
+chmod 0444 /opt/informant/staff-review-pi.ts
 curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.10.3/staff-linux-arm64 \
   -o /usr/local/bin/staff
 chmod +x /usr/local/bin/staff
