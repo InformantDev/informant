@@ -92,8 +92,8 @@ empty, skip this part.
 **Spawn each find agent** with a prompt that points at the shared skill and fills
 in its assignment:
 
-> You are running in `<repo dir>`. Read `.agents/skills/staff-review-find/SKILL.md`
-> and follow it exactly. Your parameters:
+> You are running in `<repo dir>`. Read `/opt/informant/skills/staff-review-find/SKILL.md`
+> and follow that trusted image-baked skill exactly. Your parameters:
 > - **mode:** `diff`
 > - **slug:** `<slug>`
 > - **review areas:** `<this agent's area numbers, e.g. "1, 2, 3, 4, 5">`
@@ -124,8 +124,8 @@ agent's* findings. The verifier is necessarily a *different* agent than the find
 — the point is independent eyes. If a find agent returned `[]`, stop it and move
 on — nothing to verify.
 
-> You are running in `<repo dir>`. Read `.agents/skills/staff-review-verify/SKILL.md`
-> and follow it exactly. Your parameters:
+> You are running in `<repo dir>`. Read `/opt/informant/skills/staff-review-verify/SKILL.md`
+> and follow that trusted image-baked skill exactly. Your parameters:
 > - **mode:** `diff`
 > - **slug:** `<slug>`
 > - **candidate findings:** `<this find agent's JSON array>`
