@@ -1,0 +1,94 @@
+name = "release"
+runs_on = ["container"]
+needs = ["release-build"]
+timeout_minutes = 45
+triggers = [{ event = "commit", tag = { patterns = ["v*"] } }]
+secrets = ["RELEASE_GITHUB_TOKEN"]
+command = """
+set -eu
+
+tag="$INFORMANT_BRANCH"
+if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "release tags must use semantic versions such as v0.2.0" >&2
+  exit 1
+fi
+version=${tag#v}
+artifacts="$HOME/.cache/informant-release/$INFORMANT_SHA"
+tap_directory=
+cleanup() {
+  if [ -n "$tap_directory" ]; then
+    rm -rf "$tap_directory"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+for artifact in \
+  informant-darwin-arm64 informant-darwin-x64 \
+  informant-linux-arm64 informant-linux-x64 informant.rb SHA256SUMS; do
+  if [ ! -f "$artifacts/$artifact" ] || [ -L "$artifacts/$artifact" ]; then
+    echo "release artifact is missing or is not a regular file: $artifact" >&2
+    exit 1
+  fi
+done
+(cd "$artifacts" && sha256sum -c SHA256SUMS)
+
+export GH_TOKEN="$RELEASE_GITHUB_TOKEN"
+if gh release view "$tag" --repo "$INFORMANT_REPOSITORY" >/dev/null 2>&1; then
+  gh release upload "$tag" \
+    "$artifacts"/informant-* \
+    "$artifacts/informant.rb" \
+    "$artifacts/SHA256SUMS" \
+    --clobber \
+    --repo "$INFORMANT_REPOSITORY"
+else
+  gh release create "$tag" \
+    "$artifacts"/informant-* \
+    "$artifacts/informant.rb" \
+    "$artifacts/SHA256SUMS" \
+    --generate-notes \
+    --verify-tag \
+    --title "$tag" \
+    --repo "$INFORMANT_REPOSITORY"
+fi
+
+tap_directory=$(mktemp -d)
+gh auth setup-git
+gh repo clone InformantDev/homebrew-tap "$tap_directory"
+cp "$artifacts/informant.rb" "$tap_directory/Formula/informant.rb"
+if git -C "$tap_directory" diff --quiet -- Formula/informant.rb; then
+  echo "Homebrew formula already matches $tag"
+  exit 0
+fi
+
+tap_branch="automation/informant-$tag"
+git -C "$tap_directory" checkout -B "$tap_branch" origin/main
+git -C "$tap_directory" config user.name "Informant Release Bot"
+git -C "$tap_directory" config user.email "release-bot@informant.dev"
+git -C "$tap_directory" add Formula/informant.rb
+git -C "$tap_directory" commit -m "chore: update Informant to $tag"
+git -C "$tap_directory" push --force-with-lease --set-upstream origin "$tap_branch"
+
+existing_pr=$(gh pr list \
+  --repo InformantDev/homebrew-tap \
+  --head "$tap_branch" \
+  --state open \
+  --json url \
+  --jq '.[0].url // empty')
+if [ -n "$existing_pr" ]; then
+  echo "Homebrew update PR: $existing_pr"
+else
+  gh pr create \
+    --repo InformantDev/homebrew-tap \
+    --head "$tap_branch" \
+    --base main \
+    --title "Update Informant to $tag" \
+    --body "Automated by the Informant release job for InformantDev/informant@$tag."
+fi
+"""
+cache = [{ paths = ["~/.cache/informant-release"], shared = true, build_scoped = true, protected_channel = true, read_only = true }]
+container = { image = "debian:bookworm-slim", cpu = 1, memory_mb = 1024, prepare = """
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates gh git
+rm -rf /var/lib/apt/lists/*
+""" }

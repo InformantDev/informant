@@ -161,9 +161,62 @@ describe("startup service", () => {
     expect(invocations).toEqual([
       ["launchctl", "print", "gui/501/dev.informant.worker"],
       ["brew", "upgrade", "informantdev/tap/informant"],
+      ["launchctl", "print", "gui/501/dev.informant.worker"],
     ]);
   });
 
+  test("restarts a previously inactive worker that starts during installation", async () => {
+    const invocations: string[][] = [];
+    let serviceChecks = 0;
+    const updated = await updateInformant({
+      platform: "linux",
+      install: async () => {},
+      command: async (argv) => {
+        invocations.push(argv);
+        if (argv[2] === "is-active") return result(3, "inactive");
+        if (argv[2] === "show") {
+          serviceChecks++;
+          return result(0, "", `${serviceChecks === 1 ? 100 : 200}\n`);
+        }
+        return result();
+      },
+      sleep: async () => {},
+    });
+
+    expect(updated).toEqual({ restarted: true });
+    expect(invocations).toContainEqual(["kill", "-TERM", "100"]);
+  });
+
+  test("installs a Linux update and gracefully restarts an active systemd worker", async () => {
+    const invocations: string[][] = [];
+    let serviceChecks = 0;
+    let installed = false;
+    const updated = await updateInformant({
+      platform: "linux",
+      install: async () => {
+        installed = true;
+      },
+      command: async (argv) => {
+        invocations.push(argv);
+        if (argv[2] === "show") {
+          serviceChecks++;
+          return result(0, "", serviceChecks < 3 ? "100\n" : "200\n");
+        }
+        return result();
+      },
+      sleep: async () => {},
+    });
+
+    expect(installed).toBe(true);
+    expect(updated).toEqual({ restarted: true });
+    expect(invocations).toEqual([
+      ["systemctl", "--user", "is-active", "informant.service"],
+      ["systemctl", "--user", "show", "--property=MainPID", "--value", "informant.service"],
+      ["kill", "-TERM", "100"],
+      ["systemctl", "--user", "show", "--property=MainPID", "--value", "informant.service"],
+      ["systemctl", "--user", "show", "--property=MainPID", "--value", "informant.service"],
+    ]);
+  });
   test("starts and verifies a loaded service that temporarily has no worker PID", async () => {
     const invocations: string[][] = [];
     let serviceChecks = 0;
@@ -203,7 +256,42 @@ describe("startup service", () => {
         writeStartupService: async () => {},
       }),
     ).rejects.toThrow("graceful restart did not complete within 2 seconds");
-    expect(invocations).toContainEqual(["kill", "-KILL", "100"]);
+    expect(invocations).toContainEqual([
+      "launchctl",
+      "kill",
+      "SIGKILL",
+      "gui/501/dev.informant.worker",
+    ]);
+  });
+
+  test("does not force-kill a previous PID after it leaves the managed service", async () => {
+    const invocations: string[][] = [];
+    let serviceChecks = 0;
+    await expect(
+      updateInformant({
+        platform: "darwin",
+        uid: 501,
+        command: async (argv) => {
+          invocations.push(argv);
+          if (argv[0] === "plutil") return result(0, "", "{}");
+          if (argv[1] === "print") {
+            serviceChecks++;
+            return result(0, "", serviceChecks <= 2 ? "pid = 100" : "");
+          }
+          return result();
+        },
+        sleep: async () => {},
+        restartTimeoutMs: 1_000,
+        writeStartupService: async () => {},
+      }),
+    ).rejects.toThrow("graceful restart did not complete within 1 seconds");
+    expect(invocations).not.toContainEqual(["kill", "-KILL", "100"]);
+    expect(invocations).not.toContainEqual([
+      "launchctl",
+      "kill",
+      "SIGKILL",
+      "gui/501/dev.informant.worker",
+    ]);
   });
 
   test("reports Homebrew and service restart failures separately", async () => {
