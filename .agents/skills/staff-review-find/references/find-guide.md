@@ -30,8 +30,12 @@ make the code shippable and durable, not perform expertise.
 
 **Mode `diff`:** load the changed files. Try the CLI, but never require it:
 
-Use the read-only `staff_files` tool when available; it returns the same prepared
-`{ path, status, oldContent, newContent }` snapshot without shell access. Otherwise:
+Use the read-only `staff_files` tool when available. First list changed files,
+following `nextCursor` until it is null. Then read each path's `old` and `new`
+side separately, following `nextOffsetBytes` until it is null. Every response is
+byte-bounded; concatenate a side's `content` pages in offset order to reconstruct
+the same prepared `{ path, status, oldContent, newContent }` snapshot without
+shell access. Otherwise:
 
 ```bash
 staff files --slug <slug> --json

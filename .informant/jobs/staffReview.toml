@@ -55,15 +55,31 @@ pi --print \
 
 jq -e 'type == "array"' /tmp/staff-review-findings.json >/dev/null
 jq -c '.[]' /tmp/staff-review-findings.json | while IFS= read -r finding; do
-  file="$(printf '%s' "$finding" | jq -er '.file | select(type == "string" and length > 0)')"
-  line="$(printf '%s' "$finding" | jq -er '.line | select(type == "number" and floor == . and . > 0)')"
-  end_line="$(printf '%s' "$finding" | jq -er 'if .endLine == null then "" else (.endLine | select(type == "number" and floor == . and . >= $line) | tostring) end' --argjson line "$line")"
-  side="$(printf '%s' "$finding" | jq -er '.side | select(. == "new" or . == "old")')"
-  priority="$(printf '%s' "$finding" | jq -er '.priority | select(. == "P1" or . == "P2" or . == "P3")')"
-  body="$(printf '%s' "$finding" | jq -er '.body | select(type == "string" and length > 0)')"
-  case "$file" in /*|../*|*/../*|*/..) echo "invalid finding path: $file" >&2; exit 1;; esac
-  set -- comment add --slug "$slug" --file "$file" --line "$line" --side "$side" --author "Pi Staff Review" --priority "$priority"
-  if [ -n "$end_line" ]; then set -- "$@" --end-line "$end_line"; fi
+  printf '%s' "$finding" | jq -e '
+    def positive_integer: if type == "number" then floor == . and . > 0 else false end;
+    def valid_end($line): . == null or (if type == "number" then floor == . and . >= $line else false end);
+    . as $finding |
+    type == "object" and
+    ($finding.side == "new" or $finding.side == "old") and
+    ($finding.priority == "P1" or $finding.priority == "P2" or $finding.priority == "P3") and
+    ($finding.body | type == "string" and length > 0) and
+    (($finding.file == null and $finding.line == null and $finding.endLine == null) or
+      (($finding.file | type == "string" and length > 0) and
+       ($finding.line | positive_integer) and
+       ($finding.endLine | valid_end($finding.line))))
+  ' >/dev/null
+  file="$(printf '%s' "$finding" | jq -r '.file // ""')"
+  priority="$(printf '%s' "$finding" | jq -r '.priority')"
+  body="$(printf '%s' "$finding" | jq -r '.body')"
+  set -- comment add --slug "$slug" --author "Pi Staff Review" --priority "$priority"
+  if [ -n "$file" ]; then
+    line="$(printf '%s' "$finding" | jq -r '.line')"
+    end_line="$(printf '%s' "$finding" | jq -r '.endLine // ""')"
+    side="$(printf '%s' "$finding" | jq -r '.side')"
+    case "$file" in /*|../*|*/../*|*/..) echo "invalid finding path: $file" >&2; exit 1;; esac
+    set -- "$@" --file "$file" --line "$line" --side "$side"
+    if [ -n "$end_line" ]; then set -- "$@" --end-line "$end_line"; fi
+  fi
   printf '%s' "$body" | staff "$@" >/dev/null
 done
 

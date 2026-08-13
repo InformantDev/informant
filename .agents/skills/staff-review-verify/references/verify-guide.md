@@ -21,7 +21,9 @@ Re-derive each finding's reasoning from the code yourself.
 
 - **Mode `diff`:** load the changed files and re-check against them.
 
-  Use the read-only `staff_files` tool when available; it returns the prepared
+  Use the read-only `staff_files` tool when available. List paths by following
+  `nextCursor`, then read the needed path and `old`/`new` side in byte-bounded
+  pages, following `nextOffsetBytes` until null. This returns the prepared
   changed-file snapshot without shell access. Otherwise:
 
   ```bash

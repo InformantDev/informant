@@ -56,8 +56,9 @@ review a ten-line change.
 Gather just enough to partition the work. Do **not** deep-read files — the
 sub-agents do that.
 
-Use the available `staff_files` snapshot tool, `staff files --slug <slug> --json`, or the find worker's Git fallback when
-the CLI is absent, plus `ls .staffreview/docs/` (which may be empty).
+Use the available `staff_files` snapshot tool (follow its `nextCursor` listing
+pages), `staff files --slug <slug> --json`, or the find worker's Git fallback
+when the CLI is absent, plus `ls .staffreview/docs/` (which may be empty).
 
 ## Step 3 — FIND: launch N find agents in the background
 

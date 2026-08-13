@@ -48,6 +48,8 @@ const MAX_TRANSCRIPT_ITEMS = 500;
 const MAX_TRANSCRIPT_ENTRY_CHARS = 100_000;
 const MAX_TRANSCRIPT_CHARS = 1_000_000;
 const MAX_TOOL_OUTPUT_BYTES = 50 * 1024;
+const MAX_STAFF_FILE_CONTENT_BYTES = 32 * 1024;
+const MAX_STAFF_FILE_LIST_ITEMS = 100;
 const REVIEW_TOOL_NAMES = ["read", "grep", "find", "ls", "staff_files"] as const;
 const TRUSTED_SKILL_ROOT = "/opt/informant/skills";
 const DEFAULT_READ_WAIT_SECONDS = 15;
@@ -429,26 +431,129 @@ function workspaceTools(root: string, cwd = root): ToolDefinition[] {
 	];
 }
 
-function staffFilesTool() {
+function staffFilesResult(payload: unknown) {
+	const text = JSON.stringify(payload);
+	if (Buffer.byteLength(text, "utf8") > MAX_TOOL_OUTPUT_BYTES)
+		throw new Error("Staff Review snapshot page exceeded its output limit.");
+	return { content: [{ type: "text" as const, text }], details: {} };
+}
+
+function previousUtf8Boundary(content: Buffer, offset: number): number {
+	let boundary = Math.min(Math.max(0, offset), content.length);
+	while (boundary > 0 && boundary < content.length && (content[boundary] & 0xc0) === 0x80) boundary--;
+	return boundary;
+}
+
+function staffFileContentPage(
+	file: Record<string, unknown>,
+	path: string,
+	side: "old" | "new",
+	offset: number,
+	maximumBytes: number,
+) {
+	const value = file[`${side}Content`];
+	if (value === null || value === undefined) {
+		if (offset !== 0) throw new Error("offsetBytes must be 0 when this side has no content.");
+		return staffFilesResult({
+			file: { path, status: file.status, side, offsetBytes: 0, nextOffsetBytes: null, totalBytes: 0, content: null },
+		});
+	}
+	if (typeof value !== "string") throw new Error(`Invalid ${side} content in Staff Review snapshot: ${path}`);
+
+	const content = Buffer.from(value, "utf8");
+	if (offset > content.length) throw new Error(`offsetBytes exceeds the ${side} content length.`);
+	if (offset < content.length && (content[offset] & 0xc0) === 0x80)
+		throw new Error("offsetBytes must be a UTF-8 boundary returned by nextOffsetBytes.");
+	if (offset === content.length) {
+		return staffFilesResult({
+			file: {
+				path,
+				status: file.status,
+				side,
+				offsetBytes: offset,
+				nextOffsetBytes: null,
+				totalBytes: content.length,
+				content: "",
+			},
+		});
+	}
+
+	let end = previousUtf8Boundary(content, Math.min(content.length, offset + maximumBytes));
+	while (end > offset) {
+		const nextOffsetBytes = end < content.length ? end : null;
+		try {
+			return staffFilesResult({
+				file: {
+					path,
+					status: file.status,
+					side,
+					offsetBytes: offset,
+					nextOffsetBytes,
+					totalBytes: content.length,
+					content: content.subarray(offset, end).toString("utf8"),
+				},
+			});
+		} catch {
+			end = previousUtf8Boundary(content, offset + Math.floor((end - offset) / 2));
+		}
+	}
+	throw new Error("Unable to fit Staff Review content in a bounded tool response.");
+}
+
+export function staffFilesTool() {
 	return {
 		name: "staff_files",
 		label: "Staff Review files",
-		description: "Read the immutable Staff Review diff snapshot prepared by the trusted job shell. Omit paths to list changed files; pass paths to retrieve their old and new contents.",
+		description:
+			"Read the immutable Staff Review diff snapshot in bounded pages. Omit path to list changed files and follow nextCursor. Pass one path and side, then follow nextOffsetBytes until null to read that content.",
 		parameters: Type.Object({
-			paths: Type.Optional(Type.Array(Type.String(), { maxItems: 100 })),
+			path: Type.Optional(Type.String()),
+			side: Type.Optional(Type.Union([Type.Literal("old"), Type.Literal("new")])),
+			cursor: Type.Optional(Type.Integer({ minimum: 0 })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_STAFF_FILE_LIST_ITEMS })),
+			offsetBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+			maxBytes: Type.Optional(Type.Integer({ minimum: 4, maximum: MAX_STAFF_FILE_CONTENT_BYTES })),
 		}),
 		async execute(_toolCallId, params) {
 			const snapshotPath = process.env.INFORMANT_STAFF_FILES ?? "/tmp/staff-review-files.json";
 			const source = JSON.parse(await readFile(snapshotPath, "utf8")) as { files?: Array<Record<string, unknown>> };
 			const files = Array.isArray(source.files) ? source.files : [];
-			const selected = params.paths
-				? params.paths.map((path) => {
-					const file = files.find((item) => item.path === path);
-					if (!file) throw new Error(`Changed file not found in Staff Review snapshot: ${path}`);
-					return file;
-				})
-				: files.map(({ path, status }) => ({ path, status }));
-			return { content: [{ type: "text" as const, text: JSON.stringify({ files: selected }) }], details: {} };
+			if (params.path !== undefined) {
+				if (params.side === undefined) throw new Error("side is required when path is provided.");
+				if (params.cursor !== undefined || params.limit !== undefined)
+					throw new Error("cursor and limit are only valid when listing changed files.");
+				const file = files.find((item) => item.path === params.path);
+				if (!file) throw new Error(`Changed file not found in Staff Review snapshot: ${params.path}`);
+				return staffFileContentPage(
+					file,
+					params.path,
+					params.side,
+					params.offsetBytes ?? 0,
+					params.maxBytes ?? MAX_STAFF_FILE_CONTENT_BYTES,
+				);
+			}
+			if (params.side !== undefined || params.offsetBytes !== undefined || params.maxBytes !== undefined)
+				throw new Error("path is required when reading file content.");
+
+			const cursor = params.cursor ?? 0;
+			if (cursor > files.length) throw new Error("cursor exceeds the changed-file count.");
+			const limit = params.limit ?? MAX_STAFF_FILE_LIST_ITEMS;
+			const listed: Array<{ path: unknown; status: unknown }> = [];
+			for (let index = cursor; index < files.length && listed.length < limit; index++) {
+				const file = files[index];
+				if (!file || typeof file.path !== "string") throw new Error("Invalid path in Staff Review snapshot.");
+				const candidate = [...listed, { path: file.path, status: file.status }];
+				const nextCursor = cursor + candidate.length < files.length ? cursor + candidate.length : null;
+				try {
+					staffFilesResult({ files: candidate, nextCursor, totalFiles: files.length });
+					listed.push({ path: file.path, status: file.status });
+				} catch {
+					if (listed.length === 0) throw new Error("Changed-file metadata exceeds the Staff Review output limit.");
+					break;
+				}
+			}
+			const nextCursor = cursor + listed.length < files.length ? cursor + listed.length : null;
+			return staffFilesResult({ files: listed, nextCursor, totalFiles: files.length });
 		},
 	};
 }
