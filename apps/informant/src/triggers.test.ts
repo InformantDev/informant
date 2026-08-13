@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseConfig, selectTriggeredJobs } from "./config.ts";
+import { parseConfig, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./config.ts";
 import { triggerMatches } from "./triggers.ts";
 
 const source = (triggers: string, jobTriggers = "") => `version = 1
@@ -150,6 +150,41 @@ test("commit context is optional and PR state, draft, and base filters compose",
       { type: "comment", pullRequest },
     ),
   ).toBe(false);
+});
+
+test("manual branch runs exclude tag and comment triggers", () => {
+  const config = parseConfig(`version = 1
+triggers = []
+[vm]
+image = "image"
+[[jobs]]
+name = "generic"
+command = "generic"
+triggers = [{ event = "commit" }]
+[[jobs]]
+name = "feature"
+command = "feature"
+triggers = [{ event = "commit", branch = { names = ["feature"] } }]
+[[jobs]]
+name = "release"
+command = "release"
+triggers = [{ event = "commit", tag = { patterns = ["v*"] } }]
+[[jobs]]
+name = "pull-request"
+command = "pull-request"
+triggers = [{ event = "commit", pull_request = { state = "open" } }]
+[[jobs]]
+name = "comment"
+command = "comment"
+triggers = [{ event = "comment", pull_request = { state = "open" } }]
+`);
+
+  expect(selectManuallyTriggeredJobs(config, [], "feature").jobs.map((job) => job.name)).toEqual([
+    "generic",
+    "feature",
+    "pull-request",
+  ]);
+  expect(selectManuallyTriggeredJobs(config, ["release"], "feature").jobs).toEqual([]);
 });
 
 test("tag triggers opt in and use whole-name case-sensitive globs across slashes", () => {

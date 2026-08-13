@@ -33,8 +33,8 @@ informant --version
 The installer selects x86-64 or ARM64 from the latest GitHub Release, verifies `SHA256SUMS`, and
 installs to `~/.local/bin` without administrator privileges. Set `INFORMANT_INSTALL_DIR` to choose a
 different directory or `INFORMANT_VERSION=0.1.2` to install a specific release. Re-run the installer
-to update a direct installation. `informant setup` can install the Podman packages described below;
-it does not install GitHub CLI.
+to update manually; the user-owned default also supports Informant's automatic updater.
+`informant setup` can install the Podman packages described below; it does not install GitHub CLI.
 
 ## Create the GitHub App
 
@@ -58,7 +58,8 @@ Informant will:
 5. Open GitHub's installation screen so you can choose repositories.
 6. Detect the installation and save its credentials without changing this machine's registered
    repositories.
-7. Offer to start the worker.
+7. On the first setup, ask whether to install a six-hour automatic update check.
+8. Offer to start the worker.
 
 Workers that run macOS VM jobs also need Tart and `sshpass`:
 
@@ -99,6 +100,9 @@ Use `informant startup disable` to stop the worker and remove it from login star
 without a systemd user manager must not use `startup enable`; run `informant serve` in the foreground
 or configure that command in the host's existing process supervisor. Podman itself remains daemonless
 in either arrangement.
+
+When enabled during setup, automatic updates run from a macOS LaunchAgent or Linux systemd user timer.
+Use `informant auto-update enable` or `informant auto-update disable` to change that choice later.
 
 Register more repositories with `informant repo add owner/repository`. Run the same registration and
 serve commands on another machine to add capacity. There is no shared database to configure.
