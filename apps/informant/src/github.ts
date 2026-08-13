@@ -17,10 +17,13 @@ export const COMMENT_CLAIM_NAME = "Informant CI / comment";
 export const MANUAL_TRIGGER_REQUEST_NAME = "Informant CI / trigger";
 export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
+const CLAIM_CANDIDATE_LEASE_MS = 60_000;
 const CLAIM_CLEANUP_TIMEOUT_MS = 5_000;
 const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
+const EXPIRED_CANDIDATE_TITLE = "Expired claim candidate";
 const RETRYABLE_CLAIM_TITLES = new Set([
   INTERRUPTED_CLAIM_TITLE,
+  EXPIRED_CANDIDATE_TITLE,
   "Claim lost",
   "Stale worker claim",
 ]);
@@ -34,6 +37,40 @@ const RETRYABLE_CHECK_CONCLUSIONS = new Set([
   "startup_failure",
   "timed_out",
 ]);
+
+function compactClaimCandidate(check: CheckRun): { scope: string; createdAt: number } | undefined {
+  const match = check.external_id?.match(
+    /^informant-candidate:([a-f\d]{32}):([a-z\d]+):[a-f\d-]+$/,
+  );
+  if (!match) return undefined;
+  const createdAt = Number.parseInt(match[2] ?? "", 36);
+  return Number.isSafeInteger(createdAt) ? { scope: match[1] ?? "", createdAt } : undefined;
+}
+
+function claimCandidateScope(check: CheckRun): string | undefined {
+  return compactClaimCandidate(check)?.scope;
+}
+
+function legacyClaimCandidateCreatedAt(check: CheckRun): number | undefined {
+  const encoded = check.external_id?.match(/:candidate:([a-z0-9]+):[^:]+:event:/)?.[1];
+  if (!encoded) return undefined;
+  const createdAt = Number.parseInt(encoded, 36);
+  return Number.isSafeInteger(createdAt) ? createdAt : undefined;
+}
+
+function isClaimCandidate(check: CheckRun): boolean {
+  return (
+    compactClaimCandidate(check) !== undefined || legacyClaimCandidateCreatedAt(check) !== undefined
+  );
+}
+
+function claimCandidateCreatedAt(check: CheckRun): number | undefined {
+  return compactClaimCandidate(check)?.createdAt ?? legacyClaimCandidateCreatedAt(check);
+}
+
+function promotedClaim(check: CheckRun, externalId: string): CheckRun {
+  return { ...check, status: "in_progress", external_id: externalId };
+}
 
 async function abortableSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
@@ -226,6 +263,7 @@ export class GitHubClient {
   private readonly credentials?: GitHubOptions["credentials"];
   private readonly repository?: Repository;
   private readonly rateLimitKey: string;
+  private githubClock?: { serverTime: number; observedAt: number };
 
   constructor(options: GitHubOptions = {}) {
     this.token = options.token;
@@ -373,8 +411,35 @@ export class GitHubClient {
     return `${unsigned}.${createSign("RSA-SHA256").update(unsigned).sign(privateKey, "base64url")}`;
   }
 
-  private async api<T>(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<T> {
-    const requestSignal = signal ?? init.signal ?? undefined;
+  private observeGitHubClock(response: Response): void {
+    const serverTime = new Date(response.headers.get("date") ?? "").getTime();
+    if (Number.isFinite(serverTime)) {
+      this.githubClock = { serverTime, observedAt: performance.now() };
+    }
+  }
+
+  private githubServerTime(): number | undefined {
+    return this.githubClock
+      ? this.githubClock.serverTime + (performance.now() - this.githubClock.observedAt)
+      : undefined;
+  }
+
+  private claimCandidateActive(check: CheckRun): boolean {
+    const createdAt = claimCandidateCreatedAt(check);
+    const serverTime = this.githubServerTime();
+    // If GitHub omits either timestamp, fail closed rather than discarding a live contender.
+    return createdAt === undefined || serverTime === undefined
+      ? true
+      : serverTime - createdAt <= CLAIM_CANDIDATE_LEASE_MS;
+  }
+
+  private async api<T>(
+    path: string,
+    init: RequestInit | (() => RequestInit) = {},
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const requestSignal =
+      signal ?? (typeof init === "function" ? undefined : init.signal) ?? undefined;
     await this.authenticate(requestSignal);
     for (let attempt = 0; ; attempt++) {
       requestSignal?.throwIfAborted();
@@ -383,17 +448,20 @@ export class GitHubClient {
         await abortableSleep(blockedUntil - Date.now(), requestSignal);
       }
 
+      // Build time-sensitive request bodies only after any shared rate-limit gate.
+      const requestInit = typeof init === "function" ? init() : init;
       const response = await this.request(`${API}${path}`, {
-        ...init,
+        ...requestInit,
         signal: requestSignal,
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${this.token}`,
           "X-GitHub-Api-Version": "2022-11-28",
           "Content-Type": "application/json",
-          ...init.headers,
+          ...requestInit.headers,
         },
       });
+      this.observeGitHubClock(response);
       if (response.ok) return (await response.json()) as T;
 
       const body = await response.text();
@@ -722,6 +790,7 @@ export class GitHubClient {
         (check) =>
           (check.status === "queued" ||
             (check.name === MANUAL_TRIGGER_REQUEST_NAME && check.status === "in_progress")) &&
+          !isClaimCandidate(check) &&
           !check.external_id?.includes(":event:") &&
           (manualTriggerContext(check) === undefined ||
             (manualTriggerContext(check)?.branch === (branch ?? null) &&
@@ -777,33 +846,39 @@ export class GitHubClient {
   async createCheck(
     repository: Repository,
     sha: string,
-    externalId: string,
+    externalId: string | (() => string),
     status: "queued" | "in_progress" = "in_progress",
     requestedJobs: string[] = [],
     name = CLAIM_NAME,
     metadata?: string,
     signal?: AbortSignal,
   ): Promise<CheckRun> {
-    const requestId =
-      status === "queued" && metadata === undefined
-        ? `${externalId}:jobs:${Buffer.from(JSON.stringify(requestedJobs)).toString("base64url")}`
-        : externalId;
     const check = await this.api<CheckRun>(
       `/repos/${repository.fullName}/check-runs`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          name: githubText(name),
-          head_sha: sha,
-          status,
-          external_id: requestId,
-          started_at: status === "in_progress" ? new Date().toISOString() : undefined,
-          output: {
-            title: "Informant CI",
-            summary: githubText(`Claimed by ${hostname()}`),
-            text: metadata,
-          },
-        }),
+      () => {
+        const resolvedExternalId = typeof externalId === "function" ? externalId() : externalId;
+        const requestId =
+          status === "queued" &&
+          metadata === undefined &&
+          !resolvedExternalId.includes(":candidate:") &&
+          !resolvedExternalId.startsWith("informant-candidate:")
+            ? `${resolvedExternalId}:jobs:${Buffer.from(JSON.stringify(requestedJobs)).toString("base64url")}`
+            : resolvedExternalId;
+        return {
+          method: "POST",
+          body: JSON.stringify({
+            name: githubText(name),
+            head_sha: sha,
+            status,
+            external_id: requestId,
+            started_at: status === "in_progress" ? new Date().toISOString() : undefined,
+            output: {
+              title: "Informant CI",
+              summary: githubText(`Claimed by ${hostname()}`),
+              text: metadata,
+            },
+          }),
+        };
       },
       signal,
     );
@@ -856,6 +931,7 @@ export class GitHubClient {
     values: {
       status?: "in_progress" | "completed";
       conclusion?: "success" | "failure" | "cancelled" | "neutral" | "skipped";
+      externalId?: string;
       title: string;
       summary: string;
       text?: string;
@@ -869,6 +945,7 @@ export class GitHubClient {
         body: JSON.stringify({
           status: values.status,
           conclusion: values.conclusion,
+          external_id: values.externalId,
           started_at: values.status === "in_progress" ? new Date().toISOString() : undefined,
           completed_at: values.status === "completed" ? new Date().toISOString() : undefined,
           output: {
@@ -910,6 +987,7 @@ export class GitHubClient {
             (check) =>
               (check.status === "queued" ||
                 (check.name === MANUAL_TRIGGER_REQUEST_NAME && check.status === "in_progress")) &&
+              !isClaimCandidate(check) &&
               !check.external_id?.includes(":event:"),
           );
     const requestedChecks = allRequestedChecks.filter((check) => {
@@ -1026,6 +1104,7 @@ export class GitHubClient {
       : event;
     const name = claimEvent.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const scope = `${claimEvent.type}:${claimEvent.id}`;
+    const candidateScope = createHash("sha256").update(scope).digest("hex").slice(0, 32);
     const legacyManualScope =
       claimEvent.type === "manual" && context
         ? `manual:${sha}:context:${encodedManualTriggerContext(context)}`
@@ -1047,6 +1126,7 @@ export class GitHubClient {
     const existing = availableChecks.filter(
       (check) =>
         matchesScope(check) ||
+        claimCandidateScope(check) === candidateScope ||
         requestedChecks.some((request) => request.id === check.id) ||
         (acceptsLegacyCommit &&
           !check.external_id?.includes(":event:") &&
@@ -1068,6 +1148,15 @@ export class GitHubClient {
     const active = existing.filter(
       (check) => check.status === "in_progress" && check.name !== MANUAL_TRIGGER_REQUEST_NAME,
     );
+    const candidateStates = existing
+      .filter((check) => check.status === "queued" && isClaimCandidate(check))
+      .map((check) => ({ check, active: this.claimCandidateActive(check) }));
+    const activeCandidates = candidateStates
+      .filter((candidate) => candidate.active)
+      .map((candidate) => candidate.check);
+    const expiredCandidates = candidateStates
+      .filter((candidate) => !candidate.active)
+      .map((candidate) => candidate.check);
     const stale = active.filter(
       (check) =>
         !check.started_at || Date.now() - new Date(check.started_at).getTime() > STALE_CLAIM_MS,
@@ -1112,10 +1201,27 @@ export class GitHubClient {
         );
       }),
     );
-    if (active.length > stale.length) return { requestedJobs: [], manualTrigger, retry: true };
+    await Promise.all(
+      expiredCandidates.map((check) =>
+        this.updateCheck(
+          repository,
+          check.id,
+          {
+            status: "completed",
+            conclusion: "cancelled",
+            title: EXPIRED_CANDIDATE_TITLE,
+            summary: "Claim election did not complete before its lease expired; it may be retried.",
+            text: check.output?.text,
+          },
+          executionSignal,
+        ),
+      ),
+    );
+    if (active.length > stale.length || activeCandidates.length > 0)
+      return { requestedJobs: [], manualTrigger, retry: true };
     const pendingRequests = existing.filter(
       (check) =>
-        check.status === "queued" ||
+        (check.status === "queued" && !isClaimCandidate(check)) ||
         (check.name === MANUAL_TRIGGER_REQUEST_NAME && check.status === "in_progress"),
     );
     const requested = suiteRerun || pendingRequests.length > 0;
@@ -1129,13 +1235,23 @@ export class GitHubClient {
 
     signal?.throwIfAborted();
     const candidateExternalId = `${machineId}:event:${scope}`;
+    if (this.githubServerTime() === undefined) {
+      return { requestedJobs: [], manualTrigger, retry: true };
+    }
+    let candidateAttemptExternalId = "";
+    const candidateAttempt = () => {
+      const candidateCreatedAt = this.githubServerTime();
+      if (candidateCreatedAt === undefined) throw new Error("GitHub server time is unavailable");
+      candidateAttemptExternalId = `informant-candidate:${candidateScope}:${Math.floor(candidateCreatedAt).toString(36)}:${crypto.randomUUID()}`;
+      return candidateAttemptExternalId;
+    };
     let candidate: CheckRun | undefined;
     try {
       candidate = await this.createCheck(
         repository,
         sha,
-        candidateExternalId,
-        "in_progress",
+        candidateAttempt,
+        "queued",
         [],
         name,
         context ? manualTriggerRequestMetadata({ context, jobs: [] }) : undefined,
@@ -1148,6 +1264,7 @@ export class GitHubClient {
       const election = await this.checks(repository, sha, name, executionSignal);
       const ignoredCompletions = new Set([
         ...stale.map((check) => check.id),
+        ...expiredCandidates.map((check) => check.id),
         ...retryableClaims,
         ...(requested ? historicalCompleted : []),
       ]);
@@ -1158,15 +1275,37 @@ export class GitHubClient {
       const contenders = election
         .filter(
           (check) =>
-            matchesScope(check) || (acceptsLegacyCommit && !check.external_id?.includes(":event:")),
+            matchesScope(check) ||
+            claimCandidateScope(check) === candidateScope ||
+            (acceptsLegacyCommit && !check.external_id?.includes(":event:")),
         )
-        .filter((check) => check.status === "in_progress")
+        .filter(
+          (check) =>
+            check.status === "in_progress" ||
+            (isClaimCandidate(check) &&
+              (check.id === candidate?.id || this.claimCandidateActive(check))),
+        )
         .sort((a, b) => {
-          const legacyOrder =
-            Number(matchesLegacyManualScope(b)) - Number(matchesLegacyManualScope(a));
+          const inLegacyElectionScope = (check: CheckRun) =>
+            matchesLegacyManualScope(check) ||
+            (legacyManualScope !== undefined && claimCandidateScope(check) === candidateScope);
+          const legacyOrder = Number(inLegacyElectionScope(b)) - Number(inLegacyElectionScope(a));
           return legacyOrder || a.id - b.id;
         });
       if (!completed && contenders[0]?.id === candidate.id) {
+        await this.updateCheck(
+          repository,
+          candidate.id,
+          {
+            status: "in_progress",
+            externalId: candidateExternalId,
+            title: "Informant CI",
+            summary: `Claimed by ${hostname()}`,
+            text: candidate.output?.text,
+          },
+          executionSignal,
+        );
+        candidate = promotedClaim(candidate, candidateExternalId);
         const jobRequests = pendingRequests.map(requestedJobsFor);
         const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
           ? []
@@ -1226,7 +1365,9 @@ export class GitHubClient {
             .then((checks) =>
               checks.filter(
                 (check) =>
-                  check.status === "in_progress" && check.external_id === candidateExternalId,
+                  (check.status === "queued" || check.status === "in_progress") &&
+                  (check.external_id === candidateAttemptExternalId ||
+                    check.external_id === candidateExternalId),
               ),
             )
             .catch(() => []);

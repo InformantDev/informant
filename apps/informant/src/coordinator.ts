@@ -1,3 +1,4 @@
+import { lstat, realpath } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
@@ -5,6 +6,7 @@ import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./
 import { refreshSelectedContainerBackend } from "./container-backend.ts";
 import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
 import type { ClaimResult, GitHubClient } from "./github.ts";
+import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import {
   createBuild,
   currentProcessOwner,
@@ -28,6 +30,8 @@ export interface CoordinatorDependencies {
   housekeepingBarrier?: <T>(callback: () => Promise<T>) => Promise<T>;
   refreshContainerBackend?: (signal?: AbortSignal) => Promise<boolean>;
   workerCapabilities?: () => string[];
+  listAllowedMounts?: typeof listAllowedMounts;
+  reportDiagnostic?: (message: string) => void;
   acquireExecutionSlot?: AcquireExecutionSlot;
 }
 
@@ -54,6 +58,29 @@ const defaultDependencies: CoordinatorDependencies = {
   readLogTail,
   acquireExecutionSlot,
 };
+
+async function usableAllowedMounts(
+  mounts: Array<{ name: string; source: string }>,
+  reportDiagnostic: (message: string) => void,
+): Promise<Array<{ name: string; source: string }>> {
+  const usable: Array<{ name: string; source: string }> = [];
+  for (const mount of mounts) {
+    try {
+      const source = await realpath(mount.source);
+      const metadata = await lstat(source);
+      if (!metadata.isFile()) throw new Error("source is not a regular file");
+      if (metadata.size > MAX_ALLOWED_MOUNT_BYTES) {
+        throw new Error(`source exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`);
+      }
+      usable.push({ name: mount.name, source });
+    } catch (error) {
+      reportDiagnostic(
+        `Not advertising mount:${mount.name.toLowerCase()}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return usable;
+}
 
 export function aggregatePartitionResults(
   results: Array<BuildRecord | false | undefined>,
@@ -198,6 +225,7 @@ export async function runCommit(
   event?: RunEvent,
   signal?: AbortSignal,
   admissionSignal?: AbortSignal,
+  forcedShutdownSignal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
   const manualAdmissionSignal = admissionSignal ?? signal;
   const automaticAdmissionSignal =
@@ -232,8 +260,23 @@ export async function runCommit(
       job.runtime?.type === "host" ||
       job.runtime?.type === "container",
   );
+  const usesMountCapabilities = config.jobs.some((job) =>
+    (job.runsOn ?? []).some((label) => label.toLowerCase().startsWith("mount:")),
+  );
+  const configuredAllowedMounts =
+    usesCapabilities && usesMountCapabilities && !dependencies.workerCapabilities
+      ? await (dependencies.listAllowedMounts ?? listAllowedMounts)()
+      : [];
+  const allowedMounts = await usableAllowedMounts(
+    configuredAllowedMounts,
+    dependencies.reportDiagnostic ?? ((message) => console.warn(message)),
+  );
   const advertisedCapabilities = usesCapabilities
-    ? (dependencies.workerCapabilities ?? workerCapabilities)()
+    ? (dependencies.workerCapabilities?.() ??
+      workerCapabilities(
+        Bun.env,
+        allowedMounts.map((mount) => mount.name),
+      ))
     : [];
   const baseCapabilities = advertisedCapabilities.filter(
     (capability) => capability.toLowerCase() !== "container",
@@ -331,6 +374,7 @@ export async function runCommit(
         !manualTrigger,
         manualTrigger ? [] : previousScopes,
         claimSignal,
+        forcedShutdownSignal,
       );
     }),
   );
@@ -350,6 +394,7 @@ async function runCommitPartition(
   requireRunSlot = false,
   legacyScopes: string[] = [],
   admissionSignal?: AbortSignal,
+  forcedShutdownSignal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
   if (config.jobs.length === 0) return undefined;
   const release = requireRunSlot
@@ -374,6 +419,7 @@ async function runCommitPartition(
       !requireRunSlot,
       legacyScopes,
       admissionSignal,
+      forcedShutdownSignal,
     );
   } finally {
     release?.();
@@ -393,6 +439,7 @@ async function runCommitPartitionWithSlot(
   acceptManualTrigger = true,
   legacyScopes: string[] = [],
   admissionSignal?: AbortSignal,
+  forcedShutdownSignal?: AbortSignal,
 ): Promise<BuildRecord | false | undefined> {
   const id = crypto.randomUUID().slice(0, 12);
   const machine = `${hostname()}:${process.pid}:${id}`;
@@ -407,6 +454,15 @@ async function runCommitPartitionWithSlot(
         }
       : event;
   let claim: ClaimResult | undefined;
+  const automaticExecutionSignal =
+    signal && forcedShutdownSignal
+      ? AbortSignal.any([signal, forcedShutdownSignal])
+      : (forcedShutdownSignal ?? signal);
+  // Admission cancellation is checked around the non-idempotent candidate POST inside claim().
+  // Execution cancellation may interrupt the remaining election and stale-claim bookkeeping.
+  const claimExecutionSignal = acceptManualTrigger
+    ? forcedShutdownSignal
+    : automaticExecutionSignal;
   try {
     claim = await github.claim(
       repository,
@@ -420,7 +476,7 @@ async function runCommitPartitionWithSlot(
       legacyScopes,
       acceptManualTrigger,
       admissionSignal,
-      acceptManualTrigger ? undefined : signal,
+      claimExecutionSignal,
     );
   } catch (error) {
     if (admissionSignal?.aborted) return false;
@@ -435,8 +491,9 @@ async function runCommitPartitionWithSlot(
   else if (claim.manualTrigger && claim.manualTriggerLabel) branch = claim.manualTriggerLabel;
   else if (claim.manualTrigger && typeof claim.manualTriggerBranch === "string")
     branch = claim.manualTriggerBranch;
-  const supersessionSignal = claim.manualTrigger ? undefined : signal;
-  let executionSignal = supersessionSignal;
+  // Automatic-lane supersession must not cancel manually claimed work. Forced worker shutdown is
+  // independent of supersession and must always reach the selected runtime.
+  let executionSignal = claim.manualTrigger ? forcedShutdownSignal : automaticExecutionSignal;
   const selectionBranch =
     rerunPullRequest !== undefined || claim.manualTriggerBranch === null
       ? undefined
@@ -644,8 +701,8 @@ async function runCommitPartitionWithSlot(
       record.id,
       config.jobs.map((job) => job.name),
     );
-    executionSignal = supersessionSignal
-      ? AbortSignal.any([supersessionSignal, cancellation.signal])
+    executionSignal = executionSignal
+      ? AbortSignal.any([executionSignal, cancellation.signal])
       : cancellation.signal;
     cancellation.signal.addEventListener(
       "abort",

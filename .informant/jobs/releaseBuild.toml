@@ -1,0 +1,58 @@
+name = "release-build"
+runs_on = ["container"]
+needs = ["build"]
+timeout_minutes = 45
+triggers = [{ event = "commit", tag = { patterns = ["v*"] } }]
+command = """
+set -eu
+
+tag="$INFORMANT_BRANCH"
+if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "release tags must use semantic versions such as v0.2.0" >&2
+  exit 1
+fi
+version=${tag#v}
+package_version=$(bun -e 'console.log((await Bun.file("apps/informant/package.json").json()).version)')
+if [ "$version" != "$package_version" ]; then
+  echo "tag $tag does not match package version $package_version" >&2
+  exit 1
+fi
+
+bun install --frozen-lockfile --ignore-scripts
+bun run --cwd apps/informant build:all
+
+artifacts="$HOME/.cache/informant-release/$INFORMANT_SHA"
+rm -rf "$artifacts"
+mkdir -p -m 0700 "$artifacts"
+cp apps/informant/dist/informant-darwin-arm64 "$artifacts/"
+cp apps/informant/dist/informant-darwin-x64 "$artifacts/"
+cp apps/informant/dist/informant-linux-arm64 "$artifacts/"
+cp apps/informant/dist/informant-linux-x64 "$artifacts/"
+(
+  cd "$artifacts"
+  sha256sum informant-* > BINARY_SHA256SUMS
+)
+scripts/render-homebrew-formula.sh "$tag" "$artifacts/BINARY_SHA256SUMS" "$artifacts/informant.rb"
+(
+  cd "$artifacts"
+  sha256sum informant-* informant.rb > SHA256SUMS
+)
+rm "$artifacts/BINARY_SHA256SUMS"
+
+case "$(uname -m)" in
+  x86_64 | amd64) native_asset=informant-linux-x64 ;;
+  aarch64 | arm64) native_asset=informant-linux-arm64 ;;
+  *) echo "cannot smoke-test binaries on $(uname -m)" >&2; exit 1 ;;
+esac
+"$artifacts/$native_asset" --version
+chmod a-w "$artifacts"/*
+"""
+cache = [{ paths = ["~/.cache/informant-release"], shared = true, build_scoped = true, protected_channel = true }]
+container = { image = "docker.io/oven/bun:1", cpu = 4, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = """
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates grep
+rm -rf /var/lib/apt/lists/*
+bun install --frozen-lockfile --ignore-scripts
+""" }

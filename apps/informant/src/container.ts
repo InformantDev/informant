@@ -14,6 +14,7 @@ import {
 } from "node:fs/promises";
 import { availableParallelism, totalmem } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { exchangeFilePaths } from "./atomic-rename.ts";
 import {
   appleContainerBackend,
   CONTAINER_READINESS_TIMEOUT_MS,
@@ -26,7 +27,12 @@ import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts"
 import { command } from "./process.ts";
 import { dataDirectory } from "./store.ts";
 import { cacheMounts } from "./tart/cache.ts";
-import { type RuntimeSecrets, resolveJobSecrets, streamingSecretRedactor } from "./tart/index.ts";
+import {
+  boundedLogWriter,
+  type RuntimeSecrets,
+  resolveJobSecrets,
+  streamingSecretRedactor,
+} from "./tart/index.ts";
 import { bunCopyfileBackend, raiseFileDescriptorLimit } from "./tart/layout.ts";
 import { digest, shellQuote, withImageLock } from "./tart/vm.ts";
 import type { ContainerRuntime, JobConfig, Repository } from "./types.ts";
@@ -37,9 +43,10 @@ interface ContainerResources {
 }
 
 const DEFAULT_CONTAINER_RESOURCES: ContainerResources = { cpu: 1, memoryMb: 1024 };
-const FILE_MOUNT_RESCAN_MS = 50;
-const MAX_PENDING_MOUNT_OUTPUT_BYTES = 256 * 1024;
-
+const MOUNT_OUTPUT_SPOOL_BYTES = 10 * 1024 * 1024;
+const MOUNT_OUTPUT_TRUNCATION_MARKER = "\n[informant: mounted job output truncated at 10 MiB]\n";
+const WRITABLE_MOUNT_OUTPUT_MARKER =
+  "[informant: child output suppressed because a writable credential mount may rotate secrets]\n";
 function containerCommandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
   return new Error(
     `${action}: ${result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.exitCode}`}`,
@@ -196,7 +203,7 @@ async function snapshotPreparedContainerInputs(
   runtime: ContainerRuntime,
   context: string,
   workspace?: string,
-): Promise<string | undefined> {
+): Promise<{ digest: string; inputs: Array<{ source: string; path: string }> } | undefined> {
   if (!runtime.prepareInputs) return undefined;
   if (!workspace) throw new Error("container.prepareInputs requires a job workspace");
   const root = await realpath(workspace);
@@ -243,7 +250,13 @@ async function snapshotPreparedContainerInputs(
         .digest("hex"),
     ]);
   }
-  return new Bun.CryptoHasher("sha256").update(JSON.stringify(records)).digest("hex");
+  return {
+    digest: new Bun.CryptoHasher("sha256").update(JSON.stringify(records)).digest("hex"),
+    inputs: sorted.map((file) => ({
+      source: join("informant-prepare-inputs", file.path),
+      path: file.path,
+    })),
+  };
 }
 
 export interface ContainerPreparationOperations {
@@ -252,12 +265,18 @@ export interface ContainerPreparationOperations {
   reference?: string;
   dataPath?: string;
   backend?: ContainerBackend;
+  trustedWorkspace?: string;
 }
 
 type ContainerRunOperations = Pick<
   ContainerPreparationOperations,
   "command" | "withImageLock" | "dataPath" | "backend"
-> & { allowedMounts?: Record<string, string> };
+> & {
+  allowedMounts?: Record<string, string>;
+  trustedWorkspace?: string;
+  copyMountedFile?: typeof copyFile;
+  exchange?: (left: string, right: string) => Promise<void> | void;
+};
 
 interface StagedFileMount {
   name: string;
@@ -269,6 +288,7 @@ interface StagedFileMount {
   mode: number;
   originalDigest: string;
   snapshot: MountedFileSnapshot;
+  dataPath: string;
 }
 
 interface MountedFileSnapshot {
@@ -400,6 +420,7 @@ async function stageFileMounts(
         mode,
         originalDigest: await mountedFileDigest(staged),
         snapshot: await mountedFileSnapshot(staged),
+        dataPath,
       });
     }
     return stagedMounts;
@@ -411,27 +432,237 @@ async function stageFileMounts(
   }
 }
 
-async function persistFileMount(mount: StagedFileMount): Promise<void> {
+interface MountedFileRecoveryRecord {
+  version: 1;
+  source: string;
+  temporary: string;
+  originalDigest: string;
+  replacementDigest: string;
+}
+
+type ExchangeFilePaths = (left: string, right: string) => Promise<void> | void;
+
+const mountedFileRecoveryDirectory = (dataPath = dataDirectory()) =>
+  join(dataPath, "file-mount-recovery");
+
+function mountedFileRecoveryPath(source: string, dataPath = dataDirectory()): string {
+  return join(mountedFileRecoveryDirectory(dataPath), `${digest(source)}.json`);
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  let directory: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    directory = await open(path, "r");
+    await directory.sync();
+  } catch (error) {
+    if (!["EINVAL", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  } finally {
+    await directory?.close();
+  }
+}
+
+async function writeMountedFileRecoveryRecord(
+  path: string,
+  record: MountedFileRecoveryRecord,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
+  let published = false;
+  try {
+    const file = await open(temporary, "wx", 0o600);
+    try {
+      await file.writeFile(`${JSON.stringify(record)}\n`);
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, path);
+    published = true;
+    await syncDirectory(dirname(path));
+  } finally {
+    if (!published) await rm(temporary, { force: true });
+  }
+}
+
+async function mountedFileDigestIfPresent(path: string): Promise<string | undefined> {
+  try {
+    return await mountedFileDigest(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function removeMountedFileRecoveryRecord(
+  recordPath: string,
+  temporary: string,
+): Promise<void> {
+  // Keep the recovery metadata until deletion of the displaced credential is durable.
+  await rm(temporary, { force: true });
+  await syncDirectory(dirname(temporary));
+  await rm(recordPath, { force: true });
+  await syncDirectory(dirname(recordPath));
+}
+
+async function readMountedFileRecoveryRecord(
+  recordPath: string,
+): Promise<MountedFileRecoveryRecord | undefined> {
+  const file = Bun.file(recordPath);
+  if (!(await file.exists())) return undefined;
+  const record = (await file.json()) as Partial<MountedFileRecoveryRecord>;
+  if (
+    record.version !== 1 ||
+    typeof record.source !== "string" ||
+    typeof record.temporary !== "string" ||
+    typeof record.originalDigest !== "string" ||
+    typeof record.replacementDigest !== "string" ||
+    mountedFileRecoveryPath(record.source, dirname(dirname(recordPath))) !== recordPath
+  ) {
+    throw new Error(`invalid mounted-file recovery record: ${recordPath}`);
+  }
+  return record as MountedFileRecoveryRecord;
+}
+
+async function recoverMountedFileWrite(
+  recordPath: string,
+  exchange: ExchangeFilePaths = exchangeFilePaths,
+  expectedSource?: string,
+): Promise<boolean> {
+  const record = await readMountedFileRecoveryRecord(recordPath);
+  if (!record) return false;
+  if (expectedSource !== undefined && record.source !== expectedSource) {
+    throw new Error(`mounted-file recovery record changed while locked: ${recordPath}`);
+  }
+
+  const sourceDigest = await mountedFileDigestIfPresent(record.source);
+  const temporaryDigest = await mountedFileDigestIfPresent(record.temporary);
+  if (temporaryDigest === undefined) {
+    await rm(recordPath, { force: true });
+    await syncDirectory(dirname(recordPath));
+    return true;
+  }
+  if (sourceDigest === undefined) {
+    throw new Error(
+      `mounted-file recovery requires manual intervention; ${record.source} is missing and the recovery copy is ${record.temporary}`,
+    );
+  }
+
+  if (sourceDigest === record.replacementDigest && temporaryDigest !== record.originalDigest) {
+    // The host changed after the job's initial snapshot but before the exchange. Put the captured
+    // host version back without ever removing the live pathname.
+    await exchange(record.source, record.temporary);
+    await syncDirectory(dirname(record.source));
+  } else if (
+    sourceDigest !== record.originalDigest &&
+    temporaryDigest !== record.replacementDigest &&
+    temporaryDigest !== record.originalDigest
+  ) {
+    throw new Error(
+      `mounted-file recovery requires manual intervention; preserved files are ${record.source} and ${record.temporary}`,
+    );
+  }
+
+  await removeMountedFileRecoveryRecord(recordPath, record.temporary);
+  return true;
+}
+
+export async function recoverMountedFileWrites(
+  dataPath = dataDirectory(),
+  exchange: ExchangeFilePaths = exchangeFilePaths,
+  lock: typeof withImageLock = withImageLock,
+): Promise<number> {
+  const directory = mountedFileRecoveryDirectory(dataPath);
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  let recovered = 0;
+  for (const entry of entries.filter((name) => name.endsWith(".json")).sort()) {
+    const recordPath = join(directory, entry);
+    const observed = await readMountedFileRecoveryRecord(recordPath);
+    if (!observed) continue;
+    const source = await realpath(observed.source).catch(() => observed.source);
+    if (
+      await lock(
+        `host-file-${digest(source)}`,
+        () => recoverMountedFileWrite(recordPath, exchange, observed.source),
+        undefined,
+        Number.POSITIVE_INFINITY,
+      )
+    ) {
+      recovered++;
+    }
+  }
+  return recovered;
+}
+
+async function persistFileMount(
+  mount: StagedFileMount,
+  exchange: ExchangeFilePaths = exchangeFilePaths,
+  copyMountedFile: typeof copyFile = copyFile,
+): Promise<void> {
   if (!mount.writeBack) return;
   const staged = join(mount.directory, mount.filename);
   const metadata = await lstat(staged);
   if (!metadata.isFile()) throw new Error(`mounted file was removed: ${mount.name}`);
   if (metadata.size > MAX_ALLOWED_MOUNT_BYTES)
     throw new Error(`mounted file exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes: ${mount.name}`);
+  const recoveryPath = mountedFileRecoveryPath(mount.source, mount.dataPath);
+  await recoverMountedFileWrite(recoveryPath, exchange);
   const stagedDigest = await mountedFileDigest(staged);
   if (stagedDigest === mount.originalDigest) return;
-  const temporary = `${mount.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
-  let replaced = false;
-  try {
-    await copyFile(staged, temporary);
-    await chmod(temporary, mount.mode);
-    if ((await mountedFileDigest(mount.source)) !== mount.originalDigest)
-      throw new Error(`allowed host file changed during mounted job: ${mount.name}`);
-    await rename(temporary, mount.source);
-    replaced = true;
-  } finally {
-    if (!replaced) await rm(temporary, { force: true });
+  if ((await mountedFileDigest(mount.source)) !== mount.originalDigest) {
+    throw new Error(`allowed host file changed during mounted job: ${mount.name}`);
   }
+
+  const temporary = `${mount.source}.informant-${crypto.randomUUID().slice(0, 8)}`;
+  await writeMountedFileRecoveryRecord(recoveryPath, {
+    version: 1,
+    source: mount.source,
+    temporary,
+    originalDigest: mount.originalDigest,
+    replacementDigest: stagedDigest,
+  });
+  try {
+    await copyMountedFile(staged, temporary);
+    await chmod(temporary, mount.mode);
+    const temporaryFile = await open(temporary, "r+");
+    try {
+      await temporaryFile.sync();
+    } finally {
+      await temporaryFile.close();
+    }
+  } catch (error) {
+    try {
+      await removeMountedFileRecoveryRecord(recoveryPath, temporary);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `mounted-file temporary could not be safely cleaned up: ${mount.name}`,
+      );
+    }
+    throw error;
+  }
+
+  await exchange(mount.source, temporary);
+  await syncDirectory(dirname(mount.source));
+  if ((await mountedFileDigest(temporary)) !== mount.originalDigest) {
+    try {
+      await exchange(mount.source, temporary);
+      await syncDirectory(dirname(mount.source));
+      await removeMountedFileRecoveryRecord(recoveryPath, temporary);
+    } catch (recoveryError) {
+      throw new AggregateError(
+        [new Error(`allowed host file changed during mounted job: ${mount.name}`), recoveryError],
+        `mounted file could not be safely written back: ${mount.name}`,
+      );
+    }
+    throw new Error(`allowed host file changed during mounted job: ${mount.name}`);
+  }
+  await removeMountedFileRecoveryRecord(recoveryPath, temporary);
 }
 
 const preparedContainerReferencesDirectory = (dataPath = dataDirectory()) =>
@@ -635,6 +866,11 @@ export async function ensurePreparedContainer(
   const lock = operations.withImageLock ?? withImageLock;
   const backend = operations.backend ?? appleContainerBackend;
   const preparationCommand = runtime.prepare;
+  const preparedInputWorkspace = runtime.trustedPrepareInputs
+    ? operations.trustedWorkspace
+    : workspace;
+  if (runtime.trustedPrepareInputs && !preparedInputWorkspace)
+    throw new Error("container.trustedPrepareInputs requires a trusted job workspace");
   if (!preparationCommand) {
     await activatePreparedContainerImage(
       operations.reference,
@@ -652,14 +888,24 @@ export async function ensurePreparedContainer(
   await mkdir(contextRoot, { recursive: true });
   const context = await mkdtemp(join(contextRoot, "informant-container-build-"));
   try {
-    const inputDigest = await snapshotPreparedContainerInputs(runtime, context, workspace);
-    const prepared = preparedContainerImage(runtime, inputDigest);
+    const inputSnapshot = await snapshotPreparedContainerInputs(
+      runtime,
+      context,
+      preparedInputWorkspace,
+    );
+    const prepared = preparedContainerImage(runtime, inputSnapshot?.digest);
     if (!prepared) return runtime.image;
     await Bun.write(join(context, "informant-prepare.sh"), `${preparationCommand}\n`);
-    const inputSetup = inputDigest
-      ? "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n"
+    const inputSetup = inputSnapshot
+      ? backend.kind === "apple"
+        ? `${inputSnapshot.inputs
+            .map(({ source, path }) => `COPY ${JSON.stringify([source, `/workspace/${path}`])}`)
+            .join("\n")}\nENV HOME=/home/root\n`
+        : `${inputSnapshot.inputs
+            .map(({ source, path }) => `COPY ${JSON.stringify([source, `/workspace/${path}`])}`)
+            .join("\n")}\nENV HOME=/home/root\n`
       : "";
-    const preparationLayer = inputDigest
+    const preparationLayer = inputSnapshot
       ? `RUN INFORMANT_PREPARE_ROOT=/workspace /bin/sh -lc 'cd "$INFORMANT_PREPARE_ROOT" && . /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n`
       : "RUN /bin/sh -lc '. /tmp/informant-prepare.sh' && rm -f /tmp/informant-prepare.sh\n";
     await Bun.write(
@@ -787,17 +1033,23 @@ export async function runInContainer(
       reference: `${repository.fullName}\0${job.name}`,
       dataPath: operations.dataPath,
       backend,
+      trustedWorkspace: operations.trustedWorkspace,
     });
     const run = async (fileMounts: StagedFileMount[] = []) => {
       if (!hasContainerCapacity(resources) && activeResources.cpu > 0)
         await log(`[${job.name}] waiting for an available container slot\n`);
       releaseSlot = await acquireContainerResources(resources, executionSignal);
-      const mounts = caches.mounts.map((mount) => ({
+      const mounts: NonNullable<ContainerRunOptions["mounts"]> = caches.mounts.map((mount) => ({
         source: mount.path,
         target: `/mnt/shared/${mount.name}`,
+        readOnly: mount.readOnly,
       }));
       mounts.push(
-        ...fileMounts.map((mount) => ({ source: mount.directory, target: mount.target })),
+        ...fileMounts.map((mount) => ({
+          source: mount.directory,
+          target: mount.target,
+          readOnly: !mount.writeBack,
+        })),
       );
       const args = containerRunArguments(
         {
@@ -829,26 +1081,21 @@ export async function runInContainer(
           redactor.add(mount.snapshot.values);
         }
       };
-      let pendingOutput = "";
-      let drainTask: Promise<void> | undefined;
-      let drainError: unknown;
-      const scheduleDrain = () => {
-        if (drainTask || drainError) return;
-        drainTask = (async () => {
-          await Bun.sleep(FILE_MOUNT_RESCAN_MS);
-          const text = pendingOutput;
-          pendingOutput = "";
-          await refreshMountedValues();
-          await redactor.write(text);
-        })()
-          .catch((error) => {
-            drainError = error;
-          })
-          .finally(() => {
-            drainTask = undefined;
-            if (pendingOutput && !drainError) scheduleDrain();
-          });
-      };
+      const suppressChildOutput = fileMounts.some((mount) => mount.writeBack);
+      // Keep delayed output only in memory: it may contain credentials that are not known to the
+      // redactor until the mounted process exits, so even a private named spool is too durable.
+      const spooledOutput: string[] | undefined =
+        fileMounts.length > 0 && !suppressChildOutput ? [] : undefined;
+      const writeSpool = spooledOutput
+        ? boundedLogWriter(
+            async (text) => {
+              spooledOutput.push(text);
+            },
+            MOUNT_OUTPUT_SPOOL_BYTES,
+            MOUNT_OUTPUT_TRUNCATION_MARKER,
+          )
+        : undefined;
+      let suppressedOutput = false;
       let result: Awaited<ReturnType<typeof runCommand>> | undefined;
       let commandError: unknown;
       try {
@@ -856,32 +1103,28 @@ export async function runInContainer(
           env: secrets,
           signal: executionSignal,
           onOutput: async (text) => {
-            if (drainError) throw drainError;
-            pendingOutput += text;
-            scheduleDrain();
-            if (Buffer.byteLength(pendingOutput) >= MAX_PENDING_MOUNT_OUTPUT_BYTES && drainTask) {
-              await drainTask;
-              if (drainError) throw drainError;
-            }
+            if (suppressChildOutput) suppressedOutput ||= text.length > 0;
+            else if (writeSpool) await writeSpool(text);
+            else await redactor.write(text);
           },
         });
       } catch (error) {
         commandError = error;
       }
-      while (drainTask) await drainTask;
-      let redactionError = drainError;
-      if (!redactionError)
-        try {
-          if (pendingOutput) {
-            await refreshMountedValues();
-            await redactor.write(pendingOutput);
-            pendingOutput = "";
-          }
+      let redactionError: unknown;
+      try {
+        if (spooledOutput) {
+          // Mounted credentials may be refreshed immediately after being printed. Do not publish
+          // any child output until the process exits and the final credential values are known.
           await refreshMountedValues();
-          await redactor.flush();
-        } catch (error) {
-          redactionError = error;
+          for (const text of spooledOutput) await redactor.write(text);
+        } else if (suppressedOutput) {
+          await redactor.write(WRITABLE_MOUNT_OUTPUT_MARKER);
         }
+        await redactor.flush();
+      } catch (error) {
+        redactionError = error;
+      }
       if (commandError && redactionError)
         throw new AggregateError(
           [commandError, redactionError],
@@ -905,7 +1148,11 @@ export async function runInContainer(
         runError = error;
       }
       try {
-        const results = await Promise.allSettled(staged.map(persistFileMount));
+        const results = await Promise.allSettled(
+          staged.map((mount) =>
+            persistFileMount(mount, operations.exchange, operations.copyMountedFile),
+          ),
+        );
         const errors = results
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
           .map((result) => result.reason);

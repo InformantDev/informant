@@ -11,7 +11,9 @@ import {
   pruneRuntimeImages,
   runInvocationType,
   runManualHousekeeping,
+  updateResultMessage,
 } from "./cli.ts";
+import { selectContainerBackend } from "./container-backend.ts";
 import { createBuild, currentProcessOwner, monitorBuildCancellation, saveBuild } from "./store.ts";
 import type { BuildRecord, Repository } from "./types.ts";
 
@@ -50,6 +52,21 @@ test("local and reported trigger flags cannot be mixed", async () => {
     "--local cannot be combined with --wait-for-github",
   );
   await expect(main(["trigger", "--local"])).rejects.toThrow("trigger does not accept --local");
+});
+
+test("reports recovery of a pending worker restart", () => {
+  expect(updateResultMessage({ updated: false, restarted: true, version: "0.2.0" })).toBe(
+    "Informant 0.2.0 is already current; restarted the worker after a pending update",
+  );
+});
+
+test("automatic-update commands reject trailing positional arguments", async () => {
+  await expect(main(["auto-update", "enable", "disable"])).rejects.toThrow(
+    "auto-update enable does not accept arguments",
+  );
+  await expect(main(["auto-update", "disable", "enable"])).rejects.toThrow(
+    "auto-update disable does not accept arguments",
+  );
 });
 
 test("orphan cleanup does not block worker startup", async () => {
@@ -97,7 +114,7 @@ test("image prune reports partial runtime failures and preserves the successful 
       },
     }),
   ).rejects.toThrow(
-    "Deleted 2 unused prepared images, but failed to prune rootless Podman images: runtime unavailable",
+    `Deleted 2 unused prepared images, but failed to prune ${selectContainerBackend()?.name ?? "Container"} images: runtime unavailable`,
   );
 });
 

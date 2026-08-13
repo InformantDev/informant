@@ -28,9 +28,9 @@ informant setup
 
 The installer verifies the release checksum and writes to `~/.local/bin` by default; set
 `INFORMANT_INSTALL_DIR` or `INFORMANT_VERSION` to override the destination or install a specific
-release. `informant setup` can install Podman packages, but it does not install GitHub CLI. On Linux
-without a systemd user manager, run `informant serve` in the foreground or under the host's existing
-supervisor.
+release. The user-owned default also supports automatic updates. `informant setup` can install Podman
+packages, but it does not install GitHub CLI. On Linux without a systemd user manager, run
+`informant serve` in the foreground or under the host's existing supervisor.
 
 Informant requires GitHub CLI (`gh`) and a GitHub App installation with **Checks: read/write**,
 **Contents: read**, and **Pull requests: read/write** permissions. Native host jobs run on Linux or

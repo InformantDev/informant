@@ -16,7 +16,7 @@ import {
   readConfig,
   selectJobs,
 } from "./config.ts";
-import { prunePreparedContainerImages } from "./container.ts";
+import { prunePreparedContainerImages, recoverMountedFileWrites } from "./container.ts";
 import {
   containerBackendReadiness,
   initializeContainerBackend,
@@ -34,11 +34,12 @@ import {
   listRepositories,
   removeAllowedMount,
   removeRepository,
+  saveAutomaticUpdatesPreference,
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
 import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
-import { disableStartup, enableStartup, updateInformant } from "./startup.ts";
+import { disableStartup, enableStartup } from "./startup.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
@@ -58,6 +59,11 @@ import {
 } from "./store.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 import type { Repository } from "./types.ts";
+import {
+  disableAutomaticUpdates,
+  enableAutomaticUpdates,
+  updateInformantIfAvailable,
+} from "./updater.ts";
 
 const HELP = `Informant ${packageJson.version} — background CI on your Linux and macOS machines
 
@@ -89,7 +95,9 @@ Usage:
   informant builds cancel <build-id> [--job <name>]
                                         Cancel a running build or one queued/running job
   informant logs [<build-id>]             Tail a build's logs or select a running job
-  informant update                       Update with Homebrew and restart a running worker
+  informant update                       Install a newer release and restart a running worker
+  informant auto-update enable           Check for and install new releases automatically
+  informant auto-update disable          Disable automatic release checks
   informant storage                      Show Informant disk usage and available space
   informant doctor                       Check host dependencies, auth, and disk space
   informant --version
@@ -947,6 +955,21 @@ async function doctor(): Promise<void> {
   if (failed) process.exitCode = 1;
 }
 
+export function updateResultMessage(result: {
+  updated: boolean;
+  restarted: boolean;
+  version: string;
+}): string {
+  if (result.restarted) {
+    return result.updated
+      ? `Updated Informant to ${result.version} and restarted the worker`
+      : `Informant ${result.version} is already current; restarted the worker after a pending update`;
+  }
+  return result.updated
+    ? `Updated Informant to ${result.version}; the startup worker is not running`
+    : `Informant ${result.version} is already current`;
+}
+
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const [subcommand, action, id, value] = positional;
@@ -968,17 +991,32 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   }
   if (subcommand === "update") {
     if (action) throw new Error("update does not accept arguments");
-    const updated = await updateInformant({
+    const updated = await updateInformantIfAvailable(packageJson.version, {
       onOutput: (output) => {
         process.stdout.write(output);
       },
     });
-    outro(
-      updated.restarted
-        ? "Updated Informant and restarted the worker"
-        : "Updated Informant; the startup worker is not running",
-    );
+    const message = updateResultMessage(updated);
+    if (flags.automatic === true) console.log(message);
+    else outro(message);
     return;
+  }
+  if (subcommand === "auto-update" && action === "enable") {
+    if (id) throw new Error("auto-update enable does not accept arguments");
+    const path = await enableAutomaticUpdates();
+    await saveAutomaticUpdatesPreference(true);
+    outro(`Enabled automatic Informant updates at ${path}`);
+    return;
+  }
+  if (subcommand === "auto-update" && action === "disable") {
+    if (id) throw new Error("auto-update disable does not accept arguments");
+    const disabled = await disableAutomaticUpdates();
+    await saveAutomaticUpdatesPreference(false);
+    outro(disabled ? "Disabled automatic Informant updates" : "Automatic updates are not enabled");
+    return;
+  }
+  if (subcommand === "auto-update") {
+    throw new Error("auto-update action must be one of: enable, disable");
   }
   if (subcommand === "repo") return manageRepositories(action, id);
   if (subcommand === "mount") return manageMounts(action, id, value);
@@ -986,6 +1024,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "cache") return manageCaches(action);
   if (subcommand === "serve") {
     if (action) throw new Error("serve does not accept a repository; use informant repo add first");
+    await recoverMountedFileWrites();
     const repositories = await listRepositories();
     if (repositories.length === 0) {
       throw new Error("no repositories registered; run informant repo add owner/repository");

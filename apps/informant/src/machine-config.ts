@@ -17,6 +17,7 @@ export const MAX_ALLOWED_MOUNT_BYTES = 1024 * 1024;
 interface MachineConfig {
   version: 1;
   repositories: string[];
+  automaticUpdates?: boolean;
   allowedMounts?: Record<string, string>;
   githubApps?: GitHubCredentials[];
   /** Legacy single-installation configuration. */
@@ -43,6 +44,9 @@ async function readMachineConfig(path = machineConfigPath()): Promise<MachineCon
     );
   }
   if (!Array.isArray(value.repositories)) throw new Error(`invalid Informant config: ${path}`);
+  if (value.automaticUpdates !== undefined && typeof value.automaticUpdates !== "boolean") {
+    throw new Error(`invalid Informant config: ${path}`);
+  }
   if (
     value.allowedMounts !== undefined &&
     (!value.allowedMounts ||
@@ -59,10 +63,25 @@ async function readMachineConfig(path = machineConfigPath()): Promise<MachineCon
   return {
     version: value.version,
     repositories: value.repositories.map(String),
+    automaticUpdates: value.automaticUpdates,
     allowedMounts: value.allowedMounts,
     githubApps: Array.isArray(value.githubApps) ? value.githubApps : undefined,
     github: value.github,
   };
+}
+
+export async function automaticUpdatesPreference(
+  path = machineConfigPath(),
+): Promise<boolean | undefined> {
+  return (await readMachineConfig(path)).automaticUpdates;
+}
+
+export async function saveAutomaticUpdatesPreference(
+  enabled: boolean,
+  path = machineConfigPath(),
+): Promise<void> {
+  const config = await readMachineConfig(path);
+  await writeMachineConfig({ ...config, automaticUpdates: enabled }, path);
 }
 
 export async function listAllowedMounts(
@@ -79,8 +98,10 @@ export async function allowMount(
   source: string,
   path = machineConfigPath(),
 ): Promise<void> {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
-    throw new Error("mount name must contain only letters, numbers, dots, underscores, and dashes");
+  if (!/^[a-z0-9][a-z0-9._-]*$/.test(name))
+    throw new Error(
+      "mount name must contain only lowercase letters, numbers, dots, underscores, and dashes",
+    );
   const canonical = await realpath(source).catch(() => undefined);
   const metadata = canonical ? await lstat(canonical) : undefined;
   if (!canonical || !metadata?.isFile())

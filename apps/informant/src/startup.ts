@@ -271,6 +271,7 @@ export async function disableStartup(): Promise<{ path: string; disabled: boolea
 export async function updateInformant(
   options: {
     command?: typeof command;
+    install?: () => Promise<void>;
     platform?: string;
     uid?: number;
     onOutput?: (text: string) => Promise<void> | void;
@@ -281,18 +282,23 @@ export async function updateInformant(
 ): Promise<{ restarted: boolean }> {
   const currentPlatform = options.platform ?? process.platform;
   if (currentPlatform !== "darwin" && currentPlatform !== "linux") {
-    throw new Error("Homebrew updates are supported only on macOS and Linux");
+    throw new Error("Informant updates are supported only on macOS and Linux");
   }
   const run = options.command ?? command;
-  if (currentPlatform === "linux") {
-    const initialService = await run([
-      "systemctl",
-      "--user",
-      "is-active",
-      "--quiet",
-      "informant.service",
-    ]);
-    const active = initialService.exitCode === 0;
+  const domain = currentPlatform === "darwin" ? launchDomain(options.uid) : undefined;
+  const service = domain ? `${domain}/${LABEL}` : "informant.service";
+  const serviceStatus = () =>
+    currentPlatform === "darwin"
+      ? run(["launchctl", "print", service])
+      : run(["systemctl", "--user", "show", "--property=MainPID", "--value", service]);
+  const initialService =
+    currentPlatform === "darwin"
+      ? await serviceStatus()
+      : await run(["systemctl", "--user", "is-active", service]);
+  const loaded = initialService.exitCode === 0;
+  if (options.install) {
+    await options.install();
+  } else if (currentPlatform === "darwin") {
     const upgraded = await run(["brew", "upgrade", "informantdev/tap/informant"], {
       onOutput: options.onOutput,
     });
@@ -301,34 +307,27 @@ export async function updateInformant(
         `could not update Informant with Homebrew: ${upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
       );
     }
-    if (!active) return { restarted: false };
-    const restarted = await run(["systemctl", "--user", "restart", "informant.service"]);
-    if (restarted.exitCode !== 0) {
-      throw new Error(
-        `Informant was updated but its service could not be restarted: ${restarted.stderr.trim() || `exit ${restarted.exitCode}`}`,
-      );
-    }
-    return { restarted: true };
+  } else {
+    throw new Error("a Linux update installer is required");
   }
-  const domain = launchDomain(options.uid);
-  const service = `${domain}/${LABEL}`;
-  const initialService = await run(["launchctl", "print", service]);
-  const loaded = initialService.exitCode === 0;
-  const upgraded = await run(["brew", "upgrade", "informantdev/tap/informant"], {
-    onOutput: options.onOutput,
-  });
-  if (upgraded.exitCode !== 0) {
-    throw new Error(
-      `could not update Informant with Homebrew: ${upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
-    );
+  const currentService = await serviceStatus();
+  const previousPid =
+    currentService.exitCode === 0
+      ? currentPlatform === "darwin"
+        ? servicePid(currentService.stdout)
+        : Number(currentService.stdout.trim()) || undefined
+      : undefined;
+  const currentlyLoaded =
+    currentPlatform === "darwin" ? currentService.exitCode === 0 : previousPid !== undefined;
+  if (!loaded && !currentlyLoaded) return { restarted: false };
+  if (currentPlatform === "darwin") {
+    await migrateStartupServiceDefinition(run, options.writeStartupService);
   }
-  if (!loaded) return { restarted: false };
-  const currentService = await run(["launchctl", "print", service]);
-  const previousPid = currentService.exitCode === 0 ? servicePid(currentService.stdout) : undefined;
-  await migrateStartupServiceDefinition(run, options.writeStartupService);
   const restartCommand = previousPid
     ? ["kill", "-TERM", String(previousPid)]
-    : ["launchctl", "kickstart", service];
+    : currentPlatform === "darwin"
+      ? ["launchctl", "kickstart", service]
+      : ["systemctl", "--user", "restart", service];
   const restarted = await run(restartCommand);
   if (restarted.exitCode !== 0) {
     throw new Error(
@@ -338,16 +337,31 @@ export async function updateInformant(
   const timeoutMs = options.restartTimeoutMs ?? GRACEFUL_RESTART_TIMEOUT_MS;
   const sleep = options.sleep ?? Bun.sleep;
   let elapsed = 0;
+  let timedOutPid: number | undefined;
   while (true) {
-    const current = await run(["launchctl", "print", service]);
-    const currentPid = current.exitCode === 0 ? servicePid(current.stdout) : undefined;
+    const current = await serviceStatus();
+    const currentPid =
+      current.exitCode === 0
+        ? currentPlatform === "darwin"
+          ? servicePid(current.stdout)
+          : Number(current.stdout.trim()) || undefined
+        : undefined;
     if (currentPid && (!previousPid || currentPid !== previousPid)) return { restarted: true };
-    if (elapsed >= timeoutMs) break;
+    if (elapsed >= timeoutMs) {
+      timedOutPid = currentPid;
+      break;
+    }
     const delay = Math.min(RESTART_POLL_INTERVAL_MS, timeoutMs - elapsed);
     await sleep(delay);
     elapsed += delay;
   }
-  if (previousPid) await run(["kill", "-KILL", String(previousPid)]);
+  if (previousPid && timedOutPid === previousPid) {
+    await run(
+      currentPlatform === "darwin"
+        ? ["launchctl", "kill", "SIGKILL", service]
+        : ["systemctl", "--user", "kill", "--kill-whom=main", "--signal=SIGKILL", service],
+    );
+  }
   throw new Error(
     `Informant was updated but its graceful restart did not complete within ${Math.ceil(timeoutMs / 1_000)} seconds`,
   );

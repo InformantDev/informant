@@ -510,6 +510,12 @@ export async function runInTart(
   const root = join(record.logPath, "..", "workspace");
   const repositoryPath = join(root, "repository");
   const workspaces = config.jobs.map((_, index) => join(root, `job-${index}`));
+  const trustedInputWorkspaces = config.jobs.map((job, index) => {
+    const runtime = job.runtime ?? config.vm;
+    return runtime.type === "container" && runtime.trustedPrepareInputs
+      ? join(root, `trusted-job-${index}`)
+      : undefined;
+  });
   const jobLogs = new Map<string, Uint8Array>();
   const jobLogWriters = new Map<string, ReturnType<typeof boundedLogWriter>>();
   const decoder = new TextDecoder();
@@ -602,6 +608,20 @@ export async function runInTart(
           `could not check out ${sha}${job ? ` for ${job.name}` : ""}: ${checkout.stderr}`,
         );
       }
+      const trustedInputWorkspace = trustedInputWorkspaces[index];
+      if (!trustedInputWorkspace || config.trustedSha === sha) continue;
+      const trustedCheckout = await checkoutBuildWorkspace(
+        repositoryPath,
+        trustedInputWorkspace,
+        config.trustedSha ?? sha,
+        true,
+        signal,
+      );
+      if (trustedCheckout.exitCode !== 0) {
+        throw new Error(
+          `could not check out trusted preparation inputs for ${job?.name ?? `job ${index}`}: ${trustedCheckout.stderr}`,
+        );
+      }
     }
     result = await scheduleJobs(
       config.jobs,
@@ -641,6 +661,10 @@ export async function runInTart(
                   started,
                   runtimeSecrets,
                   executionSignal,
+                  {
+                    trustedWorkspace:
+                      config.trustedSha === sha ? workspace : trustedInputWorkspaces[index],
+                  },
                 )
               : await runJob(
                   `informant-${record.id}-${index}`,

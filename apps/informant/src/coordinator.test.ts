@@ -688,6 +688,57 @@ describe("runCommit", () => {
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
   });
 
+  test("admits mount-capability jobs only when the mount is usable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "informant-coordinator-mount-"));
+    temporaryDirectories.push(root);
+    const source = join(root, "auth.json");
+    await Bun.write(source, "credential");
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const mountConfig: InformantConfig = {
+      ...config,
+      jobs: [
+        {
+          ...baseJob,
+          name: "staff-review",
+          runsOn: ["container", "mount:codex-auth"],
+          runtime: { type: "container", image: "docker.io/oven/bun:1" },
+          mounts: [{ source: "codex-auth", target: "/mnt/informant-codex", writeBack: true }],
+        },
+      ],
+    };
+
+    const configured = harness();
+    configured.dependencies.listAllowedMounts = async () => [{ name: "codex-auth", source }];
+    await runCommit(configured.github, repository, "configured", "main", mountConfig, {
+      ...configured.dependencies,
+      refreshContainerBackend: async () => true,
+    });
+    expect(configured.jobChecks).toEqual(["staff-review"]);
+
+    const unusable = harness();
+    const diagnostics: string[] = [];
+    unusable.dependencies.listAllowedMounts = async () => [
+      { name: "codex-auth", source: join(root, "deleted.json") },
+    ];
+    unusable.dependencies.reportDiagnostic = (message) => diagnostics.push(message);
+    await runCommit(unusable.github, repository, "unusable", "main", mountConfig, {
+      ...unusable.dependencies,
+      refreshContainerBackend: async () => true,
+    });
+    expect(unusable.jobChecks).toEqual([]);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toContain("Not advertising mount:codex-auth");
+
+    const unconfigured = harness();
+    unconfigured.dependencies.listAllowedMounts = async () => [];
+    await runCommit(unconfigured.github, repository, "unconfigured", "main", mountConfig, {
+      ...unconfigured.dependencies,
+      refreshContainerBackend: async () => true,
+    });
+    expect(unconfigured.jobChecks).toEqual([]);
+  });
+
   test("returns retryable before claiming selected portable container work when unavailable", async () => {
     let claims = 0;
     const github = {
@@ -2238,5 +2289,107 @@ describe("runCommit", () => {
     if (!record) throw new Error("expected a build record");
     expect(record.status).toBe("success");
     expect(record.event?.type).toBe("manual_trigger");
+  });
+
+  test("forwards forced shutdown to automatic and manual claim bookkeeping", async () => {
+    const automatic = harness();
+    const automaticLane = new AbortController();
+    const automaticAdmission = new AbortController();
+    const automaticShutdown = new AbortController();
+    let automaticClaimAdmission: AbortSignal | undefined;
+    let automaticClaimExecution: AbortSignal | undefined;
+    automatic.github.claim = async (...args) => {
+      automaticClaimAdmission = args[8];
+      automaticClaimExecution = args[9];
+      return undefined;
+    };
+
+    await runCommit(
+      automatic.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      automatic.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+      automaticLane.signal,
+      automaticAdmission.signal,
+      automaticShutdown.signal,
+    );
+
+    expect(automaticClaimAdmission?.aborted).toBeFalse();
+    expect(automaticClaimExecution?.aborted).toBeFalse();
+    automaticShutdown.abort("Graceful worker shutdown timed out.");
+    expect(automaticClaimExecution?.aborted).toBeTrue();
+    expect(automaticClaimAdmission?.aborted).toBeFalse();
+
+    const manual = harness({ manualTrigger: true });
+    const manualLane = new AbortController();
+    const manualAdmission = new AbortController();
+    const manualShutdown = new AbortController();
+    let manualClaimAdmission: AbortSignal | undefined;
+    let manualClaimExecution: AbortSignal | undefined;
+    manual.github.claim = async (...args) => {
+      manualClaimAdmission = args[8];
+      manualClaimExecution = args[9];
+      return undefined;
+    };
+
+    await runCommit(
+      manual.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      manual.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+      manualLane.signal,
+      manualAdmission.signal,
+      manualShutdown.signal,
+    );
+
+    expect(manualClaimAdmission).toBe(manualAdmission.signal);
+    expect(manualClaimExecution).toBe(manualShutdown.signal);
+  });
+
+  test("cancels a manually triggered build after forced worker shutdown", async () => {
+    const context = harness({ manualTrigger: true });
+    const supersession = new AbortController();
+    const forcedShutdown = new AbortController();
+    let runtimeSignal: AbortSignal | undefined;
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      _config,
+      _record,
+      observer,
+      signal,
+    ) => {
+      runtimeSignal = signal;
+      const job = config.jobs[0];
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      forcedShutdown.abort("Graceful worker shutdown timed out.");
+      await observer?.completed?.(job, { outcome: "cancelled", log: "cancelled" });
+      return false;
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+      supersession.signal,
+      undefined,
+      forcedShutdown.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(runtimeSignal?.aborted).toBeTrue();
+    expect(runtimeSignal?.reason).toBe("Graceful worker shutdown timed out.");
+    expect(record.status).toBe("cancelled");
   });
 });
