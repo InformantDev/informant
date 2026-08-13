@@ -70,9 +70,16 @@ export function selectManuallyTriggeredJobs(
       const triggers = job.triggers ?? config.triggers ?? [];
       return (
         triggers.length === 0 ||
-        triggers.some(
-          (rule) => !rule.branch || (branch !== undefined && rule.branch.names.includes(branch)),
-        )
+        triggers.some((rule) => {
+          if (branch === undefined) return !rule.branch;
+          return (
+            rule.event === "commit" &&
+            rule.tag === undefined &&
+            (rule.pullRequest !== undefined ||
+              rule.branch === undefined ||
+              rule.branch.names.includes(branch))
+          );
+        })
       );
     })
     .map((job) => job.name);
@@ -432,6 +439,11 @@ function parseContainer(
       : undefined;
   if (normalizedPrepareInputs && rawPrepare === undefined)
     throw new Error(`${label}.prepareInputs requires prepare`);
+  const trustedPrepareInputs = container.trustedPrepareInputs ?? false;
+  if (typeof trustedPrepareInputs !== "boolean")
+    throw new Error(`${label}.trustedPrepareInputs must be a boolean`);
+  if (trustedPrepareInputs && !normalizedPrepareInputs)
+    throw new Error(`${label}.trustedPrepareInputs requires prepareInputs`);
   return {
     type: "container",
     image,
@@ -439,6 +451,7 @@ function parseContainer(
     memoryMb,
     prepare: typeof rawPrepare === "string" ? rawPrepare.trim() : undefined,
     prepareInputs: normalizedPrepareInputs,
+    ...(trustedPrepareInputs ? { trustedPrepareInputs } : {}),
   };
 }
 

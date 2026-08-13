@@ -236,6 +236,27 @@ describe("configuration", () => {
       prepare: undefined,
       prepareInputs: undefined,
     });
+    const trustedInputs = source.replace(
+      'container = { image = "docker.io/oven/bun:1", cpu = 1 }',
+      'container = { image = "docker.io/oven/bun:1", cpu = 1, prepare = "install", prepareInputs = ["extension.ts"], trustedPrepareInputs = true }',
+    );
+    expect(parseConfig(trustedInputs).jobs[0]?.runtime).toMatchObject({
+      prepareInputs: ["extension.ts"],
+      trustedPrepareInputs: true,
+    });
+    expect(() =>
+      parseConfig(
+        trustedInputs.replace("trustedPrepareInputs = true", 'trustedPrepareInputs = "yes"'),
+      ),
+    ).toThrow("jobs[0].container.trustedPrepareInputs must be a boolean");
+    expect(() =>
+      parseConfig(
+        source.replace(
+          'container = { image = "docker.io/oven/bun:1", cpu = 1 }',
+          'container = { image = "docker.io/oven/bun:1", cpu = 1, trustedPrepareInputs = true }',
+        ),
+      ),
+    ).toThrow("jobs[0].container.trustedPrepareInputs requires prepareInputs");
     expect(() =>
       parseConfig(
         source.replace(

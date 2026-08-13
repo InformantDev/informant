@@ -423,7 +423,10 @@ test("copies preparation inputs and includes their contents in the image identit
       ).toBe('{"name":"shared"}\n');
       const dockerfile = await Bun.file(join(context, "Dockerfile")).text();
       expect(dockerfile).toContain(
-        "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n",
+        'COPY ["informant-prepare-inputs/bun.lock","/workspace/bun.lock"]\n',
+      );
+      expect(dockerfile).toContain(
+        'COPY ["informant-prepare-inputs/packages/shared/package.json","/workspace/packages/shared/package.json"]\n',
       );
       expect(dockerfile).not.toContain("ENV INFORMANT_PREPARE_ROOT");
       expect(dockerfile).toContain('cd "$INFORMANT_PREPARE_ROOT"');
@@ -434,6 +437,7 @@ test("copies preparation inputs and includes their contents in the image identit
   const operations = {
     withImageLock: async <T>(_image: string, callback: () => Promise<T>): Promise<T> => callback(),
     command: build,
+    backend: podmanContainerBackend,
   };
 
   try {
@@ -457,6 +461,56 @@ test("copies preparation inputs and includes their contents in the image identit
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+});
+
+test("trusted preparation inputs are sourced from the trusted workspace", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-prepare-untrusted-"));
+  const trustedWorkspace = await mkdtemp(join(tmpdir(), "informant-prepare-trusted-"));
+  await Bun.write(join(workspace, "extension.ts"), "attacker\n");
+  await Bun.write(join(trustedWorkspace, "extension.ts"), "trusted\n");
+  const runtime = {
+    type: "container" as const,
+    image: "oven/bun:1",
+    prepare: "install extension",
+    prepareInputs: ["extension.ts"],
+    trustedPrepareInputs: true,
+  };
+  try {
+    const image = await ensurePreparedContainer(runtime, workspace, () => {}, undefined, {
+      trustedWorkspace,
+      backend: podmanContainerBackend,
+      withImageLock: passthroughImageLock,
+      command: async (args, options) => {
+        if (args[1] === "image") return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+        if (args[1] === "build") {
+          const context = options?.cwd;
+          if (!context) throw new Error("missing build context");
+          expect(
+            await Bun.file(join(context, "informant-prepare-inputs", "extension.ts")).text(),
+          ).toBe("trusted\n");
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+    });
+    expect(image).toMatch(/^informant-prepared-container:[0-9a-f]{16}$/);
+  } finally {
+    await Promise.all([
+      rm(workspace, { recursive: true, force: true }),
+      rm(trustedWorkspace, { recursive: true, force: true }),
+    ]);
+  }
+});
+
+test("trusted preparation inputs require a trusted workspace", async () => {
+  expect(
+    ensurePreparedContainer({
+      type: "container",
+      image: "base",
+      prepare: "install extension",
+      prepareInputs: ["extension.ts"],
+      trustedPrepareInputs: true,
+    }),
+  ).rejects.toThrow("trusted job workspace");
 });
 
 test("preparation inputs cannot traverse a symbolic link", async () => {

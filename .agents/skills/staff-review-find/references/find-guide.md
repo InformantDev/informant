@@ -30,8 +30,15 @@ make the code shippable and durable, not perform expertise.
 
 **Mode `diff`:** load the changed files. Try the CLI, but never require it:
 
+Use the read-only `staff_files` tool when available. First list changed files,
+following `nextCursor` until it is null. Then read each path's `old` and `new`
+side separately, following `nextOffsetBytes` until it is null. Every response is
+byte-bounded; concatenate a side's `content` pages in offset order to reconstruct
+the same prepared `{ path, status, oldContent, newContent }` snapshot without
+shell access. Otherwise:
+
 ```bash
-staff files --slug <slug> --json   # { path, status, oldContent, newContent } per file
+staff files --slug <slug> --json
 ```
 
 Without it, map refs to Git trees, `STAGED` to the index, and `WT` to the working
@@ -106,7 +113,7 @@ code repeats it, that's a finding — cite the file in the body. If your list is
 ## Step 4 — Don't re-raise settled or already-posted work
 
 Your findings may land on a diff that already has comments (a later `/staff-loop`
-round, or the long-lived `/staff-section` diff). When the CLI is available:
+round, or the long-lived `/staff-section` diff). When the CLI is available (or when the prepared review snapshot includes comments):
 
 ```bash
 staff comment list --json   # add --slug <slug> if you were given one

@@ -16,6 +16,7 @@ export interface ContainerRuntime {
   memoryMb?: number;
   prepare?: string;
   prepareInputs?: string[];
+  trustedPrepareInputs?: boolean;
 }
 
 export interface HostRuntime {
