@@ -431,6 +431,19 @@ function workspaceTools(root: string, cwd = root): ToolDefinition[] {
 	];
 }
 
+type StaffFilePageState = {
+	offsets: Map<number, number>;
+	totalBytes: number;
+};
+
+type StaffFilesSnapshot = {
+	files: Array<Record<string, unknown>>;
+	filesByPath: Map<string, Record<string, unknown>>;
+	pageStates: Map<string, StaffFilePageState>;
+};
+
+const staffFilesSnapshots = new Map<string, Promise<StaffFilesSnapshot>>();
+
 function staffFilesResult(payload: unknown) {
 	const text = JSON.stringify(payload);
 	if (Buffer.byteLength(text, "utf8") > MAX_TOOL_OUTPUT_BYTES)
@@ -438,13 +451,46 @@ function staffFilesResult(payload: unknown) {
 	return { content: [{ type: "text" as const, text }], details: {} };
 }
 
-function previousUtf8Boundary(content: Buffer, offset: number): number {
+function loadStaffFilesSnapshot(snapshotPath: string): Promise<StaffFilesSnapshot> {
+	const existing = staffFilesSnapshots.get(snapshotPath);
+	if (existing) return existing;
+
+	const loading = readFile(snapshotPath, "utf8").then((text) => {
+		const source = JSON.parse(text) as unknown;
+		const rawFiles = isRecord(source) && Array.isArray(source.files) ? source.files : [];
+		const files: Array<Record<string, unknown>> = [];
+		const filesByPath = new Map<string, Record<string, unknown>>();
+		for (const file of rawFiles) {
+			if (!isRecord(file) || typeof file.path !== "string") throw new Error("Invalid path in Staff Review snapshot.");
+			if (filesByPath.has(file.path)) throw new Error(`Duplicate path in Staff Review snapshot: ${file.path}`);
+			files.push(file);
+			filesByPath.set(file.path, file);
+		}
+		return { files, filesByPath, pageStates: new Map() };
+	});
+	staffFilesSnapshots.set(snapshotPath, loading);
+	void loading.catch(() => {
+		if (staffFilesSnapshots.get(snapshotPath) === loading) staffFilesSnapshots.delete(snapshotPath);
+	});
+	return loading;
+}
+
+function previousUtf16Boundary(content: string, offset: number): number {
 	let boundary = Math.min(Math.max(0, offset), content.length);
-	while (boundary > 0 && boundary < content.length && (content[boundary] & 0xc0) === 0x80) boundary--;
+	if (
+		boundary > 0 &&
+		boundary < content.length &&
+		content.charCodeAt(boundary - 1) >= 0xd800 &&
+		content.charCodeAt(boundary - 1) <= 0xdbff &&
+		content.charCodeAt(boundary) >= 0xdc00 &&
+		content.charCodeAt(boundary) <= 0xdfff
+	)
+		boundary--;
 	return boundary;
 }
 
 function staffFileContentPage(
+	snapshot: StaffFilesSnapshot,
 	file: Record<string, unknown>,
 	path: string,
 	side: "old" | "new",
@@ -460,11 +506,16 @@ function staffFileContentPage(
 	}
 	if (typeof value !== "string") throw new Error(`Invalid ${side} content in Staff Review snapshot: ${path}`);
 
-	const content = Buffer.from(value, "utf8");
-	if (offset > content.length) throw new Error(`offsetBytes exceeds the ${side} content length.`);
-	if (offset < content.length && (content[offset] & 0xc0) === 0x80)
-		throw new Error("offsetBytes must be a UTF-8 boundary returned by nextOffsetBytes.");
-	if (offset === content.length) {
+	const pageKey = JSON.stringify([path, side]);
+	let pageState = snapshot.pageStates.get(pageKey);
+	if (!pageState) {
+		pageState = { offsets: new Map([[0, 0]]), totalBytes: Buffer.byteLength(value, "utf8") };
+		snapshot.pageStates.set(pageKey, pageState);
+	}
+	const characterOffset = pageState.offsets.get(offset);
+	if (characterOffset === undefined)
+		throw new Error("offsetBytes must be 0 or a value returned by nextOffsetBytes for this file side.");
+	if (characterOffset === value.length) {
 		return staffFilesResult({
 			file: {
 				path,
@@ -472,29 +523,37 @@ function staffFileContentPage(
 				side,
 				offsetBytes: offset,
 				nextOffsetBytes: null,
-				totalBytes: content.length,
+				totalBytes: pageState.totalBytes,
 				content: "",
 			},
 		});
 	}
 
-	let end = previousUtf8Boundary(content, Math.min(content.length, offset + maximumBytes));
-	while (end > offset) {
-		const nextOffsetBytes = end < content.length ? end : null;
+	let end = previousUtf16Boundary(value, Math.min(value.length, characterOffset + maximumBytes));
+	while (end > characterOffset) {
+		const content = value.slice(characterOffset, end);
+		const contentBytes = Buffer.byteLength(content, "utf8");
+		if (contentBytes > maximumBytes) {
+			end = previousUtf16Boundary(value, characterOffset + Math.floor((end - characterOffset) / 2));
+			continue;
+		}
+		const nextOffsetBytes = end < value.length ? offset + contentBytes : null;
 		try {
-			return staffFilesResult({
+			const result = staffFilesResult({
 				file: {
 					path,
 					status: file.status,
 					side,
 					offsetBytes: offset,
 					nextOffsetBytes,
-					totalBytes: content.length,
-					content: content.subarray(offset, end).toString("utf8"),
+					totalBytes: pageState.totalBytes,
+					content,
 				},
 			});
+			if (nextOffsetBytes !== null) pageState.offsets.set(nextOffsetBytes, end);
+			return result;
 		} catch {
-			end = previousUtf8Boundary(content, offset + Math.floor((end - offset) / 2));
+			end = previousUtf16Boundary(value, characterOffset + Math.floor((end - characterOffset) / 2));
 		}
 	}
 	throw new Error("Unable to fit Staff Review content in a bounded tool response.");
@@ -516,15 +575,15 @@ export function staffFilesTool() {
 		}),
 		async execute(_toolCallId, params) {
 			const snapshotPath = process.env.INFORMANT_STAFF_FILES ?? "/tmp/staff-review-files.json";
-			const source = JSON.parse(await readFile(snapshotPath, "utf8")) as { files?: Array<Record<string, unknown>> };
-			const files = Array.isArray(source.files) ? source.files : [];
+			const snapshot = await loadStaffFilesSnapshot(snapshotPath);
 			if (params.path !== undefined) {
 				if (params.side === undefined) throw new Error("side is required when path is provided.");
 				if (params.cursor !== undefined || params.limit !== undefined)
 					throw new Error("cursor and limit are only valid when listing changed files.");
-				const file = files.find((item) => item.path === params.path);
+				const file = snapshot.filesByPath.get(params.path);
 				if (!file) throw new Error(`Changed file not found in Staff Review snapshot: ${params.path}`);
 				return staffFileContentPage(
+					snapshot,
 					file,
 					params.path,
 					params.side,
@@ -536,24 +595,24 @@ export function staffFilesTool() {
 				throw new Error("path is required when reading file content.");
 
 			const cursor = params.cursor ?? 0;
-			if (cursor > files.length) throw new Error("cursor exceeds the changed-file count.");
+			if (cursor > snapshot.files.length) throw new Error("cursor exceeds the changed-file count.");
 			const limit = params.limit ?? MAX_STAFF_FILE_LIST_ITEMS;
-			const listed: Array<{ path: unknown; status: unknown }> = [];
-			for (let index = cursor; index < files.length && listed.length < limit; index++) {
-				const file = files[index];
+			const listed: Array<{ path: string; status: unknown }> = [];
+			for (let index = cursor; index < snapshot.files.length && listed.length < limit; index++) {
+				const file = snapshot.files[index];
 				if (!file || typeof file.path !== "string") throw new Error("Invalid path in Staff Review snapshot.");
 				const candidate = [...listed, { path: file.path, status: file.status }];
-				const nextCursor = cursor + candidate.length < files.length ? cursor + candidate.length : null;
+				const nextCursor = cursor + candidate.length < snapshot.files.length ? cursor + candidate.length : null;
 				try {
-					staffFilesResult({ files: candidate, nextCursor, totalFiles: files.length });
+					staffFilesResult({ files: candidate, nextCursor, totalFiles: snapshot.files.length });
 					listed.push({ path: file.path, status: file.status });
 				} catch {
 					if (listed.length === 0) throw new Error("Changed-file metadata exceeds the Staff Review output limit.");
 					break;
 				}
 			}
-			const nextCursor = cursor + listed.length < files.length ? cursor + listed.length : null;
-			return staffFilesResult({ files: listed, nextCursor, totalFiles: files.length });
+			const nextCursor = cursor + listed.length < snapshot.files.length ? cursor + listed.length : null;
+			return staffFilesResult({ files: listed, nextCursor, totalFiles: snapshot.files.length });
 		},
 	};
 }

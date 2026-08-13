@@ -7,9 +7,9 @@ the Staff Review runtime reproducible without substituting another package.
 Staff Review applies local hardening patches: parent and child file tools are
 bounded to the review workspace (plus image-baked review skills), child sessions
 inherit no shell or delegation tools, child settings are in-memory, project
-context discovery is disabled, immutable diff snapshots are exposed only through
-byte-bounded pagination, and completed protocol output is retrievable without the
-ordinary activity-view truncation.
+context discovery is disabled, immutable diff snapshots use one shared parse and
+are exposed only through byte-bounded pagination, and completed protocol output
+is retrievable without the ordinary activity-view truncation.
 
 The protected job snapshots these sources and its review skills from the trusted
 configuration revision, bakes them into the prepared image, and loads only that
