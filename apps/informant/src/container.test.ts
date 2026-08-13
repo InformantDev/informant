@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { exchangeFilePaths } from "./atomic-rename.ts";
 import {
   containerCapacity,
   containerJobCommand,
@@ -11,6 +12,7 @@ import {
   preparedContainerImage,
   pruneKnownPreparedContainerImages,
   prunePreparedContainerImages,
+  recoverMountedFileWrites,
   runInContainer,
 } from "./container.ts";
 import {
@@ -421,7 +423,10 @@ test("copies preparation inputs and includes their contents in the image identit
       ).toBe('{"name":"shared"}\n');
       const dockerfile = await Bun.file(join(context, "Dockerfile")).text();
       expect(dockerfile).toContain(
-        "COPY informant-prepare-inputs /workspace\nENV HOME=/home/root\n",
+        'COPY ["informant-prepare-inputs/bun.lock","/workspace/bun.lock"]\n',
+      );
+      expect(dockerfile).toContain(
+        'COPY ["informant-prepare-inputs/packages/shared/package.json","/workspace/packages/shared/package.json"]\n',
       );
       expect(dockerfile).not.toContain("ENV INFORMANT_PREPARE_ROOT");
       expect(dockerfile).toContain('cd "$INFORMANT_PREPARE_ROOT"');
@@ -432,6 +437,7 @@ test("copies preparation inputs and includes their contents in the image identit
   const operations = {
     withImageLock: async <T>(_image: string, callback: () => Promise<T>): Promise<T> => callback(),
     command: build,
+    backend: podmanContainerBackend,
   };
 
   try {
@@ -455,6 +461,56 @@ test("copies preparation inputs and includes their contents in the image identit
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
+});
+
+test("trusted preparation inputs are sourced from the trusted workspace", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-prepare-untrusted-"));
+  const trustedWorkspace = await mkdtemp(join(tmpdir(), "informant-prepare-trusted-"));
+  await Bun.write(join(workspace, "extension.ts"), "attacker\n");
+  await Bun.write(join(trustedWorkspace, "extension.ts"), "trusted\n");
+  const runtime = {
+    type: "container" as const,
+    image: "oven/bun:1",
+    prepare: "install extension",
+    prepareInputs: ["extension.ts"],
+    trustedPrepareInputs: true,
+  };
+  try {
+    const image = await ensurePreparedContainer(runtime, workspace, () => {}, undefined, {
+      trustedWorkspace,
+      backend: podmanContainerBackend,
+      withImageLock: passthroughImageLock,
+      command: async (args, options) => {
+        if (args[1] === "image") return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+        if (args[1] === "build") {
+          const context = options?.cwd;
+          if (!context) throw new Error("missing build context");
+          expect(
+            await Bun.file(join(context, "informant-prepare-inputs", "extension.ts")).text(),
+          ).toBe("trusted\n");
+        }
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+    });
+    expect(image).toMatch(/^informant-prepared-container:[0-9a-f]{16}$/);
+  } finally {
+    await Promise.all([
+      rm(workspace, { recursive: true, force: true }),
+      rm(trustedWorkspace, { recursive: true, force: true }),
+    ]);
+  }
+});
+
+test("trusted preparation inputs require a trusted workspace", async () => {
+  expect(
+    ensurePreparedContainer({
+      type: "container",
+      image: "base",
+      prepare: "install extension",
+      prepareInputs: ["extension.ts"],
+      trustedPrepareInputs: true,
+    }),
+  ).rejects.toThrow("trusted job workspace");
 });
 
 test("preparation inputs cannot traverse a symbolic link", async () => {
@@ -733,11 +789,12 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
             const volume = args.find((arg) => arg.endsWith(":/mnt/informant-codex"));
             if (!volume) throw new Error("expected Codex auth mount");
             const source = volume.slice(0, -":/mnt/informant-codex".length);
+            await options?.onOutput?.("access-secret intermediate-access refreshed-access");
+            await Bun.sleep(75);
             await Bun.write(
               join(source, "auth.json"),
               JSON.stringify({ tokens: { access_token: "refreshed-access" } }),
             );
-            await options?.onOutput?.("access-secret refreshed-access");
           }
           return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
         },
@@ -747,12 +804,13 @@ test("mounts, redacts, and writes back an allowed host file", async () => {
     expect(await Bun.file(join(codexHome, "auth.json")).json()).toEqual({
       tokens: { access_token: "refreshed-access" },
     });
-    expect(output.join("")).toContain("[REDACTED]");
+    expect(output.join("")).toContain("child output suppressed");
     expect(output.join("")).not.toContain("access-secret");
+    expect(output.join("")).not.toContain("intermediate-access");
     expect(output.join("")).not.toContain("refreshed-access");
     expect(locks).toEqual([
       "prepared-container-image-references",
-      `host-file-${digest(join(codexHome, "auth.json"))}`,
+      `host-file-${digest(await realpath(join(codexHome, "auth.json")))}`,
     ]);
     expect(lockAttempts).toEqual([undefined, Number.POSITIVE_INFINITY]);
   } finally {
@@ -858,6 +916,334 @@ test("does not overwrite a host file changed during a mounted job", async () => 
     ).rejects.toThrow("allowed host file changed during mounted job");
     expect(await Bun.file(source).json()).toEqual({ token: "host-refresh" });
     expect((await readdir(root)).filter((name) => name.includes(".informant-"))).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recovers an interrupted atomic mounted-file exchange on startup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-recovery-"));
+  const source = join(root, "auth.json");
+  const dataPath = join(root, "data");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  let recordedBeforeTemporary = false;
+  let exchanged = false;
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        {
+          name: "review",
+          command: "true",
+          optional: false,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          mounts: [{ source: "auth", target: "/mnt/auth", writeBack: true }],
+          needs: [],
+          runtime: { type: "container", image: "oven/bun:1" },
+        },
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { auth: source },
+          dataPath,
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const volume = args.find((arg) => arg.endsWith(":/mnt/auth"));
+              if (!volume) throw new Error("expected auth mount");
+              const staged = volume.slice(0, -":/mnt/auth".length);
+              await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "rotated" }));
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+          copyMountedFile: async (staged, temporary) => {
+            const records = await readdir(join(dataPath, "file-mount-recovery"));
+            expect(records).toHaveLength(1);
+            expect(await Bun.file(String(temporary)).exists()).toBe(false);
+            const record = await Bun.file(
+              join(dataPath, "file-mount-recovery", records[0] as string),
+            ).json();
+            expect(record.temporary).toBe(temporary);
+            recordedBeforeTemporary = true;
+            await copyFile(staged, temporary);
+          },
+          exchange: (left, right) => {
+            expect(Bun.file(source).size).toBeGreaterThan(0);
+            exchangeFilePaths(left, right);
+            exchanged = true;
+            throw new Error("simulated interruption after exchange");
+          },
+        },
+      ),
+    ).rejects.toThrow("simulated interruption after exchange");
+    expect(recordedBeforeTemporary).toBe(true);
+    expect(exchanged).toBe(true);
+    expect(await Bun.file(source).json()).toEqual({ token: "rotated" });
+    expect(await recoverMountedFileWrites(dataPath)).toBe(1);
+    expect(await Bun.file(source).json()).toEqual({ token: "rotated" });
+    expect((await readdir(root)).filter((name) => name.includes(".informant-"))).toEqual([]);
+    expect(await readdir(join(dataPath, "file-mount-recovery"))).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup discards an interrupted mounted-file copy when the source is unchanged", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-partial-copy-"));
+  const source = join(root, "auth.json");
+  const temporary = `${source}.informant-partial`;
+  const dataPath = join(root, "data");
+  const recoveryDirectory = join(dataPath, "file-mount-recovery");
+  const original = JSON.stringify({ token: "original" });
+  const replacement = JSON.stringify({ token: "rotated" });
+  const fileDigest = (contents: string) =>
+    new Bun.CryptoHasher("sha256").update(contents).digest("hex");
+  await Bun.write(source, original);
+  await Bun.write(temporary, replacement.slice(0, 5));
+  await mkdir(recoveryDirectory, { recursive: true });
+  await Bun.write(
+    join(recoveryDirectory, `${digest(source)}.json`),
+    JSON.stringify({
+      version: 1,
+      source,
+      temporary,
+      originalDigest: fileDigest(original),
+      replacementDigest: fileDigest(replacement),
+    }),
+  );
+
+  try {
+    expect(await recoverMountedFileWrites(dataPath)).toBe(1);
+    expect(await Bun.file(source).text()).toBe(original);
+    expect(await Bun.file(temporary).exists()).toBe(false);
+    expect(await readdir(recoveryDirectory)).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unchanged mounted file still clears stale write-back recovery state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-unchanged-recovery-"));
+  const source = join(root, "auth.json");
+  const dataPath = join(root, "data");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  const job: JobConfig = {
+    name: "review",
+    command: "true",
+    optional: false,
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    mounts: [{ source: "auth", target: "/mnt/auth", writeBack: true }],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        job,
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { auth: source },
+          dataPath,
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const volume = args.find((arg) => arg.endsWith(":/mnt/auth"));
+              if (!volume) throw new Error("expected auth mount");
+              const staged = volume.slice(0, -":/mnt/auth".length);
+              await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "rotated" }));
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+          exchange: (left, right) => {
+            exchangeFilePaths(left, right);
+            throw new Error("simulated interruption after exchange");
+          },
+        },
+      ),
+    ).rejects.toThrow("simulated interruption after exchange");
+    expect(await Bun.file(source).json()).toEqual({ token: "rotated" });
+    expect(await readdir(join(dataPath, "file-mount-recovery"))).toHaveLength(1);
+    expect((await readdir(root)).some((name) => name.includes(".informant-"))).toBe(true);
+
+    expect(
+      await runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        job,
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { auth: source },
+          dataPath,
+          withImageLock: passthroughImageLock,
+          command: async () => ({
+            exitCode: 0,
+            stdout: "",
+            stderr: "",
+            timedOut: false,
+          }),
+        },
+      ),
+    ).toEqual({ success: true, exitCode: 0, timedOut: false });
+    expect(await Bun.file(source).json()).toEqual({ token: "rotated" });
+    expect(await readdir(join(dataPath, "file-mount-recovery"))).toEqual([]);
+    expect((await readdir(root)).filter((name) => name.includes(".informant-"))).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup mounted-file recovery uses the live write-back lock and re-reads the record", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-recovery-lock-"));
+  const source = join(root, "auth.json");
+  const dataPath = join(root, "data");
+  await Bun.write(source, JSON.stringify({ token: "original" }));
+  let interrupted = false;
+  try {
+    await expect(
+      runInContainer(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "commit-sha",
+        "pull/1",
+        "trusted-sha",
+        false,
+        process.cwd(),
+        {
+          name: "review",
+          command: "true",
+          optional: false,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          mounts: [{ source: "auth", target: "/mnt/auth", writeBack: true }],
+          needs: [],
+          runtime: { type: "container", image: "oven/bun:1" },
+        },
+        async () => {},
+        async () => {},
+        {},
+        undefined,
+        {
+          allowedMounts: { auth: source },
+          dataPath,
+          withImageLock: passthroughImageLock,
+          command: async (args) => {
+            if (args[1] === "run") {
+              const volume = args.find((arg) => arg.endsWith(":/mnt/auth"));
+              if (!volume) throw new Error("expected auth mount");
+              const staged = volume.slice(0, -":/mnt/auth".length);
+              await Bun.write(join(staged, "auth.json"), JSON.stringify({ token: "rotated" }));
+            }
+            return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+          },
+          exchange: (left, right) => {
+            exchangeFilePaths(left, right);
+            if (!interrupted) {
+              interrupted = true;
+              throw new Error("simulated interruption after exchange");
+            }
+          },
+        },
+      ),
+    ).rejects.toThrow("simulated interruption after exchange");
+
+    const locks: Array<{ name: string; attempts: number | undefined }> = [];
+    expect(
+      await recoverMountedFileWrites(
+        dataPath,
+        exchangeFilePaths,
+        async (name, callback, _signal, attempts) => {
+          locks.push({ name, attempts });
+          return callback();
+        },
+      ),
+    ).toBe(1);
+    expect(locks).toEqual([
+      { name: `host-file-${digest(await realpath(source))}`, attempts: Number.POSITIVE_INFINITY },
+    ]);
+    expect(await Bun.file(source).json()).toEqual({ token: "rotated" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("bounds spooled output for read-only credential mounts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-file-output-"));
+  const source = join(root, "credential.txt");
+  const dataPath = join(root, "data");
+  await Bun.write(source, "secret-value");
+  const output: string[] = [];
+  try {
+    await runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "pull/1",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      {
+        name: "review",
+        command: "true",
+        optional: false,
+        timeoutMinutes: 1,
+        environment: {},
+        secrets: [],
+        mounts: [{ source: "credential", target: "/mnt/credential", writeBack: false }],
+        needs: [],
+        runtime: { type: "container", image: "oven/bun:1" },
+      },
+      async (text) => {
+        output.push(text);
+      },
+      async () => {},
+      {},
+      undefined,
+      {
+        allowedMounts: { credential: source },
+        dataPath,
+        withImageLock: passthroughImageLock,
+        command: async (args, options) => {
+          if (args[1] === "run") {
+            expect(args.some((arg) => arg.endsWith(":/mnt/credential:ro"))).toBe(true);
+            await options?.onOutput?.("before secret-");
+            await options?.onOutput?.("value after\n");
+            await options?.onOutput?.("x".repeat(10 * 1024 * 1024 + 1024));
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    );
+    expect(output.join("")).toContain("mounted job output truncated at 10 MiB");
+    expect(output.join("")).toContain("[REDACTED]");
+    expect(output.join("")).not.toContain("secret-value");
+    expect(Buffer.byteLength(output.join(""))).toBeLessThan(10 * 1024 * 1024 + 1024);
+    expect(await Bun.file(join(dataPath, "container-output-spool")).exists()).toBe(false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -970,12 +1356,7 @@ test("rejects mounted files that grow beyond the supported size", async () => {
         },
       },
     ).catch((caught) => caught);
-    expect(error).toBeInstanceOf(AggregateError);
-    expect(
-      (error as AggregateError).errors.every((nested) =>
-        String(nested).includes(`exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`),
-      ),
-    ).toBe(true);
+    expect(String(error)).toContain(`exceeds ${MAX_ALLOWED_MOUNT_BYTES} bytes`);
     expect(await Bun.file(source).text()).toBe("original");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1023,7 +1404,11 @@ test("serializes different allowlist aliases for the same host file", async () =
   try {
     await run("first");
     await run("second");
-    expect(lockNames).toEqual([`host-file-${digest(source)}`, `host-file-${digest(source)}`]);
+    const canonicalSource = await realpath(source);
+    expect(lockNames).toEqual([
+      `host-file-${digest(canonicalSource)}`,
+      `host-file-${digest(canonicalSource)}`,
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

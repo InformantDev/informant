@@ -16,6 +16,7 @@ export interface ContainerRuntime {
   memoryMb?: number;
   prepare?: string;
   prepareInputs?: string[];
+  trustedPrepareInputs?: boolean;
 }
 
 export interface HostRuntime {
@@ -49,6 +50,9 @@ export interface JobConfig {
     paths: string[];
     keyFiles: string[];
     shared: boolean;
+    buildScoped?: boolean;
+    protectedChannel?: boolean;
+    readOnly?: boolean;
   }>;
 }
 
@@ -131,7 +135,10 @@ export interface BuildRecord {
   checkId?: number;
   checkUrl?: string;
   checksCompletedAt?: string;
-  event?: { type: TriggerEvent | "manual" | "manual_trigger" | "manual_run"; id: string };
+  event?: {
+    type: TriggerEvent | "manual" | "manual_trigger" | "manual_run";
+    id: string;
+  };
   /** Transient source metadata added when builds are aggregated across the tailnet. */
   networkWorker?: { hostName: string; address: string; port: number };
 }

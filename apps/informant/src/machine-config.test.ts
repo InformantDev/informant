@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   addRepository,
   allowMount,
+  automaticUpdatesPreference,
   clearTailscaleConfig,
   getGitHubCredentials,
   getTailscaleConfig,
@@ -15,6 +16,7 @@ import {
   machineConfigPath,
   removeAllowedMount,
   removeRepository,
+  saveAutomaticUpdatesPreference,
   saveGitHubCredentials,
   saveTailscaleConfig,
 } from "./machine-config.ts";
@@ -78,6 +80,7 @@ test("allows only named existing host files for repository mounts", async () => 
     await Bun.write(source, "credential");
     await allowMount("codex-auth", source, path);
     expect(await listAllowedMounts(path)).toEqual([{ name: "codex-auth", source }]);
+    expect(allowMount("Codex-Auth", source, path)).rejects.toThrow("lowercase letters");
     expect(allowMount("bad/name", source, path)).rejects.toThrow("mount name");
     expect(allowMount("missing", join(root, "missing"), path)).rejects.toThrow("existing file");
     await Bun.write(source, Buffer.alloc(MAX_ALLOWED_MOUNT_BYTES + 1));
@@ -88,6 +91,25 @@ test("allows only named existing host files for repository mounts", async () => 
     expect(await removeAllowedMount("codex-auth", path)).toBe(false);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves mixed-case mount names written by previous releases", async () => {
+  const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
+  try {
+    await Bun.write(
+      path,
+      `${JSON.stringify({
+        version: 1,
+        repositories: [],
+        allowedMounts: { "Codex-Auth": "/tmp/auth.json" },
+      })}\n`,
+    );
+    expect(await listAllowedMounts(path)).toEqual([
+      { name: "Codex-Auth", source: "/tmp/auth.json" },
+    ]);
+  } finally {
+    await Bun.file(path).delete();
   }
 });
 
@@ -135,6 +157,28 @@ test("saving GitHub credentials preserves registered repositories", async () => 
     await saveGitHubCredentials(credentials, path);
     expect(await getGitHubCredentials(repository, path)).toEqual(credentials);
     expect((await listRepositories(path)).map((value) => value.fullName)).toEqual(["acme/widgets"]);
+  } finally {
+    await Bun.file(path).delete();
+  }
+});
+
+test("stores the initial automatic-update choice without changing machine credentials", async () => {
+  const path = join(import.meta.dir, `.machine-config-${crypto.randomUUID()}.json`);
+  const credentials = {
+    account: "acme",
+    appId: "123",
+    installationId: "456",
+    privateKeyFile: "/tmp/informant.pem",
+  };
+
+  try {
+    expect(await automaticUpdatesPreference(path)).toBeUndefined();
+    await saveGitHubCredentials(credentials, path);
+    await saveAutomaticUpdatesPreference(false, path);
+    expect(await automaticUpdatesPreference(path)).toBe(false);
+    expect(await listGitHubCredentials(path)).toEqual([credentials]);
+    await saveAutomaticUpdatesPreference(true, path);
+    expect(await automaticUpdatesPreference(path)).toBe(true);
   } finally {
     await Bun.file(path).delete();
   }

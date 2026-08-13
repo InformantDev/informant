@@ -77,6 +77,10 @@ export interface RepositoryDispatch {
   forceTagPoll: boolean;
 }
 
+export function startupRecoveryRequests(repositories: Repository[]): RepositoryDispatch[] {
+  return repositories.map((repository) => ({ repository, forceTagPoll: true }));
+}
+
 type RetryTimer = ReturnType<typeof setTimeout>;
 
 export class DispatchRetryQueue {
@@ -643,6 +647,9 @@ export async function serveWithTailscale(
       ? setInterval(() => void refreshTopology(), PEER_REFRESH_INTERVAL_MS)
       : undefined;
   try {
+    for (const request of startupRecoveryRequests(configuredRepositories)) {
+      dispatchQueue.enqueue(request);
+    }
     if (config.mode === "lead") {
       if (!config.webhookSecret) throw new Error("lead is missing its GitHub webhook secret");
       funnelServer = Bun.serve({
@@ -698,9 +705,6 @@ export async function serveWithTailscale(
       });
       const funnelUrl = await prepareTailscaleFunnel(status, config.funnelPort);
       options.onMessage?.(`Tailscale Funnel listening at ${funnelUrl}/webhooks/github`);
-      for (const repository of configuredRepositories) {
-        dispatchQueue.enqueue({ repository, forceTagPoll: true });
-      }
       await refreshTopology(true);
     } else {
       options.onMessage?.(

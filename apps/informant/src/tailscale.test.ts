@@ -9,6 +9,7 @@ import {
   DispatchRetryQueue,
   parseTailscaleStatus,
   readWebhookBody,
+  startupRecoveryRequests,
   tailscaleExecutable,
   validGitHubSignature,
   webhookForcesTagPoll,
@@ -145,6 +146,17 @@ test("recognizes tag push webhooks that must bypass the tag throttle", () => {
   expect(webhookForcesTagPoll("push", { ref: "refs/tags/v1" })).toBe(true);
   expect(webhookForcesTagPoll("push", { ref: "refs/heads/main" })).toBe(false);
   expect(webhookForcesTagPoll("pull_request", { ref: "refs/tags/v1" })).toBe(false);
+});
+
+test("startup recovery forces a synchronization for every local repository", () => {
+  const one = { owner: "owner", repo: "one", fullName: "owner/one" };
+  const two = { owner: "owner", repo: "two", fullName: "owner/two" };
+  const repositories = [one, two];
+
+  expect(startupRecoveryRequests(repositories)).toEqual([
+    { repository: one, forceTagPoll: true },
+    { repository: two, forceTagPoll: true },
+  ]);
 });
 
 test("retains failed dispatches and preserves a queued tag refresh", async () => {

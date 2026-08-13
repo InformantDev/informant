@@ -32,12 +32,14 @@ informant tailscale enable --lead      Configure Funnel and the GitHub App webho
 informant tailscale enable --worker    Receive tailnet jobs without polling GitHub
 informant tailscale status             Show Funnel state and discovered workers
 informant tailscale disable            Disable networking and restore polling
+informant auto-update enable           Check for and install new Informant releases automatically
+informant auto-update disable          Disable automatic release checks
 informant hook install                 Install the push-accelerating pre-push hook
 informant hook uninstall               Remove Informant from the pre-push hook
 informant builds                       List builds running across tailnet workers
 informant builds --all                 List recent cross-worker build history
 informant logs [<build-id>]             Tail a build's logs or select a running job
-informant update                        Update with Homebrew and restart a running worker
+informant update                        Install a newer release and restart a running worker
 informant storage                      Show Informant disk usage and available space
 informant doctor                       Verify host tools, GitHub auth, and disk space
 ```
@@ -131,10 +133,18 @@ restarts if it exits and starts again when you log in. Its output is written to 
 and `worker.stderr.log` in the Informant data directory. Run `informant startup enable` again after
 changing any `INFORMANT_*` environment-variable overrides so the service captures the new values.
 
-`informant update` upgrades `informantdev/tap/informant` with Homebrew. It restarts a loaded macOS
-LaunchAgent or active Linux systemd user service after the upgrade without starting a worker that was
-stopped or never enabled. Direct Linux installations update by re-running the install command from
-the quickstart.
+`informant update` checks GitHub's latest stable release before making changes. On macOS it upgrades
+`informantdev/tap/informant` with Homebrew. Linux Homebrew installations use that same formula
+upgrade path. For standalone Linux installations, it downloads the matching release binary, verifies
+it against the release's `SHA256SUMS`, and atomically replaces the installed executable; the
+executable and its parent directory must be writable by the worker user. If the startup worker was
+already running, the command gracefully stops it and waits for launchd or systemd to start the new
+version. It does not start a worker that was stopped or never enabled.
+
+The first-run automatic-update choice in `informant setup` installs a launchd agent or persistent
+systemd user timer that performs the same version check every six hours. The updater only installs a
+strictly newer stable version. Change the setup choice later with `informant auto-update enable` or
+`informant auto-update disable`; Linux requires a running systemd user manager.
 
 `informant run --local` accepts repeatable `--job` flags as well as comma-separated job names. Only
 selected jobs and their transitive `needs` dependencies run. Omit `--job` to run the complete job
