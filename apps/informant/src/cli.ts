@@ -934,6 +934,20 @@ export async function configuredGitHubAppSettings(
   return Promise.all(credentials.map((app) => inspect(app)));
 }
 
+export async function openTailscaleFunnelAuthorization(
+  url: string,
+  runCommand: typeof command = command,
+  currentPlatform = process.platform,
+): Promise<void> {
+  console.log(`Tailscale Funnel approval required:\n  ${url}\nOpening it in your browser...`);
+  const result = await runCommand([currentPlatform === "linux" ? "xdg-open" : "open", url], {
+    timeoutMs: 10_000,
+  });
+  if (result.exitCode !== 0 && !result.timedOut) {
+    throw new Error(`could not open Tailscale Funnel approval: ${result.stderr.trim()}`);
+  }
+}
+
 export function formatGitHubAppSettings(apps: GitHubAppWebhookSettings[]): string {
   return [
     "Configured GitHub App settings:",
@@ -975,6 +989,7 @@ async function manageTailscale(
       throw new Error("--token requires exactly one value");
     }
     const config = await enableTailscale(flags.lead === true ? "lead" : "worker", {
+      authorizeFunnel: openTailscaleFunnelAuthorization,
       networkSecret: typeof flags.token === "string" ? flags.token : undefined,
       webhookReadyConfirmed: flags.lead === true,
     });
@@ -1005,12 +1020,14 @@ async function manageTailscale(
   if (action === "status" || !action) {
     const current = await networkStatus();
     if (!current.status) {
-      console.log("Tailscale is not installed or is not connected.");
+      console.log(
+        `Tailscale is not installed or is not connected.\nInformant: ${current.config ? `${current.config.mode} · polling fallback enabled` : "not configured · polling enabled"}`,
+      );
       return;
     }
     const lines = [
       `Tailscale: ${current.status.online ? "online" : "offline"} · ${current.status.self.hostName}`,
-      `Informant: ${current.config ? `${current.config.mode} · polling disabled while connected` : "not configured · polling enabled"}`,
+      `Informant: ${current.config ? `${current.config.mode} · ${current.status.online ? "polling disabled while connected" : "polling fallback enabled"}` : "not configured · polling enabled"}`,
     ];
     if (current.config?.funnelUrl)
       lines.push(`Funnel: ${current.config.funnelUrl}/webhooks/github`);

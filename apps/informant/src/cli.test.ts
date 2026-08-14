@@ -11,6 +11,7 @@ import {
   executionLabelFromRef,
   formatGitHubAppSettings,
   main,
+  openTailscaleFunnelAuthorization,
   pruneRuntimeImages,
   runInvocationType,
   runManualHousekeeping,
@@ -79,6 +80,27 @@ test("execution labels follow the requested ref instead of the checked out branc
 test("run preserves reported triggers unless local execution is explicit", () => {
   expect(runInvocationType(false)).toBe("trigger");
   expect(runInvocationType(true)).toBe("local");
+});
+
+test("opens Tailscale Funnel approval in the platform browser", async () => {
+  const commands: string[][] = [];
+  let timeoutMs: number | undefined;
+  const output = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await openTailscaleFunnelAuthorization(
+      "https://login.tailscale.com/f/funnel?node=self-id",
+      async (argv, options) => {
+        commands.push(argv);
+        timeoutMs = options?.timeoutMs;
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+      "darwin",
+    );
+  } finally {
+    output.mockRestore();
+  }
+  expect(commands).toEqual([["open", "https://login.tailscale.com/f/funnel?node=self-id"]]);
+  expect(timeoutMs).toBe(10_000);
 });
 
 test("loads every configured GitHub App before lead confirmation", async () => {

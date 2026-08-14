@@ -13,13 +13,16 @@ import {
   githubAppWebhookSettings,
   MAX_WEBHOOK_BODY_BYTES,
   parseTailscaleStatus,
+  prepareTailscaleFunnel,
   RepositoryScanQueue,
   readWebhookBody,
   reconcileKnownWorkers,
   requireGitHubAppWebhookEvents,
+  serveWithTailscale,
   startupRecoveryRequests,
   type TailscaleStatus,
   tailscaleExecutable,
+  tailscaleStatus,
   validGitHubSignature,
   validNetworkAuthorization,
   webhookForcesTagPoll,
@@ -29,6 +32,74 @@ test("uses a Tailscale executable available on PATH", () => {
   expect(
     tailscaleExecutable((name) => (name === "tailscale" ? "/usr/local/bin/tailscale" : null)),
   ).toBe("/usr/local/bin/tailscale");
+});
+
+test("bounds status and forces Tailscale's CLI mode in background workers", async () => {
+  let term: string | undefined;
+  let timeoutMs: number | undefined;
+  await tailscaleStatus(
+    async (_argv, options) => {
+      term = options?.env?.TERM;
+      timeoutMs = options?.timeoutMs;
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          BackendState: "Running",
+          Self: { ID: "self-id", HostName: "lead", Online: true, TailscaleIPs: ["100.64.0.1"] },
+        }),
+        stderr: "",
+        timedOut: false,
+      };
+    },
+    () => "/usr/bin/tailscale",
+  );
+  expect(term).toBe(Bun.env.TERM ?? "dumb");
+  expect(timeoutMs).toBe(10_000);
+});
+
+test("opens Funnel authorization and times out with Tailscale's actionable output", async () => {
+  let timeoutMs: number | undefined;
+  let openedBeforeComplete: number | undefined;
+  const opened: string[] = [];
+  await expect(
+    prepareTailscaleFunnel(
+      {
+        executable: "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        online: true,
+        self: {
+          id: "self-id",
+          hostName: "lead",
+          dnsName: "lead.example.ts.net",
+          addresses: ["100.64.0.1"],
+          online: true,
+        },
+        peers: [],
+      },
+      7640,
+      async (_argv, options) => {
+        timeoutMs = options?.timeoutMs;
+        await options?.onOutput?.(
+          "Authorize Funnel: https://login.tailscale.com/f/funnel?node=self",
+        );
+        openedBeforeComplete = opened.length;
+        await options?.onOutput?.("-id\n");
+        return {
+          exitCode: 143,
+          stdout: "Authorize Funnel: https://login.tailscale.com/f/funnel?node=self-id",
+          stderr: "",
+          timedOut: true,
+        };
+      },
+      (url) => {
+        opened.push(url);
+      },
+    ),
+  ).rejects.toThrow(
+    "could not enable Tailscale Funnel within 2 minutes: Authorize Funnel: https://login.tailscale.com/f/funnel?node=self-id",
+  );
+  expect(timeoutMs).toBe(120_000);
+  expect(openedBeforeComplete).toBe(0);
+  expect(opened).toEqual(["https://login.tailscale.com/f/funnel?node=self-id"]);
 });
 
 test("activates and configures the GitHub App webhook with an App JWT", async () => {
@@ -237,6 +308,71 @@ test("requires a shared token before disabling polling on a network worker", asy
     },
   });
   expect(saved?.networkSecret).toBe("network-secret-that-is-at-least-32-characters");
+});
+
+test("falls back to polling when configured Tailscale coordination is unavailable", async () => {
+  const config = {
+    mode: "lead" as const,
+    workerPort: 7639,
+    funnelPort: 7640,
+    funnelUrl: "https://lead.example.ts.net",
+    webhookSecret: "webhook-secret",
+    networkSecret: "network-secret-that-is-at-least-32-characters",
+  };
+  const messages: string[] = [];
+  let pollingStarts = 0;
+  const servePolling = async () => {
+    pollingStarts++;
+  };
+
+  await serveWithTailscale(
+    [],
+    { onMessage: (message) => messages.push(message) },
+    {
+      getConfig: async () => {
+        throw new Error("invalid Tailscale configuration");
+      },
+      servePolling,
+    },
+  );
+  await serveWithTailscale(
+    [],
+    { onMessage: (message) => messages.push(message) },
+    {
+      getConfig: async () => config,
+      status: async () => undefined,
+      servePolling,
+    },
+  );
+  await serveWithTailscale(
+    [],
+    { onMessage: (message) => messages.push(message) },
+    {
+      getConfig: async () => config,
+      status: async () => ({
+        executable: "/usr/bin/tailscale",
+        online: true,
+        self: {
+          id: "self-id",
+          hostName: "lead",
+          addresses: ["100.64.0.1"],
+          online: true,
+        },
+        peers: [],
+      }),
+      serveNetwork: async () => {
+        throw new Error("Funnel failed");
+      },
+      servePolling,
+    },
+  );
+
+  expect(pollingStarts).toBe(3);
+  expect(messages).toEqual([
+    "Tailscale configuration unavailable; polling GitHub instead: invalid Tailscale configuration",
+    "Tailscale coordination unavailable; polling GitHub instead: Tailscale is offline",
+    "Tailscale coordination unavailable; polling GitHub instead: Funnel failed",
+  ]);
 });
 
 test("disables local coordination when Funnel teardown fails", async () => {
