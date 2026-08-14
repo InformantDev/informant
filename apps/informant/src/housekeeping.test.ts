@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { housekeepingPolicy, runHousekeeping, updateCacheConfiguration } from "./housekeeping.ts";
+import {
+  formatHousekeepingSummary,
+  housekeepingPolicy,
+  runHousekeeping,
+  updateCacheConfiguration,
+} from "./housekeeping.ts";
 import { digest } from "./tart/vm.ts";
 import type { Repository } from "./types.ts";
 
@@ -33,6 +38,7 @@ function operations(root: string, diskSpace = { availableBytes: 50e9, totalBytes
     reconcileContainerRepositories: async () => 0,
     pruneTartImages: async () => 0,
     pruneContainerImages: async () => 0,
+    resetAppleContainerBuilder: async () => false,
   };
 }
 
@@ -147,13 +153,67 @@ describe("automatic housekeeping", () => {
     const root = await mkdtemp(join(tmpdir(), "informant-housekeeping-active-"));
     roots.push(root);
     const build = await directory(root, "builds/old", 0);
+    let builderResets = 0;
     const summary = await runHousekeeping(
       [],
-      { ...operations(root), activeBuildIds: async () => ["active"] },
+      {
+        ...operations(root),
+        activeBuildIds: async () => ["active"],
+        resetAppleContainerBuilder: async () => {
+          builderResets++;
+          return true;
+        },
+      },
       housekeepingPolicy({}),
     );
 
     expect(summary.skipped).toBe(true);
+    expect(builderResets).toBe(0);
     expect(await Bun.file(join(build, "data")).exists()).toBe(true);
+  });
+
+  test("resets Apple builder storage behind the housekeeping and builder locks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "informant-housekeeping-builder-"));
+    roots.push(root);
+    const locks: string[] = [];
+    const summary = await runHousekeeping([], {
+      ...operations(root),
+      withLock: async <T>(name: string, callback: () => Promise<T>) => {
+        locks.push(name);
+        return callback();
+      },
+      resetAppleContainerBuilder: async ({ dataPath, withImageLock } = {}) => {
+        expect(dataPath).toBe(root);
+        if (!withImageLock) throw new Error("expected the housekeeping lock implementation");
+        return withImageLock("container-builder", async () => true);
+      },
+    });
+
+    expect(summary.appleContainerBuilder).toBe(true);
+    expect(formatHousekeepingSummary(summary)).toBe("Cleaned up Apple Container builder storage");
+    expect(locks).toEqual(["housekeeping", "container-builder"]);
+  });
+
+  test("reports Apple builder cleanup failures without stopping other housekeeping", async () => {
+    const root = await mkdtemp(join(tmpdir(), "informant-housekeeping-builder-failure-"));
+    roots.push(root);
+    let prunes = 0;
+    const summary = await runHousekeeping([], {
+      ...operations(root),
+      resetAppleContainerBuilder: async () => {
+        throw new Error("could not delete builder");
+      },
+      pruneContainerImages: async () => {
+        prunes++;
+        return 1;
+      },
+    });
+
+    expect(prunes).toBe(1);
+    expect(summary.containerImages).toBe(1);
+    expect(summary.appleContainerBuilderError).toBe("could not delete builder");
+    expect(formatHousekeepingSummary(summary)).toBe(
+      "Cleaned up 1 prepared images; Apple Container builder cleanup failed: could not delete builder",
+    );
   });
 });
