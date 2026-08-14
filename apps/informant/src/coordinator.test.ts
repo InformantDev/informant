@@ -12,6 +12,7 @@ import {
 } from "./coordinator.ts";
 import { createExecutionSlotAcquirer } from "./execution-capacity.ts";
 import type { GitHubClient } from "./github.ts";
+import { scheduleJobs } from "./tart/index.ts";
 import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
 
 const repository: Repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
@@ -144,6 +145,15 @@ function harness(
     saveBuild: async (record) => {
       saved.push({ ...record });
     },
+    monitorBuildCancellation: (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    },
     runInTart: async (
       _repository,
       _sha,
@@ -153,6 +163,7 @@ function harness(
       _signal,
       runtimeSecrets,
       configuredVmJobs,
+      jobSignal,
     ) => {
       receivedBranches.push(record.branch);
       receivedConfiguredVmJobs = configuredVmJobs;
@@ -164,12 +175,17 @@ function harness(
       const success = options.success ?? true;
       for (const job of selectedConfig.jobs) {
         await observer?.started?.(job);
+        const cancelled = _signal?.aborted || jobSignal?.(job.name)?.aborted;
         await observer?.completed?.(job, {
-          outcome: success ? "success" : "failure",
+          outcome: cancelled ? "cancelled" : success ? "success" : "failure",
           log: `${job.name} output`,
         });
       }
-      return success;
+      return (
+        success &&
+        !_signal?.aborted &&
+        !selectedConfig.jobs.some((job) => jobSignal?.(job.name)?.aborted)
+      );
     },
     readLogTail: async () => "build output",
   };
@@ -1586,6 +1602,38 @@ describe("runCommit", () => {
     expect(context.receivedBranches).toEqual(["release"]);
   });
 
+  test("pull request suite reruns exclude tag-only jobs", async () => {
+    const context = harness({ manualTrigger: true, originalPullRequest: 7 });
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const rerunConfig: InformantConfig = {
+      ...config,
+      triggers: [{ event: "commit", pullRequest: {} }],
+      jobs: [
+        base,
+        {
+          ...base,
+          name: "release-build",
+          triggers: [{ event: "commit", tag: { patterns: ["v*"] } }],
+        },
+      ],
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "feature",
+      rerunConfig,
+      context.dependencies,
+      { type: "commit", branch: "feature", id: "branch:feature:sha" },
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("success");
+    expect(context.jobChecks).toEqual(["test"]);
+  });
+
   test("a pull request rerun discovered through a branch does not satisfy its filter", async () => {
     const context = harness({ manualTrigger: true, originalPullRequest: 7 });
     const filtered = {
@@ -1650,6 +1698,208 @@ describe("runCommit", () => {
     expect(record.event?.type).toBe("manual_run");
     expect(context.jobChecks).toEqual([]);
     expect(context.updates).toEqual([]);
+  });
+
+  test("honors local build cancellation after the final job completes", async () => {
+    const context = harness();
+    const jobsCompleted = deferred<void>();
+    const cleanup = deferred<void>();
+    const buildController = new AbortController();
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      return {
+        signal: buildController.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const job = selectedConfig.jobs[0];
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      await observer?.completed?.(job, { outcome: "success", log: "finished" });
+      jobsCompleted.resolve();
+      await cleanup.promise;
+      return true;
+    };
+
+    const running = runLocalCommit(repository, "sha", "main", config, {
+      dependencies: context.dependencies,
+    });
+    await jobsCompleted.promise;
+    buildController.abort("Cancellation requested from informant builds.");
+    cleanup.resolve();
+    const record = await running;
+
+    expect(record.status).toBe("cancelled");
+    expect(record.jobs).toEqual([{ name: "test", status: "success" }]);
+  });
+
+  test("preserves queued local job cancellation when setup fails", async () => {
+    const context = harness();
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multipleJobs = { ...config, jobs: [base, { ...base, name: "lint" }] };
+    const setupStarted = deferred<void>();
+    const releaseSetup = deferred<void>();
+    let cancelTarget: (() => void) | undefined;
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      cancelTarget = () =>
+        jobControllers
+          .get(base.name)
+          ?.abort(`Cancellation requested for ${base.name} from informant builds.`);
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async () => {
+      setupStarted.resolve();
+      await releaseSetup.promise;
+      throw new Error("checkout failed");
+    };
+
+    const running = runLocalCommit(repository, "sha", "main", multipleJobs, {
+      dependencies: context.dependencies,
+    });
+    await setupStarted.promise;
+    if (!cancelTarget) throw new Error("expected a job cancellation controller");
+    cancelTarget();
+    releaseSetup.resolve();
+
+    await expect(running).rejects.toThrow("checkout failed");
+    expect(context.saved.at(-1)).toMatchObject({
+      status: "failure",
+      jobs: [
+        { name: "test", status: "cancelled" },
+        { name: "lint", status: "failure" },
+      ],
+    });
+  });
+
+  test("preserves queued reported job cancellation when setup fails", async () => {
+    const context = harness();
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multipleJobs = {
+      ...config,
+      jobs: [base, { ...base, name: "lint", needs: [base.name] }],
+    };
+    const setupStarted = deferred<void>();
+    const releaseSetup = deferred<void>();
+    let cancelTarget: (() => void) | undefined;
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      cancelTarget = () =>
+        jobControllers
+          .get(base.name)
+          ?.abort(`Cancellation requested for ${base.name} from informant builds.`);
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async () => {
+      setupStarted.resolve();
+      await releaseSetup.promise;
+      throw new Error("checkout failed");
+    };
+
+    const running = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      multipleJobs,
+      context.dependencies,
+    );
+    await setupStarted.promise;
+    if (!cancelTarget) throw new Error("expected a job cancellation controller");
+    cancelTarget();
+    releaseSetup.resolve();
+
+    await expect(running).rejects.toThrow("checkout failed");
+    expect(context.saved.at(-1)).toMatchObject({
+      status: "failure",
+      jobs: [
+        { name: "test", status: "cancelled" },
+        { name: "lint", status: "failure" },
+      ],
+    });
+    expect(
+      context.updates.find(
+        (update) => update.id === 100 && update.values.conclusion === "cancelled",
+      ),
+    ).toBeDefined();
+  });
+
+  test("keeps cancellation during job check creation active until setup exits", async () => {
+    const context = harness({ manualTrigger: true });
+    const checkStarted = deferred<void>();
+    const releaseCheck = deferred<void>();
+    const buildController = new AbortController();
+    const createJobCheck = context.github.createJobCheck.bind(context.github);
+    context.dependencies.createBuild = async (record) => {
+      context.saved.push({ ...record });
+    };
+    context.github.createJobCheck = async (...args) => {
+      if (args[3] === "test") {
+        checkStarted.resolve();
+        await releaseCheck.promise;
+      }
+      return createJobCheck(...args);
+    };
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      return {
+        signal: buildController.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    let executed = false;
+    context.dependencies.runInTart = async () => {
+      executed = true;
+      return true;
+    };
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const running = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      { ...config, jobs: [base, { ...base, name: "lint" }] },
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+
+    await checkStarted.promise;
+    buildController.abort("Cancellation requested from informant builds.");
+    await Bun.sleep(0);
+    expect(context.saved.at(-1)?.status).toBe("running");
+    releaseCheck.resolve();
+    const record = await running;
+
+    if (!record) throw new Error("expected a build record");
+    expect(executed).toBeFalse();
+    expect(context.jobChecks).toEqual(["test"]);
+    expect(record.status).toBe("cancelled");
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Build cancelled",
+    });
   });
 
   test("cancels created job checks when later check creation fails", async () => {
@@ -1892,7 +2142,261 @@ describe("runCommit", () => {
     ).toMatchObject({ conclusion: "cancelled", summary: "Superseded by main@new-sha." });
     expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
       conclusion: "cancelled",
+      title: "Superseded by a newer commit",
       summary: "Superseded by main@new-sha.",
+    });
+  });
+
+  test("marks unfinished jobs cancelled when superseded during check reconciliation", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    const automaticConfig = { ...config, triggers: [{ event: "commit" as const }] };
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 100 && values.conclusion === "cancelled") {
+        controller.abort("Superseded by main@new-sha.");
+      }
+      return updateCheck(target, id, values);
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+    ) => {
+      const [job] = selectedConfig.jobs;
+      if (!job) throw new Error("expected a job");
+      await observer?.started?.(job);
+      throw new Error("runtime failed");
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "old-sha",
+      "main",
+      automaticConfig,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:old-sha" },
+      controller.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(record.runningJobs).toEqual([]);
+    expect(record.jobs).toEqual([{ name: "test", status: "cancelled" }]);
+  });
+
+  test("cancels child checks when superseded during late reconciliation", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    const automaticConfig = { ...config, triggers: [{ event: "commit" as const }] };
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    let successAttempts = 0;
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 100 && values.conclusion === "success") {
+        successAttempts++;
+        if (successAttempts === 1) throw new Error("temporary child update failure");
+        if (successAttempts === 2) controller.abort("Superseded by main@new-sha.");
+      }
+      return updateCheck(target, id, values);
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "old-sha",
+      "main",
+      automaticConfig,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:old-sha" },
+      controller.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(successAttempts).toBe(2);
+    expect(
+      context.updates.find(
+        (update) => update.id === 100 && update.values.conclusion === "cancelled",
+      ),
+    ).toBeDefined();
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Superseded by a newer commit",
+    });
+  });
+
+  test("cancels a running job, skips its dependent, and completes independent work", async () => {
+    const context = harness({ manualTrigger: true });
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multiJobConfig = {
+      ...config,
+      jobs: [base, { ...base, name: "deploy", needs: [base.name] }, { ...base, name: "lint" }],
+    };
+    const targetStarted = deferred<void>();
+    const releaseTarget = deferred<void>();
+    const started: string[] = [];
+    let cancelTarget: (() => void) | undefined;
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      cancelTarget = () =>
+        jobControllers
+          .get(base.name)
+          ?.abort(`Cancellation requested for ${base.name} from informant builds.`);
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+      _signal,
+      _runtimeSecrets,
+      _configuredVmJobs,
+      jobSignal,
+    ) =>
+      scheduleJobs(
+        selectedConfig.jobs,
+        async (job) => {
+          started.push(job.name);
+          await observer?.started?.(job);
+          if (job.name === base.name) {
+            targetStarted.resolve();
+            await releaseTarget.promise;
+          }
+          const outcome = jobSignal?.(job.name)?.aborted ? "cancelled" : "success";
+          await observer?.completed?.(job, { outcome, log: `${job.name} output` });
+          return outcome === "cancelled" ? "cancelled" : true;
+        },
+        async (job) => {
+          await observer?.completed?.(job, { outcome: "skipped", log: "" });
+        },
+      );
+
+    const running = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      multiJobConfig,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+    await targetStarted.promise;
+    if (!cancelTarget) throw new Error("expected a job cancellation controller");
+    cancelTarget();
+    releaseTarget.resolve();
+    const record = await running;
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(record.jobs).toEqual([
+      { name: "test", status: "cancelled" },
+      { name: "deploy", status: "skipped" },
+      { name: "lint", status: "success" },
+    ]);
+    expect(new Set(started)).toEqual(new Set(["test", "lint"]));
+    expect(
+      context.updates.find((update) => update.id === 100 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({
+      conclusion: "cancelled",
+      summary: "Cancellation requested for test from informant builds.",
+    });
+    expect(
+      context.updates.find((update) => update.id === 101 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "skipped" });
+    expect(
+      context.updates.find((update) => update.id === 102 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "success" });
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "1 job cancelled",
+    });
+  });
+
+  test("keeps a cancelled build active until runtime cleanup finishes", async () => {
+    const context = harness({ manualTrigger: true });
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multipleJobs = { ...config, jobs: [base, { ...base, name: "lint" }] };
+    const started = deferred<void>();
+    const cleanup = deferred<void>();
+    const buildController = new AbortController();
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      return {
+        signal: buildController.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async (
+      _repository,
+      _sha,
+      selectedConfig,
+      _record,
+      observer,
+      signal,
+    ) => {
+      const [completed, running] = selectedConfig.jobs;
+      if (!completed || !running || !signal) throw new Error("expected two abortable jobs");
+      await observer?.started?.(completed);
+      await observer?.completed?.(completed, { outcome: "success", log: "finished" });
+      await observer?.started?.(running);
+      started.resolve();
+      await cleanup.promise;
+      await observer?.completed?.(running, { outcome: "cancelled", log: "cancelled output" });
+      return false;
+    };
+
+    const running = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      multipleJobs,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:sha" },
+    );
+    await started.promise;
+    buildController.abort("Cancellation requested from informant builds.");
+    await Bun.sleep(0);
+    expect(context.saved.at(-1)?.status).toBe("running");
+    cleanup.resolve();
+    const record = await running;
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(record.jobs).toEqual([
+      { name: "test", status: "success" },
+      { name: "lint", status: "cancelled" },
+    ]);
+    expect(record.event?.type).toBe("manual_trigger");
+    expect(
+      context.updates
+        .filter((update) => update.id === 100 && update.values.status === "completed")
+        .map((update) => update.values.conclusion),
+    ).toEqual(["success"]);
+    expect(
+      context.updates.find((update) => update.id === 101 && update.values.status === "completed")
+        ?.values,
+    ).toMatchObject({ conclusion: "cancelled" });
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Build cancelled",
+      summary: "Cancellation requested from informant builds.",
     });
   });
 
@@ -2062,7 +2566,8 @@ describe("runCommit", () => {
     );
 
     if (!record) throw new Error("expected a build record");
-    expect(runtimeSignal).toBe(forcedShutdown.signal);
+    expect(runtimeSignal?.aborted).toBeTrue();
+    expect(runtimeSignal?.reason).toBe("Graceful worker shutdown timed out.");
     expect(record.status).toBe("cancelled");
   });
 });

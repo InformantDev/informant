@@ -74,7 +74,9 @@ temporary_binary="$install_dir/.informant.$$"
 trap 'rm -rf "$temporary_directory"; rm -f "$temporary_binary"' EXIT HUP INT TERM
 cp "$temporary_directory/$asset" "$temporary_binary"
 chmod 0755 "$temporary_binary"
-installed_version=$("$temporary_binary" --version) || fail "the downloaded binary could not run"
+version_output=$("$temporary_binary" --version) || fail "the downloaded binary could not run"
+installed_version=$(printf '%s\n' "$version_output" | awk 'NR == 1 { print; exit }')
+[ -n "$installed_version" ] || fail "the downloaded binary did not report a version"
 if [ "$version" != latest ]; then
   requested_version=${version#v}
   [ "$installed_version" = "$requested_version" ] || \

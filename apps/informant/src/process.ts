@@ -11,6 +11,7 @@ export interface CommandOptions {
   inheritEnv?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
+  killProcessGroup?: boolean;
   onOutput?: (text: string) => Promise<void> | void;
 }
 
@@ -57,6 +58,7 @@ export async function command(
         env: { ...(options.inheritEnv === false ? {} : Bun.env), ...options.env },
         stdout: "pipe",
         stderr: "pipe",
+        detached: options.killProcessGroup === true && process.platform !== "win32",
       });
     } catch {
       return undefined;
@@ -66,14 +68,60 @@ export async function command(
     const error = `could not start command: ${argv[0] ?? "unknown"}`;
     return { exitCode: 127, stdout: "", stderr: String(error), timedOut: false };
   }
-  const process = spawned;
+  const child = spawned;
+  const processGroup =
+    options.killProcessGroup === true && process.platform !== "win32" && child.pid > 0;
   let timedOut = false;
+  let stopping = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let groupTermination: Promise<void> | undefined;
   const captureController = new AbortController();
+  const kill = (signal: NodeJS.Signals) => {
+    if (processGroup) {
+      try {
+        process.kill(-child.pid, signal);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      }
+    }
+    child.kill(signal);
+  };
+  const groupIsAlive = () => {
+    if (!processGroup) return false;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
   const stop = () => {
-    process.kill("SIGTERM");
+    if (stopping) return;
+    stopping = true;
+    kill("SIGTERM");
+    if (processGroup) {
+      groupTermination ??= new Promise<void>((resolve) => {
+        const deadline = Date.now() + 2_000;
+        const check = () => {
+          if (!groupIsAlive()) {
+            resolve();
+            return;
+          }
+          if (Date.now() >= deadline) {
+            kill("SIGKILL");
+            captureController.abort();
+            resolve();
+            return;
+          }
+          killTimer = setTimeout(check, 25);
+        };
+        killTimer = setTimeout(check, 25);
+      });
+      return;
+    }
     killTimer ??= setTimeout(() => {
-      process.kill("SIGKILL");
+      kill("SIGKILL");
       captureController.abort();
     }, 2_000);
   };
@@ -84,19 +132,21 @@ export async function command(
         stop();
       }, options.timeoutMs)
     : undefined;
-  const stdout = captureTail(process.stdout, captureController.signal, options.onOutput);
-  const stderr = captureTail(process.stderr, captureController.signal, options.onOutput);
+  const stdout = captureTail(child.stdout, captureController.signal, options.onOutput);
+  const stderr = captureTail(child.stderr, captureController.signal, options.onOutput);
   try {
     const [capturedStdout, capturedStderr, exitCode] = await Promise.all([
       stdout,
       stderr,
-      process.exited,
+      child.exited,
     ]);
+    if (groupTermination) await groupTermination;
     options.signal?.throwIfAborted();
     return { stdout: capturedStdout, stderr: capturedStderr, exitCode, timedOut };
   } catch (error) {
     stop();
-    await Promise.allSettled([stdout, stderr, process.exited]);
+    await Promise.allSettled([stdout, stderr, child.exited]);
+    if (groupTermination) await groupTermination;
     throw error;
   } finally {
     if (timer) clearTimeout(timer);

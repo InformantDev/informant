@@ -72,6 +72,54 @@ test("command terminates when its signal is aborted", async () => {
   expect(Date.now() - started).toBeLessThan(3_000);
 });
 
+test("command can terminate a cancelled process group", async () => {
+  const controller = new AbortController();
+  let output = "";
+  let descendantPid: number | undefined;
+  let reportStarted: (() => void) | undefined;
+  const reported = new Promise<void>((resolve) => {
+    reportStarted = resolve;
+  });
+  const result = command(["sh", "-c", 'sleep 30 & echo "$!"; wait'], {
+    signal: controller.signal,
+    killProcessGroup: true,
+    onOutput: (text) => {
+      output += text;
+      const match = output.match(/^(\d+)\n/);
+      if (match?.[1] && descendantPid === undefined) {
+        descendantPid = Number(match[1]);
+        reportStarted?.();
+      }
+    },
+  });
+
+  try {
+    await reported;
+    controller.abort("cancel process tree");
+    await expect(result).rejects.toThrow("cancel process tree");
+    for (let attempt = 0; attempt < 50 && descendantPid !== undefined; attempt++) {
+      const state = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(descendantPid)], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      if (state.exitCode !== 0 || state.stdout.toString().trim().startsWith("Z")) {
+        descendantPid = undefined;
+        break;
+      }
+      await Bun.sleep(20);
+    }
+    expect(descendantPid).toBeUndefined();
+  } finally {
+    if (descendantPid !== undefined) {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // Best-effort cleanup if the assertion failed before the child was reaped.
+      }
+    }
+  }
+});
+
 test("command terminates when its output callback fails", async () => {
   const started = Date.now();
   const result = command(["sh", "-c", "printf output; sleep 30"], {

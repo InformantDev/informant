@@ -201,6 +201,11 @@ function versionParts(value: string): { core: number[]; prerelease?: string } | 
   };
 }
 
+export function reportedInformantVersion(output: string): string | undefined {
+  const firstLine = output.split(/\r?\n/, 1)[0]?.trim();
+  return firstLine && versionParts(firstLine) ? firstLine : undefined;
+}
+
 export function compareVersions(left: string, right: string): number {
   const a = versionParts(left);
   const b = versionParts(right);
@@ -371,13 +376,10 @@ export async function installLinuxRelease(
     const validation = await (options.command ?? command)([temporary, "--version"], {
       timeoutMs: 30_000,
     });
-    if (
-      validation.exitCode !== 0 ||
-      validation.timedOut ||
-      validation.stdout.trim() !== release.version
-    ) {
+    const reportedVersion = reportedInformantVersion(validation.stdout);
+    if (validation.exitCode !== 0 || validation.timedOut || reportedVersion !== release.version) {
       throw new Error(
-        `downloaded binary reported ${validation.stdout.trim() || validation.stderr.trim() || `exit ${validation.exitCode}`} instead of ${release.version}`,
+        `downloaded binary reported ${reportedVersion || validation.stdout.trim() || validation.stderr.trim() || `exit ${validation.exitCode}`} instead of ${release.version}`,
       );
     }
     await rename(temporary, executable);
@@ -451,10 +453,11 @@ async function installHomebrewRelease(
     );
   }
   const installed = await run([executable, "--version"]);
+  const installedVersion = reportedInformantVersion(installed.stdout);
   if (
     installed.exitCode !== 0 ||
-    !versionParts(installed.stdout.trim()) ||
-    compareVersions(installed.stdout.trim(), release.version) !== 0
+    !installedVersion ||
+    compareVersions(installedVersion, release.version) !== 0
   ) {
     throw new Error(
       `Homebrew did not install Informant ${release.version}; the formula may still be updating`,
