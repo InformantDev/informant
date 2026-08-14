@@ -5,11 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   actionableWebhook,
+  addedRepositoryRecoveryRequests,
   configureGitHubAppWebhook,
   DispatchRetryQueue,
+  enableTailscale,
+  MAX_WEBHOOK_BODY_BYTES,
   parseTailscaleStatus,
   readWebhookBody,
   startupRecoveryRequests,
+  type TailscaleStatus,
   tailscaleExecutable,
   validGitHubSignature,
   webhookForcesTagPoll,
@@ -57,6 +61,50 @@ test("activates and configures the GitHub App webhook with an App JWT", async ()
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("persists and reuses a lead secret when configuring one App fails", async () => {
+  const status: TailscaleStatus = {
+    executable: "/usr/bin/tailscale",
+    online: true,
+    self: {
+      id: "self-id",
+      hostName: "lead",
+      dnsName: "lead.example.ts.net",
+      addresses: ["100.64.0.1"],
+      online: true,
+    },
+    peers: [],
+  };
+  const credentials = [
+    { appId: "one", installationId: "1", privateKeyFile: "/unused/one.pem" },
+    { appId: "two", installationId: "2", privateKeyFile: "/unused/two.pem" },
+  ];
+  let saved: Awaited<ReturnType<typeof enableTailscale>> | undefined;
+  let failSecond = true;
+  const configuredSecrets: string[] = [];
+  const operations = {
+    status: async () => status,
+    getConfig: async () => saved,
+    saveConfig: async (config: NonNullable<typeof saved>) => {
+      saved = config;
+    },
+    prepareFunnel: async () => "https://lead.example.ts.net",
+    listCredentials: async () => credentials,
+    createSecret: () => "recoverable-secret",
+    configureWebhook: async (app: (typeof credentials)[number], _url: string, secret: string) => {
+      configuredSecrets.push(secret);
+      if (failSecond && app.appId === "two") throw new Error("temporary failure");
+    },
+  };
+
+  await expect(enableTailscale("lead", operations)).rejects.toThrow("temporary failure");
+  expect(saved?.webhookSecret).toBe("recoverable-secret");
+  failSecond = false;
+  configuredSecrets.length = 0;
+  await enableTailscale("lead", operations);
+
+  expect(configuredSecrets).toEqual(["recoverable-secret", "recoverable-secret"]);
 });
 
 test("parses this machine and online peers from Tailscale status", () => {
@@ -114,7 +162,8 @@ test("dispatches only webhook actions that can create trigger work", () => {
   expect(actionableWebhook("installation", { action: "created" })).toBe(false);
 });
 
-test("bounds webhook bodies with and without a content length", async () => {
+test("bounds webhook bodies at GitHub's supported maximum", async () => {
+  expect(MAX_WEBHOOK_BODY_BYTES).toBe(25 * 1024 * 1024);
   await expect(
     readWebhookBody(
       new Request("https://lead.example/webhooks/github", {
@@ -157,6 +206,38 @@ test("startup recovery forces a synchronization for every local repository", () 
     { repository: one, forceTagPoll: true },
     { repository: two, forceTagPoll: true },
   ]);
+});
+
+test("repository refresh recovers only newly registered repositories", () => {
+  const one = { owner: "owner", repo: "one", fullName: "owner/one" };
+  const two = { owner: "owner", repo: "two", fullName: "OWNER/TWO" };
+
+  expect(addedRepositoryRecoveryRequests([one], [one, two])).toEqual([
+    { repository: two, forceTagPoll: true },
+  ]);
+  expect(addedRepositoryRecoveryRequests([one, two], [one, two])).toEqual([]);
+});
+
+test("runs another dispatch when an ordinary webhook arrives during an active dispatch", async () => {
+  const requests: boolean[] = [];
+  let finishFirst!: (value: boolean) => void;
+  const first = new Promise<boolean>((resolve) => {
+    finishFirst = resolve;
+  });
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(async (request) => {
+    requests.push(request.forceTagPoll);
+    return requests.length === 1 ? first : true;
+  });
+
+  queue.enqueue({ repository, forceTagPoll: false });
+  while (requests.length === 0) await Bun.sleep(0);
+  queue.enqueue({ repository, forceTagPoll: false });
+  finishFirst(true);
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toEqual([false, false]);
+  await queue.stop();
 });
 
 test("retains failed dispatches and preserves a queued tag refresh", async () => {

@@ -30,7 +30,7 @@ export const DEFAULT_FUNNEL_PORT = 7640;
 const REQUEST_TIMEOUT_MS = 2_000;
 const PEER_REFRESH_INTERVAL_MS = 10_000;
 const MAX_DISPATCH_RETRY_MS = 60_000;
-export const MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024;
+export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 const MACOS_TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 
 export interface TailscalePeer {
@@ -81,12 +81,28 @@ export function startupRecoveryRequests(repositories: Repository[]): RepositoryD
   return repositories.map((repository) => ({ repository, forceTagPoll: true }));
 }
 
+export function addedRepositoryRecoveryRequests(
+  previous: Repository[],
+  current: Repository[],
+): RepositoryDispatch[] {
+  const existing = new Set(previous.map((repository) => repository.fullName.toLowerCase()));
+  return startupRecoveryRequests(
+    current.filter((repository) => !existing.has(repository.fullName.toLowerCase())),
+  );
+}
+
 type RetryTimer = ReturnType<typeof setTimeout>;
 
 export class DispatchRetryQueue {
   private readonly entries = new Map<
     string,
-    { request: RepositoryDispatch; attempts: number; running?: Promise<void>; timer?: RetryTimer }
+    {
+      request: RepositoryDispatch;
+      attempts: number;
+      pending: boolean;
+      running?: Promise<void>;
+      timer?: RetryTimer;
+    }
   >();
   private stopped = false;
 
@@ -103,9 +119,10 @@ export class DispatchRetryQueue {
     const existing = this.entries.get(key);
     if (existing) {
       existing.request.forceTagPoll ||= request.forceTagPoll;
+      if (existing.running) existing.pending = true;
       return;
     }
-    this.entries.set(key, { request, attempts: 0 });
+    this.entries.set(key, { request, attempts: 0, pending: false });
     this.run(key);
   }
 
@@ -117,32 +134,34 @@ export class DispatchRetryQueue {
     const entry = this.entries.get(key);
     if (!entry || entry.running) return;
     entry.timer = undefined;
+    entry.pending = false;
     const request = { ...entry.request };
+    entry.request.forceTagPoll = false;
+    const retry = () => {
+      const current = this.entries.get(key);
+      if (!current) return;
+      current.running = undefined;
+      current.request.forceTagPoll ||= request.forceTagPoll;
+      if (this.stopped) return;
+      current.attempts++;
+      const delayMs = Math.min(1_000 * 2 ** (current.attempts - 1), MAX_DISPATCH_RETRY_MS);
+      this.onRetry(current.request, delayMs);
+      current.timer = this.schedule(() => this.run(key), delayMs);
+    };
     entry.running = this.dispatch(request)
       .then((succeeded) => {
+        if (!succeeded) return retry();
         const current = this.entries.get(key);
         if (!current) return;
         current.running = undefined;
-        if (succeeded && (!current.request.forceTagPoll || request.forceTagPoll)) {
-          this.entries.delete(key);
+        current.attempts = 0;
+        if (current.pending && !this.stopped) {
+          this.run(key);
           return;
         }
-        if (this.stopped) return;
-        current.attempts++;
-        const delayMs = Math.min(1_000 * 2 ** (current.attempts - 1), MAX_DISPATCH_RETRY_MS);
-        this.onRetry(current.request, delayMs);
-        current.timer = this.schedule(() => this.run(key), delayMs);
+        this.entries.delete(key);
       })
-      .catch(() => {
-        const current = this.entries.get(key);
-        if (!current) return;
-        current.running = undefined;
-        if (this.stopped) return;
-        current.attempts++;
-        const delayMs = Math.min(1_000 * 2 ** (current.attempts - 1), MAX_DISPATCH_RETRY_MS);
-        this.onRetry(current.request, delayMs);
-        current.timer = this.schedule(() => this.run(key), delayMs);
-      });
+      .catch(retry);
   }
 
   async stop(): Promise<void> {
@@ -364,25 +383,50 @@ export async function configureGitHubAppWebhook(
   }
 }
 
-export async function enableTailscale(mode: "lead" | "worker"): Promise<TailscaleConfig> {
-  const status = await tailscaleStatus();
+export interface EnableTailscaleOperations {
+  configureWebhook?: typeof configureGitHubAppWebhook;
+  createSecret?: () => string;
+  getConfig?: typeof getTailscaleConfig;
+  listCredentials?: typeof listGitHubCredentials;
+  prepareFunnel?: typeof prepareTailscaleFunnel;
+  saveConfig?: typeof saveTailscaleConfig;
+  status?: typeof tailscaleStatus;
+}
+
+export async function enableTailscale(
+  mode: "lead" | "worker",
+  operations: EnableTailscaleOperations = {},
+): Promise<TailscaleConfig> {
+  const status = await (operations.status ?? tailscaleStatus)();
   if (!status?.online) throw new Error("Tailscale must be installed, connected, and online");
   const base: TailscaleConfig = {
     mode,
     workerPort: DEFAULT_WORKER_PORT,
     funnelPort: DEFAULT_FUNNEL_PORT,
   };
+  const saveConfig = operations.saveConfig ?? saveTailscaleConfig;
   if (mode === "worker") {
-    await saveTailscaleConfig(base);
+    await saveConfig(base);
     return base;
   }
-  const secret = randomBytes(32).toString("hex");
-  const funnelUrl = await prepareTailscaleFunnel(status, base.funnelPort);
-  const credentials = await listGitHubCredentials();
+  const existing = await (operations.getConfig ?? getTailscaleConfig)();
+  const secret =
+    existing?.mode === "lead" && existing.webhookSecret
+      ? existing.webhookSecret
+      : (operations.createSecret ?? (() => randomBytes(32).toString("hex")))();
+  const funnelUrl = await (operations.prepareFunnel ?? prepareTailscaleFunnel)(
+    status,
+    base.funnelPort,
+  );
+  const credentials = await (operations.listCredentials ?? listGitHubCredentials)();
   if (credentials.length === 0) throw new Error("configure a GitHub App before enabling a lead");
-  await Promise.all(credentials.map((app) => configureGitHubAppWebhook(app, funnelUrl, secret)));
   const config = { ...base, funnelUrl, webhookSecret: secret };
-  await saveTailscaleConfig(config);
+  await saveConfig(config);
+  await Promise.all(
+    credentials.map((app) =>
+      (operations.configureWebhook ?? configureGitHubAppWebhook)(app, funnelUrl, secret),
+    ),
+  );
   return config;
 }
 
@@ -518,7 +562,12 @@ export async function serveWithTailscale(
         });
       }
     }
-    if (tasks.length === 0) return false;
+    if (tasks.length === 0) {
+      options.onMessage?.(
+        `dropping ${request.repository.fullName} dispatch; no registered worker advertises it`,
+      );
+      return true;
+    }
     const results = await Promise.allSettled(tasks.map((task) => task.promise));
     for (const [index, result] of results.entries()) {
       if (result.status === "rejected") {
@@ -633,7 +682,14 @@ export async function serveWithTailscale(
     if (refreshingRepositories) return;
     refreshingRepositories = true;
     try {
-      configuredRepositories = await loadRepositories();
+      const nextRepositories = await loadRepositories();
+      for (const request of addedRepositoryRecoveryRequests(
+        configuredRepositories,
+        nextRepositories,
+      )) {
+        dispatchQueue.enqueue(request);
+      }
+      configuredRepositories = nextRepositories;
     } catch (error) {
       options.onMessage?.(
         `could not refresh repositories: ${error instanceof Error ? error.message : error}`,
