@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, readdir, rm, stat, utimes } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   claimBuildWorkspace,
@@ -182,6 +182,125 @@ test("cancellation requests target a running build or one active job", async () 
   record.completedAt = new Date().toISOString();
   await saveBuild(record);
   await expect(requestBuildCancellation(record.id)).rejects.toThrow("build is not running");
+});
+
+test("cancellation requests are hidden until their contents are complete", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "atomic-cancellation",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    jobs: [{ name: "test", status: "running" }],
+    owner: currentProcessOwner(),
+    logPath: join(root, "builds", "atomic-cancellation", "build.log"),
+  };
+  await createBuild(record);
+  const monitor = monitorBuildCancellation(record.id, ["test"], 5);
+  let stagingPath: string | undefined;
+  let partialWritten: (() => void) | undefined;
+  const partial = new Promise<void>((resolve) => {
+    partialWritten = resolve;
+  });
+  let releaseWrite: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => {
+    releaseWrite = resolve;
+  });
+
+  try {
+    const cancellation = requestBuildCancellation(record.id, undefined, {
+      requestId: "atomic-request",
+      timeoutMs: 500,
+      write: async (path, contents) => {
+        stagingPath = path;
+        await Bun.write(path, "{");
+        partialWritten?.();
+        await blocked;
+        await Bun.write(path, contents);
+      },
+    });
+    await partial;
+    await Bun.sleep(20);
+    if (!stagingPath) throw new Error("expected a staging path");
+    expect(await Bun.file(stagingPath).exists()).toBe(true);
+    expect(await readdir(join(dirname(stagingPath), "requests"))).toEqual([]);
+    expect(monitor.signal.aborted).toBe(false);
+
+    releaseWrite?.();
+    await cancellation;
+    expect(monitor.signal.aborted).toBe(true);
+    expect(await Bun.file(stagingPath).exists()).toBe(false);
+  } finally {
+    releaseWrite?.();
+    await monitor.close();
+  }
+});
+
+test("cancellation revalidates a stale read after a terminal save", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "terminal-save-race",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    jobs: [{ name: "test", status: "running" }],
+    owner: currentProcessOwner(),
+    logPath: join(root, "builds", "terminal-save-race", "build.log"),
+  };
+  await createBuild(record);
+  let readCaptured: (() => void) | undefined;
+  const captured = new Promise<void>((resolve) => {
+    readCaptured = resolve;
+  });
+  let releaseRead: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => {
+    releaseRead = resolve;
+  });
+  let reads = 0;
+  const monitor = monitorBuildCancellation(record.id, ["test"], 5, {
+    readBuild: async (id) => {
+      const build = await getBuild(id);
+      if (reads++ === 0) {
+        readCaptured?.();
+        await blocked;
+      }
+      return build;
+    },
+  });
+
+  try {
+    const cancellation = requestBuildCancellation(record.id, undefined, {
+      requestId: "terminal-save-request",
+      timeoutMs: 500,
+    });
+    await captured;
+    record.status = "success";
+    record.runningJobs = [];
+    record.jobs = [{ name: "test", status: "success" }];
+    record.completedAt = new Date().toISOString();
+    await saveBuild(record);
+    releaseRead?.();
+
+    await expect(cancellation).rejects.toThrow("build is not running: terminal-save-race");
+    expect(monitor.signal.aborted).toBe(false);
+    expect(monitor.jobSignal("test")?.aborted).toBe(false);
+    expect((await getBuild(record.id))?.status).toBe("success");
+  } finally {
+    releaseRead?.();
+    await monitor.close();
+  }
 });
 
 test("cancellation reconciles a build whose owning worker exited", async () => {

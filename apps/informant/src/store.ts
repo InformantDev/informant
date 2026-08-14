@@ -53,7 +53,28 @@ export function jobLogPath(record: BuildRecord, job: string): string {
 
 const WORKSPACE_OWNER = ".owner.json";
 const ACTIVE_MARKER_GRACE_MS = 60_000;
-const buildSaves = new Map<string, Promise<void>>();
+
+interface BuildSaveState {
+  revision: number;
+  readers: number;
+  tail?: Promise<void>;
+}
+
+const buildSaveStates = new Map<string, BuildSaveState>();
+
+function buildSaveState(id: string): BuildSaveState {
+  const existing = buildSaveStates.get(id);
+  if (existing) return existing;
+  const state: BuildSaveState = { revision: 0, readers: 0 };
+  buildSaveStates.set(id, state);
+  return state;
+}
+
+function cleanBuildSaveState(id: string, state: BuildSaveState): void {
+  if (state.readers === 0 && state.tail === undefined && buildSaveStates.get(id) === state) {
+    buildSaveStates.delete(id);
+  }
+}
 
 function processStartIdentity(pid: number): string | undefined {
   const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
@@ -118,7 +139,9 @@ export async function saveBuild(record: BuildRecord): Promise<void> {
   const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
   const contents = JSON.stringify(record, null, 2);
   const status = record.status;
-  const previous = buildSaves.get(record.id) ?? Promise.resolve();
+  const state = buildSaveState(record.id);
+  state.revision++;
+  const previous = state.tail ?? Promise.resolve();
   const save = previous
     .catch(() => undefined)
     .then(async () => {
@@ -137,11 +160,12 @@ export async function saveBuild(record: BuildRecord): Promise<void> {
         await rm(temporaryPath, { force: true }).catch(() => undefined);
       }
     });
-  buildSaves.set(record.id, save);
+  state.tail = save;
   try {
     await save;
   } finally {
-    if (buildSaves.get(record.id) === save) buildSaves.delete(record.id);
+    if (state.tail === save) state.tail = undefined;
+    cleanBuildSaveState(record.id, state);
   }
 }
 
@@ -242,14 +266,26 @@ export async function requestBuildCancellation(
   const requestId = operations.requestId ?? crypto.randomUUID();
   const acknowledgement = cancellationAcknowledgementPath(id, requestId);
   const path = cancellationRequestPath(id, requestId);
+  const temporaryPath = join(cancellationDirectory(id), `.request-${crypto.randomUUID()}.tmp`);
   await mkdir(cancellationRequestDirectory(id), { recursive: true });
-  await (operations.write ?? Bun.write)(
-    path,
-    JSON.stringify({ buildId: id, job, requestId, requestedAt: new Date().toISOString() }),
-  );
   const sleep = operations.sleep ?? Bun.sleep;
-  const deadline = Date.now() + (operations.timeoutMs ?? 5_000);
   try {
+    await (operations.write ?? Bun.write)(
+      temporaryPath,
+      JSON.stringify({ buildId: id, job, requestId, requestedAt: new Date().toISOString() }),
+    );
+    await mkdir(cancellationRequestDirectory(id), { recursive: true });
+    try {
+      await rename(temporaryPath, path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        const current = await getBuild(id);
+        if (!current) throw new Error(`build not found: ${id}`);
+        validateCancellationTarget(current, id, job);
+      }
+      throw error;
+    }
+    const deadline = Date.now() + (operations.timeoutMs ?? 5_000);
     while (Date.now() < deadline) {
       if (await Bun.file(acknowledgement).exists()) return build;
       const current = await getBuild(id);
@@ -265,6 +301,7 @@ export async function requestBuildCancellation(
     await rm(path, { force: true });
     throw new Error(`cancellation request was not acknowledged for ${job ?? id}`);
   } finally {
+    await rm(temporaryPath, { force: true });
     await rm(path, { force: true });
     await rm(acknowledgement, { force: true });
   }
@@ -280,6 +317,9 @@ export function monitorBuildCancellation(
   id: string,
   jobs: string[],
   pollIntervalMs = 250,
+  operations: {
+    readBuild?: typeof getBuild;
+  } = {},
 ): BuildCancellationMonitor {
   const buildController = new AbortController();
   const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
@@ -318,19 +358,43 @@ export function monitorBuildCancellation(
         .filter((entry) => entry.isFile())
         .map((entry) => join(requestDirectory, entry.name));
       if (paths.length > 0) {
-        await buildSaves.get(id)?.catch(() => undefined);
-        const build = await getBuild(id);
-        if (build) {
-          await Promise.all(
-            paths.map(async (path) => {
-              const request = (await Bun.file(path)
-                .json()
-                .catch(() => undefined)) as CancellationRequest | undefined;
-              if (request) await acknowledge(path, request, build);
-              else await rm(path, { force: true });
-            }),
-          );
-        } else await Promise.all(paths.map((path) => rm(path, { force: true })));
+        const requests = await Promise.all(
+          paths.map(async (path) => ({
+            path,
+            request: (await Bun.file(path)
+              .json()
+              .catch(() => undefined)) as CancellationRequest | undefined,
+          })),
+        );
+        const malformed = requests.filter(({ request }) => !request);
+        await Promise.all(malformed.map(({ path }) => rm(path, { force: true })));
+        const valid = requests.filter(
+          (entry): entry is { path: string; request: CancellationRequest } =>
+            entry.request !== undefined,
+        );
+        if (valid.length > 0) {
+          const state = buildSaveState(id);
+          state.readers++;
+          try {
+            while (true) {
+              const revision = state.revision;
+              await state.tail?.catch(() => undefined);
+              const build = await (operations.readBuild ?? getBuild)(id);
+              if (state.revision !== revision) continue;
+              if (build) {
+                await Promise.all(
+                  valid.map(({ path, request }) => acknowledge(path, request, build)),
+                );
+              } else {
+                await Promise.all(valid.map(({ path }) => rm(path, { force: true })));
+              }
+              break;
+            }
+          } finally {
+            state.readers--;
+            cleanBuildSaveState(id, state);
+          }
+        }
       }
       await new Promise<void>((resolve) => {
         wake = resolve;

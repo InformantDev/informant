@@ -45,11 +45,12 @@ review a ten-line change.
 
 > The review runs ~2×N agents total — N find agents, each paired with a verify
 > agent that re-checks its findings — but they're **pipelined and reaped as they
-> go**: the moment a find agent returns you stop its task and start its verifier,
-> so the *live* sub-agent count stays around N (a find slot becomes a verify slot),
-> never 2N. Reaping finished agents is load-bearing — leaving them open exhausts
-> the limited sub-agent pool and trips the sub-agent limit. The verify pass itself
-> is non-negotiable: it's what keeps false positives out of the review.
+> go**: the moment a find agent completes, retrieve its protocol output, terminate
+> it, and start its verifier. The *live* sub-agent count therefore stays around N
+> (a find slot becomes a verify slot), never 2N. Reaping completed agents is
+> load-bearing — leaving them retained exhausts the limited sub-agent pool and
+> trips the sub-agent limit. The verify pass itself is non-negotiable: it's what
+> keeps false positives out of the review.
 
 ## Step 2 — Survey (lean)
 
@@ -63,9 +64,10 @@ when the CLI is absent, plus `ls .staffreview/docs/` (which may be empty).
 ## Step 3 — FIND: launch N find agents in the background
 
 Partition the work two ways, then spawn **N find agents in the background** —
-issue all N Agent/Task calls with `run_in_background` so each reports back
-independently and you can act on it the instant it finishes. **Do not wait for
-the whole wave**: Step 4 consumes each agent's findings as they arrive.
+call `subagent_create` once per finder, retain every returned id, and use the repo
+root as `cwd`. `subagent_create` is background by definition; there is no
+`run_in_background` option. **Do not wait for the whole wave**: Step 4 consumes
+each agent's findings as it completes.
 
 **Partition the 10 review areas** into N buckets (keep related areas together;
 the heavier areas — correctness, edge cases, concurrency, security, data — carry
@@ -110,20 +112,23 @@ behind a pre-verify barrier.
 
 ## Step 4 — VERIFY PIPELINE → DEDUP → POST
 
-This stage is **event-driven, not a second wave.** As **each** find agent reports
-back, run its findings through its own verify chain immediately — don't wait on
-the other find agents to start verification. Background agents draw from a
-**limited sub-agent pool**, so **reap each one the instant you've consumed it**
-(the `TaskStop` steps below) — leaving finished agents open is what exhausts the
-limit.
+This stage is **event-driven, not a second wave.** Poll activity with
+`subagent_read` (omit `id` to monitor all agents, using its default wait). As
+**each** find agent completes, run its findings through its own verify chain
+immediately — don't wait on the other find agents to start verification.
+Background agents draw from a **limited sub-agent pool**, so retrieve and reap
+each completed agent immediately; leaving completed agents retained is what
+exhausts the limit.
 
-**1. Verify (one verify agent per returning find agent).** The moment a find
-agent reports back, **stop its background task** (`TaskStop` with the id you got
-when you launched it) — you already have its findings, so it must not keep holding
-a slot. Then spawn a verify agent in the background, seeded with *only that find
-agent's* findings. The verifier is necessarily a *different* agent than the finder
-— the point is independent eyes. If a find agent returned `[]`, stop it and move
-on — nothing to verify.
+**1. Verify (one verify agent per returning find agent).** When a finder reports
+`completed`, call `subagent_read` again with that finder's `id` and
+`completed_output: true`. This read-before-remove step retrieves the complete,
+untruncated findings JSON. Only after consuming it, call `subagent_terminate`
+with that id and `remove: true` to dispose the session and retained record. Then
+call `subagent_create` for a verifier, seeded with *only that find agent's*
+findings. The verifier is necessarily a *different* agent than the finder — the
+point is independent eyes. If a finder returned `[]`, terminate/remove it after
+the completed-output read and move on — nothing to verify.
 
 > You are running in `<repo dir>`. Read `/opt/informant/skills/staff-review-verify/SKILL.md`
 > and follow that trusted image-baked skill exactly. Your parameters:
@@ -134,13 +139,14 @@ on — nothing to verify.
 > Return the verdicts JSON the skill specifies — nothing else. Do not post,
 > spawn agents, or modify code.
 
-**2. Collect survivors (as each verify agent returns).** Keep only
-**confirmed** findings. When a verdict carries a `correctedAnchor`, replace that
-finding's `file`/`line`/`endLine`/`side` with it wholesale (a relocated
-single-line finding loses its old `endLine`; a relocated range keeps the
-corrected one). Discard the rest — track how many you dropped for the Step 5
-report. Reap each verify agent immediately after consuming its verdicts, then
-append that batch's confirmed survivors to an in-memory list.
+**2. Collect survivors (as each verify agent completes).** Retrieve its full
+verdict JSON with `subagent_read { id, completed_output: true }` before calling
+`subagent_terminate { id, remove: true }`. Keep only **confirmed** findings. When
+a verdict carries a `correctedAnchor`, replace that finding's
+`file`/`line`/`endLine`/`side` with it wholesale (a relocated single-line
+finding loses its old `endLine`; a relocated range keeps the corrected one).
+Discard the rest — track how many you dropped for the Step 5 report. Append that
+batch's confirmed survivors to an in-memory list.
 
 **3. Dedup and publish survivors after all verify chains drain.** Once every
 verify agent has returned and been reaped, dedup the collected survivors.
@@ -173,21 +179,25 @@ no single line to attach to, post it top-level (no `--file`/`--line`). Do **not*
 post a verdict/"LGTM"/recap that just restates the inline findings — if every
 finding has a home inline, post nothing extra.
 
-Once you've consumed a verify agent's verdicts and added any confirmed survivors
-to the in-memory list, **stop that verify agent's task too** (`TaskStop`) — don't
-leave finished agents open.
+Once you've consumed a verifier's completed output and added any confirmed
+survivors to the in-memory list, terminate it with `remove: true` — don't leave
+completed agents retained.
 
 Reaping on consume this way keeps the **live** sub-agent count at ~N (each find
 slot turns into a verify slot), never 2N. If `N` is large enough that launching
 all find agents at once would exceed the pool, launch them in batches and reap
 completed ones before starting more.
 
-Continue until **every** find chain and its verify agent have drained and all
+Continue polling with `subagent_read` until **every** find chain and its verifier
+have drained, every completed output has been read before removal, and all
 survivors are posted. Only then go to Step 5.
 
 ## Step 5 — Report back
 
-Summarize to the user in chat (don't post a top-level comment for this):
+When a trusted outer job step handles posting, return only the final survivor
+JSON array requested in Step 4, with no summary or other prose, then stop.
+
+Otherwise, summarize to the user in chat (don't post a top-level comment for this):
 
 - `N` find agents used; the diff slug.
 - Findings: raised by the find agents → confirmed by their verifiers → posted
@@ -216,14 +226,15 @@ following `/staff-resolve`.
   **nothing is posted unverified**. A find agent's verifier starts as soon as
   that finder returns; posting waits for every verify chain to drain so the final
   survivor list can be deduped once.
-- **Reap each background agent as soon as you've consumed it.** Stop a find
-  agent's task (`TaskStop`) the instant you read its findings — then start its
-  verifier — and stop a verify agent's task once you've consumed its verdicts
-  and appended any confirmed survivors to the in-memory list.
-  Finished agents left open keep holding slots in a **limited pool** and will trip
-  the sub-agent limit. Reaping on consume keeps the *live* count at ~`N` (a find
-  slot converts to a verify slot), not 2N; if `N` is large, launch finds in
-  batches so you never exceed the pool.
+- **Read completed output before reaping each background agent.** Poll with
+  `subagent_read`; once an agent is completed, retrieve its exact protocol result
+  with `subagent_read { id, completed_output: true }`, then call
+  `subagent_terminate { id, remove: true }`. Do this for each finder before
+  starting its verifier and for each verifier after consuming its verdicts.
+  Completed agents left retained keep holding slots in a **limited pool** and
+  will trip the sub-agent limit. Reaping on consume keeps the *live* count at
+  ~`N` (a find slot converts to a verify slot), not 2N; if `N` is large, launch
+  finds in batches so you never exceed the pool.
 - **No worktree isolation.** Sub-agents read the real working tree the diff
   points at; don't isolate them.
 - **Don't commit or modify code.** The review ends with findings posted or

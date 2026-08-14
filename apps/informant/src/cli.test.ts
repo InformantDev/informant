@@ -206,6 +206,11 @@ test("builds shows running jobs by default and recent history with --all", async
 
     const cancellation = monitorBuildCancellation("running-build", ["test", "lint"], 5);
     try {
+      await expect(main(["builds", "cancel", "running-build", "test"])).rejects.toThrow(
+        "builds cancel does not accept arguments after the build ID",
+      );
+      expect(cancellation.signal.aborted).toBe(false);
+
       await main(["builds", "cancel", "running-build", "--job", "test"]);
       for (let attempt = 0; attempt < 50 && !cancellation.jobSignal("test")?.aborted; attempt++) {
         await Bun.sleep(5);

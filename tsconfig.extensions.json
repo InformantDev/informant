@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["bun"] },
+  "include": [
+    "informant-subagents.ts",
+    "informant-footer-events.ts",
+    "informant-extensions.test.ts"
+  ]
+}

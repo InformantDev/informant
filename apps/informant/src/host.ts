@@ -46,6 +46,7 @@ export async function runOnHost(
     inheritEnv: false,
     timeoutMs: job.timeoutMinutes * 60_000,
     signal,
+    killProcessGroup: true,
     onOutput: redactor.write,
   });
   await redactor.flush();

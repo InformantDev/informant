@@ -1109,6 +1109,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     throw new Error("builds logs has moved to informant logs [<build-id>]");
   if (subcommand === "builds" && action === "cancel") {
     if (!id) throw new Error("builds cancel requires a build ID");
+    if (value) throw new Error("builds cancel does not accept arguments after the build ID");
     const jobs = requestedJobs(flags.job);
     if (jobs.length > 1) throw new Error("builds cancel accepts at most one --job");
     const job = jobs[0];

@@ -526,6 +526,7 @@ async function runCommitPartitionWithSlot(
     lastProgressAt: number;
   }
   const jobChecks = new Map<string, JobCheckState>();
+  let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
 
   const record: BuildRecord = {
     id,
@@ -548,13 +549,17 @@ async function runCommitPartitionWithSlot(
         ? { type: event.type, id: event.id }
         : { type: "manual", id: check.id.toString() },
   };
+  const cancellationSummary = (name: string, fallback: string): string => {
+    const jobCancellation = cancellation?.jobSignal(name);
+    if (jobCancellation?.aborted) return String(jobCancellation.reason || fallback);
+    if (executionSignal?.aborted) return String(executionSignal.reason || fallback);
+    return fallback;
+  };
   const cancelledValues = (name: string): CheckUpdate => ({
     status: "completed",
     conclusion: "cancelled",
     title: `${name} cancelled`,
-    summary: executionSignal?.aborted
-      ? String(executionSignal.reason || "The build was cancelled.")
-      : "The build stopped before this job completed.",
+    summary: cancellationSummary(name, "The build stopped before this job completed."),
   });
   const completedValues = (job: JobConfig, outcome: JobOutcome, log: string): CheckUpdate => {
     const optionalFailure = outcome === "failure" && job.optional;
@@ -573,7 +578,7 @@ async function runCommitPartitionWithSlot(
         outcome === "skipped"
           ? "Skipped because a dependency failed."
           : outcome === "cancelled"
-            ? String(executionSignal?.reason || "The build was cancelled.")
+            ? cancellationSummary(job.name, "The build was cancelled.")
             : optionalFailure
               ? "This optional job failed without failing the build."
               : `Ran on ${record.machine}.`,
@@ -691,7 +696,6 @@ async function runCommitPartitionWithSlot(
   let childrenReconciled = false;
   let executionFinished = false;
   let workActive = false;
-  let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
   try {
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))

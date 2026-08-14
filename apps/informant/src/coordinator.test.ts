@@ -2133,7 +2133,10 @@ describe("runCommit", () => {
     expect(
       context.updates.find((update) => update.id === 100 && update.values.status === "completed")
         ?.values,
-    ).toMatchObject({ conclusion: "cancelled" });
+    ).toMatchObject({
+      conclusion: "cancelled",
+      summary: "Cancellation requested for test from informant builds.",
+    });
     expect(
       context.updates.find((update) => update.id === 101 && update.values.status === "completed")
         ?.values,
