@@ -1020,12 +1020,14 @@ async function manageTailscale(
   if (action === "status" || !action) {
     const current = await networkStatus();
     if (!current.status) {
-      console.log("Tailscale is not installed or is not connected.");
+      console.log(
+        `Tailscale is not installed or is not connected.\nInformant: ${current.config ? `${current.config.mode} · polling fallback enabled` : "not configured · polling enabled"}`,
+      );
       return;
     }
     const lines = [
       `Tailscale: ${current.status.online ? "online" : "offline"} · ${current.status.self.hostName}`,
-      `Informant: ${current.config ? `${current.config.mode} · polling disabled while connected` : "not configured · polling enabled"}`,
+      `Informant: ${current.config ? `${current.config.mode} · ${current.status.online ? "polling disabled while connected" : "polling fallback enabled"}` : "not configured · polling enabled"}`,
     ];
     if (current.config?.funnelUrl)
       lines.push(`Funnel: ${current.config.funnelUrl}/webhooks/github`);

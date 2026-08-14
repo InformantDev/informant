@@ -18,6 +18,7 @@ import {
   readWebhookBody,
   reconcileKnownWorkers,
   requireGitHubAppWebhookEvents,
+  serveWithTailscale,
   startupRecoveryRequests,
   type TailscaleStatus,
   tailscaleExecutable,
@@ -307,6 +308,71 @@ test("requires a shared token before disabling polling on a network worker", asy
     },
   });
   expect(saved?.networkSecret).toBe("network-secret-that-is-at-least-32-characters");
+});
+
+test("falls back to polling when configured Tailscale coordination is unavailable", async () => {
+  const config = {
+    mode: "lead" as const,
+    workerPort: 7639,
+    funnelPort: 7640,
+    funnelUrl: "https://lead.example.ts.net",
+    webhookSecret: "webhook-secret",
+    networkSecret: "network-secret-that-is-at-least-32-characters",
+  };
+  const messages: string[] = [];
+  let pollingStarts = 0;
+  const servePolling = async () => {
+    pollingStarts++;
+  };
+
+  await serveWithTailscale(
+    [],
+    { onMessage: (message) => messages.push(message) },
+    {
+      getConfig: async () => {
+        throw new Error("invalid Tailscale configuration");
+      },
+      servePolling,
+    },
+  );
+  await serveWithTailscale(
+    [],
+    { onMessage: (message) => messages.push(message) },
+    {
+      getConfig: async () => config,
+      status: async () => undefined,
+      servePolling,
+    },
+  );
+  await serveWithTailscale(
+    [],
+    { onMessage: (message) => messages.push(message) },
+    {
+      getConfig: async () => config,
+      status: async () => ({
+        executable: "/usr/bin/tailscale",
+        online: true,
+        self: {
+          id: "self-id",
+          hostName: "lead",
+          addresses: ["100.64.0.1"],
+          online: true,
+        },
+        peers: [],
+      }),
+      serveNetwork: async () => {
+        throw new Error("Funnel failed");
+      },
+      servePolling,
+    },
+  );
+
+  expect(pollingStarts).toBe(3);
+  expect(messages).toEqual([
+    "Tailscale configuration unavailable; polling GitHub instead: invalid Tailscale configuration",
+    "Tailscale coordination unavailable; polling GitHub instead: Tailscale is offline",
+    "Tailscale coordination unavailable; polling GitHub instead: Funnel failed",
+  ]);
 });
 
 test("disables local coordination when Funnel teardown fails", async () => {

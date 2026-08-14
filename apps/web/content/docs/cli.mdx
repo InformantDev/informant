@@ -75,9 +75,11 @@ informant tailscale status
 informant startup enable # restart after changing the role
 ```
 
-`tailscale disable` gracefully restarts an active managed worker so polling resumes immediately. If
-the worker is running in a terminal or another supervisor, polling begins the next time that process
-starts.
+A configured lead or worker automatically falls back to GitHub polling when Tailscale is offline,
+incomplete, or fails during network startup. It returns to authenticated tailnet coordination after a
+healthy restart. `tailscale disable` permanently removes the network role and gracefully restarts an
+active managed worker so polling resumes immediately. If the worker is running in a terminal or
+another supervisor, polling begins the next time that process starts.
 
 Lead enablement prints direct **General** and **Permissions & events** settings links for every
 locally configured GitHub App, requires confirmation that each webhook is active, verifies that it

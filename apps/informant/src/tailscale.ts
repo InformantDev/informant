@@ -723,20 +723,61 @@ export interface TailscaleServeOptions extends ServerOptions {
   version?: string;
 }
 
+export interface TailscaleServeOperations {
+  getConfig?: typeof getTailscaleConfig;
+  serveNetwork?: typeof serveConfiguredWithTailscale;
+  servePolling?: typeof serveRepositories;
+  status?: typeof tailscaleStatus;
+}
+
 export async function serveWithTailscale(
   repositories: Repository[],
   options: TailscaleServeOptions = {},
+  operations: TailscaleServeOperations = {},
 ): Promise<void> {
-  const config = await getTailscaleConfig();
-  if (!config || options.once) return serveRepositories(repositories, options);
-  const networkSecret = requireNetworkSecret(config);
-  const status = await tailscaleStatus();
-  const selfAddress = status && firstIpv4(status.self);
-  if (!status?.online || !selfAddress) {
-    throw new Error(
-      "Tailscale coordination is configured but unavailable; reconnect Tailscale or run informant tailscale disable to restore polling",
+  const servePolling = operations.servePolling ?? serveRepositories;
+  let config: TailscaleConfig | undefined;
+  try {
+    config = await (operations.getConfig ?? getTailscaleConfig)();
+  } catch (error) {
+    if (options.signal?.aborted) return;
+    options.onMessage?.(
+      `Tailscale configuration unavailable; polling GitHub instead: ${error instanceof Error ? error.message : error}`,
     );
+    await servePolling(repositories, options);
+    return;
   }
+  if (!config || options.once) return servePolling(repositories, options);
+  try {
+    const networkSecret = requireNetworkSecret(config);
+    const status = await (operations.status ?? tailscaleStatus)();
+    const selfAddress = status && firstIpv4(status.self);
+    if (!status?.online || !selfAddress) throw new Error("Tailscale is offline");
+    await (operations.serveNetwork ?? serveConfiguredWithTailscale)(
+      repositories,
+      options,
+      config,
+      status,
+      selfAddress,
+      networkSecret,
+    );
+  } catch (error) {
+    if (options.signal?.aborted) return;
+    options.onMessage?.(
+      `Tailscale coordination unavailable; polling GitHub instead: ${error instanceof Error ? error.message : error}`,
+    );
+    await servePolling(repositories, options);
+  }
+}
+
+async function serveConfiguredWithTailscale(
+  repositories: Repository[],
+  options: TailscaleServeOptions,
+  config: TailscaleConfig,
+  status: TailscaleStatus,
+  selfAddress: string,
+  networkSecret: string,
+): Promise<void> {
   await refreshSelectedContainerBackend(options.signal);
 
   let configuredRepositories = repositories;
