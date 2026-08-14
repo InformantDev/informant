@@ -222,6 +222,23 @@ function dependencies(
   };
 }
 
+test("one-shot event scans propagate polling failures for delivery retry", async () => {
+  const client = github({});
+  client.defaultBranch = async () => {
+    throw new Error("temporary GitHub failure");
+  };
+  const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      dependencies: dependencies(client, state, async () => undefined),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("temporary GitHub failure");
+});
+
 test("serveRepositories preserves caller idle notifications after housekeeping", async () => {
   const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
   const deps = dependencies(github({}), state, async () => undefined);

@@ -18,7 +18,8 @@ GitHub branch/PR/comment ──webhook──▶ Tailscale Funnel lead
 When Tailscale is installed and Informant is configured as a lead, the lead publishes only the
 signed GitHub webhook endpoint through Funnel. Each machine also exposes a small worker endpoint on
 its Tailscale IPv4 address. The lead discovers online Informant peers from `tailscale status --json`
-and dispatches repository notifications across the tailnet. Every notified machine performs one
+and authenticates every private API request with the shared worker token before dispatching
+repository notifications across the tailnet. Every notified machine performs one
 GitHub synchronization and enters the existing capability-specific Checks election. Job definitions,
 GitHub credentials, and secrets are never sent between workers.
 
@@ -30,7 +31,8 @@ queued with bounded exponential retries, and the lead refreshes peer topology so
 reconnect receive a recovery synchronization. Tag-push notifications bypass the normal tag throttle.
 If Tailscale is not configured, `informant serve` retains the polling path. A configured worker never
 silently falls back to polling when disconnected; reconnect Tailscale or explicitly run
-`informant tailscale disable`. Funnel never exposes the private worker/build API.
+`informant tailscale disable`. Connecting an existing GitHub App keeps polling enabled until worker
+mode is selected explicitly with the lead's token. Funnel never exposes the private worker/build API.
 
 Workers advertise `self-hosted`, their operating system, architecture, hostname, and optional custom
 capabilities. A healthy selected container backend adds the dynamic `container` capability. Linux

@@ -1,4 +1,4 @@
-import { createSign } from "node:crypto";
+import { createSign, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -20,8 +20,8 @@ import {
   configureGitHubAppWebhook,
   DEFAULT_FUNNEL_PORT,
   DEFAULT_WORKER_PORT,
-  enableTailscale,
   prepareTailscaleFunnel,
+  REQUIRED_GITHUB_WEBHOOK_EVENTS,
   serveWithTailscale,
   tailscaleStatus,
 } from "./tailscale.ts";
@@ -384,7 +384,7 @@ async function createApp(owner?: string, webhookUrl?: string): Promise<ManifestA
           issues: "read",
           pull_requests: "write",
         },
-        default_events: webhookUrl ? ["push", "pull_request", "issue_comment", "check_suite"] : [],
+        default_events: webhookUrl ? [...REQUIRED_GITHUB_WEBHOOK_EVENTS] : [],
         hook_attributes: { url: webhookUrl ?? APP_URL, active: Boolean(webhookUrl) },
       })
         .replaceAll("&", "&amp;")
@@ -498,10 +498,6 @@ export async function setup(): Promise<void> {
   if (setupType === "connect") {
     const account = await connectExistingApp();
     if (!account) return;
-    if (!(await getTailscaleConfig()) && (await tailscaleStatus())?.online) {
-      await enableTailscale("worker");
-      console.log("Tailscale worker mode enabled; this machine will receive jobs without polling.");
-    }
     await finishSetup(account);
     return;
   }
@@ -560,13 +556,16 @@ export async function setup(): Promise<void> {
     if (!credentials) throw new Error("could not reload the new GitHub App credentials");
     await configureGitHubAppWebhook(credentials, funnelUrl, existingTailscale.webhookSecret);
   } else if (funnelUrl && app.webhook_secret) {
+    const networkSecret = randomBytes(32).toString("hex");
     await saveTailscaleConfig({
       mode: "lead",
       funnelUrl,
       webhookSecret: app.webhook_secret,
+      networkSecret,
       workerPort: DEFAULT_WORKER_PORT,
       funnelPort: DEFAULT_FUNNEL_PORT,
     });
+    console.log(`Tailscale worker token: ${networkSecret}`);
   } else if (funnelUrl) {
     console.warn("GitHub did not return a webhook secret; polling remains enabled.");
   }

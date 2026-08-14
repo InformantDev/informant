@@ -31,6 +31,12 @@ const REQUEST_TIMEOUT_MS = 2_000;
 const PEER_REFRESH_INTERVAL_MS = 10_000;
 const MAX_DISPATCH_RETRY_MS = 60_000;
 export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
+export const REQUIRED_GITHUB_WEBHOOK_EVENTS = [
+  "push",
+  "pull_request",
+  "issue_comment",
+  "check_suite",
+] as const;
 const MACOS_TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 
 export interface TailscalePeer {
@@ -75,6 +81,17 @@ export interface NetworkWorker {
 export interface RepositoryDispatch {
   repository: Repository;
   forceTagPoll: boolean;
+}
+
+export function reconcileKnownWorkers(
+  knownWorkers: Map<string, NetworkWorker>,
+  discoveredWorkers: NetworkWorker[],
+): void {
+  const discoveredIds = new Set(discoveredWorkers.map((worker) => worker.id));
+  for (const id of knownWorkers.keys()) {
+    if (!discoveredIds.has(id)) knownWorkers.delete(id);
+  }
+  for (const worker of discoveredWorkers) knownWorkers.set(worker.id, worker);
 }
 
 export function startupRecoveryRequests(repositories: Repository[]): RepositoryDispatch[] {
@@ -350,6 +367,26 @@ async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Respon
   return fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
 }
 
+function requireNetworkSecret(config: TailscaleConfig): string {
+  if (!config.networkSecret) {
+    throw new Error(
+      "Tailscale worker authentication is not configured; re-enable this network role",
+    );
+  }
+  return config.networkSecret;
+}
+
+function networkRequestHeaders(config: TailscaleConfig): Record<string, string> {
+  return { Authorization: `Bearer ${requireNetworkSecret(config)}` };
+}
+
+export function validNetworkAuthorization(value: string | null, secret: string): boolean {
+  if (!value?.startsWith("Bearer ")) return false;
+  const received = Buffer.from(value.slice("Bearer ".length));
+  const expected = Buffer.from(secret);
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
+
 export async function discoverNetworkWorkers(
   config: TailscaleConfig,
   status: TailscaleStatus,
@@ -361,7 +398,9 @@ export async function discoverNetworkWorkers(
         const address = firstIpv4(peer);
         if (!address) return [];
         return [
-          fetchWithTimeout(peerUrl(address, config.workerPort, "/v1/health"))
+          fetchWithTimeout(peerUrl(address, config.workerPort, "/v1/health"), {
+            headers: networkRequestHeaders(config),
+          })
             .then(async (response) => {
               if (!response.ok) return undefined;
               const result = (await response.json()) as Partial<NetworkWorker>;
@@ -425,27 +464,43 @@ function appJwt(appId: string, privateKey: string): string {
   return `${unsigned}.${createSign("RSA-SHA256").update(unsigned).sign(privateKey, "base64url")}`;
 }
 
+async function githubAppHeaders(credentials: GitHubCredentials): Promise<Record<string, string>> {
+  const privateKey = await readFile(credentials.privateKeyFile, "utf8");
+  return {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${appJwt(credentials.appId, privateKey)}`,
+    "Content-Type": "application/json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+}
+
+export async function requireGitHubAppWebhookEvents(
+  credentials: GitHubCredentials,
+  request: typeof fetch = fetch,
+): Promise<void> {
+  const response = await request(`${API}/app`, {
+    headers: await githubAppHeaders(credentials),
+  });
+  if (!response.ok) {
+    throw new Error(`could not inspect GitHub App webhook events: ${await response.text()}`);
+  }
+  const app = (await response.json()) as { events?: unknown };
+  const events = Array.isArray(app.events) ? new Set(app.events.map(String)) : new Set<string>();
+  const missing = REQUIRED_GITHUB_WEBHOOK_EVENTS.filter((event) => !events.has(event));
+  if (missing.length > 0) {
+    throw new Error(
+      `GitHub App ${credentials.appId} must subscribe to these webhook events before lead mode can be enabled: ${missing.join(", ")}`,
+    );
+  }
+}
+
 export async function configureGitHubAppWebhook(
   credentials: GitHubCredentials,
   url: string,
   secret: string,
   request: typeof fetch = fetch,
 ): Promise<void> {
-  const privateKey = await readFile(credentials.privateKeyFile, "utf8");
-  const headers = {
-    Accept: "application/vnd.github+json",
-    Authorization: `Bearer ${appJwt(credentials.appId, privateKey)}`,
-    "Content-Type": "application/json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-  const enabled = await request(`${API}/app`, {
-    method: "PATCH",
-    headers,
-    body: JSON.stringify({ webhook_active: true, webhook_url: `${url}/webhooks/github` }),
-  });
-  if (!enabled.ok) {
-    throw new Error(`could not enable GitHub App webhook: ${await enabled.text()}`);
-  }
+  const headers = await githubAppHeaders(credentials);
   const configured = await request(`${API}/app/hook/config`, {
     method: "PATCH",
     headers,
@@ -458,12 +513,16 @@ export async function configureGitHubAppWebhook(
 
 export interface EnableTailscaleOperations {
   configureWebhook?: typeof configureGitHubAppWebhook;
+  createNetworkSecret?: () => string;
   createSecret?: () => string;
   getConfig?: typeof getTailscaleConfig;
   listCredentials?: typeof listGitHubCredentials;
   prepareFunnel?: typeof prepareTailscaleFunnel;
+  networkSecret?: string;
   saveConfig?: typeof saveTailscaleConfig;
   status?: typeof tailscaleStatus;
+  validateWebhook?: typeof requireGitHubAppWebhookEvents;
+  webhookReadyConfirmed?: boolean;
 }
 
 export async function enableTailscale(
@@ -472,28 +531,49 @@ export async function enableTailscale(
 ): Promise<TailscaleConfig> {
   const status = await (operations.status ?? tailscaleStatus)();
   if (!status?.online) throw new Error("Tailscale must be installed, connected, and online");
-  const base: TailscaleConfig = {
+  const suppliedNetworkSecret = operations.networkSecret?.trim();
+  if (suppliedNetworkSecret !== undefined && !/^[A-Za-z0-9_-]{32,}$/.test(suppliedNetworkSecret)) {
+    throw new Error(
+      "the Tailscale worker token must contain at least 32 letters, digits, hyphens, or underscores",
+    );
+  }
+  const base = {
     mode,
     workerPort: DEFAULT_WORKER_PORT,
     funnelPort: DEFAULT_FUNNEL_PORT,
-  };
+  } satisfies Omit<TailscaleConfig, "networkSecret">;
   const saveConfig = operations.saveConfig ?? saveTailscaleConfig;
   if (mode === "worker") {
-    await saveConfig(base);
-    return base;
+    if (!suppliedNetworkSecret) {
+      throw new Error("tailscale worker mode requires the token shown by the lead");
+    }
+    const config = { ...base, networkSecret: suppliedNetworkSecret };
+    await saveConfig(config);
+    return config;
+  }
+  if (operations.webhookReadyConfirmed !== true) {
+    throw new Error("confirm the GitHub App webhook is active before enabling Tailscale lead mode");
   }
   const existing = await (operations.getConfig ?? getTailscaleConfig)();
   const secret =
     existing?.mode === "lead" && existing.webhookSecret
       ? existing.webhookSecret
       : (operations.createSecret ?? (() => randomBytes(32).toString("hex")))();
+  const networkSecret =
+    existing?.mode === "lead" && existing.networkSecret
+      ? existing.networkSecret
+      : (suppliedNetworkSecret ??
+        (operations.createNetworkSecret ?? (() => randomBytes(32).toString("hex")))());
+  const credentials = await (operations.listCredentials ?? listGitHubCredentials)();
+  if (credentials.length === 0) throw new Error("configure a GitHub App before enabling a lead");
+  await Promise.all(
+    credentials.map((app) => (operations.validateWebhook ?? requireGitHubAppWebhookEvents)(app)),
+  );
   const funnelUrl = await (operations.prepareFunnel ?? prepareTailscaleFunnel)(
     status,
     base.funnelPort,
   );
-  const credentials = await (operations.listCredentials ?? listGitHubCredentials)();
-  if (credentials.length === 0) throw new Error("configure a GitHub App before enabling a lead");
-  const config = { ...base, funnelUrl, webhookSecret: secret };
+  const config = { ...base, funnelUrl, webhookSecret: secret, networkSecret };
   await saveConfig(config);
   await Promise.all(
     credentials.map((app) =>
@@ -583,6 +663,7 @@ export async function serveWithTailscale(
 ): Promise<void> {
   const config = await getTailscaleConfig();
   if (!config || options.once) return serveRepositories(repositories, options);
+  const networkSecret = requireNetworkSecret(config);
   const status = await tailscaleStatus();
   const selfAddress = status && firstIpv4(status.self);
   if (!status?.online || !selfAddress) {
@@ -596,20 +677,25 @@ export async function serveWithTailscale(
   const scans = new RepositoryScanQueue(
     repositories,
     (repository, forceTagPoll, signal) =>
-      serveRepositories([repository], { ...options, once: true, forceTagPoll, signal }),
+      serveRepositories([repository], {
+        ...options,
+        once: true,
+        forceTagPoll,
+        signal,
+        throwOnPollError: true,
+      }),
     options.signal,
   );
 
   const knownWorkers = new Map<string, NetworkWorker>();
   const refreshWorkers = async (): Promise<NetworkWorker[]> => {
     const currentStatus = await tailscaleStatus();
-    if (!currentStatus?.online) return [];
-    const workers = await discoverNetworkWorkers(config, currentStatus);
-    const peers = new Set(currentStatus.peers.map((peer) => peer.id));
-    for (const id of knownWorkers.keys()) {
-      if (!peers.has(id)) knownWorkers.delete(id);
+    if (!currentStatus?.online) {
+      knownWorkers.clear();
+      return [];
     }
-    for (const worker of workers) knownWorkers.set(worker.id, worker);
+    const workers = await discoverNetworkWorkers(config, currentStatus);
+    reconcileKnownWorkers(knownWorkers, workers);
     return workers;
   };
   const dispatch = async (request: RepositoryDispatch): Promise<boolean> => {
@@ -637,7 +723,10 @@ export async function serveWithTailscale(
           label: worker.hostName,
           promise: fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              ...networkRequestHeaders(config),
+              "Content-Type": "application/json",
+            },
             body: JSON.stringify({
               repository: request.repository.fullName,
               forceTagPoll: request.forceTagPoll,
@@ -674,6 +763,9 @@ export async function serveWithTailscale(
     hostname: selfAddress,
     port: config.workerPort,
     async fetch(request): Promise<Response> {
+      if (!validNetworkAuthorization(request.headers.get("Authorization"), networkSecret)) {
+        return new Response("unauthorized", { status: 401 });
+      }
       const url = new URL(request.url);
       if (request.method === "GET" && url.pathname === "/v1/health") {
         return Response.json({
@@ -725,10 +817,9 @@ export async function serveWithTailscale(
           (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
         );
         if (!repository) return new Response("repository is not registered", { status: 404 });
-        void scans.run(repository, body.forceTagPoll === true).catch((error) => {
-          options.onMessage?.(
-            `${repository.fullName} · network dispatch failed: ${error instanceof Error ? error.message : error}`,
-          );
+        dispatchQueue.enqueue({
+          repository,
+          forceTagPoll: body.forceTagPoll === true,
         });
         return new Response(null, { status: 202 });
       }
@@ -880,6 +971,7 @@ export async function listBuildsAcrossWorkers(includeHistory: boolean): Promise<
     workers.map((worker) =>
       fetchWithTimeout(
         peerUrl(worker.address, config.workerPort, `/v1/builds${includeHistory ? "?all=1" : ""}`),
+        { headers: networkRequestHeaders(config) },
       )
         .then(async (response) => {
           if (!response.ok) return [];
@@ -903,7 +995,7 @@ export async function listBuildsAcrossWorkers(includeHistory: boolean): Promise<
 }
 
 export interface RemoteLogChunk {
-  text: string;
+  bytes: Uint8Array;
   offset: number;
   running: boolean;
   worker: NetworkWorker;
@@ -926,14 +1018,14 @@ export async function remoteBuildLog(
     const parameters = new URLSearchParams({ offset: String(options.offset ?? 0) });
     if (options.job) parameters.set("job", options.job);
     const path = `/v1/logs/${encodeURIComponent(id)}?${parameters}`;
-    const response = await fetchWithTimeout(peerUrl(worker.address, config.workerPort, path)).catch(
-      () => undefined,
-    );
+    const response = await fetchWithTimeout(peerUrl(worker.address, config.workerPort, path), {
+      headers: networkRequestHeaders(config),
+    }).catch(() => undefined);
     if (!response?.ok) continue;
     const offset = Number(response.headers.get("X-Informant-Log-Offset"));
     if (!Number.isSafeInteger(offset) || offset < 0) continue;
     return {
-      text: await response.text(),
+      bytes: new Uint8Array(await response.arrayBuffer()),
       offset,
       running: response.headers.get("X-Informant-Build-Status") === "running",
       worker,

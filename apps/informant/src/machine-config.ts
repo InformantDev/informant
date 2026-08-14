@@ -16,6 +16,7 @@ export interface TailscaleConfig {
   mode: "lead" | "worker";
   funnelUrl?: string;
   webhookSecret?: string;
+  networkSecret?: string;
   workerPort: number;
   funnelPort: number;
 }
@@ -163,6 +164,7 @@ export async function getTailscaleConfig(
     !Number.isInteger(value.funnelPort) ||
     value.funnelPort < 1 ||
     value.funnelPort > 65_535 ||
+    (value.networkSecret !== undefined && !/^[A-Za-z0-9_-]{32,}$/.test(value.networkSecret)) ||
     (value.mode === "lead" &&
       (!value.funnelUrl?.startsWith("https://") || !value.webhookSecret?.length))
   ) {

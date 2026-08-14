@@ -28,8 +28,10 @@ informant cache prune                  Delete keyed caches while preserving shar
 informant cache clear                  Delete all persistent job caches
 informant startup enable               Start the worker now and automatically at login
 informant startup disable              Stop and remove the automatic startup worker
-informant tailscale enable --lead      Configure Funnel and the GitHub App webhook
-informant tailscale enable --worker    Receive tailnet jobs without polling GitHub
+informant tailscale enable --lead [--webhook-ready]
+                                        Configure Funnel and the GitHub App webhook
+informant tailscale enable --worker --token <token>
+                                        Receive tailnet jobs without polling GitHub
 informant tailscale status             Show Funnel state and discovered workers
 informant tailscale disable            Disable networking and restore polling
 informant auto-update enable           Check for and install new Informant releases automatically
@@ -62,13 +64,13 @@ Informant finds both a `tailscale` command on `PATH` and the CLI embedded at
 `/Applications/Tailscale.app/Contents/MacOS/Tailscale`. A newly created App makes this machine the
 lead, enables Funnel, stores GitHub's webhook secret in the mode-`600` machine configuration, and
 subscribes to push, pull request, issue comment, and check suite events. Connecting an existing App
-configures the machine as a worker, assuming that App already has a working lead webhook.
+keeps polling enabled; switch it to worker mode explicitly only after a lead is running.
 
 Use the explicit commands to change roles later:
 
 ```bash
-informant tailscale enable --lead
-informant tailscale enable --worker
+informant tailscale enable --lead --webhook-ready
+informant tailscale enable --worker --token <token-shown-by-lead>
 informant tailscale status
 informant startup enable # restart after changing the role
 ```
@@ -77,12 +79,14 @@ informant startup enable # restart after changing the role
 the worker is running in a terminal or another supervisor, polling begins the next time that process
 starts.
 
-Lead enablement updates every locally configured GitHub App to the Funnel URL. If an older App was
-created without webhook event subscriptions, select **Push**, **Pull request**, **Issue comment**, and
-**Check suite** under its **Permissions & events** settings once. Worker endpoints bind only to the
-machine's Tailscale address; the public Funnel forwards to a separate loopback port containing only
-the HMAC-verified GitHub endpoint. Tailnet membership is the trust boundary for discovery, dispatch,
-and cross-worker build history.
+Lead enablement requires confirmation that every locally configured GitHub App webhook is active,
+verifies that it subscribes to **Push**, **Pull request**, **Issue comment**, and **Check suite**, then
+updates its Funnel URL. GitHub does not expose an API for changing an existing App's activation or
+event subscriptions, so lead enablement stops with instructions instead of disabling polling when
+one is missing. The lead prints a worker token; supply that token
+when explicitly enabling each worker. All private health, dispatch, build, and log requests require
+this shared token in addition to traveling over Tailscale. The public Funnel forwards to a separate
+loopback port containing only the HMAC-verified GitHub endpoint.
 
 Local build records live under `~/.local/share/informant`; set `INFORMANT_DATA_DIR` to move them.
 The build list shows running jobs and links each build to its GitHub pull request or commit. Pass

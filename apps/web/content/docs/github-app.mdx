@@ -144,8 +144,10 @@ same Check claims. Do not create another App for that account on the second mach
 2. Run `informant setup` on the new machine.
 3. Choose **Connect an existing App used by another machine**.
 4. Enter the existing App ID, installation ID, and downloaded PEM path.
-5. Register repositories and start `informant serve`. With Tailscale connected, setup selects worker
-   mode so this machine receives notifications from the lead instead of polling GitHub.
+5. Register repositories and start `informant serve`; polling remains enabled by default.
+6. After confirming the network lead is running, copy its worker token and run
+   `informant tailscale enable --worker --token <token>`, then restart this worker to receive
+   authenticated notifications from the lead instead of polling GitHub.
 
 Deleting one machine's key from the GitHub App settings then revokes that machine without rotating
 every worker.

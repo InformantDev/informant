@@ -99,8 +99,10 @@ Usage:
   informant cache clear                  Delete all persistent job caches
   informant startup enable               Start the worker now and at login
   informant startup disable              Stop and remove the startup worker
-  informant tailscale enable --lead      Receive webhooks through a Tailscale Funnel
-  informant tailscale enable --worker    Receive jobs from a network lead without polling
+  informant tailscale enable --lead [--webhook-ready]
+                                        Receive webhooks through a Tailscale Funnel
+  informant tailscale enable --worker --token <token>
+                                        Receive jobs from a network lead without polling
   informant tailscale status             Show the tailnet worker topology
   informant tailscale disable            Disable tailnet coordination and restore polling
   informant hook install                 Accelerate pushes with a pre-push hook
@@ -742,6 +744,12 @@ export async function tailRemoteLog(
   const read = operations.read ?? remoteBuildLog;
   const sleep = operations.sleep ?? Bun.sleep;
   const write = operations.write ?? ((text: string) => process.stdout.write(text));
+  const decoder = new TextDecoder();
+  const finish = (): true => {
+    const remainder = decoder.decode();
+    if (remainder) write(remainder);
+    return true;
+  };
   let offset = 0;
   let worker: NetworkWorker | undefined;
   let found = false;
@@ -751,7 +759,7 @@ export async function tailRemoteLog(
     if (!chunk) {
       if (!found) return false;
       unavailableReads++;
-      if (unavailableReads >= 3) return true;
+      if (unavailableReads >= 3) return finish();
       worker = undefined;
       await sleep(1_000);
       continue;
@@ -760,8 +768,9 @@ export async function tailRemoteLog(
     unavailableReads = 0;
     worker = chunk.worker;
     offset = chunk.offset;
-    if (chunk.text) write(chunk.text);
-    if (!chunk.running) return true;
+    const text = decoder.decode(chunk.bytes, { stream: true });
+    if (text) write(text);
+    if (!chunk.running) return finish();
     await sleep(250);
   }
 }
@@ -922,11 +931,29 @@ async function manageTailscale(
     if (flags.lead !== true && flags.worker !== true) {
       throw new Error("tailscale enable requires --lead or --worker");
     }
-    const config = await enableTailscale(flags.lead === true ? "lead" : "worker");
+    if (flags.lead === true && flags["webhook-ready"] !== true) {
+      const ready = await confirm({
+        message:
+          "Are all configured GitHub App webhooks active and subscribed to Push, Pull request, Issue comment, and Check suite events?",
+        initialValue: false,
+      });
+      if (isCancel(ready) || !ready) {
+        throw new Error(
+          "enable the required GitHub App webhook events, then retry with --webhook-ready",
+        );
+      }
+    }
+    if (flags.token !== undefined && typeof flags.token !== "string") {
+      throw new Error("--token requires exactly one value");
+    }
+    const config = await enableTailscale(flags.lead === true ? "lead" : "worker", {
+      networkSecret: typeof flags.token === "string" ? flags.token : undefined,
+      webhookReadyConfirmed: flags.lead === true,
+    });
     outro(
       config.mode === "lead"
-        ? `Enabled Tailscale lead at ${config.funnelUrl}/webhooks/github; restart the worker`
-        : "Enabled Tailscale network worker; restart the worker",
+        ? `Enabled Tailscale lead at ${config.funnelUrl}/webhooks/github; worker token: ${config.networkSecret}; restart the worker`
+        : "Enabled authenticated Tailscale network worker; restart the worker",
     );
     return;
   }

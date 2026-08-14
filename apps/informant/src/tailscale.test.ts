@@ -14,10 +14,13 @@ import {
   parseTailscaleStatus,
   RepositoryScanQueue,
   readWebhookBody,
+  reconcileKnownWorkers,
+  requireGitHubAppWebhookEvents,
   startupRecoveryRequests,
   type TailscaleStatus,
   tailscaleExecutable,
   validGitHubSignature,
+  validNetworkAuthorization,
   webhookForcesTagPoll,
 } from "./tailscale.ts";
 
@@ -47,14 +50,10 @@ test("activates and configures the GitHub App webhook with an App JWT", async ()
       }) as typeof fetch,
     );
     expect(requests.map((request) => request.url)).toEqual([
-      "https://api.github.com/app",
       "https://api.github.com/app/hook/config",
     ]);
+    expect(requests[0]?.init?.method).toBe("PATCH");
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
-      webhook_active: true,
-      webhook_url: "https://lead.example.ts.net/webhooks/github",
-    });
-    expect(JSON.parse(String(requests[1]?.init?.body))).toEqual({
       url: "https://lead.example.ts.net/webhooks/github",
       content_type: "json",
       secret: "shared-secret",
@@ -63,6 +62,80 @@ test("activates and configures the GitHub App webhook with an App JWT", async ()
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("requires existing GitHub Apps to subscribe to every dispatch event", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-tailscale-events-test-"));
+  const privateKeyFile = join(root, "app.pem");
+  const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({
+    format: "pem",
+    type: "pkcs8",
+  });
+  await Bun.write(privateKeyFile, privateKey);
+  const credentials = { appId: "123", installationId: "456", privateKeyFile };
+  try {
+    await expect(
+      requireGitHubAppWebhookEvents(credentials, (async (_input, _init) =>
+        Response.json({ events: ["push", "pull_request"] })) as typeof fetch),
+    ).rejects.toThrow("issue_comment, check_suite");
+    await expect(
+      requireGitHubAppWebhookEvents(credentials, (async (_input, _init) =>
+        Response.json({
+          events: ["push", "pull_request", "issue_comment", "check_suite"],
+        })) as typeof fetch),
+    ).resolves.toBeUndefined();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("requires explicit confirmation that existing App webhooks are active", async () => {
+  await expect(
+    enableTailscale("lead", {
+      status: async () => ({
+        executable: "/usr/bin/tailscale",
+        online: true,
+        self: {
+          id: "self-id",
+          hostName: "lead",
+          addresses: ["100.64.0.1"],
+          online: true,
+        },
+        peers: [],
+      }),
+    }),
+  ).rejects.toThrow("confirm the GitHub App webhook is active");
+});
+
+test("keeps polling enabled when an App lacks required webhook events", async () => {
+  let saved = false;
+  await expect(
+    enableTailscale("lead", {
+      webhookReadyConfirmed: true,
+      status: async () => ({
+        executable: "/usr/bin/tailscale",
+        online: true,
+        self: {
+          id: "self-id",
+          hostName: "lead",
+          addresses: ["100.64.0.1"],
+          online: true,
+        },
+        peers: [],
+      }),
+      listCredentials: async () => [
+        { appId: "one", installationId: "1", privateKeyFile: "/unused/one.pem" },
+      ],
+      validateWebhook: async () => {
+        throw new Error("missing check_suite");
+      },
+      prepareFunnel: async () => "https://lead.example.ts.net",
+      saveConfig: async () => {
+        saved = true;
+      },
+    }),
+  ).rejects.toThrow("missing check_suite");
+  expect(saved).toBe(false);
 });
 
 test("persists and reuses a lead secret when configuring one App fails", async () => {
@@ -86,6 +159,7 @@ test("persists and reuses a lead secret when configuring one App fails", async (
   let failSecond = true;
   const configuredSecrets: string[] = [];
   const operations = {
+    webhookReadyConfirmed: true,
     status: async () => status,
     getConfig: async () => saved,
     saveConfig: async (config: NonNullable<typeof saved>) => {
@@ -94,6 +168,8 @@ test("persists and reuses a lead secret when configuring one App fails", async (
     prepareFunnel: async () => "https://lead.example.ts.net",
     listCredentials: async () => credentials,
     createSecret: () => "recoverable-secret",
+    createNetworkSecret: () => "network-secret-that-is-at-least-32-characters",
+    validateWebhook: async () => {},
     configureWebhook: async (app: (typeof credentials)[number], _url: string, secret: string) => {
       configuredSecrets.push(secret);
       if (failSecond && app.appId === "two") throw new Error("temporary failure");
@@ -102,11 +178,39 @@ test("persists and reuses a lead secret when configuring one App fails", async (
 
   await expect(enableTailscale("lead", operations)).rejects.toThrow("temporary failure");
   expect(saved?.webhookSecret).toBe("recoverable-secret");
+  expect(saved?.networkSecret).toBe("network-secret-that-is-at-least-32-characters");
   failSecond = false;
   configuredSecrets.length = 0;
   await enableTailscale("lead", operations);
 
   expect(configuredSecrets).toEqual(["recoverable-secret", "recoverable-secret"]);
+});
+
+test("requires a shared token before disabling polling on a network worker", async () => {
+  const status: TailscaleStatus = {
+    executable: "/usr/bin/tailscale",
+    online: true,
+    self: {
+      id: "worker-id",
+      hostName: "worker",
+      addresses: ["100.64.0.2"],
+      online: true,
+    },
+    peers: [],
+  };
+  let saved: Awaited<ReturnType<typeof enableTailscale>> | undefined;
+
+  await expect(enableTailscale("worker", { status: async () => status })).rejects.toThrow(
+    "requires the token shown by the lead",
+  );
+  await enableTailscale("worker", {
+    status: async () => status,
+    networkSecret: "network-secret-that-is-at-least-32-characters",
+    saveConfig: async (config) => {
+      saved = config;
+    },
+  });
+  expect(saved?.networkSecret).toBe("network-secret-that-is-at-least-32-characters");
 });
 
 test("disables local coordination when Funnel teardown fails", async () => {
@@ -180,6 +284,13 @@ test("parses this machine and online peers from Tailscale status", () => {
   ]);
 });
 
+test("authenticates private worker API requests with a shared token", () => {
+  const secret = "network-secret-that-is-at-least-32-characters";
+  expect(validNetworkAuthorization(`Bearer ${secret}`, secret)).toBe(true);
+  expect(validNetworkAuthorization("Bearer wrong", secret)).toBe(false);
+  expect(validNetworkAuthorization(null, secret)).toBe(false);
+});
+
 test("verifies GitHub webhook signatures without accepting malformed values", () => {
   const body = JSON.stringify({ repository: { full_name: "owner/repo" } });
   const signature = `sha256=${createHmac("sha256", "secret").update(body).digest("hex")}`;
@@ -243,6 +354,27 @@ test("startup recovery forces a synchronization for every local repository", () 
     { repository: one, forceTagPoll: true },
     { repository: two, forceTagPoll: true },
   ]);
+});
+
+test("worker refresh evicts peers absent from the latest successful discovery", () => {
+  const healthy = {
+    id: "healthy",
+    hostName: "old-name",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: [],
+  };
+  const stale = { ...healthy, id: "stale", address: "100.64.0.3" };
+  const updated = { ...healthy, hostName: "new-name" };
+  const known = new Map([
+    [healthy.id, healthy],
+    [stale.id, stale],
+  ]);
+
+  reconcileKnownWorkers(known, [updated]);
+  expect([...known.values()]).toEqual([updated]);
+  reconcileKnownWorkers(known, []);
+  expect(known.size).toBe(0);
 });
 
 test("repository refresh recovers only newly registered repositories", () => {

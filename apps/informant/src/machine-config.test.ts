@@ -53,6 +53,7 @@ test("stores Tailscale role configuration without changing repositories", async 
     mode: "lead" as const,
     funnelUrl: "https://lead.example.ts.net",
     webhookSecret: "secret",
+    networkSecret: "network-secret-that-is-at-least-32-characters",
     workerPort: 7639,
     funnelPort: 7640,
   };

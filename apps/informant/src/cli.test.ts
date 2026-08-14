@@ -364,6 +364,9 @@ test("remote logs keep reading from their last offset until the build completes"
   };
   const offsets: number[] = [];
   const output: string[] = [];
+  const expected = "first 😀\nsecond\n";
+  const bytes = new TextEncoder().encode(expected);
+  const split = new TextEncoder().encode("first ").byteLength + 2;
   let reads = 0;
 
   expect(
@@ -372,15 +375,16 @@ test("remote logs keep reading from their last offset until the build completes"
         offsets.push(options?.offset ?? 0);
         reads++;
         return reads === 1
-          ? { text: "first\n", offset: 6, running: true, worker }
-          : { text: "second\n", offset: 13, running: false, worker };
+          ? { bytes: bytes.subarray(0, split), offset: split, running: true, worker }
+          : { bytes: bytes.subarray(split), offset: bytes.length, running: false, worker };
       },
       sleep: async () => {},
       write: (text) => output.push(text),
     }),
   ).toBe(true);
-  expect(offsets).toEqual([0, 6]);
-  expect(output.join("")).toBe("first\nsecond\n");
+  expect(offsets).toEqual([0, split]);
+  expect(output.join("")).toBe(expected);
+  expect(output.join("")).not.toContain("�");
 });
 
 test("remote logs stop after a previously found worker remains unavailable", async () => {
@@ -399,7 +403,14 @@ test("remote logs stop after a previously found worker remains unavailable", asy
       read: async (_id, options) => {
         workers.push(options?.worker?.id);
         reads++;
-        return reads === 1 ? { text: "partial\n", offset: 8, running: true, worker } : undefined;
+        return reads === 1
+          ? {
+              bytes: new TextEncoder().encode("partial\n"),
+              offset: 8,
+              running: true,
+              worker,
+            }
+          : undefined;
       },
       sleep: async () => {},
       write: () => {},
