@@ -233,7 +233,8 @@ function githubText(value: string): string {
   return stripVTControlCharacters(value).replaceAll("\r\n", "\n");
 }
 
-function outputTail(value: string | undefined, maximumBytes = 60_000): string | undefined {
+function outputTail(value: string | null | undefined, maximumBytes = 60_000): string | undefined {
+  if (value == null) return undefined;
   if (!value) return value;
   const plain = githubText(value);
   const bytes = new TextEncoder().encode(plain);
@@ -934,7 +935,7 @@ export class GitHubClient {
       externalId?: string;
       title: string;
       summary: string;
-      text?: string;
+      text?: string | null;
     },
     signal?: AbortSignal,
   ): Promise<CheckRun> {
