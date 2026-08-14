@@ -401,6 +401,53 @@ test("uncertain candidate creation is reconciled after forced shutdown", async (
   });
 });
 
+test("automatic candidate promotion omits null output text returned by GitHub", async () => {
+  let candidate: CheckRun | undefined;
+  let promotion: { output?: Record<string, unknown> } | undefined;
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      candidate = {
+        id: 1,
+        ...body,
+        output: { ...body.output, text: null },
+      } as CheckRun;
+      return githubResponse(candidate);
+    }
+    if (init?.method === "PATCH") {
+      promotion = JSON.parse(String(init.body));
+      if (promotion?.output?.text === null) {
+        return githubResponse(
+          { message: "For 'properties/text', nil is not a string." },
+          { status: 422 },
+        );
+      }
+      if (candidate) Object.assign(candidate, promotion);
+      return githubResponse(candidate ?? {});
+    }
+    const checks =
+      url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME || !candidate
+        ? []
+        : [candidate];
+    return githubResponse({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "null-output", repo: "widgets", fullName: "null-output/widgets" },
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+  );
+
+  expect(claim?.check?.id).toBe(1);
+  expect(promotion).toMatchObject({
+    status: "in_progress",
+    output: { title: "Informant CI", summary: expect.any(String) },
+  });
+  expect(promotion?.output).not.toHaveProperty("text");
+});
+
 test("an expired compact candidate is cancelled and retried in its automatic scope", async () => {
   const serverTime = new Date("2026-01-01T00:02:00.000Z");
   const scope = "commit:branch:main:abc123";
@@ -680,6 +727,26 @@ test("check output strips terminal control sequences", async () => {
 
   expect(requestBody?.output).toMatchObject({ title: "test", summary: "running" });
   expect(requestBody?.output?.text).toBe("```text\nfailed\n```");
+});
+
+test("check updates omit null output text returned by GitHub", async () => {
+  let requestBody: { output?: Record<string, unknown> } | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return githubResponse({ id: 1, name: "Informant CI", status: "in_progress" });
+  }) as typeof globalThis.fetch;
+
+  await new GitHubClient({ token: "installation-token", fetch }).updateCheck(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    1,
+    {
+      title: "Informant CI",
+      summary: "Claimed",
+      text: null,
+    },
+  );
+
+  expect(requestBody?.output).toEqual({ title: "Informant CI", summary: "Claimed" });
 });
 
 test("directory files returns sorted TOML files only", async () => {
