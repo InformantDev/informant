@@ -114,8 +114,8 @@ and collect one compact line per entry: its `source:` URL/slug + the lesson titl
 + tags. This is the dedup index you pass to **every** scout (it's small — one line
 per entry). If the docs is empty, the index is "none".
 
-**Load the docs cache** `.staffreview/docs-cache.json` (already gitignored under
-`.staffreview/`). Create it if absent. Sweep mode uses `scannedPRs` to avoid
+**Load the docs cache** `.staffreview/docs-cache.json` (gitignored as per-machine
+state). Create it if absent. Sweep mode uses `scannedPRs` to avoid
 reviewing the same PR forever; targeted mode ignores `scannedPRs` because the
 user named those PRs explicitly.
 
@@ -293,8 +293,8 @@ user did **not** flag (left as open comments for a future run).
 
 ## The docs cache
 
-`.staffreview/docs-cache.json` lives under the already-gitignored `.staffreview/`
-tree — never commit it. `scannedPRs` is only for sweep mode, so repeated sweeps
+`.staffreview/docs-cache.json` is gitignored **per-machine state** — never commit
+it. `scannedPRs` is only for sweep mode, so repeated sweeps
 make progress instead of re-reading the same PRs. `lastPresented` is the handoff
 cache for Step 7. Deleting the file is safe; it only means the next sweep starts
 fresh and Step 7 cannot know which presented threads belong to a previous run.

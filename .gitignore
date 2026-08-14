@@ -7,11 +7,11 @@ dist
 .DS_Store
 .env
 .env.*.local
-.staffreview/
 .informant/worktrees/
 .informant/logs/
 .staffreview/diffs/
 .staffreview/attachments/
 .staffreview/active.json
+.staffreview/docs-cache.json
 .staffreview/section-cache.json
 .pi/worktrees

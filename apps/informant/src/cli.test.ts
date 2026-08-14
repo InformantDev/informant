@@ -10,8 +10,10 @@ import {
   configuredGitHubAppSettings,
   executionLabelFromRef,
   formatGitHubAppSettings,
+  initialJobConfig,
   main,
   openTailscaleFunnelAuthorization,
+  parseArgs,
   pruneRuntimeImages,
   runInvocationType,
   runManualHousekeeping,
@@ -80,6 +82,29 @@ test("execution labels follow the requested ref instead of the checked out branc
 test("run preserves reported triggers unless local execution is explicit", () => {
   expect(runInvocationType(false)).toBe("trigger");
   expect(runInvocationType(true)).toBe("local");
+});
+
+test("argument parsing preserves equals signs in values", () => {
+  expect(parseArgs(["trigger", "--ref=feature=x"])).toEqual({
+    positional: ["trigger"],
+    flags: { ref: "feature=x" },
+  });
+});
+
+test("boolean flags do not consume trailing positional arguments", async () => {
+  expect(parseArgs(["serve", "--once", "unexpected"])).toEqual({
+    positional: ["serve", "unexpected"],
+    flags: { once: true },
+  });
+  await expect(main(["serve", "--once", "unexpected"])).rejects.toThrow(
+    "serve does not accept a repository",
+  );
+});
+
+test("initial job commands preserve replacement tokens", () => {
+  expect(initialJobConfig("echo $$ && echo $&")).toContain(
+    'command = """\necho $$ && echo $&\n"""',
+  );
 });
 
 test("opens Tailscale Funnel approval in the platform browser", async () => {
@@ -228,6 +253,45 @@ test("image prune reports partial runtime failures and preserves the successful 
   ).rejects.toThrow(
     `Deleted 2 unused prepared images, but failed to prune ${selectContainerBackend()?.name ?? "Container"} images: runtime unavailable`,
   );
+});
+
+test("manual destructive cleanup refuses to race active builds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-cli-cache-active-"));
+  const cacheRoot = join(root, "caches");
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
+  const record: BuildRecord = {
+    id: "active-cache-build",
+    repo: "owner/repo",
+    sha: "1111111111111111111111111111111111111111",
+    branch: "main",
+    machine: "runner-one",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    owner,
+    logPath: join(root, "builds", "active-cache-build", "build.log"),
+  };
+  try {
+    await mkdir(join(cacheRoot, "repository", "keyed-entry"), { recursive: true });
+    await createBuild(record);
+
+    await expect(main(["cache", "prune"])).rejects.toThrow(
+      "cannot prune caches while builds are active",
+    );
+    await expect(main(["image", "prune"])).rejects.toThrow(
+      "cannot prune images while builds are active",
+    );
+    expect(await readdir(join(cacheRoot, "repository"))).toEqual(["keyed-entry"]);
+  } finally {
+    record.status = "cancelled";
+    record.completedAt = new Date().toISOString();
+    await saveBuild(record);
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("cache prune preserves shared caches and cache clear removes the cache root", async () => {
