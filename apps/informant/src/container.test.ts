@@ -13,6 +13,7 @@ import {
   pruneKnownPreparedContainerImages,
   prunePreparedContainerImages,
   recoverMountedFileWrites,
+  resetAppleContainerBuilder,
   runInContainer,
 } from "./container.ts";
 import {
@@ -611,6 +612,252 @@ test("serializes preparation of different images through the shared Apple builde
   );
 
   expect(locks).toEqual(["container-builder", "container-builder"]);
+});
+
+test("resets only the shared Apple builder and leaves it stopped for lazy recreation", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  const pending = join(dataPath, "apple-container-builder-cleanup-pending");
+  const completed = join(dataPath, "apple-container-builder-cleanup-completed");
+  await Bun.write(pending, "pending\n");
+  const invocations: string[][] = [];
+  const locks: string[] = [];
+  const result = await resetAppleContainerBuilder({
+    dataPath,
+    hostPlatform: "darwin",
+    withImageLock: async (name, callback) => {
+      locks.push(name);
+      return callback();
+    },
+    command: async (args) => {
+      invocations.push(args);
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+    },
+  });
+
+  expect(result).toBe(true);
+  expect(locks).toEqual(["container-builder"]);
+  expect(invocations).toEqual([
+    ["container", "--version"],
+    ["container", "system", "status", "--format", "json"],
+    ["container", "builder", "stop"],
+    ["container", "builder", "delete"],
+  ]);
+  expect(await Bun.file(pending).exists()).toBe(false);
+  expect(await Bun.file(completed).exists()).toBe(true);
+
+  invocations.length = 0;
+  expect(
+    await resetAppleContainerBuilder({
+      dataPath,
+      hostPlatform: "darwin",
+      command: async (args) => {
+        invocations.push(args);
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+    }),
+  ).toBe(false);
+  expect(invocations).toEqual([]);
+});
+
+test("guards Apple builder cleanup by platform and runtime availability", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  await Bun.write(join(dataPath, "apple-container-builder-cleanup-pending"), "pending\n");
+  const invocations: string[][] = [];
+  const command = async (args: string[]) => {
+    invocations.push(args);
+    return {
+      exitCode: args[1] === "system" ? 1 : 0,
+      stdout: "",
+      stderr: "runtime unavailable",
+      timedOut: false,
+    };
+  };
+
+  expect(await resetAppleContainerBuilder({ dataPath, hostPlatform: "linux", command })).toBe(
+    false,
+  );
+  expect(invocations).toEqual([]);
+  expect(await resetAppleContainerBuilder({ dataPath, hostPlatform: "darwin", command })).toBe(
+    false,
+  );
+  expect(invocations).toEqual([
+    ["container", "--version"],
+    ["container", "system", "status", "--format", "json"],
+  ]);
+  expect(await Bun.file(join(dataPath, "apple-container-builder-cleanup-pending")).exists()).toBe(
+    true,
+  );
+});
+
+test("retains pending Apple builder cleanup after a lifecycle command fails", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  const pending = join(dataPath, "apple-container-builder-cleanup-pending");
+  await Bun.write(pending, "pending\n");
+  const invocations: string[][] = [];
+
+  await expect(
+    resetAppleContainerBuilder({
+      dataPath,
+      hostPlatform: "darwin",
+      withImageLock: passthroughImageLock,
+      command: async (args) => {
+        invocations.push(args);
+        return {
+          exitCode: args[2] === "stop" ? 1 : 0,
+          stdout: "",
+          stderr: args[2] === "stop" ? "busy" : "",
+          timedOut: false,
+        };
+      },
+    }),
+  ).rejects.toThrow("could not stop the shared Apple Container builder: busy");
+  expect(invocations.at(-1)).toEqual(["container", "builder", "stop"]);
+  expect(await Bun.file(pending).exists()).toBe(true);
+});
+
+test("does not treat unrelated not-found failures as an absent Apple builder", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  const pending = join(dataPath, "apple-container-builder-cleanup-pending");
+  await Bun.write(pending, "pending\n");
+
+  await expect(
+    resetAppleContainerBuilder({
+      dataPath,
+      hostPlatform: "darwin",
+      withImageLock: passthroughImageLock,
+      command: async (args) => ({
+        exitCode: args[2] === "stop" ? 1 : 0,
+        stdout: "",
+        stderr: args[2] === "stop" ? "builder state file not found" : "",
+        timedOut: false,
+      }),
+    }),
+  ).rejects.toThrow(
+    "could not stop the shared Apple Container builder: builder state file not found",
+  );
+  expect(await Bun.file(pending).exists()).toBe(true);
+});
+
+test("completes Apple builder cleanup when an earlier attempt already deleted the builder", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  const pending = join(dataPath, "apple-container-builder-cleanup-pending");
+  const completed = join(dataPath, "apple-container-builder-cleanup-completed");
+  await Bun.write(pending, "pending\n");
+  const invocations: string[][] = [];
+
+  expect(
+    await resetAppleContainerBuilder({
+      dataPath,
+      hostPlatform: "darwin",
+      withImageLock: passthroughImageLock,
+      command: async (args) => {
+        invocations.push(args);
+        if (args[2] === "stop")
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: 'Error: container "buildkit" does not exist',
+            timedOut: false,
+          };
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+    }),
+  ).toBe(true);
+  expect(invocations.at(-1)).toEqual(["container", "builder", "stop"]);
+  expect(invocations).not.toContainEqual(["container", "builder", "delete"]);
+  expect(await Bun.file(pending).exists()).toBe(false);
+  expect(await Bun.file(completed).exists()).toBe(true);
+});
+
+test("schedules Apple builder cleanup before a prepared-image build can fail", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await expect(
+    ensurePreparedContainer(
+      { type: "container", image: "base", prepare: "install tools" },
+      undefined,
+      () => {},
+      undefined,
+      {
+        dataPath,
+        reference: "owner/repo\0job",
+        withImageLock: passthroughImageLock,
+        command: async (args) => ({
+          exitCode: args[1] === "image" ? 1 : args[1] === "build" ? 2 : 0,
+          stdout: "",
+          stderr: args[1] === "build" ? "build failed" : "",
+          timedOut: false,
+        }),
+      },
+    ),
+  ).rejects.toThrow("container image preparation failed: build failed");
+  expect(await Bun.file(join(dataPath, "apple-container-builder-cleanup-pending")).exists()).toBe(
+    true,
+  );
+});
+
+test("does not build when Apple builder cleanup cannot be scheduled", async () => {
+  const dataPath = temporaryContainerDataPath();
+  await mkdir(dataPath, { recursive: true });
+  await Bun.write(join(dataPath, "apple-container-builder-cleanup-completed"), "completed\n");
+  await symlink(
+    join(dataPath, "missing", "cleanup-marker"),
+    join(dataPath, "apple-container-builder-cleanup-pending"),
+  );
+  const invocations: string[][] = [];
+  const messages: string[] = [];
+
+  await expect(
+    ensurePreparedContainer(
+      { type: "container", image: "base", prepare: "install tools" },
+      undefined,
+      (message) => {
+        messages.push(message);
+      },
+      undefined,
+      {
+        dataPath,
+        reference: "owner/repo\0job",
+        withImageLock: passthroughImageLock,
+        command: async (args) => {
+          invocations.push(args);
+          return {
+            exitCode: args[1] === "image" ? 1 : 0,
+            stdout: "",
+            stderr: "",
+            timedOut: false,
+          };
+        },
+      },
+    ),
+  ).rejects.toThrow();
+  expect(messages.some((message) => message.startsWith("Could not schedule"))).toBe(true);
+  expect(invocations.some((args) => args[1] === "build")).toBe(false);
+});
+
+test("migrates older prepared-image history into one Apple builder reset", async () => {
+  const dataPath = temporaryContainerDataPath();
+  const history = join(dataPath, "prepared-container-image-history");
+  await mkdir(history, { recursive: true });
+  await Bun.write(join(history, "known-image"), "informant-prepared-container:aaaaaaaaaaaaaaaa\n");
+  const invocations: string[][] = [];
+
+  expect(
+    await resetAppleContainerBuilder({
+      dataPath,
+      hostPlatform: "darwin",
+      withImageLock: passthroughImageLock,
+      command: async (args) => {
+        invocations.push(args);
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+    }),
+  ).toBe(true);
+  expect(invocations.at(-1)).toEqual(["container", "builder", "delete"]);
 });
 
 test("prepares distinct Podman images concurrently", async () => {
