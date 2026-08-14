@@ -4,6 +4,7 @@ import {
   pruneKnownPreparedContainerImages,
   type prunePreparedContainerImages,
   reconcilePreparedContainerImageRepositories,
+  resetAppleContainerBuilder,
 } from "./container.ts";
 import {
   allocatedDirectorySize,
@@ -37,6 +38,8 @@ export interface HousekeepingSummary {
   sharedCaches: number;
   tartImages: number;
   containerImages: number;
+  appleContainerBuilder?: boolean;
+  appleContainerBuilderError?: string;
   pressure: boolean;
 }
 
@@ -52,6 +55,7 @@ interface HousekeepingOperations {
   reconcileContainerRepositories?: typeof reconcilePreparedContainerImageRepositories;
   pruneTartImages?: typeof prunePreparedImages;
   pruneContainerImages?: typeof prunePreparedContainerImages;
+  resetAppleContainerBuilder?: typeof resetAppleContainerBuilder;
 }
 
 interface DirectoryEntry {
@@ -348,6 +352,7 @@ export async function runHousekeeping(
       sharedCaches: 0,
       tartImages: 0,
       containerImages: 0,
+      appleContainerBuilder: false,
       pressure: false,
     };
     if (active.size > 0) return empty;
@@ -359,6 +364,14 @@ export async function runHousekeeping(
     empty.cacheVersions += await pruneStaleCacheVersions(dataPath, now, policy);
     const quota = await pruneCacheQuota(dataPath, policy.keyedCacheMaxBytes, measureMany);
     empty.cacheVersions += quota.removed;
+
+    try {
+      empty.appleContainerBuilder = await (
+        operations.resetAppleContainerBuilder ?? resetAppleContainerBuilder
+      )({ dataPath, withImageLock: lock });
+    } catch (error) {
+      empty.appleContainerBuilderError = error instanceof Error ? error.message : String(error);
+    }
 
     const repositoryNames = repositories.map((repository) => repository.fullName);
     await (operations.reconcileTartRepositories ?? reconcilePreparedImageRepositories)(
@@ -396,6 +409,13 @@ export function formatHousekeepingSummary(summary: HousekeepingSummary): string 
   if (summary.sharedCaches > 0) parts.push(`${summary.sharedCaches} shared caches`);
   const images = summary.tartImages + summary.containerImages;
   if (images > 0) parts.push(`${images} prepared images`);
-  if (parts.length === 0) return undefined;
-  return `Cleaned up ${parts.join(", ")}${summary.pressure ? " to recover low disk space" : ""}`;
+  if (summary.appleContainerBuilder) parts.push("Apple Container builder storage");
+  const cleaned =
+    parts.length > 0
+      ? `Cleaned up ${parts.join(", ")}${summary.pressure ? " to recover low disk space" : ""}`
+      : undefined;
+  const failure = summary.appleContainerBuilderError
+    ? `Apple Container builder cleanup failed: ${summary.appleContainerBuilderError}`
+    : undefined;
+  return [cleaned, failure].filter(Boolean).join("; ") || undefined;
 }

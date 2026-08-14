@@ -296,6 +296,14 @@ Informant tracks which configured repository jobs use each prepared Tart or cont
 When the final reference moves to another image, or a repository or job is removed, idle housekeeping
 deletes the unreferenced image. `informant image prune` runs that cleanup immediately.
 
+On macOS, an Apple Container image build also schedules the shared BuildKit builder for reset during
+the next idle housekeeping pass. Informant waits until it has no active builds, then uses
+`container builder stop` followed by `container builder delete`; the next image build recreates the
+builder lazily. Deleting the builder is necessary to return its sparse filesystem's allocated blocks
+to the host. It discards build cache shared with other Apple Container clients, but it does not delete
+published images, application containers, or volumes. The reset is serialized with Informant image
+preparation, and failures are logged and retried without failing the completed job.
+
 Container runtimes can declare repository-relative files or glob patterns with `prepareInputs`.
 Informant copies matching files into the image's `/workspace`, exposes that path as
 `$INFORMANT_PREPARE_ROOT` during preparation, and includes their paths, modes, and contents in the
