@@ -4,7 +4,7 @@ import { mkdir, readdir, realpath, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { SelectPrompt } from "@clack/core";
-import { cancel, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
+import { cancel, confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import packageJson from "../package.json" with { type: "json" };
 import {
   CONFIG_FILE,
@@ -29,17 +29,18 @@ import { formatHousekeepingSummary, runHousekeeping } from "./housekeeping.ts";
 import {
   addRepository,
   allowMount,
+  getTailscaleConfig,
   listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
   removeAllowedMount,
   removeRepository,
   saveAutomaticUpdatesPreference,
+  type TailscaleConfig,
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
-import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
-import { disableStartup, enableStartup } from "./startup.ts";
+import { disableStartup, enableStartup, restartStartupWorker } from "./startup.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
@@ -51,13 +52,23 @@ import {
   dataDirectory,
   getBuild,
   jobLogPath,
-  listActiveBuilds,
-  listBuilds,
   reconcileBuildLiveness,
   recordWorkerVersion,
   removeOrphanedBuildWorkspaces,
+  requestBuildCancellation,
   runningWorkerVersion,
 } from "./store.ts";
+import {
+  disableTailscale,
+  enableTailscale,
+  type GitHubAppWebhookSettings,
+  githubAppWebhookSettings,
+  listBuildsAcrossWorkers,
+  type NetworkWorker,
+  networkStatus,
+  remoteBuildLog,
+  serveWithTailscale,
+} from "./tailscale.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 import type { Repository } from "./types.ts";
 import {
@@ -77,7 +88,7 @@ Usage:
   informant mount allow <name> <file>     Allow jobs to request a host file by name
   informant mount list                    List allowed host file mounts
   informant mount remove <name>           Remove a host file from the allowlist
-  informant serve [--once]                Poll all registered repositories
+  informant serve [--once]                Serve webhooks or poll registered repositories
   informant run --local [--ref <ref>] [--job <name>]
                                         Run all or selected jobs locally
   informant trigger [--ref <ref>] [--job <name>]
@@ -90,9 +101,17 @@ Usage:
   informant cache clear                  Delete all persistent job caches
   informant startup enable               Start the worker now and at login
   informant startup disable              Stop and remove the startup worker
+  informant tailscale enable --lead [--webhook-ready]
+                                        Receive webhooks through a Tailscale Funnel
+  informant tailscale enable --worker --token <token>
+                                        Receive jobs from a network lead without polling
+  informant tailscale status             Show the tailnet worker topology
+  informant tailscale disable            Disable tailnet coordination and restore polling
   informant hook install                 Accelerate pushes with a pre-push hook
   informant hook uninstall               Remove Informant from the pre-push hook
-  informant builds [--all]               List running builds or recent history
+  informant builds [--all]               List builds across this machine and tailnet workers
+  informant builds cancel <build-id> [--job <name>]
+                                        Cancel a running local build or queued/running job
   informant logs [<build-id>]             Tail a build's logs or select a running job
   informant update                       Install a newer release and restart a running worker
   informant auto-update enable           Check for and install new releases automatically
@@ -334,7 +353,7 @@ function githubUrl(build: NonNullable<Awaited<ReturnType<typeof getBuild>>>): st
 
 async function showBuilds(includeHistory: boolean): Promise<void> {
   if (process.stdin.isTTY) return browseBuilds(includeHistory);
-  const builds = includeHistory ? await listBuilds() : await listActiveBuilds();
+  const builds = await listBuildsAcrossWorkers(includeHistory);
   console.log(buildList(builds, includeHistory));
 }
 
@@ -387,6 +406,7 @@ interface BrowserOption {
   label: string;
   hint?: string;
   disabled?: boolean;
+  cancellable?: boolean;
 }
 
 const terminalColor = {
@@ -455,19 +475,27 @@ function buildBrowserOptions(builds: Build[]): BrowserOption[] {
     {
       value: build.id,
       label: `${terminalColor.bold}${build.repo}${terminalColor.reset} · ${terminalColor.blue}${build.branch}@${build.sha.slice(0, 7)}${terminalColor.reset}`,
-      hint: `${coloredStatus(build.status)} · ${buildTiming(build)} · ${terminalColor.dim}${build.id}${terminalColor.reset}`,
+      hint: `${coloredStatus(build.status)} · ${buildTiming(build)} · ${terminalColor.dim}${build.id}${terminalColor.reset}${build.networkWorker ? ` · remote on ${build.networkWorker.hostName}` : ""}`,
+      disabled: Boolean(build.networkWorker),
+      cancellable: !build.networkWorker && build.status === "running",
     },
     ...jobsForBuild(build).map((job) => ({
       value: `${build.id}\0${job.name}`,
       label: `  ${terminalColor.dim}↳${terminalColor.reset} ${job.name}`,
       hint: coloredStatus(job.status),
+      disabled: Boolean(build.networkWorker),
+      cancellable: !build.networkWorker && (job.status === "queued" || job.status === "running"),
     })),
   ]);
 }
 
-async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol> {
-  const load = async () =>
-    buildBrowserOptions(includeHistory ? await listBuilds() : await listActiveBuilds());
+interface BuildBrowserChoice {
+  value: string | symbol;
+  action: "logs" | "cancel";
+}
+
+async function liveBuildSelect(includeHistory: boolean): Promise<BuildBrowserChoice> {
+  const load = async () => buildBrowserOptions(await listBuildsAcrossWorkers(includeHistory));
   const options = await load();
   const prompt = new SelectPrompt<BrowserOption>({
     options,
@@ -491,8 +519,16 @@ async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol
         return `│  ${marker} ${option.label}${option.hint ? `  (${option.hint})` : ""}`;
       });
       const title = includeHistory ? "Recent builds" : "Running builds";
-      return `${terminalColor.cyan}◆${terminalColor.reset}  ${terminalColor.bold}${title}${terminalColor.reset}\n${lines.join("\n")}\n└  ${terminalColor.dim}↑/↓ navigate · Enter open logs · Esc back${terminalColor.reset}`;
+      const canCancel = active?.cancellable ? " · c cancel" : "";
+      return `${terminalColor.cyan}◆${terminalColor.reset}  ${terminalColor.bold}${title}${terminalColor.reset}\n${lines.join("\n")}\n└  ${terminalColor.dim}↑/↓ navigate · Enter open logs${canCancel} · Esc back${terminalColor.reset}`;
     },
+  });
+  let action: BuildBrowserChoice["action"] = "logs";
+  prompt.on("key", (character) => {
+    if (character?.toLowerCase() !== "c") return;
+    if (!prompt.options[prompt.cursor]?.cancellable) return;
+    action = "cancel";
+    prompt.state = "submit";
   });
   let open = true;
   let refreshing = false;
@@ -516,7 +552,7 @@ async function liveBuildSelect(includeHistory: boolean): Promise<string | symbol
   try {
     const selection = (await prompt.prompt()) ?? Symbol.for("informant:no-selection");
     process.stdout.write("\x1b[1A\x1b[2K\r");
-    return selection;
+    return { value: selection, action };
   } finally {
     open = false;
     clearInterval(refresh);
@@ -645,8 +681,20 @@ async function browseBuilds(includeHistory: boolean, initialBuildId?: string): P
       initial = undefined;
     }
     const choice = await liveBuildSelect(includeHistory);
-    if (isCancel(choice) || typeof choice !== "string" || choice === "none") return;
-    const [buildId, job] = choice.split("\0", 2);
+    if (isCancel(choice.value) || typeof choice.value !== "string" || choice.value === "none")
+      return;
+    const [buildId, job] = choice.value.split("\0", 2);
+    if (choice.action === "cancel" && buildId) {
+      const accepted = await confirm({
+        message: job ? `Cancel ${job} in build ${buildId}?` : `Cancel build ${buildId}?`,
+        initialValue: false,
+      });
+      if (!isCancel(accepted) && accepted) {
+        await requestBuildCancellation(buildId, job);
+        outro(job ? `Cancellation requested for ${job}` : `Cancellation requested for ${buildId}`);
+      }
+      continue;
+    }
     if (buildId && (await browseLog(buildId, job)) === "exit") return;
   }
 }
@@ -687,10 +735,55 @@ async function tailLog(
   }
 }
 
+export async function tailRemoteLog(
+  buildId: string,
+  operations: {
+    read?: typeof remoteBuildLog;
+    sleep?: (milliseconds: number) => Promise<unknown>;
+    write?: (text: string) => unknown;
+  } = {},
+): Promise<boolean> {
+  const read = operations.read ?? remoteBuildLog;
+  const sleep = operations.sleep ?? Bun.sleep;
+  const write = operations.write ?? ((text: string) => process.stdout.write(text));
+  const decoder = new TextDecoder();
+  const finish = (): true => {
+    const remainder = decoder.decode();
+    if (remainder) write(remainder);
+    return true;
+  };
+  let offset = 0;
+  let worker: NetworkWorker | undefined;
+  let found = false;
+  let unavailableReads = 0;
+  while (true) {
+    const chunk = await read(buildId, { offset, worker });
+    if (!chunk) {
+      if (!found) return false;
+      unavailableReads++;
+      if (unavailableReads >= 3) return finish();
+      worker = undefined;
+      await sleep(1_000);
+      continue;
+    }
+    found = true;
+    unavailableReads = 0;
+    worker = chunk.worker;
+    offset = chunk.offset;
+    const text = decoder.decode(chunk.bytes, { stream: true });
+    if (text) write(text);
+    if (!chunk.running) return finish();
+    await sleep(250);
+  }
+}
+
 async function showLogs(id?: string): Promise<void> {
   if (id) {
     const build = await getBuild(id);
-    if (!build) throw new Error(`build not found: ${id}`);
+    if (!build) {
+      if (!(await tailRemoteLog(id))) throw new Error(`build not found: ${id}`);
+      return;
+    }
     if (process.stdin.isTTY) return browseBuilds(true, id);
     return tailLog(build.id, build.logPath, (current) => current.status === "running");
   }
@@ -829,6 +922,130 @@ async function manageRepositories(action?: string, value?: string): Promise<void
   throw new Error("repo action must be one of: add, list, remove");
 }
 
+export async function configuredGitHubAppSettings(
+  operations: {
+    inspect?: typeof githubAppWebhookSettings;
+    listCredentials?: typeof listGitHubCredentials;
+  } = {},
+): Promise<GitHubAppWebhookSettings[]> {
+  const credentials = await (operations.listCredentials ?? listGitHubCredentials)();
+  if (credentials.length === 0) throw new Error("configure a GitHub App before enabling a lead");
+  const inspect = operations.inspect ?? githubAppWebhookSettings;
+  return Promise.all(credentials.map((app) => inspect(app)));
+}
+
+export async function openTailscaleFunnelAuthorization(
+  url: string,
+  runCommand: typeof command = command,
+  currentPlatform = process.platform,
+): Promise<void> {
+  console.log(`Tailscale Funnel approval required:\n  ${url}\nOpening it in your browser...`);
+  const result = await runCommand([currentPlatform === "linux" ? "xdg-open" : "open", url], {
+    timeoutMs: 10_000,
+  });
+  if (result.exitCode !== 0 && !result.timedOut) {
+    throw new Error(`could not open Tailscale Funnel approval: ${result.stderr.trim()}`);
+  }
+}
+
+export function formatGitHubAppSettings(apps: GitHubAppWebhookSettings[]): string {
+  return [
+    "Configured GitHub App settings:",
+    ...apps.flatMap((app) => [
+      `  ${app.name} (${app.appId})`,
+      `    General: ${app.settingsUrl}`,
+      `    Permissions & events: ${app.permissionsUrl}`,
+    ]),
+  ].join("\n");
+}
+
+async function manageTailscale(
+  action?: string,
+  flags: Record<string, string | boolean | string[]> = {},
+): Promise<void> {
+  if (action === "enable") {
+    if (flags.lead === true && flags.worker === true) {
+      throw new Error("choose either --lead or --worker");
+    }
+    if (flags.lead !== true && flags.worker !== true) {
+      throw new Error("tailscale enable requires --lead or --worker");
+    }
+    if (flags.lead === true) {
+      console.log(formatGitHubAppSettings(await configuredGitHubAppSettings()));
+    }
+    if (flags.lead === true && flags["webhook-ready"] !== true) {
+      const ready = await confirm({
+        message:
+          "Have you enabled each webhook and selected Push, Pull request, Issue comment, and Check suite at the links above?",
+        initialValue: false,
+      });
+      if (isCancel(ready) || !ready) {
+        throw new Error(
+          "enable the required GitHub App webhook events, then retry with --webhook-ready",
+        );
+      }
+    }
+    if (flags.token !== undefined && typeof flags.token !== "string") {
+      throw new Error("--token requires exactly one value");
+    }
+    const config = await enableTailscale(flags.lead === true ? "lead" : "worker", {
+      authorizeFunnel: openTailscaleFunnelAuthorization,
+      networkSecret: typeof flags.token === "string" ? flags.token : undefined,
+      webhookReadyConfirmed: flags.lead === true,
+    });
+    outro(
+      config.mode === "lead"
+        ? `Enabled Tailscale lead at ${config.funnelUrl}/webhooks/github; worker token: ${config.networkSecret}; restart the worker`
+        : "Enabled authenticated Tailscale network worker; restart the worker",
+    );
+    return;
+  }
+  if (action === "disable") {
+    const { disabled, funnelResetError } = await disableTailscale();
+    const restarted = disabled ? await restartStartupWorker() : false;
+    if (funnelResetError) {
+      console.warn(
+        `Disabled local Tailscale coordination, but could not reset Funnel: ${funnelResetError.message}`,
+      );
+    }
+    outro(
+      disabled
+        ? restarted
+          ? "Disabled Tailscale coordination and restarted the polling worker"
+          : "Disabled Tailscale coordination; polling will resume on the next worker start"
+        : "Tailscale coordination is not enabled",
+    );
+    return;
+  }
+  if (action === "status" || !action) {
+    const current = await networkStatus();
+    if (!current.status) {
+      console.log(
+        `Tailscale is not installed or is not connected.\nInformant: ${current.config ? `${current.config.mode} · polling fallback enabled` : "not configured · polling enabled"}`,
+      );
+      return;
+    }
+    const lines = [
+      `Tailscale: ${current.status.online ? "online" : "offline"} · ${current.status.self.hostName}`,
+      `Informant: ${current.config ? `${current.config.mode} · ${current.status.online ? "polling disabled while connected" : "polling fallback enabled"}` : "not configured · polling enabled"}`,
+    ];
+    if (current.config?.funnelUrl)
+      lines.push(`Funnel: ${current.config.funnelUrl}/webhooks/github`);
+    if (current.workers.length === 0) lines.push("Workers: no other Informant workers discovered");
+    else {
+      lines.push("Workers:");
+      for (const worker of current.workers) {
+        lines.push(
+          `  ${worker.hostName} · ${worker.address} · ${worker.capabilities.join(", ")} · ${worker.repositories.length} ${worker.repositories.length === 1 ? "repository" : "repositories"}`,
+        );
+      }
+    }
+    console.log(lines.join("\n"));
+    return;
+  }
+  throw new Error("tailscale action must be one of: enable, status, disable");
+}
+
 async function manageMounts(action?: string, name?: string, source?: string): Promise<void> {
   if (action === "list" || !action) {
     const mounts = await listAllowedMounts();
@@ -945,6 +1162,13 @@ export function updateResultMessage(result: {
     : `Informant ${result.version} is already current`;
 }
 
+export function canServeWithoutRepositories(
+  config: TailscaleConfig | undefined,
+  once: boolean,
+): boolean {
+  return config?.mode === "lead" && !once;
+}
+
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const [subcommand, action, id, value] = positional;
@@ -994,6 +1218,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     throw new Error("auto-update action must be one of: enable, disable");
   }
   if (subcommand === "repo") return manageRepositories(action, id);
+  if (subcommand === "tailscale") return manageTailscale(action, flags);
   if (subcommand === "mount") return manageMounts(action, id, value);
   if (subcommand === "image") return manageImages(action);
   if (subcommand === "cache") return manageCaches(action);
@@ -1001,7 +1226,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     if (action) throw new Error("serve does not accept a repository; use informant repo add first");
     await recoverMountedFileWrites();
     const repositories = await listRepositories();
-    if (repositories.length === 0) {
+    if (
+      repositories.length === 0 &&
+      !canServeWithoutRepositories(await getTailscaleConfig(), flags.once === true)
+    ) {
       throw new Error("no repositories registered; run informant repo add owner/repository");
     }
     await recordWorkerVersion(packageJson.version);
@@ -1014,10 +1242,11 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);
     try {
-      return await serveRepositories(repositories, {
+      return await serveWithTailscale(repositories, {
         once: flags.once === true,
         signal: shutdown.signal,
         onMessage: console.log,
+        version: packageJson.version,
       });
     } finally {
       process.off("SIGTERM", stop);
@@ -1083,6 +1312,17 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   if (subcommand === "logs") return showLogs(action);
   if (subcommand === "builds" && action === "logs")
     throw new Error("builds logs has moved to informant logs [<build-id>]");
+  if (subcommand === "builds" && action === "cancel") {
+    if (!id) throw new Error("builds cancel requires a build ID");
+    if (value) throw new Error("builds cancel does not accept arguments after the build ID");
+    const jobs = requestedJobs(flags.job);
+    if (flags.job !== undefined && jobs.length === 0) throw new Error("--job requires a job name");
+    if (jobs.length > 1) throw new Error("builds cancel accepts at most one --job");
+    const job = jobs[0];
+    await requestBuildCancellation(id, job);
+    outro(job ? `Cancellation requested for ${job}` : `Cancellation requested for ${id}`);
+    return;
+  }
   if (subcommand === "builds") {
     if (process.stdin.isTTY) return browseBuilds(flags.all === true);
     return showBuilds(flags.all === true);

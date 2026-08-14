@@ -1,4 +1,4 @@
-import { createSign } from "node:crypto";
+import { createSign, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -7,14 +7,24 @@ import { appleContainerInstalled, ensureAppleContainerSystem } from "./container
 import { podmanContainerBackend } from "./container-backend.ts";
 import {
   automaticUpdatesPreference,
+  getTailscaleConfig,
   listGitHubCredentials,
   listRepositories,
   machineConfigPath,
   saveAutomaticUpdatesPreference,
   saveGitHubCredentials,
+  saveTailscaleConfig,
 } from "./machine-config.ts";
 import { command } from "./process.ts";
-import { serveRepositories } from "./server.ts";
+import {
+  configureGitHubAppWebhook,
+  DEFAULT_FUNNEL_PORT,
+  DEFAULT_WORKER_PORT,
+  prepareTailscaleFunnel,
+  REQUIRED_GITHUB_WEBHOOK_EVENTS,
+  serveWithTailscale,
+  tailscaleStatus,
+} from "./tailscale.ts";
 import { disableAutomaticUpdates, enableAutomaticUpdates } from "./updater.ts";
 
 const API = "https://api.github.com";
@@ -240,6 +250,7 @@ interface ManifestApp {
   id: number;
   slug: string;
   pem: string;
+  webhook_secret?: string;
 }
 
 function appJwt(appId: number | string, privateKey: string): string {
@@ -322,7 +333,7 @@ async function openBrowser(url: string): Promise<void> {
   if (result.exitCode !== 0) throw new Error(`could not open browser: ${result.stderr}`);
 }
 
-async function createApp(owner?: string): Promise<ManifestApp> {
+async function createApp(owner?: string, webhookUrl?: string): Promise<ManifestApp> {
   const state = crypto.randomUUID();
   let resolveApp!: (app: ManifestApp) => void;
   let rejectApp!: (error: Error) => void;
@@ -367,9 +378,14 @@ async function createApp(owner?: string): Promise<ManifestApp> {
         url: APP_URL,
         redirect_url: callback,
         public: false,
-        default_permissions: { checks: "write", contents: "read", pull_requests: "write" },
-        default_events: [],
-        hook_attributes: { url: APP_URL, active: false },
+        default_permissions: {
+          checks: "write",
+          contents: "read",
+          issues: "read",
+          pull_requests: "write",
+        },
+        default_events: webhookUrl ? [...REQUIRED_GITHUB_WEBHOOK_EVENTS] : [],
+        hook_attributes: { url: webhookUrl ?? APP_URL, active: Boolean(webhookUrl) },
       })
         .replaceAll("&", "&amp;")
         .replaceAll('"', "&quot;");
@@ -463,7 +479,7 @@ async function finishSetup(account: string): Promise<void> {
   const start = await confirm({ message: "Start the worker now?", initialValue: true });
   outro(`GitHub App configured for ${account}.`);
   if (!isCancel(start) && start) {
-    await serveRepositories(repositories, { onMessage: console.log });
+    await serveWithTailscale(repositories, { onMessage: console.log });
   }
 }
 
@@ -505,8 +521,26 @@ export async function setup(): Promise<void> {
   }
 
   const progress = spinner();
+  const existingTailscale = await getTailscaleConfig();
+  let funnelUrl = existingTailscale?.mode === "lead" ? existingTailscale.funnelUrl : undefined;
+  const tailStatus = await tailscaleStatus();
+  if (!funnelUrl && tailStatus?.online) {
+    try {
+      funnelUrl = await prepareTailscaleFunnel(
+        tailStatus,
+        DEFAULT_FUNNEL_PORT,
+        command,
+        openBrowser,
+      );
+      console.log(`Tailscale Funnel ready at ${funnelUrl}/webhooks/github`);
+    } catch (error) {
+      console.warn(
+        `Could not enable Tailscale Funnel; setup will use polling: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+  }
   progress.start("Waiting for GitHub App creation in your browser");
-  const app = await createApp(owner);
+  const app = await createApp(owner, funnelUrl ? `${funnelUrl}/webhooks/github` : undefined);
   progress.stop("GitHub App created");
 
   await openBrowser(`https://github.com/apps/${app.slug}/installations/new`);
@@ -520,6 +554,26 @@ export async function setup(): Promise<void> {
   if (!installation) throw new Error("GitHub App was not installed within 5 minutes");
 
   await storeInstallation(String(app.id), installation, app.pem);
+  if (funnelUrl && existingTailscale?.mode === "lead" && existingTailscale.webhookSecret) {
+    const credentials = (await listGitHubCredentials()).find(
+      (candidate) => candidate.appId === String(app.id),
+    );
+    if (!credentials) throw new Error("could not reload the new GitHub App credentials");
+    await configureGitHubAppWebhook(credentials, funnelUrl, existingTailscale.webhookSecret);
+  } else if (funnelUrl && app.webhook_secret) {
+    const networkSecret = randomBytes(32).toString("hex");
+    await saveTailscaleConfig({
+      mode: "lead",
+      funnelUrl,
+      webhookSecret: app.webhook_secret,
+      networkSecret,
+      workerPort: DEFAULT_WORKER_PORT,
+      funnelPort: DEFAULT_FUNNEL_PORT,
+    });
+    console.log(`Tailscale worker token: ${networkSecret}`);
+  } else if (funnelUrl) {
+    console.warn("GitHub did not return a webhook secret; polling remains enabled.");
+  }
   progress.stop(`GitHub App configured for ${installation.account.login}`);
   await finishSetup(installation.account.login);
 }

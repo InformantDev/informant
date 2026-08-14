@@ -12,7 +12,7 @@ informant repo remove [owner/repo]     Stop handling a repository
 informant mount allow <name> <file>    Allow jobs to request a host file by name
 informant mount list                   List allowed host file mounts
 informant mount remove <name>          Remove a host file from the allowlist
-informant serve                        Poll every registered repository continuously
+informant serve                        Run webhook networking or the polling fallback
 informant serve --once                 Poll every registered repository once
 informant run --local --ref HEAD       Locally run every job for a commit
 informant run --local --job test       Locally run one job and the jobs it needs
@@ -28,12 +28,21 @@ informant cache prune                  Delete keyed caches while preserving shar
 informant cache clear                  Delete all persistent job caches
 informant startup enable               Start the worker now and automatically at login
 informant startup disable              Stop and remove the automatic startup worker
+informant tailscale enable --lead [--webhook-ready]
+                                        Configure Funnel and the GitHub App webhook
+informant tailscale enable --worker --token <token>
+                                        Receive tailnet jobs without polling GitHub
+informant tailscale status             Show Funnel state and discovered workers
+informant tailscale disable            Disable networking and restore polling
 informant auto-update enable           Check for and install new Informant releases automatically
 informant auto-update disable          Disable automatic release checks
 informant hook install                 Install the push-accelerating pre-push hook
 informant hook uninstall               Remove Informant from the pre-push hook
-informant builds                       List builds currently running on this machine
-informant builds --all                 List recent build history
+informant builds                       List builds running across tailnet workers
+informant builds --all                 List recent cross-worker build history
+informant builds cancel <build-id>     Cancel a running local build
+informant builds cancel <build-id> --job test
+                                       Cancel one queued or running local job
 informant logs [<build-id>]             Tail a build's logs or select a running job
 informant update                        Install a newer release and restart a running worker
 informant storage                      Show Informant disk usage and available space
@@ -45,15 +54,58 @@ overrides for headless provisioning and external secret managers. The separate `
 clone repositories. See [GitHub App credentials](/docs/github-app) for details.
 
 Registered repositories are machine-local and persist in `~/.config/informant/config.json`. Set
-`INFORMANT_CONFIG_FILE` to use a different location. A running worker automatically starts polling
-newly registered repositories and stops polling repositories after they are removed.
+`INFORMANT_CONFIG_FILE` to use a different location. A running polling worker automatically starts
+serving newly registered repositories and stops after they are removed.
+
+## Tailscale networking
+
+Install and connect Tailscale before `informant setup` to avoid continuous GitHub polling. On macOS,
+Informant finds both a `tailscale` command on `PATH` and the CLI embedded at
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale`. A newly created App makes this machine the
+lead, enables Funnel, stores GitHub's webhook secret in the mode-`600` machine configuration, and
+subscribes to push, pull request, issue comment, and check suite events. Connecting an existing App
+keeps polling enabled; switch it to worker mode explicitly only after a lead is running.
+
+Use the explicit commands to change roles later:
+
+```bash
+informant tailscale enable --lead --webhook-ready
+informant tailscale enable --worker --token <token-shown-by-lead>
+informant tailscale status
+informant startup enable # restart after changing the role
+```
+
+A configured lead or worker automatically falls back to GitHub polling when Tailscale is offline,
+incomplete, or fails during network startup. It returns to authenticated tailnet coordination after a
+healthy restart. `tailscale disable` permanently removes the network role and gracefully restarts an
+active managed worker so polling resumes immediately. If the worker is running in a terminal or
+another supervisor, polling begins the next time that process starts.
+
+Lead enablement prints direct **General** and **Permissions & events** settings links for every
+locally configured GitHub App, requires confirmation that each webhook is active, verifies that it
+subscribes to **Push**, **Pull request**, **Issue comment**, and **Check suite**, then updates its
+Funnel URL. When Tailscale requires tailnet-owner approval for Funnel, Informant opens the approval
+page and waits up to two minutes instead of hanging silently. GitHub does not expose an API for
+changing an existing App's activation or
+event subscriptions, so lead enablement stops with instructions instead of disabling polling when
+one is missing. The lead prints a worker token; supply that token
+when explicitly enabling each worker. All private health, dispatch, build, and log requests require
+this shared token in addition to traveling over Tailscale. The public Funnel forwards to a separate
+loopback port containing only the HMAC-verified GitHub endpoint.
 
 Local build records live under `~/.local/share/informant`; set `INFORMANT_DATA_DIR` to move them.
 The build list shows running jobs and links each build to its GitHub pull request or commit. Pass
-`--all` to show the 100 most recently updated local records. Retained logs contain at most the final
+`--all` to merge the 100 most recently updated records reported by each reachable worker. Retained logs contain at most the final
 1 MiB of stdout and 1 MiB of stderr from each command. Run `informant logs` interactively to select
-and follow a currently running job, or pass a build ID to follow its combined log directly. Informant
+and follow a currently running local job, or pass a local or remote build ID to tail its combined log
+directly. Informant
 timestamps job lifecycle events while leaving command output unchanged.
+
+In the interactive build list, select a running build or a queued/running job and press `c` to cancel
+it after confirmation. Scripts can use `informant builds cancel <build-id>`, with `--job <name>` to
+cancel only one job. Cancelling a job leaves independent jobs running; jobs that depend on it are
+skipped. Informant stops the selected process, marks its local record and GitHub check as cancelled,
+and then completes the aggregate check.
 
 `informant storage` breaks down the data directory into caches, builds and logs, and other files. It
 also includes Informant-owned Tart VM images, counts prepared images in Apple Container or rootless
@@ -124,5 +176,5 @@ job checks on the selected commit. The push-acceleration hook uses this path. Du
 `informant trigger` or `informant run --local` explicitly.
 
 Completed builds can also be re-run from GitHub. Open the commit or pull request checks, select the
-Informant check, and click **Re-run**. GitHub marks the Check Suite as queued, and the next Informant
-poll lets one eligible machine claim the new attempt. No webhook endpoint is required.
+Informant check, and click **Re-run**. GitHub marks the Check Suite as queued; the App's webhook
+notifies network workers immediately, or the next polling cycle finds it when networking is disabled.

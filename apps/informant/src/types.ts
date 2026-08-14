@@ -143,4 +143,6 @@ export interface BuildRecord {
     type: TriggerEvent | "manual" | "manual_trigger" | "manual_run";
     id: string;
   };
+  /** Transient source metadata added when builds are aggregated across the tailnet. */
+  networkWorker?: { hostName: string; address: string; port: number };
 }

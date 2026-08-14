@@ -8,6 +8,7 @@ description: Put a Linux or macOS machine on CI duty in a few minutes.
 - Apple Silicon macOS 13 or newer; Apple Container jobs require macOS 26 or newer
 - Or Debian/Ubuntu/Fedora/RHEL Linux with rootless Podman and cgroups v2
 - Git and GitHub CLI; Homebrew or `curl` for the supported installation paths
+- Optional but recommended: Tailscale with Funnel enabled for webhook-driven multi-machine workers
 
 ## Install Informant
 
@@ -52,8 +53,8 @@ Informant will:
    memory, security, and writable bind-mount constraints. Podman is daemonless; Informant does not
    start a service and does not require systemd.
 2. Ask whether your account or an organization should own the App.
-3. Open GitHub with **Checks: read/write**, **Contents: read**, **Pull requests: read/write**, and
-   webhooks disabled.
+3. If Tailscale is connected, enable a Funnel and open GitHub with the signed webhook and required
+   events already configured. Otherwise create the App with webhooks disabled and use polling.
 4. Receive and protect the generated private key automatically.
 5. Open GitHub's installation screen so you can choose repositories.
 6. Detect the installation and save its credentials without changing this machine's registered
@@ -105,4 +106,8 @@ When enabled during setup, automatic updates run from a macOS LaunchAgent or Lin
 Use `informant auto-update enable` or `informant auto-update disable` to change that choice later.
 
 Register more repositories with `informant repo add owner/repository`. Run the same registration and
-serve commands on another machine to add capacity. There is no shared database to configure.
+serve commands on another machine to add capacity. When connecting an existing GitHub App on a Tailscale peer, setup keeps polling enabled until a lead
+is explicitly confirmed. After the lead is running, copy the token it prints and run
+`informant tailscale enable --worker --token <token>` on the peer, then restart its worker. Run
+`informant tailscale status` on any machine to inspect the topology. There is no shared database to
+configure.

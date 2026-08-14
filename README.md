@@ -1,7 +1,8 @@
 # Informant
 
-**Local machines, reporting for CI duty.** Informant polls GitHub from behind your firewall,
-claims commits through the Checks API, and runs TOML-defined jobs in disposable native checkouts,
+**Local machines, reporting for CI duty.** Informant receives GitHub webhooks through an optional
+Tailscale Funnel, falls back to polling when Tailscale is not configured, claims commits through the
+Checks API, and runs TOML-defined jobs in disposable native checkouts,
 Apple containers, rootless Podman containers, or Tart VMs.
 Each job can select and prepare its own runtime image, keeping macOS VMs limited to jobs that need them.
 
@@ -12,6 +13,7 @@ Install the standalone binary and GitHub CLI with Homebrew on macOS or Linux:
 ```bash
 brew install informantdev/tap/informant
 gh auth login
+# Optional: install and connect Tailscale first for webhook-driven network workers
 informant setup
 ```
 

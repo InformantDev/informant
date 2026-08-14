@@ -1,4 +1,4 @@
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { parseRepository } from "./config.ts";
@@ -12,6 +12,15 @@ export interface GitHubCredentials {
   privateKeyFile: string;
 }
 
+export interface TailscaleConfig {
+  mode: "lead" | "worker";
+  funnelUrl?: string;
+  webhookSecret?: string;
+  networkSecret?: string;
+  workerPort: number;
+  funnelPort: number;
+}
+
 export const MAX_ALLOWED_MOUNT_BYTES = 1024 * 1024;
 
 interface MachineConfig {
@@ -22,6 +31,7 @@ interface MachineConfig {
   githubApps?: GitHubCredentials[];
   /** Legacy single-installation configuration. */
   github?: GitHubCredentials;
+  tailscale?: TailscaleConfig;
 }
 
 export function machineConfigPath(
@@ -67,6 +77,7 @@ async function readMachineConfig(path = machineConfigPath()): Promise<MachineCon
     allowedMounts: value.allowedMounts,
     githubApps: Array.isArray(value.githubApps) ? value.githubApps : undefined,
     github: value.github,
+    tailscale: value.tailscale,
   };
 }
 
@@ -136,6 +147,46 @@ async function writeMachineConfig(
 ): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await Bun.write(path, `${JSON.stringify(config, null, 2)}\n`);
+  await chmod(path, 0o600);
+}
+
+export async function getTailscaleConfig(
+  path = machineConfigPath(),
+): Promise<TailscaleConfig | undefined> {
+  const config = await readMachineConfig(path);
+  const value = config.tailscale;
+  if (!value) return undefined;
+  if (
+    (value.mode !== "lead" && value.mode !== "worker") ||
+    !Number.isInteger(value.workerPort) ||
+    value.workerPort < 1 ||
+    value.workerPort > 65_535 ||
+    !Number.isInteger(value.funnelPort) ||
+    value.funnelPort < 1 ||
+    value.funnelPort > 65_535 ||
+    (value.networkSecret !== undefined && !/^[A-Za-z0-9_-]{32,}$/.test(value.networkSecret)) ||
+    (value.mode === "lead" &&
+      (!value.funnelUrl?.startsWith("https://") || !value.webhookSecret?.length))
+  ) {
+    throw new Error(`invalid Tailscale configuration in ${path}`);
+  }
+  return value;
+}
+
+export async function saveTailscaleConfig(
+  tailscale: TailscaleConfig,
+  path = machineConfigPath(),
+): Promise<void> {
+  const config = await readMachineConfig(path);
+  await writeMachineConfig({ ...config, tailscale }, path);
+}
+
+export async function clearTailscaleConfig(path = machineConfigPath()): Promise<boolean> {
+  const config = await readMachineConfig(path);
+  if (!config.tailscale) return false;
+  const { tailscale: _tailscale, ...remaining } = config;
+  await writeMachineConfig(remaining, path);
+  return true;
 }
 
 export async function listRepositories(path = machineConfigPath()): Promise<Repository[]> {

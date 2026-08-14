@@ -2,18 +2,30 @@ import { expect, spyOn, test } from "bun:test";
 import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import packageJson from "../package.json" with { type: "json" };
 import {
   branchNameFromSymbolicRef,
+  canServeWithoutRepositories,
   cleanOrphanedBuildWorkspacesInBackground,
+  configuredGitHubAppSettings,
   executionLabelFromRef,
+  formatGitHubAppSettings,
   main,
+  openTailscaleFunnelAuthorization,
   pruneRuntimeImages,
   runInvocationType,
   runManualHousekeeping,
+  tailRemoteLog,
   updateResultMessage,
 } from "./cli.ts";
 import { selectContainerBackend } from "./container-backend.ts";
-import { createBuild, currentProcessOwner, recordWorkerVersion, saveBuild } from "./store.ts";
+import {
+  createBuild,
+  currentProcessOwner,
+  monitorBuildCancellation,
+  recordWorkerVersion,
+  saveBuild,
+} from "./store.ts";
 import type { BuildRecord, Repository } from "./types.ts";
 
 test("--version prints the package version without help", async () => {
@@ -24,7 +36,7 @@ test("--version prints the package version without help", async () => {
   try {
     await main(["--version"]);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith("0.1.4");
+    expect(log).toHaveBeenCalledWith(packageJson.version);
   } finally {
     log.mockRestore();
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
@@ -42,7 +54,7 @@ test("--version includes the version of a running server", async () => {
     await recordWorkerVersion("0.1.3");
     await main(["--version"]);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith("0.1.4\nserver: 0.1.3");
+    expect(log).toHaveBeenCalledWith(`${packageJson.version}\nserver: 0.1.3`);
   } finally {
     log.mockRestore();
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
@@ -68,6 +80,83 @@ test("execution labels follow the requested ref instead of the checked out branc
 test("run preserves reported triggers unless local execution is explicit", () => {
   expect(runInvocationType(false)).toBe("trigger");
   expect(runInvocationType(true)).toBe("local");
+});
+
+test("opens Tailscale Funnel approval in the platform browser", async () => {
+  const commands: string[][] = [];
+  let timeoutMs: number | undefined;
+  const output = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await openTailscaleFunnelAuthorization(
+      "https://login.tailscale.com/f/funnel?node=self-id",
+      async (argv, options) => {
+        commands.push(argv);
+        timeoutMs = options?.timeoutMs;
+        return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+      "darwin",
+    );
+  } finally {
+    output.mockRestore();
+  }
+  expect(commands).toEqual([["open", "https://login.tailscale.com/f/funnel?node=self-id"]]);
+  expect(timeoutMs).toBe(10_000);
+});
+
+test("loads every configured GitHub App before lead confirmation", async () => {
+  const inspected: string[] = [];
+  const apps = await configuredGitHubAppSettings({
+    listCredentials: async () => [
+      { appId: "one", installationId: "1", privateKeyFile: "/unused/one.pem" },
+      { appId: "two", installationId: "2", privateKeyFile: "/unused/two.pem" },
+    ],
+    inspect: async (credentials) => {
+      inspected.push(credentials.appId);
+      const settingsUrl = `https://github.com/settings/apps/${credentials.appId}`;
+      return {
+        appId: credentials.appId,
+        name: `Informant ${credentials.appId}`,
+        events: [],
+        settingsUrl,
+        permissionsUrl: `${settingsUrl}/permissions`,
+      };
+    },
+  });
+
+  expect(inspected).toEqual(["one", "two"]);
+  expect(apps.map((app) => app.appId)).toEqual(["one", "two"]);
+});
+
+test("formats direct GitHub App settings links for lead setup", () => {
+  expect(
+    formatGitHubAppSettings([
+      {
+        appId: "123",
+        name: "Informant acme",
+        events: [],
+        settingsUrl: "https://github.com/organizations/acme/settings/apps/informant-acme",
+        permissionsUrl:
+          "https://github.com/organizations/acme/settings/apps/informant-acme/permissions",
+      },
+    ]),
+  ).toBe(
+    [
+      "Configured GitHub App settings:",
+      "  Informant acme (123)",
+      "    General: https://github.com/organizations/acme/settings/apps/informant-acme",
+      "    Permissions & events: https://github.com/organizations/acme/settings/apps/informant-acme/permissions",
+    ].join("\n"),
+  );
+});
+
+test("a dedicated Tailscale lead can serve without local repositories", () => {
+  const lead = { mode: "lead", workerPort: 7639, funnelPort: 7640 } as const;
+  const worker = { mode: "worker", workerPort: 7639, funnelPort: 7640 } as const;
+
+  expect(canServeWithoutRepositories(lead, false)).toBe(true);
+  expect(canServeWithoutRepositories(lead, true)).toBe(false);
+  expect(canServeWithoutRepositories(worker, false)).toBe(false);
+  expect(canServeWithoutRepositories(undefined, false)).toBe(false);
 });
 
 test("local and reported trigger flags cannot be mixed", async () => {
@@ -227,6 +316,29 @@ test("builds shows running jobs by default and recent history with --all", async
     expect(activeOutput).toContain(" elapsed");
     expect(activeOutput).not.toContain("finished-build");
 
+    const cancellation = monitorBuildCancellation("running-build", ["test", "lint"], 5);
+    try {
+      await expect(main(["builds", "cancel", "running-build", "test"])).rejects.toThrow(
+        "builds cancel does not accept arguments after the build ID",
+      );
+      await expect(main(["builds", "cancel", "running-build", "--job="])).rejects.toThrow(
+        "--job requires a job name",
+      );
+      await expect(main(["builds", "cancel", "running-build", "--job=,"])).rejects.toThrow(
+        "--job requires a job name",
+      );
+      expect(cancellation.signal.aborted).toBe(false);
+
+      await main(["builds", "cancel", "running-build", "--job", "test"]);
+      for (let attempt = 0; attempt < 50 && !cancellation.jobSignal("test")?.aborted; attempt++) {
+        await Bun.sleep(5);
+      }
+      expect(cancellation.jobSignal("test")?.aborted).toBe(true);
+      expect(cancellation.signal.aborted).toBe(false);
+    } finally {
+      await cancellation.close();
+    }
+
     await main(["builds", "--all"]);
     const historyOutput = String(log.mock.calls.at(-1)?.[0]);
     expect(historyOutput).toContain("running-build");
@@ -310,4 +422,70 @@ test("logs stops following a running record when its worker is dead", async () =
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("remote logs keep reading from their last offset until the build completes", async () => {
+  const worker = {
+    id: "worker-1",
+    hostName: "worker",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: ["owner/repo"],
+  };
+  const offsets: number[] = [];
+  const output: string[] = [];
+  const expected = "first 😀\nsecond\n";
+  const bytes = new TextEncoder().encode(expected);
+  const split = new TextEncoder().encode("first ").byteLength + 2;
+  let reads = 0;
+
+  expect(
+    await tailRemoteLog("remote-build", {
+      read: async (_id, options) => {
+        offsets.push(options?.offset ?? 0);
+        reads++;
+        return reads === 1
+          ? { bytes: bytes.subarray(0, split), offset: split, running: true, worker }
+          : { bytes: bytes.subarray(split), offset: bytes.length, running: false, worker };
+      },
+      sleep: async () => {},
+      write: (text) => output.push(text),
+    }),
+  ).toBe(true);
+  expect(offsets).toEqual([0, split]);
+  expect(output.join("")).toBe(expected);
+  expect(output.join("")).not.toContain("�");
+});
+
+test("remote logs stop after a previously found worker remains unavailable", async () => {
+  const worker = {
+    id: "worker-1",
+    hostName: "worker",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: ["owner/repo"],
+  };
+  const workers: Array<string | undefined> = [];
+  let reads = 0;
+
+  expect(
+    await tailRemoteLog("remote-build", {
+      read: async (_id, options) => {
+        workers.push(options?.worker?.id);
+        reads++;
+        return reads === 1
+          ? {
+              bytes: new TextEncoder().encode("partial\n"),
+              offset: 8,
+              running: true,
+              worker,
+            }
+          : undefined;
+      },
+      sleep: async () => {},
+      write: () => {},
+    }),
+  ).toBe(true);
+  expect(reads).toBe(4);
+  expect(workers).toEqual([undefined, "worker-1", undefined, undefined]);
 });

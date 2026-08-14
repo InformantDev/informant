@@ -16,6 +16,11 @@ repository list are separate. It stores the key at
 `~/.config/informant/app-<APP_ID>.pem` with mode `600` and records the IDs in
 `~/.config/informant/config.json`. No environment variables are required.
 
+When Tailscale is connected, the manifest also enables a Tailscale Funnel webhook and subscribes the
+App to push, pull request, issue comment, and check suite events. GitHub's generated webhook secret is
+stored in the same mode-`600` machine configuration. Without Tailscale, setup leaves webhooks disabled
+and the worker polls as before.
+
 Run `informant setup` once for each personal account or organization whose repositories this machine
 will handle. Informant creates a private App for that account and keeps all previously configured Apps.
 At runtime, each registered repository uses the installation whose account matches the repository owner.
@@ -41,8 +46,9 @@ saved by `informant setup`:
 
 The registration URL requests **Checks: read/write**, **Contents: read**, and **Pull requests:
 read/write**, and disables webhooks. Pull-request write access lets CI jobs use the short-lived App
-token to publish review comments. Informant polls GitHub, so it does not need a webhook URL or a
-publicly reachable server.
+token to publish review comments. This manual configuration uses polling. To use Tailscale, also grant
+**Issues: read**, subscribe to **Push**, **Pull request**, **Issue comment**, and **Check suite**, then
+run `informant tailscale enable --lead` to configure and activate the Funnel URL.
 
 Apps created before pull-request review jobs were introduced may still have read-only access. Open
 the App's **Permissions & events** settings, change **Pull requests** to **Read and write**, save, and
@@ -138,7 +144,10 @@ same Check claims. Do not create another App for that account on the second mach
 2. Run `informant setup` on the new machine.
 3. Choose **Connect an existing App used by another machine**.
 4. Enter the existing App ID, installation ID, and downloaded PEM path.
-5. Register repositories and start `informant serve`.
+5. Register repositories and start `informant serve`; polling remains enabled by default.
+6. After confirming the network lead is running, copy its worker token and run
+   `informant tailscale enable --worker --token <token>`, then restart this worker to receive
+   authenticated notifications from the lead instead of polling GitHub.
 
 Deleting one machine's key from the GitHub App settings then revokes that machine without rotating
 every worker.

@@ -318,7 +318,18 @@ test("runInTart checks out and wires trusted container preparation inputs", asyn
 
   try {
     expect(
-      await runInTart(repository, sha, tartConfig, record, {}, undefined, {}, [], operations),
+      await runInTart(
+        repository,
+        sha,
+        tartConfig,
+        record,
+        {},
+        undefined,
+        {},
+        [],
+        undefined,
+        operations,
+      ),
     ).toBe(true);
     expect(checkouts).toEqual([
       { repositoryPath, workspace: jobWorkspace, sha, isolated: false },
@@ -334,6 +345,101 @@ test("runInTart checks out and wires trusted container preparation inputs", asyn
       trustedWorkspace,
     });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runInTart rechecks cancellation after reporting a runtime failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-tart-cancelled-failure-"));
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const sha = "trusted-sha";
+  const record: BuildRecord = {
+    id: "cancelled-failure",
+    repo: repository.fullName,
+    sha,
+    branch: "main",
+    machine: "worker",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    logPath: join(root, "build", "build.log"),
+  };
+  const tartConfig: InformantConfig = {
+    ...config(),
+    trustedSha: sha,
+    jobs: [
+      {
+        ...job("test"),
+        runtime: { type: "container", image: "example/test:latest" },
+      },
+    ],
+  };
+  const cancellation = new AbortController();
+  let progressStarted: (() => void) | undefined;
+  const progressEntered = new Promise<void>((resolve) => {
+    progressStarted = resolve;
+  });
+  let releaseProgress: (() => void) | undefined;
+  const progressBlocked = new Promise<void>((resolve) => {
+    releaseProgress = resolve;
+  });
+  const outcomes: string[] = [];
+  const operations: RunInTartOperations = {
+    reconcilePreparedImageReferences: async () => 0,
+    claimBuildWorkspace: async (workspace) => {
+      await mkdir(workspace, { recursive: true });
+    },
+    requireCommand: async () => "",
+    checkoutBuildWorkspace: async () => ({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+    }),
+    runInContainer: async (
+      _repository,
+      _sha,
+      _branch,
+      _trustedSha,
+      _trustedCaches,
+      _workspace,
+      _job,
+      _log,
+      started,
+    ) => {
+      await started();
+      throw new Error("runtime failed");
+    },
+  };
+
+  try {
+    const running = runInTart(
+      repository,
+      sha,
+      tartConfig,
+      record,
+      {
+        progress: async () => {
+          progressStarted?.();
+          await progressBlocked;
+        },
+        completed: (_job, result) => {
+          outcomes.push(result.outcome);
+        },
+      },
+      undefined,
+      {},
+      [],
+      () => cancellation.signal,
+      operations,
+    );
+    await progressEntered;
+    cancellation.abort("cancel during failure reporting");
+    releaseProgress?.();
+
+    expect(await running).toBe(false);
+    expect(outcomes).toEqual(["cancelled"]);
+  } finally {
+    releaseProgress?.();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -1141,5 +1247,47 @@ describe("job scheduler", () => {
     expect(executed).toEqual(["review"]);
     expect(failed).toEqual(["review"]);
     expect(skipped).toEqual(["publish"]);
+  });
+
+  test("cancelled optional jobs still block dependent jobs", async () => {
+    const executed: string[] = [];
+    const skipped: string[] = [];
+    expect(
+      await scheduleJobs(
+        [job("review", [], true), job("publish", ["review"])],
+        async (current) => {
+          executed.push(current.name);
+          return "cancelled";
+        },
+        async (current) => {
+          skipped.push(current.name);
+        },
+      ),
+    ).toBe(false);
+    expect(executed).toEqual(["review"]);
+    expect(skipped).toEqual(["publish"]);
+  });
+
+  test("cancels a queued job before its runtime callback starts", async () => {
+    const controller = new AbortController();
+    const executed: string[] = [];
+    const cancelled: string[] = [];
+    expect(
+      await scheduleJobs(
+        [job("build"), job("deploy", ["build"])],
+        async (current) => {
+          executed.push(current.name);
+          if (current.name === "build") controller.abort("cancel deploy");
+          return true;
+        },
+        async (current) => {
+          cancelled.push(current.name);
+        },
+        undefined,
+        (current) => current.name === "deploy" && controller.signal.aborted,
+      ),
+    ).toBe(false);
+    expect(executed).toEqual(["build"]);
+    expect(cancelled).toEqual(["deploy"]);
   });
 });
