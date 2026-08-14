@@ -907,9 +907,13 @@ async function runCommitPartitionWithSlot(
     if (executionFinished) throw error;
     record.status = "failure";
     record.runningJobs = [];
-    record.jobs = record.jobs?.map((job) =>
-      job.status === "queued" || job.status === "running" ? { ...job, status: "failure" } : job,
-    );
+    record.jobs = record.jobs?.map((job) => {
+      if (job.status !== "queued" && job.status !== "running") return job;
+      return {
+        ...job,
+        status: cancellation?.jobSignal(job.name)?.aborted ? "cancelled" : "failure",
+      };
+    });
     record.completedAt = new Date().toISOString();
     await dependencies.saveBuild(record).catch(() => undefined);
     let reportingError: unknown;

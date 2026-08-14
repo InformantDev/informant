@@ -319,6 +319,7 @@ export function monitorBuildCancellation(
   pollIntervalMs = 250,
   operations: {
     readBuild?: typeof getBuild;
+    writeAcknowledgement?: (path: string) => Promise<unknown>;
   } = {},
 ): BuildCancellationMonitor {
   const buildController = new AbortController();
@@ -339,15 +340,28 @@ export function monitorBuildCancellation(
       await rm(path, { force: true });
       return;
     }
+    const acknowledgement = cancellationAcknowledgementPath(id, request.requestId);
+    const temporaryAcknowledgement = join(
+      dirname(acknowledgement),
+      `.acknowledgement-${crypto.randomUUID()}.tmp`,
+    );
+    try {
+      await mkdir(dirname(acknowledgement), { recursive: true });
+      await (operations.writeAcknowledgement ?? ((target) => Bun.write(target, "")))(
+        temporaryAcknowledgement,
+      );
+      await rename(temporaryAcknowledgement, acknowledgement);
+    } catch {
+      await rm(temporaryAcknowledgement, { force: true }).catch(() => undefined);
+      // Leave the request pending so transient publication failures can be retried.
+      return;
+    }
     controller.abort(
       request.job
         ? `Cancellation requested for ${request.job} from informant builds.`
         : "Cancellation requested from informant builds.",
     );
-    const acknowledgement = cancellationAcknowledgementPath(id, request.requestId);
-    await mkdir(dirname(acknowledgement), { recursive: true });
-    await Bun.write(acknowledgement, "");
-    await rm(path, { force: true });
+    await rm(path, { force: true }).catch(() => undefined);
   };
   const task = (async () => {
     while (open) {

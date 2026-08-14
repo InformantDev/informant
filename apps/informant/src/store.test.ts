@@ -242,6 +242,65 @@ test("cancellation requests are hidden until their contents are complete", async
   }
 });
 
+test("cancellation waits for acknowledgement publication and retries transient failures", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "acknowledgement-retry",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    runningJobs: ["test"],
+    jobs: [{ name: "test", status: "running" }],
+    owner: currentProcessOwner(),
+    logPath: join(root, "builds", "acknowledgement-retry", "build.log"),
+  };
+  await createBuild(record);
+  let firstAttemptReached: (() => void) | undefined;
+  const firstAttempt = new Promise<void>((resolve) => {
+    firstAttemptReached = resolve;
+  });
+  let releaseFirstAttempt: (() => void) | undefined;
+  const firstAttemptBlocked = new Promise<void>((resolve) => {
+    releaseFirstAttempt = resolve;
+  });
+  const acknowledgementWrites: string[] = [];
+  const monitor = monitorBuildCancellation(record.id, ["test"], 5, {
+    writeAcknowledgement: async (path) => {
+      acknowledgementWrites.push(path);
+      if (acknowledgementWrites.length === 1) {
+        await Bun.write(path, "partial");
+        firstAttemptReached?.();
+        await firstAttemptBlocked;
+        throw new Error("disk temporarily unavailable");
+      }
+      return Bun.write(path, "");
+    },
+  });
+
+  try {
+    const cancellation = requestBuildCancellation(record.id, undefined, {
+      requestId: "acknowledgement-retry-request",
+      timeoutMs: 500,
+    });
+    await firstAttempt;
+    expect(acknowledgementWrites[0]).toEndWith(".tmp");
+    expect(monitor.signal.aborted).toBe(false);
+    releaseFirstAttempt?.();
+
+    await cancellation;
+    expect(acknowledgementWrites.length).toBeGreaterThanOrEqual(2);
+    expect(monitor.signal.aborted).toBe(true);
+  } finally {
+    releaseFirstAttempt?.();
+    await monitor.close();
+  }
+});
+
 test("cancellation revalidates a stale read after a terminal save", async () => {
   const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
   roots.push(root);

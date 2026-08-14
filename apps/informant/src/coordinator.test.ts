@@ -1786,6 +1786,64 @@ describe("runCommit", () => {
     });
   });
 
+  test("preserves queued reported job cancellation when setup fails", async () => {
+    const context = harness();
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multipleJobs = {
+      ...config,
+      jobs: [base, { ...base, name: "lint", needs: [base.name] }],
+    };
+    const setupStarted = deferred<void>();
+    const releaseSetup = deferred<void>();
+    let cancelTarget: (() => void) | undefined;
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      cancelTarget = () =>
+        jobControllers
+          .get(base.name)
+          ?.abort(`Cancellation requested for ${base.name} from informant builds.`);
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async () => {
+      setupStarted.resolve();
+      await releaseSetup.promise;
+      throw new Error("checkout failed");
+    };
+
+    const running = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      multipleJobs,
+      context.dependencies,
+    );
+    await setupStarted.promise;
+    if (!cancelTarget) throw new Error("expected a job cancellation controller");
+    cancelTarget();
+    releaseSetup.resolve();
+
+    await expect(running).rejects.toThrow("checkout failed");
+    expect(context.saved.at(-1)).toMatchObject({
+      status: "failure",
+      jobs: [
+        { name: "test", status: "cancelled" },
+        { name: "lint", status: "failure" },
+      ],
+    });
+    expect(
+      context.updates.find(
+        (update) => update.id === 100 && update.values.conclusion === "cancelled",
+      ),
+    ).toBeDefined();
+  });
+
   test("keeps cancellation during job check creation active until setup exits", async () => {
     const context = harness({ manualTrigger: true });
     const checkStarted = deferred<void>();
