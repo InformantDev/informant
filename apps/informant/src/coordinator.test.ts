@@ -1602,6 +1602,38 @@ describe("runCommit", () => {
     expect(context.receivedBranches).toEqual(["release"]);
   });
 
+  test("pull request suite reruns exclude tag-only jobs", async () => {
+    const context = harness({ manualTrigger: true, originalPullRequest: 7 });
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const rerunConfig: InformantConfig = {
+      ...config,
+      triggers: [{ event: "commit", pullRequest: {} }],
+      jobs: [
+        base,
+        {
+          ...base,
+          name: "release-build",
+          triggers: [{ event: "commit", tag: { patterns: ["v*"] } }],
+        },
+      ],
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "feature",
+      rerunConfig,
+      context.dependencies,
+      { type: "commit", branch: "feature", id: "branch:feature:sha" },
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("success");
+    expect(context.jobChecks).toEqual(["test"]);
+  });
+
   test("a pull request rerun discovered through a branch does not satisfy its filter", async () => {
     const context = harness({ manualTrigger: true, originalPullRequest: 7 });
     const filtered = {

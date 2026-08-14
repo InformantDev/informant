@@ -498,11 +498,26 @@ async function runCommitPartitionWithSlot(
     rerunPullRequest !== undefined || claim.manualTriggerBranch === null
       ? undefined
       : (claim.manualTriggerBranch ?? event?.branch);
-  config = claim.manualTrigger
-    ? selectManuallyTriggeredJobs(config, claim.requestedJobs, selectionBranch)
-    : event
-      ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
+  if (claim.manualTrigger && rerunPullRequest !== undefined) {
+    const requestedConfig = claim.requestedJobs.length
+      ? selectJobs(config, claim.requestedJobs)
       : config;
+    const pullRequestEvent = event?.pullRequest?.number === rerunPullRequest ? event : undefined;
+    config = selectTriggeredJobs(
+      requestedConfig,
+      (rule) =>
+        pullRequestEvent
+          ? triggerMatches(rule, pullRequestEvent)
+          : rule.event === "commit" && rule.branch === undefined && rule.tag === undefined,
+      undefined,
+    );
+  } else {
+    config = claim.manualTrigger
+      ? selectManuallyTriggeredJobs(config, claim.requestedJobs, selectionBranch)
+      : event
+        ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
+        : config;
+  }
   if (config.jobs.length === 0) {
     await github.updateCheck(repository, check.id, {
       status: "completed",
