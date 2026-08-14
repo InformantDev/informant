@@ -15,9 +15,11 @@ import {
   jobEventLine,
   preparedImageName,
   prunePreparedImages,
+  type RunInTartOperations,
   reconcilePreparedImageReferences,
   reconcilePreparedImageRepositories,
   resolveJobSecrets,
+  runInTart,
   scheduleJobs,
   secretMount,
   streamingSecretRedactor,
@@ -31,7 +33,7 @@ import {
   raiseFileDescriptorLimit,
 } from "./tart/layout.ts";
 import { digest, sshCommand, withImageLock } from "./tart/vm.ts";
-import type { InformantConfig } from "./types.ts";
+import type { BuildRecord, InformantConfig } from "./types.ts";
 
 const job = (
   name: string,
@@ -221,6 +223,119 @@ const config = (prepare?: string): InformantConfig => ({
     prepare,
   },
   jobs: [job("test")],
+});
+
+test("runInTart checks out and wires trusted container preparation inputs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-tart-orchestration-"));
+  const buildDirectory = join(root, "build");
+  const workspaceRoot = join(buildDirectory, "workspace");
+  const repositoryPath = join(workspaceRoot, "repository");
+  const jobWorkspace = join(workspaceRoot, "job-0");
+  const trustedWorkspace = join(workspaceRoot, "trusted-job-0");
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const sha = "untrusted-sha";
+  const trustedSha = "trusted-sha";
+  const record: BuildRecord = {
+    id: "orchestration",
+    repo: repository.fullName,
+    sha,
+    branch: "feature",
+    machine: "worker",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    logPath: join(buildDirectory, "build.log"),
+  };
+  const tartConfig: InformantConfig = {
+    ...config(),
+    trustedSha,
+    jobs: [
+      {
+        ...job("review"),
+        runtime: {
+          type: "container",
+          image: "example/review:latest",
+          prepare: "install review tools",
+          prepareInputs: ["extension.ts"],
+          trustedPrepareInputs: true,
+        },
+      },
+    ],
+  };
+  const checkouts: Array<{
+    repositoryPath: string;
+    workspace: string;
+    sha: string;
+    isolated: boolean;
+  }> = [];
+  let containerCall:
+    | {
+        repository: typeof repository;
+        sha: string;
+        branch: string;
+        trustedSha: string;
+        trustedCaches: boolean;
+        workspace: string;
+        trustedWorkspace?: string;
+      }
+    | undefined;
+  const operations: RunInTartOperations = {
+    reconcilePreparedImageReferences: async () => 0,
+    claimBuildWorkspace: async (workspace) => {
+      await mkdir(workspace, { recursive: true });
+    },
+    requireCommand: async () => "",
+    checkoutBuildWorkspace: async (source, workspace, checkoutSha, isolated) => {
+      checkouts.push({ repositoryPath: source, workspace, sha: checkoutSha, isolated });
+      return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+    },
+    runInContainer: async (
+      receivedRepository,
+      receivedSha,
+      branch,
+      receivedTrustedSha,
+      trustedCaches,
+      workspace,
+      _job,
+      _log,
+      started,
+      _runtimeSecrets,
+      _signal,
+      containerOperations,
+    ) => {
+      containerCall = {
+        repository: receivedRepository,
+        sha: receivedSha,
+        branch,
+        trustedSha: receivedTrustedSha,
+        trustedCaches,
+        workspace,
+        trustedWorkspace: containerOperations?.trustedWorkspace,
+      };
+      await started();
+      return { success: true, exitCode: 0, timedOut: false };
+    },
+  };
+
+  try {
+    expect(
+      await runInTart(repository, sha, tartConfig, record, {}, undefined, {}, [], operations),
+    ).toBe(true);
+    expect(checkouts).toEqual([
+      { repositoryPath, workspace: jobWorkspace, sha, isolated: false },
+      { repositoryPath, workspace: trustedWorkspace, sha: trustedSha, isolated: true },
+    ]);
+    expect(containerCall).toEqual({
+      repository,
+      sha,
+      branch: record.branch,
+      trustedSha,
+      trustedCaches: false,
+      workspace: jobWorkspace,
+      trustedWorkspace,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("prepared image identity changes with its source or preparation", () => {

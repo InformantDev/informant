@@ -13,13 +13,19 @@
     "check:fix": "biome check --write .",
     "dev": "bun run --cwd apps/informant dev",
     "docs:dev": "bun run --cwd apps/web dev",
-    "test": "turbo run test --filter=@informant/cli",
-    "typecheck": "turbo run typecheck"
+    "test": "bun run test:extensions && turbo run test --filter=@informant/cli",
+    "test:extensions": "bun test informant-extensions.test.ts",
+    "typecheck": "bun run typecheck:extensions && turbo run typecheck",
+    "typecheck:extensions": "tsc --noEmit -p tsconfig.extensions.json"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.16",
+    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1",
     "@types/bun": "latest",
     "turbo": "2.10.8",
+    "typebox": "1.3.7",
     "typescript": "^5"
   }
 }
