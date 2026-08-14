@@ -34,6 +34,9 @@ informant hook install                 Install the push-accelerating pre-push ho
 informant hook uninstall               Remove Informant from the pre-push hook
 informant builds                       List builds currently running on this machine
 informant builds --all                 List recent build history
+informant builds cancel <build-id>     Cancel a running build
+informant builds cancel <build-id> --job test
+                                       Cancel one queued or running job
 informant logs [<build-id>]             Tail a build's logs or select a running job
 informant update                        Install a newer release and restart a running worker
 informant storage                      Show Informant disk usage and available space
@@ -54,6 +57,12 @@ The build list shows running jobs and links each build to its GitHub pull reques
 1 MiB of stdout and 1 MiB of stderr from each command. Run `informant logs` interactively to select
 and follow a currently running job, or pass a build ID to follow its combined log directly. Informant
 timestamps job lifecycle events while leaving command output unchanged.
+
+In the interactive build list, select a running build or a queued/running job and press `c` to cancel
+it after confirmation. Scripts can use `informant builds cancel <build-id>`, with `--job <name>` to
+cancel only one job. Cancelling a job leaves independent jobs running; jobs that depend on it are
+skipped. Informant stops the selected process, marks its local record and GitHub check as cancelled,
+and then completes the aggregate check.
 
 `informant storage` breaks down the data directory into caches, builds and logs, and other files. It
 also includes Informant-owned Tart VM images, counts prepared images in Apple Container or rootless

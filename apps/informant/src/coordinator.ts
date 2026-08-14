@@ -7,7 +7,13 @@ import { refreshSelectedContainerBackend } from "./container-backend.ts";
 import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
 import type { ClaimResult, GitHubClient } from "./github.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
-import { createBuild, currentProcessOwner, dataDirectory, saveBuild } from "./store.ts";
+import {
+  createBuild,
+  currentProcessOwner,
+  dataDirectory,
+  monitorBuildCancellation,
+  saveBuild,
+} from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
 import { withImageLock } from "./tart/vm.ts";
 import { type EventContext, triggerMatches } from "./triggers.ts";
@@ -20,6 +26,7 @@ export interface CoordinatorDependencies {
   saveBuild: typeof saveBuild;
   runInTart: typeof runInTart;
   readLogTail: (path: string) => Promise<string>;
+  monitorBuildCancellation?: typeof monitorBuildCancellation;
   housekeepingBarrier?: <T>(callback: () => Promise<T>) => Promise<T>;
   refreshContainerBackend?: (signal?: AbortSignal) => Promise<boolean>;
   workerCapabilities?: () => string[];
@@ -147,10 +154,16 @@ export async function runLocalCommit(
     event: { type: "manual_run", id },
   };
 
+  let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
+
   try {
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));
+    cancellation = (dependencies.monitorBuildCancellation ?? monitorBuildCancellation)(
+      record.id,
+      config.jobs.map((job) => job.name),
+    );
     const success = await dependencies.runInTart(
       repository,
       sha,
@@ -172,23 +185,33 @@ export async function runLocalCommit(
           await dependencies.saveBuild(record).catch(() => undefined);
         },
       },
-      undefined,
+      cancellation.signal,
       options.runtimeSecrets,
       configuredVmJobs,
+      cancellation.jobSignal,
     );
-    record.status = success ? "success" : "failure";
+    const cancelled =
+      cancellation.signal.aborted ||
+      (record.jobs?.some((job) => job.status === "cancelled") ?? false);
+    record.status = cancelled ? "cancelled" : success ? "success" : "failure";
     record.completedAt = new Date().toISOString();
     await dependencies.saveBuild(record);
     return record;
   } catch (error) {
-    record.status = "failure";
+    const cancelled = cancellation?.signal.aborted ?? false;
+    record.status = cancelled ? "cancelled" : "failure";
     record.runningJobs = [];
-    record.jobs = record.jobs?.map((job) =>
-      job.status === "queued" || job.status === "running" ? { ...job, status: "failure" } : job,
-    );
+    record.jobs = record.jobs?.map((job) => {
+      if (job.status !== "queued" && job.status !== "running") return job;
+      const jobCancelled = cancellation?.jobSignal(job.name)?.aborted ?? false;
+      return { ...job, status: cancelled || jobCancelled ? "cancelled" : "failure" };
+    });
     record.completedAt = new Date().toISOString();
     await dependencies.saveBuild(record).catch(() => undefined);
+    if (cancelled) return record;
     throw error;
+  } finally {
+    await cancellation?.close();
   }
 }
 
@@ -470,16 +493,31 @@ async function runCommitPartitionWithSlot(
     branch = claim.manualTriggerBranch;
   // Automatic-lane supersession must not cancel manually claimed work. Forced worker shutdown is
   // independent of supersession and must always reach the selected runtime.
-  const executionSignal = claim.manualTrigger ? forcedShutdownSignal : automaticExecutionSignal;
+  let executionSignal = claim.manualTrigger ? forcedShutdownSignal : automaticExecutionSignal;
   const selectionBranch =
     rerunPullRequest !== undefined || claim.manualTriggerBranch === null
       ? undefined
       : (claim.manualTriggerBranch ?? event?.branch);
-  config = claim.manualTrigger
-    ? selectManuallyTriggeredJobs(config, claim.requestedJobs, selectionBranch)
-    : event
-      ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
+  if (claim.manualTrigger && rerunPullRequest !== undefined) {
+    const requestedConfig = claim.requestedJobs.length
+      ? selectJobs(config, claim.requestedJobs)
       : config;
+    const pullRequestEvent = event?.pullRequest?.number === rerunPullRequest ? event : undefined;
+    config = selectTriggeredJobs(
+      requestedConfig,
+      (rule) =>
+        pullRequestEvent
+          ? triggerMatches(rule, pullRequestEvent)
+          : rule.event === "commit" && rule.branch === undefined && rule.tag === undefined,
+      undefined,
+    );
+  } else {
+    config = claim.manualTrigger
+      ? selectManuallyTriggeredJobs(config, claim.requestedJobs, selectionBranch)
+      : event
+        ? selectTriggeredJobs(config, (rule) => triggerMatches(rule, event), event.branch)
+        : config;
+  }
   if (config.jobs.length === 0) {
     await github.updateCheck(repository, check.id, {
       status: "completed",
@@ -503,6 +541,7 @@ async function runCommitPartitionWithSlot(
     lastProgressAt: number;
   }
   const jobChecks = new Map<string, JobCheckState>();
+  let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
 
   const record: BuildRecord = {
     id,
@@ -525,13 +564,17 @@ async function runCommitPartitionWithSlot(
         ? { type: event.type, id: event.id }
         : { type: "manual", id: check.id.toString() },
   };
+  const cancellationSummary = (name: string, fallback: string): string => {
+    const jobCancellation = cancellation?.jobSignal(name);
+    if (jobCancellation?.aborted) return String(jobCancellation.reason || fallback);
+    if (executionSignal?.aborted) return String(executionSignal.reason || fallback);
+    return fallback;
+  };
   const cancelledValues = (name: string): CheckUpdate => ({
     status: "completed",
     conclusion: "cancelled",
     title: `${name} cancelled`,
-    summary: executionSignal?.aborted
-      ? String(executionSignal.reason || "Superseded by a newer commit.")
-      : "The build stopped before this job completed.",
+    summary: cancellationSummary(name, "The build stopped before this job completed."),
   });
   const completedValues = (job: JobConfig, outcome: JobOutcome, log: string): CheckUpdate => {
     const optionalFailure = outcome === "failure" && job.optional;
@@ -550,7 +593,7 @@ async function runCommitPartitionWithSlot(
         outcome === "skipped"
           ? "Skipped because a dependency failed."
           : outcome === "cancelled"
-            ? String(executionSignal?.reason || "The build was cancelled.")
+            ? cancellationSummary(job.name, "The build was cancelled.")
             : optionalFailure
               ? "This optional job failed without failing the build."
               : `Ran on ${record.machine}.`,
@@ -667,14 +710,40 @@ async function runCommitPartitionWithSlot(
 
   let childrenReconciled = false;
   let executionFinished = false;
+  let workActive = false;
   try {
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));
+    workActive = true;
+    cancellation = (dependencies.monitorBuildCancellation ?? monitorBuildCancellation)(
+      record.id,
+      config.jobs.map((job) => job.name),
+    );
+    executionSignal = executionSignal
+      ? AbortSignal.any([executionSignal, cancellation.signal])
+      : cancellation.signal;
+    cancellation.signal.addEventListener(
+      "abort",
+      () => {
+        if (workActive) return;
+        record.status = "cancelled";
+        record.runningJobs = [];
+        record.jobs = record.jobs?.map((job) =>
+          job.status === "queued" || job.status === "running"
+            ? { ...job, status: "cancelled" }
+            : job,
+        );
+        record.completedAt = new Date().toISOString();
+        void dependencies.saveBuild(record).catch(() => undefined);
+      },
+      { once: true },
+    );
     let executionError: unknown;
     let success = false;
     try {
       for (const job of config.jobs) {
+        executionSignal.throwIfAborted();
         const jobCheck = await github.createJobCheck(repository, sha, check.id, job.name);
         jobChecks.set(job.name, {
           check: jobCheck,
@@ -682,6 +751,7 @@ async function runCommitPartitionWithSlot(
           terminal: false,
           lastProgressAt: 0,
         });
+        executionSignal.throwIfAborted();
       }
 
       const runtimeSecrets: RuntimeSecrets = config.jobs.some((job) =>
@@ -727,12 +797,20 @@ async function runCommitPartitionWithSlot(
         executionSignal,
         runtimeSecrets,
         configuredVmJobs,
+        cancellation.jobSignal,
       );
     } catch (error) {
       executionError = error;
+    } finally {
+      workActive = false;
     }
 
     if (executionSignal?.aborted) {
+      const unfinishedJobs = new Set(
+        record.jobs
+          ?.filter((job) => job.status === "queued" || job.status === "running")
+          .map((job) => job.name),
+      );
       record.status = "cancelled";
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
@@ -742,6 +820,7 @@ async function runCommitPartitionWithSlot(
       executionFinished = true;
       await dependencies.saveBuild(record);
       for (const state of jobChecks.values()) {
+        if (cancellation.signal.aborted && !unfinishedJobs.has(state.job.name)) continue;
         state.desired = cancelledValues(state.job.name);
         state.terminal = false;
       }
@@ -757,7 +836,7 @@ async function runCommitPartitionWithSlot(
         await completeAggregate({
           status: "completed",
           conclusion: "cancelled",
-          title: "Superseded by a newer commit",
+          title: cancellation.signal.aborted ? "Build cancelled" : "Superseded by a newer commit",
           summary: String(executionSignal.reason || "This build was cancelled."),
         });
       } catch (error) {
@@ -773,34 +852,68 @@ async function runCommitPartitionWithSlot(
     }
     await reconcileJobChecks().catch(() => reconcileJobChecks());
     childrenReconciled = true;
+    if (executionSignal.aborted) {
+      record.status = "cancelled";
+      record.runningJobs = [];
+      record.jobs = record.jobs?.map((job) =>
+        job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
+      );
+      record.completedAt = new Date().toISOString();
+      executionFinished = true;
+      await dependencies.saveBuild(record);
+      if (!cancellation.signal.aborted) {
+        for (const state of jobChecks.values()) {
+          state.desired = cancelledValues(state.job.name);
+          state.terminal = false;
+        }
+        childrenReconciled = false;
+        await reconcileJobChecks().catch(() => reconcileJobChecks());
+        childrenReconciled = true;
+      }
+      await completeAggregate({
+        status: "completed",
+        conclusion: "cancelled",
+        title: cancellation.signal.aborted ? "Build cancelled" : "Superseded by a newer commit",
+        summary: String(executionSignal.reason || "This build was cancelled."),
+      });
+      return record;
+    }
     if (executionError) throw executionError;
 
-    record.status = success ? "success" : "failure";
-    record.completedAt = new Date().toISOString();
     const outcomes = [...jobChecks.values()].map((state) => state.desired?.conclusion);
     const passed = outcomes.filter((outcome) => outcome === "success").length;
     const failed = outcomes.filter((outcome) => outcome === "failure").length;
     const optionalFailures = outcomes.filter((outcome) => outcome === "neutral").length;
     const skipped = outcomes.filter((outcome) => outcome === "skipped").length;
+    const cancelled = outcomes.filter((outcome) => outcome === "cancelled").length;
+    record.status = cancelled > 0 ? "cancelled" : success ? "success" : "failure";
+    record.completedAt = new Date().toISOString();
     executionFinished = true;
     await dependencies.saveBuild(record).catch(() => undefined);
     await completeAggregate({
       status: "completed",
-      conclusion: success ? "success" : "failure",
-      title: success
-        ? optionalFailures > 0
-          ? "All required jobs passed"
-          : "All jobs passed"
-        : "A job failed",
-      summary: `${passed} passed, ${failed} failed, ${optionalFailures} optional failure${optionalFailures === 1 ? "" : "s"}, and ${skipped} skipped on ${record.machine}.`,
+      conclusion: cancelled > 0 ? "cancelled" : success ? "success" : "failure",
+      title:
+        cancelled > 0
+          ? `${cancelled} ${cancelled === 1 ? "job" : "jobs"} cancelled`
+          : success
+            ? optionalFailures > 0
+              ? "All required jobs passed"
+              : "All jobs passed"
+            : "A job failed",
+      summary: `${passed} passed, ${failed} failed, ${optionalFailures} optional failure${optionalFailures === 1 ? "" : "s"}, ${cancelled} cancelled, and ${skipped} skipped on ${record.machine}.`,
     });
   } catch (error) {
     if (executionFinished) throw error;
     record.status = "failure";
     record.runningJobs = [];
-    record.jobs = record.jobs?.map((job) =>
-      job.status === "queued" || job.status === "running" ? { ...job, status: "failure" } : job,
-    );
+    record.jobs = record.jobs?.map((job) => {
+      if (job.status !== "queued" && job.status !== "running") return job;
+      return {
+        ...job,
+        status: cancellation?.jobSignal(job.name)?.aborted ? "cancelled" : "failure",
+      };
+    });
     record.completedAt = new Date().toISOString();
     await dependencies.saveBuild(record).catch(() => undefined);
     let reportingError: unknown;
@@ -835,6 +948,7 @@ async function runCommitPartitionWithSlot(
     }
     throw error;
   } finally {
+    await cancellation?.close();
     await dependencies.saveBuild(record).catch(() => undefined);
   }
   return record;

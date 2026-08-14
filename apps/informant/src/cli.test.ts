@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { appendFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import packageJson from "../package.json" with { type: "json" };
 import {
   branchNameFromSymbolicRef,
   cleanOrphanedBuildWorkspacesInBackground,
@@ -13,7 +14,13 @@ import {
   updateResultMessage,
 } from "./cli.ts";
 import { selectContainerBackend } from "./container-backend.ts";
-import { createBuild, currentProcessOwner, recordWorkerVersion, saveBuild } from "./store.ts";
+import {
+  createBuild,
+  currentProcessOwner,
+  monitorBuildCancellation,
+  recordWorkerVersion,
+  saveBuild,
+} from "./store.ts";
 import type { BuildRecord, Repository } from "./types.ts";
 
 test("--version prints the package version without help", async () => {
@@ -24,7 +31,7 @@ test("--version prints the package version without help", async () => {
   try {
     await main(["--version"]);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith("0.1.4");
+    expect(log).toHaveBeenCalledWith(packageJson.version);
   } finally {
     log.mockRestore();
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
@@ -42,7 +49,7 @@ test("--version includes the version of a running server", async () => {
     await recordWorkerVersion("0.1.3");
     await main(["--version"]);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith("0.1.4\nserver: 0.1.3");
+    expect(log).toHaveBeenCalledWith(`${packageJson.version}\nserver: 0.1.3`);
   } finally {
     log.mockRestore();
     if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
@@ -226,6 +233,29 @@ test("builds shows running jobs by default and recent history with --all", async
     );
     expect(activeOutput).toContain(" elapsed");
     expect(activeOutput).not.toContain("finished-build");
+
+    const cancellation = monitorBuildCancellation("running-build", ["test", "lint"], 5);
+    try {
+      await expect(main(["builds", "cancel", "running-build", "test"])).rejects.toThrow(
+        "builds cancel does not accept arguments after the build ID",
+      );
+      await expect(main(["builds", "cancel", "running-build", "--job="])).rejects.toThrow(
+        "--job requires a job name",
+      );
+      await expect(main(["builds", "cancel", "running-build", "--job=,"])).rejects.toThrow(
+        "--job requires a job name",
+      );
+      expect(cancellation.signal.aborted).toBe(false);
+
+      await main(["builds", "cancel", "running-build", "--job", "test"]);
+      for (let attempt = 0; attempt < 50 && !cancellation.jobSignal("test")?.aborted; attempt++) {
+        await Bun.sleep(5);
+      }
+      expect(cancellation.jobSignal("test")?.aborted).toBe(true);
+      expect(cancellation.signal.aborted).toBe(false);
+    } finally {
+      await cancellation.close();
+    }
 
     await main(["builds", "--all"]);
     const historyOutput = String(log.mock.calls.at(-1)?.[0]);

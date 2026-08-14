@@ -72,3 +72,42 @@ test("rejects untrusted commits before executing a host job", async () => {
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+test("does not start a host job whose signal is already cancelled", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-host-"));
+  const controller = new AbortController();
+  controller.abort("cancelled while queued");
+  let started = false;
+  try {
+    await expect(
+      runOnHost(
+        { owner: "owner", repo: "repo", fullName: "owner/repo" },
+        "abc123",
+        "main",
+        "abc123",
+        workspace,
+        {
+          name: "test",
+          command: "touch executed",
+          optional: false,
+          timeoutMinutes: 1,
+          environment: {},
+          secrets: [],
+          needs: [],
+          runsOn: ["linux"],
+          runtime: { type: "host" },
+        },
+        async () => {},
+        async () => {
+          started = true;
+        },
+        {},
+        controller.signal,
+      ),
+    ).rejects.toBe("cancelled while queued");
+    expect(started).toBeFalse();
+    expect(await Bun.file(join(workspace, "executed")).exists()).toBeFalse();
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
