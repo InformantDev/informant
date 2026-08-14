@@ -123,6 +123,10 @@ async function repositoryConfig(
 
 export interface ServerOptions {
   once?: boolean;
+  /** Bypass the periodic tag throttle for a tag-push webhook synchronization. */
+  forceTagPoll?: boolean;
+  /** Propagate a failed one-shot poll so event-driven callers can retry it. */
+  throwOnPollError?: boolean;
   signal?: AbortSignal;
   onMessage?: (message: string) => void;
   onIdle?: () => Promise<void> | void;
@@ -491,7 +495,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       );
       const shouldPollTags =
         hasTagTriggers &&
-        (!state.tagsPolledAt ||
+        (options.forceTagPoll ||
+          !state.tagsPolledAt ||
           Date.now() - new Date(state.tagsPolledAt).getTime() >= TAG_POLL_INTERVAL_MS);
       const [branches, tags, prs] = await Promise.all([
         github.branches(repository, options.signal),
@@ -814,6 +819,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             : `poll failed: ${detail}`;
       if (pollError !== lastPollError) message(pollError);
       lastPollError = pollError;
+      if (options.once && options.throwOnPollError) {
+        await drainOnce();
+        throw error;
+      }
     }
     if (options.once) {
       await drainOnce();

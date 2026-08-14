@@ -29,17 +29,18 @@ import { formatHousekeepingSummary, runHousekeeping } from "./housekeeping.ts";
 import {
   addRepository,
   allowMount,
+  getTailscaleConfig,
   listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
   removeAllowedMount,
   removeRepository,
   saveAutomaticUpdatesPreference,
+  type TailscaleConfig,
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
-import { serveRepositories } from "./server.ts";
 import { setup } from "./setup.ts";
-import { disableStartup, enableStartup } from "./startup.ts";
+import { disableStartup, enableStartup, restartStartupWorker } from "./startup.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
@@ -51,14 +52,21 @@ import {
   dataDirectory,
   getBuild,
   jobLogPath,
-  listActiveBuilds,
-  listBuilds,
   reconcileBuildLiveness,
   recordWorkerVersion,
   removeOrphanedBuildWorkspaces,
   requestBuildCancellation,
   runningWorkerVersion,
 } from "./store.ts";
+import {
+  disableTailscale,
+  enableTailscale,
+  listBuildsAcrossWorkers,
+  type NetworkWorker,
+  networkStatus,
+  remoteBuildLog,
+  serveWithTailscale,
+} from "./tailscale.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 import type { Repository } from "./types.ts";
 import {
@@ -78,7 +86,7 @@ Usage:
   informant mount allow <name> <file>     Allow jobs to request a host file by name
   informant mount list                    List allowed host file mounts
   informant mount remove <name>           Remove a host file from the allowlist
-  informant serve [--once]                Poll all registered repositories
+  informant serve [--once]                Serve webhooks or poll registered repositories
   informant run --local [--ref <ref>] [--job <name>]
                                         Run all or selected jobs locally
   informant trigger [--ref <ref>] [--job <name>]
@@ -91,11 +99,17 @@ Usage:
   informant cache clear                  Delete all persistent job caches
   informant startup enable               Start the worker now and at login
   informant startup disable              Stop and remove the startup worker
+  informant tailscale enable --lead [--webhook-ready]
+                                        Receive webhooks through a Tailscale Funnel
+  informant tailscale enable --worker --token <token>
+                                        Receive jobs from a network lead without polling
+  informant tailscale status             Show the tailnet worker topology
+  informant tailscale disable            Disable tailnet coordination and restore polling
   informant hook install                 Accelerate pushes with a pre-push hook
   informant hook uninstall               Remove Informant from the pre-push hook
-  informant builds [--all]               List running builds or recent history
+  informant builds [--all]               List builds across this machine and tailnet workers
   informant builds cancel <build-id> [--job <name>]
-                                        Cancel a running build or one queued/running job
+                                        Cancel a running local build or queued/running job
   informant logs [<build-id>]             Tail a build's logs or select a running job
   informant update                       Install a newer release and restart a running worker
   informant auto-update enable           Check for and install new releases automatically
@@ -337,7 +351,7 @@ function githubUrl(build: NonNullable<Awaited<ReturnType<typeof getBuild>>>): st
 
 async function showBuilds(includeHistory: boolean): Promise<void> {
   if (process.stdin.isTTY) return browseBuilds(includeHistory);
-  const builds = includeHistory ? await listBuilds() : await listActiveBuilds();
+  const builds = await listBuildsAcrossWorkers(includeHistory);
   console.log(buildList(builds, includeHistory));
 }
 
@@ -459,14 +473,16 @@ function buildBrowserOptions(builds: Build[]): BrowserOption[] {
     {
       value: build.id,
       label: `${terminalColor.bold}${build.repo}${terminalColor.reset} · ${terminalColor.blue}${build.branch}@${build.sha.slice(0, 7)}${terminalColor.reset}`,
-      hint: `${coloredStatus(build.status)} · ${buildTiming(build)} · ${terminalColor.dim}${build.id}${terminalColor.reset}`,
-      cancellable: build.status === "running",
+      hint: `${coloredStatus(build.status)} · ${buildTiming(build)} · ${terminalColor.dim}${build.id}${terminalColor.reset}${build.networkWorker ? ` · remote on ${build.networkWorker.hostName}` : ""}`,
+      disabled: Boolean(build.networkWorker),
+      cancellable: !build.networkWorker && build.status === "running",
     },
     ...jobsForBuild(build).map((job) => ({
       value: `${build.id}\0${job.name}`,
       label: `  ${terminalColor.dim}↳${terminalColor.reset} ${job.name}`,
       hint: coloredStatus(job.status),
-      cancellable: job.status === "queued" || job.status === "running",
+      disabled: Boolean(build.networkWorker),
+      cancellable: !build.networkWorker && (job.status === "queued" || job.status === "running"),
     })),
   ]);
 }
@@ -477,8 +493,7 @@ interface BuildBrowserChoice {
 }
 
 async function liveBuildSelect(includeHistory: boolean): Promise<BuildBrowserChoice> {
-  const load = async () =>
-    buildBrowserOptions(includeHistory ? await listBuilds() : await listActiveBuilds());
+  const load = async () => buildBrowserOptions(await listBuildsAcrossWorkers(includeHistory));
   const options = await load();
   const prompt = new SelectPrompt<BrowserOption>({
     options,
@@ -718,10 +733,55 @@ async function tailLog(
   }
 }
 
+export async function tailRemoteLog(
+  buildId: string,
+  operations: {
+    read?: typeof remoteBuildLog;
+    sleep?: (milliseconds: number) => Promise<unknown>;
+    write?: (text: string) => unknown;
+  } = {},
+): Promise<boolean> {
+  const read = operations.read ?? remoteBuildLog;
+  const sleep = operations.sleep ?? Bun.sleep;
+  const write = operations.write ?? ((text: string) => process.stdout.write(text));
+  const decoder = new TextDecoder();
+  const finish = (): true => {
+    const remainder = decoder.decode();
+    if (remainder) write(remainder);
+    return true;
+  };
+  let offset = 0;
+  let worker: NetworkWorker | undefined;
+  let found = false;
+  let unavailableReads = 0;
+  while (true) {
+    const chunk = await read(buildId, { offset, worker });
+    if (!chunk) {
+      if (!found) return false;
+      unavailableReads++;
+      if (unavailableReads >= 3) return finish();
+      worker = undefined;
+      await sleep(1_000);
+      continue;
+    }
+    found = true;
+    unavailableReads = 0;
+    worker = chunk.worker;
+    offset = chunk.offset;
+    const text = decoder.decode(chunk.bytes, { stream: true });
+    if (text) write(text);
+    if (!chunk.running) return finish();
+    await sleep(250);
+  }
+}
+
 async function showLogs(id?: string): Promise<void> {
   if (id) {
     const build = await getBuild(id);
-    if (!build) throw new Error(`build not found: ${id}`);
+    if (!build) {
+      if (!(await tailRemoteLog(id))) throw new Error(`build not found: ${id}`);
+      return;
+    }
     if (process.stdin.isTTY) return browseBuilds(true, id);
     return tailLog(build.id, build.logPath, (current) => current.status === "running");
   }
@@ -860,6 +920,87 @@ async function manageRepositories(action?: string, value?: string): Promise<void
   throw new Error("repo action must be one of: add, list, remove");
 }
 
+async function manageTailscale(
+  action?: string,
+  flags: Record<string, string | boolean | string[]> = {},
+): Promise<void> {
+  if (action === "enable") {
+    if (flags.lead === true && flags.worker === true) {
+      throw new Error("choose either --lead or --worker");
+    }
+    if (flags.lead !== true && flags.worker !== true) {
+      throw new Error("tailscale enable requires --lead or --worker");
+    }
+    if (flags.lead === true && flags["webhook-ready"] !== true) {
+      const ready = await confirm({
+        message:
+          "Are all configured GitHub App webhooks active and subscribed to Push, Pull request, Issue comment, and Check suite events?",
+        initialValue: false,
+      });
+      if (isCancel(ready) || !ready) {
+        throw new Error(
+          "enable the required GitHub App webhook events, then retry with --webhook-ready",
+        );
+      }
+    }
+    if (flags.token !== undefined && typeof flags.token !== "string") {
+      throw new Error("--token requires exactly one value");
+    }
+    const config = await enableTailscale(flags.lead === true ? "lead" : "worker", {
+      networkSecret: typeof flags.token === "string" ? flags.token : undefined,
+      webhookReadyConfirmed: flags.lead === true,
+    });
+    outro(
+      config.mode === "lead"
+        ? `Enabled Tailscale lead at ${config.funnelUrl}/webhooks/github; worker token: ${config.networkSecret}; restart the worker`
+        : "Enabled authenticated Tailscale network worker; restart the worker",
+    );
+    return;
+  }
+  if (action === "disable") {
+    const { disabled, funnelResetError } = await disableTailscale();
+    const restarted = disabled ? await restartStartupWorker() : false;
+    if (funnelResetError) {
+      console.warn(
+        `Disabled local Tailscale coordination, but could not reset Funnel: ${funnelResetError.message}`,
+      );
+    }
+    outro(
+      disabled
+        ? restarted
+          ? "Disabled Tailscale coordination and restarted the polling worker"
+          : "Disabled Tailscale coordination; polling will resume on the next worker start"
+        : "Tailscale coordination is not enabled",
+    );
+    return;
+  }
+  if (action === "status" || !action) {
+    const current = await networkStatus();
+    if (!current.status) {
+      console.log("Tailscale is not installed or is not connected.");
+      return;
+    }
+    const lines = [
+      `Tailscale: ${current.status.online ? "online" : "offline"} · ${current.status.self.hostName}`,
+      `Informant: ${current.config ? `${current.config.mode} · polling disabled while connected` : "not configured · polling enabled"}`,
+    ];
+    if (current.config?.funnelUrl)
+      lines.push(`Funnel: ${current.config.funnelUrl}/webhooks/github`);
+    if (current.workers.length === 0) lines.push("Workers: no other Informant workers discovered");
+    else {
+      lines.push("Workers:");
+      for (const worker of current.workers) {
+        lines.push(
+          `  ${worker.hostName} · ${worker.address} · ${worker.capabilities.join(", ")} · ${worker.repositories.length} ${worker.repositories.length === 1 ? "repository" : "repositories"}`,
+        );
+      }
+    }
+    console.log(lines.join("\n"));
+    return;
+  }
+  throw new Error("tailscale action must be one of: enable, status, disable");
+}
+
 async function manageMounts(action?: string, name?: string, source?: string): Promise<void> {
   if (action === "list" || !action) {
     const mounts = await listAllowedMounts();
@@ -976,6 +1117,13 @@ export function updateResultMessage(result: {
     : `Informant ${result.version} is already current`;
 }
 
+export function canServeWithoutRepositories(
+  config: TailscaleConfig | undefined,
+  once: boolean,
+): boolean {
+  return config?.mode === "lead" && !once;
+}
+
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const [subcommand, action, id, value] = positional;
@@ -1025,6 +1173,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     throw new Error("auto-update action must be one of: enable, disable");
   }
   if (subcommand === "repo") return manageRepositories(action, id);
+  if (subcommand === "tailscale") return manageTailscale(action, flags);
   if (subcommand === "mount") return manageMounts(action, id, value);
   if (subcommand === "image") return manageImages(action);
   if (subcommand === "cache") return manageCaches(action);
@@ -1032,7 +1181,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     if (action) throw new Error("serve does not accept a repository; use informant repo add first");
     await recoverMountedFileWrites();
     const repositories = await listRepositories();
-    if (repositories.length === 0) {
+    if (
+      repositories.length === 0 &&
+      !canServeWithoutRepositories(await getTailscaleConfig(), flags.once === true)
+    ) {
       throw new Error("no repositories registered; run informant repo add owner/repository");
     }
     await recordWorkerVersion(packageJson.version);
@@ -1045,10 +1197,11 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     process.once("SIGTERM", stop);
     process.once("SIGINT", stop);
     try {
-      return await serveRepositories(repositories, {
+      return await serveWithTailscale(repositories, {
         once: flags.once === true,
         signal: shutdown.signal,
         onMessage: console.log,
+        version: packageJson.version,
       });
     } finally {
       process.off("SIGTERM", stop);

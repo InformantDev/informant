@@ -222,6 +222,23 @@ function dependencies(
   };
 }
 
+test("one-shot event scans propagate polling failures for delivery retry", async () => {
+  const client = github({});
+  client.defaultBranch = async () => {
+    throw new Error("temporary GitHub failure");
+  };
+  const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      dependencies: dependencies(client, state, async () => undefined),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("temporary GitHub failure");
+});
+
 test("serveRepositories preserves caller idle notifications after housekeeping", async () => {
   const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
   const deps = dependencies(github({}), state, async () => undefined);
@@ -677,6 +694,29 @@ describe("serve polling orchestration", () => {
     deps.repositoryConfig = async () => tagConfig;
     await serve(repository, { once: true, dependencies: deps });
     expect(tagPolls).toBe(0);
+  });
+
+  test("a tag webhook bypasses the periodic tag enumeration throttle", async () => {
+    let tagPolls = 0;
+    const client = github({
+      tags: async () => {
+        tagPolls++;
+        return [];
+      },
+    });
+    const state: PollState = {
+      pending: [],
+      seenCommentIds: [],
+      pendingTags: [],
+      tagRefs: [],
+      tagsPolledAt: new Date().toISOString(),
+    };
+    const deps = dependencies(client, state, async () => undefined);
+    deps.repositoryConfig = async () => tagConfig;
+
+    await serve(repository, { once: true, forceTagPoll: true, dependencies: deps });
+
+    expect(tagPolls).toBe(1);
   });
 
   test("launches new matching tags with tag context and durable acknowledgement", async () => {

@@ -5,6 +5,7 @@ import {
   parseStartupEnvironment,
   renderLinuxStartupService,
   renderStartupService,
+  restartStartupWorker,
   startupEnvironment,
   updateInformant,
 } from "./startup.ts";
@@ -100,6 +101,37 @@ describe("startup service", () => {
     expect(service).toContain("StandardOutput=append:/tmp/informant logs/worker.stdout.log");
     expect(service).toContain("StandardError=append:/tmp/informant logs/worker.stderr.log");
     expect(service).toContain("WantedBy=default.target");
+  });
+
+  test("restarts an active Linux worker without starting an inactive service", async () => {
+    const activeCommands: string[][] = [];
+    expect(
+      await restartStartupWorker({
+        platform: "linux",
+        command: async (argv) => {
+          activeCommands.push(argv);
+          return result();
+        },
+      }),
+    ).toBe(true);
+    expect(activeCommands).toEqual([
+      ["systemctl", "--user", "is-active", "--quiet", "informant.service"],
+      ["systemctl", "--user", "restart", "informant.service"],
+    ]);
+
+    const inactiveCommands: string[][] = [];
+    expect(
+      await restartStartupWorker({
+        platform: "linux",
+        command: async (argv) => {
+          inactiveCommands.push(argv);
+          return result(3);
+        },
+      }),
+    ).toBe(false);
+    expect(inactiveCommands).toEqual([
+      ["systemctl", "--user", "is-active", "--quiet", "informant.service"],
+    ]);
   });
 
   test("updates through Homebrew and restarts a loaded service", async () => {

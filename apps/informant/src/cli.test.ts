@@ -5,12 +5,14 @@ import { join } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import {
   branchNameFromSymbolicRef,
+  canServeWithoutRepositories,
   cleanOrphanedBuildWorkspacesInBackground,
   executionLabelFromRef,
   main,
   pruneRuntimeImages,
   runInvocationType,
   runManualHousekeeping,
+  tailRemoteLog,
   updateResultMessage,
 } from "./cli.ts";
 import { selectContainerBackend } from "./container-backend.ts";
@@ -75,6 +77,16 @@ test("execution labels follow the requested ref instead of the checked out branc
 test("run preserves reported triggers unless local execution is explicit", () => {
   expect(runInvocationType(false)).toBe("trigger");
   expect(runInvocationType(true)).toBe("local");
+});
+
+test("a dedicated Tailscale lead can serve without local repositories", () => {
+  const lead = { mode: "lead", workerPort: 7639, funnelPort: 7640 } as const;
+  const worker = { mode: "worker", workerPort: 7639, funnelPort: 7640 } as const;
+
+  expect(canServeWithoutRepositories(lead, false)).toBe(true);
+  expect(canServeWithoutRepositories(lead, true)).toBe(false);
+  expect(canServeWithoutRepositories(worker, false)).toBe(false);
+  expect(canServeWithoutRepositories(undefined, false)).toBe(false);
 });
 
 test("local and reported trigger flags cannot be mixed", async () => {
@@ -340,4 +352,70 @@ test("logs stops following a running record when its worker is dead", async () =
     else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("remote logs keep reading from their last offset until the build completes", async () => {
+  const worker = {
+    id: "worker-1",
+    hostName: "worker",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: ["owner/repo"],
+  };
+  const offsets: number[] = [];
+  const output: string[] = [];
+  const expected = "first 😀\nsecond\n";
+  const bytes = new TextEncoder().encode(expected);
+  const split = new TextEncoder().encode("first ").byteLength + 2;
+  let reads = 0;
+
+  expect(
+    await tailRemoteLog("remote-build", {
+      read: async (_id, options) => {
+        offsets.push(options?.offset ?? 0);
+        reads++;
+        return reads === 1
+          ? { bytes: bytes.subarray(0, split), offset: split, running: true, worker }
+          : { bytes: bytes.subarray(split), offset: bytes.length, running: false, worker };
+      },
+      sleep: async () => {},
+      write: (text) => output.push(text),
+    }),
+  ).toBe(true);
+  expect(offsets).toEqual([0, split]);
+  expect(output.join("")).toBe(expected);
+  expect(output.join("")).not.toContain("�");
+});
+
+test("remote logs stop after a previously found worker remains unavailable", async () => {
+  const worker = {
+    id: "worker-1",
+    hostName: "worker",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: ["owner/repo"],
+  };
+  const workers: Array<string | undefined> = [];
+  let reads = 0;
+
+  expect(
+    await tailRemoteLog("remote-build", {
+      read: async (_id, options) => {
+        workers.push(options?.worker?.id);
+        reads++;
+        return reads === 1
+          ? {
+              bytes: new TextEncoder().encode("partial\n"),
+              offset: 8,
+              running: true,
+              worker,
+            }
+          : undefined;
+      },
+      sleep: async () => {},
+      write: () => {},
+    }),
+  ).toBe(true);
+  expect(reads).toBe(4);
+  expect(workers).toEqual([undefined, "worker-1", undefined, undefined]);
 });
