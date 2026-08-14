@@ -57,6 +57,14 @@ function containerCommandError(action: string, result: Awaited<ReturnType<typeof
   );
 }
 
+function appleContainerBuilderIsAbsent(result: Awaited<ReturnType<typeof command>>): boolean {
+  if (result.timedOut || result.exitCode === 0) return false;
+  const output = `${result.stderr}\n${result.stdout}`;
+  return /\b(?:(?:builder|container)(?:\s+(?:"[^"\r\n]+"|'[^'\r\n]+'))?\s+(?:not found|does not exist)|no such (?:builder|container))\b/i.test(
+    output,
+  );
+}
+
 export async function appleContainerInstalled(
   runCommand = command,
   signal?: AbortSignal,
@@ -154,11 +162,14 @@ export async function resetAppleContainerBuilder(
   return lock("container-builder", async () => {
     if (!(await appleContainerBuilderCleanupDue(dataPath))) return false;
     const stopped = await runCommand(["container", "builder", "stop"], options);
-    if (stopped.exitCode !== 0 || stopped.timedOut)
+    const alreadyAbsent = appleContainerBuilderIsAbsent(stopped);
+    if ((stopped.exitCode !== 0 || stopped.timedOut) && !alreadyAbsent)
       throw containerCommandError("could not stop the shared Apple Container builder", stopped);
-    const deleted = await runCommand(["container", "builder", "delete"], options);
-    if (deleted.exitCode !== 0 || deleted.timedOut)
-      throw containerCommandError("could not delete the shared Apple Container builder", deleted);
+    if (!alreadyAbsent) {
+      const deleted = await runCommand(["container", "builder", "delete"], options);
+      if ((deleted.exitCode !== 0 || deleted.timedOut) && !appleContainerBuilderIsAbsent(deleted))
+        throw containerCommandError("could not delete the shared Apple Container builder", deleted);
+    }
 
     await rm(appleContainerBuilderCleanupPath(dataPath, APPLE_CONTAINER_BUILDER_CLEANUP_PENDING), {
       force: true,
@@ -1000,13 +1011,14 @@ export async function ensurePreparedContainer(
 
         await onMessage(`Preparing container image ${prepared}`);
         if (backend.kind === "apple" && operations.reference) {
-          await scheduleAppleContainerBuilderCleanup(operations.dataPath ?? dataDirectory()).catch(
-            async (error) => {
-              await onMessage(
-                `Could not schedule Apple Container builder cleanup: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            },
-          );
+          try {
+            await scheduleAppleContainerBuilderCleanup(operations.dataPath ?? dataDirectory());
+          } catch (error) {
+            await onMessage(
+              `Could not schedule Apple Container builder cleanup: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            throw error;
+          }
         }
         const args = backend.buildArguments(prepared, runtime.cpu, runtime.memoryMb);
         const preparation = await runCommand(args, {
