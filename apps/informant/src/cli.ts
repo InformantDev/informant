@@ -29,12 +29,14 @@ import { formatHousekeepingSummary, runHousekeeping } from "./housekeeping.ts";
 import {
   addRepository,
   allowMount,
+  getTailscaleConfig,
   listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
   removeAllowedMount,
   removeRepository,
   saveAutomaticUpdatesPreference,
+  type TailscaleConfig,
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
 import { setup } from "./setup.ts";
@@ -743,15 +745,19 @@ export async function tailRemoteLog(
   let offset = 0;
   let worker: NetworkWorker | undefined;
   let found = false;
+  let unavailableReads = 0;
   while (true) {
     const chunk = await read(buildId, { offset, worker });
     if (!chunk) {
       if (!found) return false;
+      unavailableReads++;
+      if (unavailableReads >= 3) return true;
       worker = undefined;
       await sleep(1_000);
       continue;
     }
     found = true;
+    unavailableReads = 0;
     worker = chunk.worker;
     offset = chunk.offset;
     if (chunk.text) write(chunk.text);
@@ -925,8 +931,13 @@ async function manageTailscale(
     return;
   }
   if (action === "disable") {
-    const disabled = await disableTailscale();
+    const { disabled, funnelResetError } = await disableTailscale();
     const restarted = disabled ? await restartStartupWorker() : false;
+    if (funnelResetError) {
+      console.warn(
+        `Disabled local Tailscale coordination, but could not reset Funnel: ${funnelResetError.message}`,
+      );
+    }
     outro(
       disabled
         ? restarted
@@ -1079,6 +1090,13 @@ export function updateResultMessage(result: {
     : `Informant ${result.version} is already current`;
 }
 
+export function canServeWithoutRepositories(
+  config: TailscaleConfig | undefined,
+  once: boolean,
+): boolean {
+  return config?.mode === "lead" && !once;
+}
+
 export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const [subcommand, action, id, value] = positional;
@@ -1136,7 +1154,10 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     if (action) throw new Error("serve does not accept a repository; use informant repo add first");
     await recoverMountedFileWrites();
     const repositories = await listRepositories();
-    if (repositories.length === 0) {
+    if (
+      repositories.length === 0 &&
+      !canServeWithoutRepositories(await getTailscaleConfig(), flags.once === true)
+    ) {
       throw new Error("no repositories registered; run informant repo add owner/repository");
     }
     await recordWorkerVersion(packageJson.version);

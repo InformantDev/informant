@@ -8,9 +8,11 @@ import {
   addedRepositoryRecoveryRequests,
   configureGitHubAppWebhook,
   DispatchRetryQueue,
+  disableTailscale,
   enableTailscale,
   MAX_WEBHOOK_BODY_BYTES,
   parseTailscaleStatus,
+  RepositoryScanQueue,
   readWebhookBody,
   startupRecoveryRequests,
   type TailscaleStatus,
@@ -105,6 +107,41 @@ test("persists and reuses a lead secret when configuring one App fails", async (
   await enableTailscale("lead", operations);
 
   expect(configuredSecrets).toEqual(["recoverable-secret", "recoverable-secret"]);
+});
+
+test("disables local coordination when Funnel teardown fails", async () => {
+  let cleared = false;
+  const result = await disableTailscale({
+    getConfig: async () => ({
+      mode: "lead",
+      workerPort: 7639,
+      funnelPort: 7640,
+      funnelUrl: "https://lead.example.ts.net",
+      webhookSecret: "secret",
+    }),
+    status: async () => ({
+      executable: "/usr/bin/tailscale",
+      online: true,
+      self: {
+        id: "self-id",
+        hostName: "lead",
+        addresses: ["100.64.0.1"],
+        online: true,
+      },
+      peers: [],
+    }),
+    resetFunnel: async () => {
+      throw new Error("permission denied");
+    },
+    clearConfig: async () => {
+      cleared = true;
+      return true;
+    },
+  });
+
+  expect(cleared).toBe(true);
+  expect(result.disabled).toBe(true);
+  expect(result.funnelResetError?.message).toBe("permission denied");
 });
 
 test("parses this machine and online peers from Tailscale status", () => {
@@ -216,6 +253,30 @@ test("repository refresh recovers only newly registered repositories", () => {
     { repository: two, forceTagPoll: true },
   ]);
   expect(addedRepositoryRecoveryRequests([one, two], [one, two])).toEqual([]);
+});
+
+test("repository removal cancels an active scan and suppresses queued scans", async () => {
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const signals: AbortSignal[] = [];
+  let starts = 0;
+  const scans = new RepositoryScanQueue([repository], async (_repository, _force, signal) => {
+    starts++;
+    signals.push(signal);
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  });
+
+  const active = scans.run(repository);
+  while (starts === 0) await Bun.sleep(0);
+  const queued = scans.run(repository);
+  scans.reconcile([]);
+  await Promise.all([active, queued]);
+
+  expect(starts).toBe(1);
+  expect(signals[0]?.aborted).toBe(true);
+  await scans.stop();
 });
 
 test("runs another dispatch when an ordinary webhook arrives during an active dispatch", async () => {

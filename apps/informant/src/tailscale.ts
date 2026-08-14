@@ -93,6 +93,79 @@ export function addedRepositoryRecoveryRequests(
 
 type RetryTimer = ReturnType<typeof setTimeout>;
 
+export class RepositoryScanQueue {
+  private readonly registrations = new Map<
+    string,
+    { repository: Repository; controller: AbortController }
+  >();
+  private readonly scans = new Map<string, Promise<void>>();
+  private stopped = false;
+
+  constructor(
+    repositories: Repository[],
+    private readonly execute: (
+      repository: Repository,
+      forceTagPoll: boolean,
+      signal: AbortSignal,
+    ) => Promise<void>,
+    private readonly serviceSignal?: AbortSignal,
+  ) {
+    this.reconcile(repositories);
+  }
+
+  reconcile(repositories: Repository[]): void {
+    if (this.stopped) return;
+    const next = new Map(
+      repositories.map((repository) => [repository.fullName.toLowerCase(), repository]),
+    );
+    for (const [key, registration] of this.registrations) {
+      if (next.has(key)) continue;
+      registration.controller.abort(`${registration.repository.fullName} is no longer registered.`);
+      this.registrations.delete(key);
+    }
+    for (const [key, repository] of next) {
+      const registration = this.registrations.get(key);
+      if (registration) registration.repository = repository;
+      else this.registrations.set(key, { repository, controller: new AbortController() });
+    }
+  }
+
+  run(repository: Repository, forceTagPoll = false): Promise<void> {
+    const key = repository.fullName.toLowerCase();
+    const registration = this.registrations.get(key);
+    if (this.stopped || !registration) return Promise.resolve();
+    const previous = this.scans.get(key) ?? Promise.resolve();
+    let next!: Promise<void>;
+    next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.stopped || registration.controller.signal.aborted) return;
+        const signal = this.serviceSignal
+          ? AbortSignal.any([registration.controller.signal, this.serviceSignal])
+          : registration.controller.signal;
+        if (signal.aborted) return;
+        await this.execute(registration.repository, forceTagPoll, signal);
+      })
+      .finally(() => {
+        if (this.scans.get(key) === next) this.scans.delete(key);
+      });
+    this.scans.set(key, next);
+    return next;
+  }
+
+  async stop(reason: unknown = "Worker shutdown requested."): Promise<void> {
+    if (!this.stopped) {
+      this.stopped = true;
+      for (const registration of this.registrations.values()) {
+        registration.controller.abort(reason);
+      }
+    }
+    await Promise.allSettled(this.scans.values());
+    this.registrations.clear();
+    this.scans.clear();
+  }
+}
+
 export class DispatchRetryQueue {
   private readonly entries = new Map<
     string,
@@ -430,12 +503,32 @@ export async function enableTailscale(
   return config;
 }
 
-export async function disableTailscale(): Promise<boolean> {
-  const config = await getTailscaleConfig();
-  if (!config) return false;
-  const status = await tailscaleStatus();
-  if (config.mode === "lead" && status?.online) await resetTailscaleFunnel(status);
-  return clearTailscaleConfig();
+export interface TailscaleDisableResult {
+  disabled: boolean;
+  funnelResetError?: Error;
+}
+
+export async function disableTailscale(
+  operations: {
+    getConfig?: typeof getTailscaleConfig;
+    status?: typeof tailscaleStatus;
+    resetFunnel?: typeof resetTailscaleFunnel;
+    clearConfig?: typeof clearTailscaleConfig;
+  } = {},
+): Promise<TailscaleDisableResult> {
+  const config = await (operations.getConfig ?? getTailscaleConfig)();
+  if (!config) return { disabled: false };
+  let funnelResetError: Error | undefined;
+  if (config.mode === "lead") {
+    try {
+      const status = await (operations.status ?? tailscaleStatus)();
+      if (status?.online) await (operations.resetFunnel ?? resetTailscaleFunnel)(status);
+    } catch (error) {
+      funnelResetError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  const disabled = await (operations.clearConfig ?? clearTailscaleConfig)();
+  return { disabled, funnelResetError };
 }
 
 export function validGitHubSignature(
@@ -500,19 +593,12 @@ export async function serveWithTailscale(
   await refreshSelectedContainerBackend(options.signal);
 
   let configuredRepositories = repositories;
-  const scans = new Map<string, Promise<void>>();
-  const scan = (repository: Repository, forceTagPoll = false) => {
-    const key = repository.fullName.toLowerCase();
-    const previous = scans.get(key) ?? Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(() => serveRepositories([repository], { ...options, once: true, forceTagPoll }))
-      .finally(() => {
-        if (scans.get(key) === next) scans.delete(key);
-      });
-    scans.set(key, next);
-    return next;
-  };
+  const scans = new RepositoryScanQueue(
+    repositories,
+    (repository, forceTagPoll, signal) =>
+      serveRepositories([repository], { ...options, once: true, forceTagPoll, signal }),
+    options.signal,
+  );
 
   const knownWorkers = new Map<string, NetworkWorker>();
   const refreshWorkers = async (): Promise<NetworkWorker[]> => {
@@ -535,7 +621,7 @@ export async function serveWithTailscale(
     if (localRepository) {
       tasks.push({
         label: hostname(),
-        promise: scan(localRepository, request.forceTagPoll),
+        promise: scans.run(localRepository, request.forceTagPoll),
       });
     }
     if (config.mode === "lead") {
@@ -639,7 +725,11 @@ export async function serveWithTailscale(
           (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
         );
         if (!repository) return new Response("repository is not registered", { status: 404 });
-        void scan(repository, body.forceTagPoll === true);
+        void scans.run(repository, body.forceTagPoll === true).catch((error) => {
+          options.onMessage?.(
+            `${repository.fullName} · network dispatch failed: ${error instanceof Error ? error.message : error}`,
+          );
+        });
         return new Response(null, { status: 202 });
       }
       return new Response("not found", { status: 404 });
@@ -683,13 +773,13 @@ export async function serveWithTailscale(
     refreshingRepositories = true;
     try {
       const nextRepositories = await loadRepositories();
-      for (const request of addedRepositoryRecoveryRequests(
+      const recoveryRequests = addedRepositoryRecoveryRequests(
         configuredRepositories,
         nextRepositories,
-      )) {
-        dispatchQueue.enqueue(request);
-      }
+      );
+      scans.reconcile(nextRepositories);
       configuredRepositories = nextRepositories;
+      for (const request of recoveryRequests) dispatchQueue.enqueue(request);
     } catch (error) {
       options.onMessage?.(
         `could not refresh repositories: ${error instanceof Error ? error.message : error}`,
@@ -768,13 +858,15 @@ export async function serveWithTailscale(
       );
     }
     await waitForAbort(options.signal);
-    await Promise.allSettled(scans.values());
   } finally {
     clearInterval(refreshRepositories);
     if (refreshPeerTopology) clearInterval(refreshPeerTopology);
-    await dispatchQueue.stop();
     funnelServer?.stop(true);
     privateServer.stop(true);
+    await Promise.all([
+      dispatchQueue.stop(),
+      scans.stop(options.signal?.reason ?? "Worker shutdown requested."),
+    ]);
   }
 }
 
