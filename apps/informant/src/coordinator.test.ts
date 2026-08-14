@@ -1709,6 +1709,51 @@ describe("runCommit", () => {
     expect(record.jobs).toEqual([{ name: "test", status: "success" }]);
   });
 
+  test("preserves queued local job cancellation when setup fails", async () => {
+    const context = harness();
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const multipleJobs = { ...config, jobs: [base, { ...base, name: "lint" }] };
+    const setupStarted = deferred<void>();
+    const releaseSetup = deferred<void>();
+    let cancelTarget: (() => void) | undefined;
+    context.dependencies.monitorBuildCancellation = (_id, jobs) => {
+      const build = new AbortController();
+      const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
+      cancelTarget = () =>
+        jobControllers
+          .get(base.name)
+          ?.abort(`Cancellation requested for ${base.name} from informant builds.`);
+      return {
+        signal: build.signal,
+        jobSignal: (job) => jobControllers.get(job)?.signal,
+        close: async () => {},
+      };
+    };
+    context.dependencies.runInTart = async () => {
+      setupStarted.resolve();
+      await releaseSetup.promise;
+      throw new Error("checkout failed");
+    };
+
+    const running = runLocalCommit(repository, "sha", "main", multipleJobs, {
+      dependencies: context.dependencies,
+    });
+    await setupStarted.promise;
+    if (!cancelTarget) throw new Error("expected a job cancellation controller");
+    cancelTarget();
+    releaseSetup.resolve();
+
+    await expect(running).rejects.toThrow("checkout failed");
+    expect(context.saved.at(-1)).toMatchObject({
+      status: "failure",
+      jobs: [
+        { name: "test", status: "cancelled" },
+        { name: "lint", status: "failure" },
+      ],
+    });
+  });
+
   test("keeps cancellation during job check creation active until setup exits", async () => {
     const context = harness({ manualTrigger: true });
     const checkStarted = deferred<void>();
@@ -2051,6 +2096,46 @@ describe("runCommit", () => {
     expect(record.status).toBe("cancelled");
     expect(record.runningJobs).toEqual([]);
     expect(record.jobs).toEqual([{ name: "test", status: "cancelled" }]);
+  });
+
+  test("cancels child checks when superseded during late reconciliation", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    const automaticConfig = { ...config, triggers: [{ event: "commit" as const }] };
+    const updateCheck = context.github.updateCheck.bind(context.github);
+    let successAttempts = 0;
+    context.github.updateCheck = async (target, id, values) => {
+      if (id === 100 && values.conclusion === "success") {
+        successAttempts++;
+        if (successAttempts === 1) throw new Error("temporary child update failure");
+        if (successAttempts === 2) controller.abort("Superseded by main@new-sha.");
+      }
+      return updateCheck(target, id, values);
+    };
+
+    const record = await runCommit(
+      context.github,
+      repository,
+      "old-sha",
+      "main",
+      automaticConfig,
+      context.dependencies,
+      { type: "commit", branch: "main", id: "branch:main:old-sha" },
+      controller.signal,
+    );
+
+    if (!record) throw new Error("expected a build record");
+    expect(record.status).toBe("cancelled");
+    expect(successAttempts).toBe(2);
+    expect(
+      context.updates.find(
+        (update) => update.id === 100 && update.values.conclusion === "cancelled",
+      ),
+    ).toBeDefined();
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Superseded by a newer commit",
+    });
   });
 
   test("cancels a running job, skips its dependent, and completes independent work", async () => {

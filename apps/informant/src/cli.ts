@@ -1111,6 +1111,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     if (!id) throw new Error("builds cancel requires a build ID");
     if (value) throw new Error("builds cancel does not accept arguments after the build ID");
     const jobs = requestedJobs(flags.job);
+    if (flags.job !== undefined && jobs.length === 0) throw new Error("--job requires a job name");
     if (jobs.length > 1) throw new Error("builds cancel accepts at most one --job");
     const job = jobs[0];
     await requestBuildCancellation(id, job);

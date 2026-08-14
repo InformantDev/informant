@@ -201,11 +201,11 @@ export async function runLocalCommit(
     const cancelled = cancellation?.signal.aborted ?? false;
     record.status = cancelled ? "cancelled" : "failure";
     record.runningJobs = [];
-    record.jobs = record.jobs?.map((job) =>
-      job.status === "queued" || job.status === "running"
-        ? { ...job, status: cancelled ? "cancelled" : "failure" }
-        : job,
-    );
+    record.jobs = record.jobs?.map((job) => {
+      if (job.status !== "queued" && job.status !== "running") return job;
+      const jobCancelled = cancellation?.jobSignal(job.name)?.aborted ?? false;
+      return { ...job, status: cancelled || jobCancelled ? "cancelled" : "failure" };
+    });
     record.completedAt = new Date().toISOString();
     await dependencies.saveBuild(record).catch(() => undefined);
     if (cancelled) return record;
@@ -846,6 +846,15 @@ async function runCommitPartitionWithSlot(
       record.completedAt = new Date().toISOString();
       executionFinished = true;
       await dependencies.saveBuild(record);
+      if (!cancellation.signal.aborted) {
+        for (const state of jobChecks.values()) {
+          state.desired = cancelledValues(state.job.name);
+          state.terminal = false;
+        }
+        childrenReconciled = false;
+        await reconcileJobChecks().catch(() => reconcileJobChecks());
+        childrenReconciled = true;
+      }
       await completeAggregate({
         status: "completed",
         conclusion: "cancelled",

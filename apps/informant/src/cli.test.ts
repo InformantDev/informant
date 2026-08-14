@@ -209,6 +209,12 @@ test("builds shows running jobs by default and recent history with --all", async
       await expect(main(["builds", "cancel", "running-build", "test"])).rejects.toThrow(
         "builds cancel does not accept arguments after the build ID",
       );
+      await expect(main(["builds", "cancel", "running-build", "--job="])).rejects.toThrow(
+        "--job requires a job name",
+      );
+      await expect(main(["builds", "cancel", "running-build", "--job=,"])).rejects.toThrow(
+        "--job requires a job name",
+      );
       expect(cancellation.signal.aborted).toBe(false);
 
       await main(["builds", "cancel", "running-build", "--job", "test"]);

@@ -98,16 +98,15 @@ test("command can terminate a cancelled process group", async () => {
     controller.abort("cancel process tree");
     await expect(result).rejects.toThrow("cancel process tree");
     for (let attempt = 0; attempt < 50 && descendantPid !== undefined; attempt++) {
-      try {
-        process.kill(descendantPid, 0);
-        await Bun.sleep(20);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-          descendantPid = undefined;
-          break;
-        }
-        throw error;
+      const state = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(descendantPid)], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      if (state.exitCode !== 0 || state.stdout.toString().trim().startsWith("Z")) {
+        descendantPid = undefined;
+        break;
       }
+      await Bun.sleep(20);
     }
     expect(descendantPid).toBeUndefined();
   } finally {
