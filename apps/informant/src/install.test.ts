@@ -14,6 +14,7 @@ async function fixture(
   options: {
     architecture?: string;
     runnable?: boolean;
+    serverVersion?: string;
     validChecksum?: boolean;
     version?: string;
   } = {},
@@ -30,7 +31,7 @@ async function fixture(
   const binary =
     options.runnable === false
       ? "#!/bin/sh\nexit 1\n"
-      : `#!/bin/sh\nprintf '${options.version ?? "9.9.9"}\\n'\n`;
+      : `#!/bin/sh\nprintf '${options.version ?? "9.9.9"}\\n${options.serverVersion ? `server: ${options.serverVersion}\\n` : ""}'\n`;
   await writeFile(join(release, asset), binary);
   await chmod(join(release, asset), 0o755);
   const digest = new Bun.CryptoHasher("sha256").update(binary).digest("hex");
@@ -134,6 +135,15 @@ describe("Linux installer", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain("Installed Informant 0.1.2");
+  });
+
+  test("uses the first line when the binary also reports a running server", async () => {
+    const paths = await fixture({ version: "0.1.2", serverVersion: "0.1.1" });
+    const result = await runInstaller(paths, { INFORMANT_VERSION: "v0.1.2" });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain("Installed Informant 0.1.2");
+    expect(result.stdout.toString()).not.toContain("server: 0.1.1");
   });
 
   test("restarts an active systemd user service after installing", async () => {

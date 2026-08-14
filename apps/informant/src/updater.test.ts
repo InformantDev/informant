@@ -16,6 +16,7 @@ import {
   renderAutomaticUpdateService,
   renderLinuxAutomaticUpdateService,
   renderLinuxAutomaticUpdateTimer,
+  reportedInformantVersion,
   resolveInformantExecutable,
   updateInformantIfAvailable,
   updaterEnvironment,
@@ -45,6 +46,11 @@ describe("release updates", () => {
     expect(compareVersions("0.1.10", "0.1.2")).toBe(1);
     expect(compareVersions("v1.0.0", "1.0.0")).toBe(0);
     expect(compareVersions("1.0.0-beta.2", "1.0.0")).toBe(-1);
+  });
+
+  test("reads the client version from version output that also reports a server", () => {
+    expect(reportedInformantVersion("0.2.0\nserver: 0.1.4\n")).toBe("0.2.0");
+    expect(reportedInformantVersion("server: 0.1.4\n")).toBeUndefined();
   });
 
   test("reads the latest stable GitHub release", async () => {
@@ -159,7 +165,7 @@ describe("release updates", () => {
           commands.push(argv);
           if (argv[0] === "brew") brewTimeout = options?.timeoutMs;
           if (argv[1] === "print") return result(113);
-          if (argv[0] === "informant") return result(0, "", "0.2.0\n");
+          if (argv[0] === "informant") return result(0, "", "0.2.0\nserver: 0.1.4\n");
           return result();
         },
       }),
@@ -238,7 +244,9 @@ describe("release updates", () => {
             if (argv[0] === "brew" && argv[1] === "--prefix") {
               return result(0, "", `${prefix}\n`);
             }
-            if (argv[0] === stableExecutable) return result(0, "", "0.2.0\n");
+            if (argv[0] === stableExecutable) {
+              return result(0, "", "0.2.0\nserver: 0.1.4\n");
+            }
             return result();
           },
         }),
@@ -438,7 +446,7 @@ describe("release updates", () => {
       await installLinuxRelease(release, {
         arch: "x64",
         executable,
-        command: async () => result(0, "", "0.2.0\n"),
+        command: async () => result(0, "", "0.2.0\nserver: 0.1.4\n"),
         fetch: async (input, init) => {
           expect(init?.signal).toBeInstanceOf(AbortSignal);
           const url = String(input);
