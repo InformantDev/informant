@@ -25,8 +25,9 @@ if [ "$head_sha" != "$INFORMANT_SHA" ]; then
   exit 1
 fi
 
-staff diff --base "$base_sha" --head working-tree --json >/dev/null
-slug="$base_sha..WT"
+merge_base="$(git merge-base "$base_sha" "$head_sha")"
+staff diff --base "$merge_base" --head working-tree --json >/dev/null
+slug="$merge_base..WT"
 staff files --slug "$slug" --json > /tmp/staff-review-files.json
 bun --eval '
 import { snapshotGithubReviewThreads } from "/opt/informant/extensions/subagents.ts";

@@ -52,6 +52,7 @@ import {
   dataDirectory,
   getBuild,
   jobLogPath,
+  listActiveBuilds,
   reconcileBuildLiveness,
   recordWorkerVersion,
   removeOrphanedBuildWorkspaces,
@@ -70,6 +71,7 @@ import {
   serveWithTailscale,
 } from "./tailscale.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
+import { withImageLock } from "./tart/vm.ts";
 import type { Repository } from "./types.ts";
 import {
   disableAutomaticUpdates,
@@ -121,7 +123,20 @@ Usage:
   informant --version
 `;
 
-function parseArgs(argv: string[]): {
+const BOOLEAN_FLAGS = new Set([
+  "all",
+  "automatic",
+  "help",
+  "lead",
+  "local",
+  "once",
+  "version",
+  "wait-for-github",
+  "webhook-ready",
+  "worker",
+]);
+
+export function parseArgs(argv: string[]): {
   positional: string[];
   flags: Record<string, string | boolean | string[]>;
 } {
@@ -144,9 +159,15 @@ function parseArgs(argv: string[]): {
       positional.push(value);
       continue;
     }
-    const [name, inline] = value.slice(2).split("=", 2);
+    const source = value.slice(2);
+    const separator = source.indexOf("=");
+    const name = separator === -1 ? source : source.slice(0, separator);
+    const inline = separator === -1 ? undefined : source.slice(separator + 1);
     if (!name) continue;
-    if (inline !== undefined) setFlag(name, inline);
+    if (inline !== undefined) {
+      if (BOOLEAN_FLAGS.has(name)) throw new Error(`--${name} does not accept a value`);
+      setFlag(name, inline);
+    } else if (BOOLEAN_FLAGS.has(name)) setFlag(name, true);
     else {
       const next = argv[index + 1];
       if (next && !next.startsWith("-")) {
@@ -192,6 +213,10 @@ async function repositoryFromGit(): Promise<ReturnType<typeof parseRepository>> 
   return parseRepository(remote.replace(/^git@github\.com:/, ""));
 }
 
+export function initialJobConfig(command: string): string {
+  return jobTemplate().replace("bun install --frozen-lockfile && bun test", () => command);
+}
+
 async function init(): Promise<void> {
   const path = resolve(CONFIG_FILE);
   if (existsSync(path)) throw new Error("Informant configuration already exists");
@@ -212,10 +237,7 @@ async function init(): Promise<void> {
   }
   await mkdir(resolve(JOBS_DIRECTORY), { recursive: true });
   await Bun.write(path, directoryConfigTemplate());
-  await Bun.write(
-    resolve(JOBS_DIRECTORY, "test.toml"),
-    jobTemplate().replace("bun install --frozen-lockfile && bun test", jobs),
-  );
+  await Bun.write(resolve(JOBS_DIRECTORY, "test.toml"), initialJobConfig(jobs));
   const added = await addRepository(repository);
   outro(
     added
@@ -862,26 +884,34 @@ async function manageCaches(action?: string): Promise<void> {
     console.log(path);
     return;
   }
-  if (action === "prune") {
-    const entries = await readdir(path, { withFileTypes: true }).catch(() => []);
-    const linuxPath = join(path, "linux");
-    const linuxEntries = await readdir(linuxPath, { withFileTypes: true }).catch(() => []);
-    await Promise.all(
-      [
-        ...entries
-          .filter((entry) => entry.name !== "shared" && entry.name !== "linux")
-          .map((entry) => join(path, entry.name)),
-        ...linuxEntries
-          .filter((entry) => entry.name !== "shared")
-          .map((entry) => join(linuxPath, entry.name)),
-      ].map((entry) => rm(entry, { recursive: true, force: true })),
+  if (action === "prune" || action === "clear") {
+    await withImageLock("housekeeping", async () => {
+      if ((await listActiveBuilds()).length > 0) {
+        throw new Error(`cannot ${action} caches while builds are active`);
+      }
+      if (action === "clear") {
+        await rm(path, { recursive: true, force: true });
+        return;
+      }
+      const entries = await readdir(path, { withFileTypes: true }).catch(() => []);
+      const linuxPath = join(path, "linux");
+      const linuxEntries = await readdir(linuxPath, { withFileTypes: true }).catch(() => []);
+      await Promise.all(
+        [
+          ...entries
+            .filter((entry) => entry.name !== "shared" && entry.name !== "linux")
+            .map((entry) => join(path, entry.name)),
+          ...linuxEntries
+            .filter((entry) => entry.name !== "shared")
+            .map((entry) => join(linuxPath, entry.name)),
+        ].map((entry) => rm(entry, { recursive: true, force: true })),
+      );
+    });
+    outro(
+      action === "clear"
+        ? "Deleted all persistent job caches"
+        : "Deleted keyed job caches; preserved shared caches",
     );
-    outro("Deleted keyed job caches; preserved shared caches");
-    return;
-  }
-  if (action === "clear") {
-    await rm(path, { recursive: true, force: true });
-    outro("Deleted all persistent job caches");
     return;
   }
   throw new Error("cache action must be one of: path, prune, clear");
