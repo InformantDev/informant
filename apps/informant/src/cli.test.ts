@@ -7,7 +7,9 @@ import {
   branchNameFromSymbolicRef,
   canServeWithoutRepositories,
   cleanOrphanedBuildWorkspacesInBackground,
+  configuredGitHubAppSettings,
   executionLabelFromRef,
+  formatGitHubAppSettings,
   main,
   pruneRuntimeImages,
   runInvocationType,
@@ -77,6 +79,52 @@ test("execution labels follow the requested ref instead of the checked out branc
 test("run preserves reported triggers unless local execution is explicit", () => {
   expect(runInvocationType(false)).toBe("trigger");
   expect(runInvocationType(true)).toBe("local");
+});
+
+test("loads every configured GitHub App before lead confirmation", async () => {
+  const inspected: string[] = [];
+  const apps = await configuredGitHubAppSettings({
+    listCredentials: async () => [
+      { appId: "one", installationId: "1", privateKeyFile: "/unused/one.pem" },
+      { appId: "two", installationId: "2", privateKeyFile: "/unused/two.pem" },
+    ],
+    inspect: async (credentials) => {
+      inspected.push(credentials.appId);
+      const settingsUrl = `https://github.com/settings/apps/${credentials.appId}`;
+      return {
+        appId: credentials.appId,
+        name: `Informant ${credentials.appId}`,
+        events: [],
+        settingsUrl,
+        permissionsUrl: `${settingsUrl}/permissions`,
+      };
+    },
+  });
+
+  expect(inspected).toEqual(["one", "two"]);
+  expect(apps.map((app) => app.appId)).toEqual(["one", "two"]);
+});
+
+test("formats direct GitHub App settings links for lead setup", () => {
+  expect(
+    formatGitHubAppSettings([
+      {
+        appId: "123",
+        name: "Informant acme",
+        events: [],
+        settingsUrl: "https://github.com/organizations/acme/settings/apps/informant-acme",
+        permissionsUrl:
+          "https://github.com/organizations/acme/settings/apps/informant-acme/permissions",
+      },
+    ]),
+  ).toBe(
+    [
+      "Configured GitHub App settings:",
+      "  Informant acme (123)",
+      "    General: https://github.com/organizations/acme/settings/apps/informant-acme",
+      "    Permissions & events: https://github.com/organizations/acme/settings/apps/informant-acme/permissions",
+    ].join("\n"),
+  );
 });
 
 test("a dedicated Tailscale lead can serve without local repositories", () => {

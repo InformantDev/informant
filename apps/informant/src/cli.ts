@@ -61,6 +61,8 @@ import {
 import {
   disableTailscale,
   enableTailscale,
+  type GitHubAppWebhookSettings,
+  githubAppWebhookSettings,
   listBuildsAcrossWorkers,
   type NetworkWorker,
   networkStatus,
@@ -920,6 +922,29 @@ async function manageRepositories(action?: string, value?: string): Promise<void
   throw new Error("repo action must be one of: add, list, remove");
 }
 
+export async function configuredGitHubAppSettings(
+  operations: {
+    inspect?: typeof githubAppWebhookSettings;
+    listCredentials?: typeof listGitHubCredentials;
+  } = {},
+): Promise<GitHubAppWebhookSettings[]> {
+  const credentials = await (operations.listCredentials ?? listGitHubCredentials)();
+  if (credentials.length === 0) throw new Error("configure a GitHub App before enabling a lead");
+  const inspect = operations.inspect ?? githubAppWebhookSettings;
+  return Promise.all(credentials.map((app) => inspect(app)));
+}
+
+export function formatGitHubAppSettings(apps: GitHubAppWebhookSettings[]): string {
+  return [
+    "Configured GitHub App settings:",
+    ...apps.flatMap((app) => [
+      `  ${app.name} (${app.appId})`,
+      `    General: ${app.settingsUrl}`,
+      `    Permissions & events: ${app.permissionsUrl}`,
+    ]),
+  ].join("\n");
+}
+
 async function manageTailscale(
   action?: string,
   flags: Record<string, string | boolean | string[]> = {},
@@ -931,10 +956,13 @@ async function manageTailscale(
     if (flags.lead !== true && flags.worker !== true) {
       throw new Error("tailscale enable requires --lead or --worker");
     }
+    if (flags.lead === true) {
+      console.log(formatGitHubAppSettings(await configuredGitHubAppSettings()));
+    }
     if (flags.lead === true && flags["webhook-ready"] !== true) {
       const ready = await confirm({
         message:
-          "Are all configured GitHub App webhooks active and subscribed to Push, Pull request, Issue comment, and Check suite events?",
+          "Have you enabled each webhook and selected Push, Pull request, Issue comment, and Check suite at the links above?",
         initialValue: false,
       });
       if (isCancel(ready) || !ready) {

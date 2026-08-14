@@ -474,22 +474,67 @@ async function githubAppHeaders(credentials: GitHubCredentials): Promise<Record<
   };
 }
 
-export async function requireGitHubAppWebhookEvents(
+export interface GitHubAppWebhookSettings {
+  appId: string;
+  name: string;
+  events: string[];
+  settingsUrl: string;
+  permissionsUrl: string;
+}
+
+export async function githubAppWebhookSettings(
   credentials: GitHubCredentials,
   request: typeof fetch = fetch,
-): Promise<void> {
+): Promise<GitHubAppWebhookSettings> {
   const response = await request(`${API}/app`, {
     headers: await githubAppHeaders(credentials),
   });
   if (!response.ok) {
-    throw new Error(`could not inspect GitHub App webhook events: ${await response.text()}`);
+    throw new Error(
+      `could not inspect GitHub App ${credentials.appId} settings: ${await response.text()}`,
+    );
   }
-  const app = (await response.json()) as { events?: unknown };
-  const events = Array.isArray(app.events) ? new Set(app.events.map(String)) : new Set<string>();
+  const value = await response.json().catch(() => undefined);
+  if (!value || typeof value !== "object") {
+    throw new Error(`could not inspect GitHub App ${credentials.appId}: invalid API response`);
+  }
+  const app = value as {
+    name?: unknown;
+    slug?: unknown;
+    events?: unknown;
+    owner?: { login?: unknown; type?: unknown };
+  };
+  if (
+    typeof app.name !== "string" ||
+    typeof app.slug !== "string" ||
+    typeof app.owner?.login !== "string" ||
+    (app.owner.type !== "Organization" && app.owner.type !== "User")
+  ) {
+    throw new Error(`could not inspect GitHub App ${credentials.appId}: invalid API response`);
+  }
+  const settingsUrl =
+    app.owner.type === "Organization"
+      ? `https://github.com/organizations/${encodeURIComponent(app.owner.login)}/settings/apps/${encodeURIComponent(app.slug)}`
+      : `https://github.com/settings/apps/${encodeURIComponent(app.slug)}`;
+  return {
+    appId: credentials.appId,
+    name: app.name,
+    events: Array.isArray(app.events) ? app.events.map(String) : [],
+    settingsUrl,
+    permissionsUrl: `${settingsUrl}/permissions`,
+  };
+}
+
+export async function requireGitHubAppWebhookEvents(
+  credentials: GitHubCredentials,
+  request: typeof fetch = fetch,
+): Promise<void> {
+  const app = await githubAppWebhookSettings(credentials, request);
+  const events = new Set(app.events);
   const missing = REQUIRED_GITHUB_WEBHOOK_EVENTS.filter((event) => !events.has(event));
   if (missing.length > 0) {
     throw new Error(
-      `GitHub App ${credentials.appId} must subscribe to these webhook events before lead mode can be enabled: ${missing.join(", ")}`,
+      `${app.name} (${app.appId}) must subscribe to these webhook events before lead mode can be enabled: ${missing.join(", ")}. Update Permissions & events: ${app.permissionsUrl}`,
     );
   }
 }
