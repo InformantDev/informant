@@ -21,7 +21,7 @@ test("--version prints the package version without help", async () => {
   try {
     await main(["--version"]);
     expect(log).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledWith("0.1.3");
+    expect(log).toHaveBeenCalledWith("0.1.4");
   } finally {
     log.mockRestore();
   }
