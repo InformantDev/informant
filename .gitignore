@@ -12,5 +12,6 @@ dist
 .staffreview/diffs/
 .staffreview/attachments/
 .staffreview/active.json
+.staffreview/docs-cache.json
 .staffreview/section-cache.json
 .pi/worktrees
