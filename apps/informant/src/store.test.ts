@@ -9,8 +9,10 @@ import {
   jobLogPath,
   listActiveBuilds,
   monitorBuildCancellation,
+  recordWorkerVersion,
   removeOrphanedBuildWorkspaces,
   requestBuildCancellation,
+  runningWorkerVersion,
   saveBuild,
 } from "./store.ts";
 import type { BuildRecord } from "./types.ts";
@@ -51,6 +53,49 @@ test("build saves preserve invocation order and complete JSON", async () => {
   await Promise.all([first, second]);
 
   expect((await getBuild(record.id))?.runningJobs).toEqual(["second"]);
+});
+
+test("worker version state belongs to a specific live process", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  const workers = join(root, "workers");
+  const dead = join(workers, "dead.json");
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+
+  await recordWorkerVersion("1.2.3");
+  expect(await runningWorkerVersion()).toBe("1.2.3");
+
+  await Bun.write(
+    dead,
+    JSON.stringify({
+      owner: { pid: 2_147_483_647, startedAt: "dead" },
+      recordedAt: "9999-12-31T23:59:59.999Z",
+      version: "9.9.9",
+    }),
+  );
+  expect(await runningWorkerVersion()).toBe("1.2.3");
+  expect(await Bun.file(dead).exists()).toBe(false);
+});
+
+test("worker version state rejects malformed versions", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  const workers = join(root, "workers");
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("expected the current process to have an identity");
+  await mkdir(workers, { recursive: true });
+  await Bun.write(
+    join(workers, "malformed.json"),
+    JSON.stringify({
+      owner,
+      recordedAt: new Date().toISOString(),
+      version: "unexpected\ntext",
+    }),
+  );
+
+  expect(await runningWorkerVersion()).toBeUndefined();
+  await expect(recordWorkerVersion("unexpected\ntext")).rejects.toThrow("Invalid worker version");
 });
 
 test("active builds are indexed and dead owners are reconciled", async () => {

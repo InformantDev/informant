@@ -54,8 +54,10 @@ import {
   listActiveBuilds,
   listBuilds,
   reconcileBuildLiveness,
+  recordWorkerVersion,
   removeOrphanedBuildWorkspaces,
   requestBuildCancellation,
+  runningWorkerVersion,
 } from "./store.ts";
 import { ensurePreparedImage, listPreparedImages, prunePreparedImages } from "./tart/index.ts";
 import type { Repository } from "./types.ts";
@@ -955,6 +957,10 @@ async function doctor(): Promise<void> {
   if (failed) process.exitCode = 1;
 }
 
+export function versionOutput(clientVersion: string, serverVersion?: string): string {
+  return serverVersion ? `${clientVersion}\nserver: ${serverVersion}` : clientVersion;
+}
+
 export function updateResultMessage(result: {
   updated: boolean;
   restarted: boolean;
@@ -974,7 +980,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const [subcommand, action, id, value] = positional;
   if (flags.version || subcommand === "--version") {
-    console.log(packageJson.version);
+    console.log(versionOutput(packageJson.version, await runningWorkerVersion()));
     return;
   }
   if (!subcommand || flags.help || subcommand === "help") {
@@ -1029,6 +1035,7 @@ export async function main(argv = Bun.argv.slice(2)): Promise<void> {
     if (repositories.length === 0) {
       throw new Error("no repositories registered; run informant repo add owner/repository");
     }
+    await recordWorkerVersion(packageJson.version);
     intro(
       `Informant worker · ${repositories.length} ${repositories.length === 1 ? "repository" : "repositories"}`,
     );

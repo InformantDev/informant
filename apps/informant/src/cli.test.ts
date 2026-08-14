@@ -14,10 +14,19 @@ import {
   updateResultMessage,
 } from "./cli.ts";
 import { selectContainerBackend } from "./container-backend.ts";
-import { createBuild, currentProcessOwner, monitorBuildCancellation, saveBuild } from "./store.ts";
+import {
+  createBuild,
+  currentProcessOwner,
+  monitorBuildCancellation,
+  recordWorkerVersion,
+  saveBuild,
+} from "./store.ts";
 import type { BuildRecord, Repository } from "./types.ts";
 
 test("--version prints the package version without help", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-version-test-"));
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = root;
   const log = spyOn(console, "log").mockImplementation(() => {});
   try {
     await main(["--version"]);
@@ -25,6 +34,27 @@ test("--version prints the package version without help", async () => {
     expect(log).toHaveBeenCalledWith(packageJson.version);
   } finally {
     log.mockRestore();
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("--version includes the version of a running server", async () => {
+  const root = await mkdtemp(join(tmpdir(), "informant-version-test-"));
+  const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await recordWorkerVersion("0.1.3");
+    await main(["--version"]);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(`${packageJson.version}\nserver: 0.1.3`);
+  } finally {
+    log.mockRestore();
+    if (originalDataDirectory === undefined) delete Bun.env.INFORMANT_DATA_DIR;
+    else Bun.env.INFORMANT_DATA_DIR = originalDataDirectory;
+    await rm(root, { recursive: true, force: true });
   }
 });
 

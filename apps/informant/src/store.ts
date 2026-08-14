@@ -46,6 +46,15 @@ interface CancellationRequest {
   requestedAt: string;
 }
 
+function workerStateDirectory(): string {
+  return join(dataDirectory(), "workers");
+}
+
+function workerStatePath(owner: NonNullable<BuildRecord["owner"]>): string {
+  const identity = createHash("sha256").update(`${owner.pid}\0${owner.startedAt}`).digest("hex");
+  return join(workerStateDirectory(), `${owner.pid}-${identity}.json`);
+}
+
 export function jobLogPath(record: BuildRecord, job: string): string {
   const id = createHash("sha256").update(job).digest("hex");
   return join(dirname(record.logPath), "jobs", `${id}.log`);
@@ -103,6 +112,61 @@ function processOwnerIsLive(owner: unknown): boolean {
     if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
     return processStartIdentity(value.pid as number) === value.startedAt;
   }
+}
+
+export async function recordWorkerVersion(version: string): Promise<void> {
+  if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error(`Invalid worker version: ${version}`);
+  const owner = currentProcessOwner();
+  if (!owner) throw new Error("Could not determine worker process start identity");
+  const path = workerStatePath(owner);
+  const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  try {
+    await Bun.write(
+      temporaryPath,
+      JSON.stringify({ owner, version, recordedAt: new Date().toISOString() }),
+    );
+    await rename(temporaryPath, path);
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
+}
+
+export async function runningWorkerVersion(): Promise<string | undefined> {
+  const directory = workerStateDirectory();
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+  const live = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map(async (entry) => {
+        const path = join(directory, entry.name);
+        try {
+          const value = (await Bun.file(path).json()) as {
+            owner?: unknown;
+            recordedAt?: unknown;
+            version?: unknown;
+          };
+          if (
+            typeof value.version !== "string" ||
+            !/^\d+\.\d+\.\d+$/.test(value.version) ||
+            typeof value.recordedAt !== "string" ||
+            !Number.isFinite(Date.parse(value.recordedAt))
+          ) {
+            return undefined;
+          }
+          if (!processOwnerIsLive(value.owner)) {
+            await rm(path, { force: true });
+            return undefined;
+          }
+          return { recordedAt: value.recordedAt, version: value.version };
+        } catch {
+          return undefined;
+        }
+      }),
+  );
+  return live
+    .filter((value): value is NonNullable<typeof value> => value !== undefined)
+    .sort((left, right) => right.recordedAt.localeCompare(left.recordedAt))[0]?.version;
 }
 
 export async function claimBuildWorkspace(workspace: string): Promise<void> {
