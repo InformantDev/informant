@@ -79,9 +79,10 @@ informant startup enable # restart after changing the role
 the worker is running in a terminal or another supervisor, polling begins the next time that process
 starts.
 
-Lead enablement requires confirmation that every locally configured GitHub App webhook is active,
-verifies that it subscribes to **Push**, **Pull request**, **Issue comment**, and **Check suite**, then
-updates its Funnel URL. GitHub does not expose an API for changing an existing App's activation or
+Lead enablement prints direct **General** and **Permissions & events** settings links for every
+locally configured GitHub App, requires confirmation that each webhook is active, verifies that it
+subscribes to **Push**, **Pull request**, **Issue comment**, and **Check suite**, then updates its
+Funnel URL. GitHub does not expose an API for changing an existing App's activation or
 event subscriptions, so lead enablement stops with instructions instead of disabling polling when
 one is missing. The lead prints a worker token; supply that token
 when explicitly enabling each worker. All private health, dispatch, build, and log requests require

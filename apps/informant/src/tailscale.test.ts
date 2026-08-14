@@ -10,6 +10,7 @@ import {
   DispatchRetryQueue,
   disableTailscale,
   enableTailscale,
+  githubAppWebhookSettings,
   MAX_WEBHOOK_BODY_BYTES,
   parseTailscaleStatus,
   RepositoryScanQueue,
@@ -73,17 +74,42 @@ test("requires existing GitHub Apps to subscribe to every dispatch event", async
   });
   await Bun.write(privateKeyFile, privateKey);
   const credentials = { appId: "123", installationId: "456", privateKeyFile };
+  const app = {
+    name: "Informant acme",
+    slug: "informant-acme",
+    owner: { login: "acme", type: "Organization" },
+  };
   try {
     await expect(
       requireGitHubAppWebhookEvents(credentials, (async (_input, _init) =>
-        Response.json({ events: ["push", "pull_request"] })) as typeof fetch),
-    ).rejects.toThrow("issue_comment, check_suite");
+        Response.json({ ...app, events: ["push", "pull_request"] })) as typeof fetch),
+    ).rejects.toThrow(
+      "https://github.com/organizations/acme/settings/apps/informant-acme/permissions",
+    );
     await expect(
       requireGitHubAppWebhookEvents(credentials, (async (_input, _init) =>
         Response.json({
+          ...app,
           events: ["push", "pull_request", "issue_comment", "check_suite"],
         })) as typeof fetch),
     ).resolves.toBeUndefined();
+    await expect(
+      githubAppWebhookSettings(credentials, (async (_input, _init) =>
+        Response.json({
+          ...app,
+          owner: { login: "ian", type: "User" },
+          events: [],
+        })) as typeof fetch),
+    ).resolves.toMatchObject({
+      settingsUrl: "https://github.com/settings/apps/informant-acme",
+      permissionsUrl: "https://github.com/settings/apps/informant-acme/permissions",
+    });
+    await expect(
+      githubAppWebhookSettings(
+        credentials,
+        (async (_input, _init) => new Response("not JSON")) as typeof fetch,
+      ),
+    ).rejects.toThrow("GitHub App 123: invalid API response");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
