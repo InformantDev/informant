@@ -168,6 +168,31 @@ test("shutdown interrupts a rate limit wait before retrying", async () => {
   expect(requests).toBe(1);
 });
 
+test("stalled GitHub requests time out so polling can retry", async () => {
+  let requestSignal: AbortSignal | null | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestSignal = init?.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return reject(new Error("expected a bounded request signal"));
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as typeof globalThis.fetch;
+
+  const error = await new GitHubClient({
+    token: "installation-token",
+    fetch,
+    requestTimeoutMs: 1,
+  })
+    .defaultBranch({ owner: "timeout-test", repo: "widgets", fullName: "timeout-test/widgets" })
+    .catch((value) => value);
+
+  expect(requestSignal?.aborted).toBe(true);
+  expect(error).toBeInstanceOf(DOMException);
+  expect(error.name).toBe("TimeoutError");
+});
+
 test("suite rerun detection forwards its cancellation signal", async () => {
   let suiteSignal: AbortSignal | null | undefined;
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -196,7 +221,10 @@ test("suite rerun detection forwards its cancellation signal", async () => {
       shutdown.signal,
     ),
   ).toBe(true);
-  expect(suiteSignal).toBe(shutdown.signal);
+  expect(suiteSignal?.aborted).toBe(false);
+  shutdown.abort("Worker shutdown requested.");
+  expect(suiteSignal?.aborted).toBe(true);
+  expect(suiteSignal?.reason).toBe("Worker shutdown requested.");
 });
 
 test("post-claim election ignores admission cancellation but honors forced shutdown", async () => {
@@ -259,10 +287,13 @@ test("post-claim election ignores admission cancellation but honors forced shutd
 
   await enteredElection;
   admission.abort("Worker shutdown requested.");
-  expect(candidateSignal).toBe(execution.signal);
-  expect(electionSignal).toBe(execution.signal);
+  expect(candidateSignal?.aborted).toBe(false);
   expect(electionSignal?.aborted).toBe(false);
   execution.abort("Graceful worker shutdown timed out.");
+  expect(candidateSignal?.aborted).toBe(true);
+  expect(candidateSignal?.reason).toBe("Graceful worker shutdown timed out.");
+  expect(electionSignal?.aborted).toBe(true);
+  expect(electionSignal?.reason).toBe("Graceful worker shutdown timed out.");
 
   expect(await pending.catch((error) => error)).toBe("Graceful worker shutdown timed out.");
   expect(cleanupSignal).not.toBe(admission.signal);
@@ -320,8 +351,9 @@ test("candidate creation finishes before honoring admission cancellation", async
   );
 
   await enteredCandidate;
-  expect(candidateSignal).toBe(execution.signal);
+  expect(candidateSignal?.aborted).toBe(false);
   admission.abort("Worker shutdown requested.");
+  expect(candidateSignal?.aborted).toBe(false);
   resolveCandidate(
     githubResponse({
       id: 1,
@@ -662,8 +694,9 @@ test("stale cleanup finishes before admission cancellation is honored", async ()
   );
 
   await cleanupStarted;
-  expect(cleanupSignal).toBe(execution.signal);
+  expect(cleanupSignal?.aborted).toBe(false);
   admission.abort("Worker shutdown requested.");
+  expect(cleanupSignal?.aborted).toBe(false);
   resolveCleanup(githubResponse({ ...stale, status: "completed", conclusion: "cancelled" }));
 
   expect(await pending.catch((error) => error)).toBe("Worker shutdown requested.");

@@ -19,6 +19,7 @@ export const JOB_CHECK_PREFIX = "Informant / ";
 const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
 const CLAIM_CANDIDATE_LEASE_MS = 60_000;
 const CLAIM_CLEANUP_TIMEOUT_MS = 5_000;
+const GITHUB_REQUEST_TIMEOUT_MS = 30_000;
 const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
 const EXPIRED_CANDIDATE_TITLE = "Expired claim candidate";
 const RETRYABLE_CLAIM_TITLES = new Set([
@@ -248,6 +249,7 @@ interface GitHubOptions {
   token?: string;
   fetch?: typeof globalThis.fetch;
   repository?: Repository;
+  requestTimeoutMs?: number;
   credentials?: {
     appId: string;
     installationId: string;
@@ -264,6 +266,7 @@ export class GitHubClient {
   private readonly credentials?: GitHubOptions["credentials"];
   private readonly repository?: Repository;
   private readonly rateLimitKey: string;
+  private readonly requestTimeoutMs: number;
   private githubClock?: { serverTime: number; observedAt: number };
 
   constructor(options: GitHubOptions = {}) {
@@ -273,6 +276,12 @@ export class GitHubClient {
     this.credentials = options.credentials;
     this.repository = options.repository;
     this.rateLimitKey = options.repository?.owner.toLowerCase() ?? "default";
+    this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? GITHUB_REQUEST_TIMEOUT_MS);
+  }
+
+  private requestSignal(signal?: AbortSignal): AbortSignal {
+    const timeout = AbortSignal.timeout(this.requestTimeoutMs);
+    return signal ? AbortSignal.any([signal, timeout]) : timeout;
   }
 
   async authenticate(signal?: AbortSignal): Promise<void> {
@@ -328,7 +337,7 @@ export class GitHubClient {
       `${API}/app/installations/${installationId}/access_tokens`,
       {
         method: "POST",
-        signal,
+        signal: this.requestSignal(signal),
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${jwt}`,
@@ -377,6 +386,7 @@ export class GitHubClient {
       `${API}/app/installations/${installationId}/access_tokens`,
       {
         method: "POST",
+        signal: this.requestSignal(),
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${this.appJwt(appId, privateKey)}`,
@@ -453,7 +463,7 @@ export class GitHubClient {
       const requestInit = typeof init === "function" ? init() : init;
       const response = await this.request(`${API}${path}`, {
         ...requestInit,
-        signal: requestSignal,
+        signal: this.requestSignal(requestSignal),
         headers: {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${this.token}`,
