@@ -871,7 +871,12 @@ async function manageImages(action?: string): Promise<void> {
     return;
   }
   if (action === "prune") {
-    const count = await pruneRuntimeImages();
+    const count = await withImageLock("housekeeping", async () => {
+      if ((await listActiveBuilds()).length > 0) {
+        throw new Error("cannot prune images while builds are active");
+      }
+      return pruneRuntimeImages();
+    });
     outro(`Deleted ${count} unused prepared ${count === 1 ? "image" : "images"}`);
     return;
   }

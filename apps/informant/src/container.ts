@@ -814,12 +814,9 @@ export async function listPreparedContainerImages(
 async function activatePreparedContainerImage(
   reference: string | undefined,
   prepared: string | undefined,
-  onMessage: (message: string) => Promise<void> | void,
-  runCommand: typeof command,
   lock: typeof withImageLock,
   signal?: AbortSignal,
   dataPath?: string,
-  backend: ContainerBackend = selectContainerBackend() ?? appleContainerBackend,
 ): Promise<void> {
   if (!reference) return;
   await lock(
@@ -832,26 +829,9 @@ async function activatePreparedContainerImage(
         await Bun.write(preparedContainerHistoryPath(prepared, dataPath), `${prepared}\n`);
       }
       if (previous === prepared) return;
-      if (previous) {
-        const referenced = await preparedContainerReferenceValues(
-          path,
-          preparedContainerReferencesDirectory(dataPath),
-        );
-        if (!referenced.includes(previous)) {
-          const result = await lock(
-            `container-${digest(previous).slice(0, 24)}`,
-            () => runCommand(backend.removeImageArguments(previous), { signal }),
-            signal,
-          );
-          if (result.exitCode === 0) {
-            await rm(preparedContainerHistoryPath(previous, dataPath), { force: true });
-            await onMessage(`Deleted superseded container image ${previous}`);
-          } else
-            await onMessage(
-              `Could not delete superseded container image ${previous}; will retry later`,
-            );
-        }
-      }
+      // Do not eagerly delete the previous image here: another active build may already have
+      // selected it while waiting for container capacity. Idle housekeeping prunes unreferenced
+      // images after all active builds finish.
       await mkdir(dirname(path), { recursive: true });
       if (prepared) await Bun.write(path, `${prepared}\n`);
       else await rm(path, { force: true });
@@ -966,12 +946,9 @@ export async function ensurePreparedContainer(
     await activatePreparedContainerImage(
       operations.reference,
       undefined,
-      onMessage,
-      runCommand,
       lock,
       signal,
       operations.dataPath,
-      backend,
     );
     return runtime.image;
   }
@@ -1037,12 +1014,9 @@ export async function ensurePreparedContainer(
     await activatePreparedContainerImage(
       operations.reference,
       image,
-      onMessage,
-      runCommand,
       lock,
       signal,
       operations.dataPath,
-      backend,
     );
     return image;
   } finally {

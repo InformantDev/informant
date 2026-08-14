@@ -294,7 +294,7 @@ test("prepares and reuses a deterministic container image", async () => {
   expect(reused).toEqual([["container", "image", "inspect", prepared]]);
 });
 
-test("tracks prepared container image references and prunes images after their last user moves", async () => {
+test("defers superseded container image pruning until idle cleanup", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-container-references-"));
   const dataPath = join(root, "data");
   const firstRuntime = { type: "container" as const, image: "base", prepare: "install first" };
@@ -347,7 +347,7 @@ test("tracks prepared container image references and prunes images after their l
       reference: "owner/two\0job",
       dataPath,
     });
-    expect(deleted).toEqual([first]);
+    expect(deleted).toEqual([]);
     expect(
       await pruneKnownPreparedContainerImages(
         command,
@@ -355,7 +355,8 @@ test("tracks prepared container image references and prunes images after their l
         withImageLock,
         appleContainerBackend,
       ),
-    ).toBe(0);
+    ).toBe(1);
+    expect(deleted).toEqual([first]);
     expect(
       await prunePreparedContainerImages(
         command,
@@ -893,7 +894,7 @@ test("prepares distinct Podman images concurrently", async () => {
         activeBuilds++;
         maximumActiveBuilds = Math.max(maximumActiveBuilds, activeBuilds);
         if (builds === 2) bothBuilding.resolve();
-        if (builds === 1) await Promise.race([bothBuilding.promise, Bun.sleep(100)]);
+        if (builds === 1) await bothBuilding.promise;
         activeBuilds--;
       }
       return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
@@ -919,7 +920,7 @@ test("prepares distinct Podman images concurrently", async () => {
 
   expect(new Set(locks).size).toBe(2);
   expect(maximumActiveBuilds).toBe(2);
-});
+}, 5_000);
 
 test("passes secrets through the client environment and always removes the container", async () => {
   const invocations: Array<{ args: string[]; environment?: Record<string, string> }> = [];
@@ -984,6 +985,46 @@ test("passes secrets through the client environment and always removes the conta
   expect(output.join("")).not.toContain("━━");
   expect(output.join("")).toContain("[REDACTED]");
   expect(output.join("")).not.toContain("line one");
+});
+
+test("removes the container when its run command throws", async () => {
+  const invocations: string[][] = [];
+  const job: JobConfig = {
+    name: "test",
+    command: "bun test",
+    optional: false,
+    timeoutMinutes: 1,
+    environment: {},
+    secrets: [],
+    needs: [],
+    runtime: { type: "container", image: "oven/bun:1" },
+  };
+
+  await expect(
+    runInContainer(
+      { owner: "owner", repo: "repo", fullName: "owner/repo" },
+      "commit-sha",
+      "feature",
+      "trusted-sha",
+      false,
+      process.cwd(),
+      job,
+      async () => {},
+      async () => {},
+      {},
+      undefined,
+      {
+        dataPath: temporaryContainerDataPath(),
+        withImageLock: passthroughImageLock,
+        command: async (args) => {
+          invocations.push(args);
+          if (args[1] === "run") throw new Error("simulated run failure");
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      },
+    ),
+  ).rejects.toThrow("simulated run failure");
+  expect(invocations.at(-1)?.slice(0, 3)).toEqual(["container", "delete", "--force"]);
 });
 
 test("mounts, redacts, and writes back an allowed host file", async () => {
@@ -1427,13 +1468,21 @@ test("startup mounted-file recovery uses the live write-back lock and re-reads t
         exchangeFilePaths,
         async (name, callback, _signal, attempts) => {
           locks.push({ name, attempts });
+          const recoveryDirectory = join(dataPath, "file-mount-recovery");
+          const entry = (await readdir(recoveryDirectory))[0];
+          if (!entry) throw new Error("expected a recovery record");
+          const recordPath = join(recoveryDirectory, entry);
+          const record = (await Bun.file(recordPath).json()) as { temporary: string };
+          await rm(record.temporary, { force: true });
+          await rm(recordPath, { force: true });
           return callback();
         },
       ),
-    ).toBe(1);
+    ).toBe(0);
     expect(locks).toEqual([
       { name: `host-file-${digest(await realpath(source))}`, attempts: Number.POSITIVE_INFINITY },
     ]);
+    expect(await readdir(join(dataPath, "file-mount-recovery"))).toEqual([]);
     expect(await Bun.file(source).json()).toEqual({ token: "rotated" });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1891,7 +1940,7 @@ test("limits concurrent Apple containers across jobs", async () => {
   const result = () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
   const releases = new Map<string, ReturnType<typeof deferred<ReturnType<typeof result>>>>();
   const dataPath = temporaryContainerDataPath();
-  const run = (name: string) =>
+  const run = (name: string, signal?: AbortSignal) =>
     runInContainer(
       repository,
       "commit-sha",
@@ -1921,7 +1970,7 @@ test("limits concurrent Apple containers across jobs", async () => {
         reportedStarted.push(name);
       },
       {},
-      undefined,
+      signal,
       {
         dataPath,
         withImageLock: passthroughImageLock,
@@ -1938,19 +1987,26 @@ test("limits concurrent Apple containers across jobs", async () => {
     );
 
   const names = ["first", "second"];
-  const jobs = names.map(run);
-  while (started.length < 1) await Bun.sleep(1);
-  expect(started).toHaveLength(1);
-  expect(reportedStarted).toEqual(started);
-  expect(waiting).toHaveLength(1);
-  expect(new Set([...started, ...waiting])).toEqual(new Set(names));
+  const controllers = names.map(() => new AbortController());
+  const jobs = names.map((name, index) => run(name, controllers[index]?.signal));
+  try {
+    while (started.length < 1) await Bun.sleep(1);
+    expect(started).toHaveLength(1);
+    expect(reportedStarted).toEqual(started);
+    expect(waiting).toHaveLength(1);
+    expect(new Set([...started, ...waiting])).toEqual(new Set(names));
 
-  releases.get(started[0] ?? "")?.resolve(result());
-  while (started.length < names.length) await Bun.sleep(1);
-  expect(new Set(started)).toEqual(new Set(names));
-  expect(new Set(reportedStarted)).toEqual(new Set(names));
-  for (const release of releases.values()) release.resolve(result());
-  await Promise.all(jobs);
+    releases.get(started[0] ?? "")?.resolve(result());
+    while (started.length < names.length) await Bun.sleep(1);
+    expect(new Set(started)).toEqual(new Set(names));
+    expect(new Set(reportedStarted)).toEqual(new Set(names));
+    for (const release of releases.values()) release.resolve(result());
+    await Promise.all(jobs);
+  } finally {
+    for (const controller of controllers) controller.abort("test cleanup");
+    for (const release of releases.values()) release.resolve(result());
+    await Promise.allSettled(jobs);
+  }
 });
 
 test("cancelling a queued job does not invoke Apple Container", async () => {

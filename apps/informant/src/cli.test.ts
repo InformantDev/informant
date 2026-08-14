@@ -255,7 +255,7 @@ test("image prune reports partial runtime failures and preserves the successful 
   );
 });
 
-test("cache cleanup refuses to race active builds", async () => {
+test("manual destructive cleanup refuses to race active builds", async () => {
   const root = await mkdtemp(join(tmpdir(), "informant-cli-cache-active-"));
   const cacheRoot = join(root, "caches");
   const originalDataDirectory = Bun.env.INFORMANT_DATA_DIR;
@@ -279,6 +279,9 @@ test("cache cleanup refuses to race active builds", async () => {
 
     await expect(main(["cache", "prune"])).rejects.toThrow(
       "cannot prune caches while builds are active",
+    );
+    await expect(main(["image", "prune"])).rejects.toThrow(
+      "cannot prune images while builds are active",
     );
     expect(await readdir(join(cacheRoot, "repository"))).toEqual(["keyed-entry"]);
   } finally {
