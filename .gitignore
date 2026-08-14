@@ -14,3 +14,4 @@ dist
 .staffreview/attachments/
 .staffreview/active.json
 .staffreview/section-cache.json
+.pi/worktrees
