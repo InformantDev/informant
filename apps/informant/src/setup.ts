@@ -526,7 +526,12 @@ export async function setup(): Promise<void> {
   const tailStatus = await tailscaleStatus();
   if (!funnelUrl && tailStatus?.online) {
     try {
-      funnelUrl = await prepareTailscaleFunnel(tailStatus, DEFAULT_FUNNEL_PORT);
+      funnelUrl = await prepareTailscaleFunnel(
+        tailStatus,
+        DEFAULT_FUNNEL_PORT,
+        command,
+        openBrowser,
+      );
       console.log(`Tailscale Funnel ready at ${funnelUrl}/webhooks/github`);
     } catch (error) {
       console.warn(

@@ -13,7 +13,7 @@ import {
   saveTailscaleConfig,
   type TailscaleConfig,
 } from "./machine-config.ts";
-import { type CommandResult, command } from "./process.ts";
+import { command } from "./process.ts";
 import { type ServerOptions, serveRepositories } from "./server.ts";
 import {
   getBuild,
@@ -346,11 +346,15 @@ export function parseTailscaleStatus(executable: string, output: string): Tailsc
 }
 
 export async function tailscaleStatus(
-  runCommand: (argv: string[]) => Promise<CommandResult> = command,
+  runCommand: typeof command = command,
+  resolveExecutable: () => string | undefined = tailscaleExecutable,
 ): Promise<TailscaleStatus | undefined> {
-  const executable = tailscaleExecutable();
+  const executable = resolveExecutable();
   if (!executable) return undefined;
-  const result = await runCommand([executable, "status", "--json"]);
+  const result = await runCommand([executable, "status", "--json"], {
+    env: { TERM: Bun.env.TERM ?? "dumb" },
+    timeoutMs: 10_000,
+  });
   if (result.exitCode !== 0) return undefined;
   return parseTailscaleStatus(executable, result.stdout);
 }
@@ -426,18 +430,29 @@ export async function discoverNetworkWorkers(
 export async function prepareTailscaleFunnel(
   status: TailscaleStatus,
   port = DEFAULT_FUNNEL_PORT,
-  runCommand: (argv: string[]) => Promise<CommandResult> = command,
+  runCommand: typeof command = command,
+  authorize?: (url: string) => Promise<void> | void,
 ): Promise<string> {
-  const result = await runCommand([
-    status.executable,
-    "funnel",
-    "--bg",
-    "--yes",
-    `http://127.0.0.1:${port}`,
-  ]);
-  if (result.exitCode !== 0) {
+  let output = "";
+  let authorizationUrl: string | undefined;
+  const result = await runCommand(
+    [status.executable, "funnel", "--bg", "--yes", `http://127.0.0.1:${port}`],
+    {
+      env: { TERM: Bun.env.TERM ?? "dumb" },
+      timeoutMs: 120_000,
+      onOutput: async (text) => {
+        output = `${output}${text}`.slice(-8_192);
+        const url = output.match(/https:\/\/login\.tailscale\.com\/f\/funnel\?[^\s]+(?=\s)/)?.[0];
+        if (!url || url === authorizationUrl) return;
+        authorizationUrl = url;
+        await authorize?.(url);
+      },
+    },
+  );
+  if (result.exitCode !== 0 || result.timedOut) {
+    const detail = result.stderr.trim() || result.stdout.trim();
     throw new Error(
-      `could not enable Tailscale Funnel: ${result.stderr.trim() || result.stdout.trim()}`,
+      `could not enable Tailscale Funnel${result.timedOut ? " within 2 minutes" : ""}: ${detail || "check that this node is allowed to use Funnel, then retry"}`,
     );
   }
   const dnsName = status.self.dnsName;
@@ -447,12 +462,15 @@ export async function prepareTailscaleFunnel(
 
 export async function resetTailscaleFunnel(
   status: TailscaleStatus,
-  runCommand: (argv: string[]) => Promise<CommandResult> = command,
+  runCommand: typeof command = command,
 ): Promise<void> {
-  const result = await runCommand([status.executable, "funnel", "--https=443", "off"]);
-  if (result.exitCode !== 0) {
+  const result = await runCommand([status.executable, "funnel", "--https=443", "off"], {
+    env: { TERM: Bun.env.TERM ?? "dumb" },
+    timeoutMs: 30_000,
+  });
+  if (result.exitCode !== 0 || result.timedOut) {
     throw new Error(
-      `could not disable Tailscale Funnel: ${result.stderr.trim() || result.stdout.trim()}`,
+      `could not disable Tailscale Funnel: ${result.stderr.trim() || result.stdout.trim() || "command timed out"}`,
     );
   }
 }
@@ -563,6 +581,7 @@ export interface EnableTailscaleOperations {
   getConfig?: typeof getTailscaleConfig;
   listCredentials?: typeof listGitHubCredentials;
   prepareFunnel?: typeof prepareTailscaleFunnel;
+  authorizeFunnel?: (url: string) => Promise<void> | void;
   networkSecret?: string;
   saveConfig?: typeof saveTailscaleConfig;
   status?: typeof tailscaleStatus;
@@ -617,6 +636,8 @@ export async function enableTailscale(
   const funnelUrl = await (operations.prepareFunnel ?? prepareTailscaleFunnel)(
     status,
     base.funnelPort,
+    command,
+    operations.authorizeFunnel,
   );
   const config = { ...base, funnelUrl, webhookSecret: secret, networkSecret };
   await saveConfig(config);

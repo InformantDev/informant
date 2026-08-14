@@ -82,7 +82,9 @@ starts.
 Lead enablement prints direct **General** and **Permissions & events** settings links for every
 locally configured GitHub App, requires confirmation that each webhook is active, verifies that it
 subscribes to **Push**, **Pull request**, **Issue comment**, and **Check suite**, then updates its
-Funnel URL. GitHub does not expose an API for changing an existing App's activation or
+Funnel URL. When Tailscale requires tailnet-owner approval for Funnel, Informant opens the approval
+page and waits up to two minutes instead of hanging silently. GitHub does not expose an API for
+changing an existing App's activation or
 event subscriptions, so lead enablement stops with instructions instead of disabling polling when
 one is missing. The lead prints a worker token; supply that token
 when explicitly enabling each worker. All private health, dispatch, build, and log requests require
