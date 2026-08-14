@@ -1,8 +1,13 @@
 # Vendored Pi extensions
 
-`subagents.ts` and its `footer-events.ts` dependency come from `@vessup/pi-kit`.
-The package is currently private and unpublished, so keeping its source here makes
-the Staff Review runtime reproducible without substituting another package.
+The vendored repository sources `informant-subagents.ts` and
+`informant-footer-events.ts` come from `@vessup/pi-kit`. The package is currently
+private and unpublished, so keeping its source here makes the Staff Review runtime
+reproducible without substituting another package.
+
+The prepared runtime image installs those files under the aliases
+`/opt/informant/extensions/subagents.ts` and
+`/opt/informant/extensions/footer-events.ts`, respectively.
 
 Staff Review applies local hardening patches: parent and child file tools are
 bounded to the review workspace (plus image-baked review skills), child sessions

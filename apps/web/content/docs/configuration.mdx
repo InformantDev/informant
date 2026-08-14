@@ -206,7 +206,17 @@ informant mount allow codex-auth "$HOME/.codex/auth.json"
 If a Codex login is stored only in the system keychain, create the file-backed login first with
 `codex -c 'cli_auth_credentials_store="file"' login`.
 
-Then request that name from a job and choose a container directory. Informant mounts a temporary
+The built-in Staff Review job uses Pi and requires a `pi-auth` mount. After signing in with Pi's
+`/login` command, allow its credential file on every worker that should claim Staff Review jobs:
+
+```bash
+informant mount allow pi-auth "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/auth.json"
+```
+
+The worker will then advertise `mount:pi-auth`; without it, the worker cannot claim the built-in job.
+This replaces the `codex-auth` requirement used by earlier Staff Review job definitions.
+
+Then request an allowlist name from a job and choose a container directory. Informant mounts a temporary
 directory containing the file under its original basename:
 
 ```toml
@@ -258,8 +268,10 @@ closed PR. Fork PR heads are not executed.
 Jobs inherit top-level triggers. A job's own `triggers` replaces them; `triggers = []` makes it manual-
 or dependency-only. Matching rules are ORed, and dependencies of matching root jobs are always added.
 Legacy `branches` still becomes commit branch rules (default `main`), but cannot be combined with
-top-level `triggers`. Manual runs ignore trigger eligibility, except that branch constraints embedded
-in existing trigger rules remain enforced for compatibility. Prefer job filters for new configuration.
+top-level `triggers`. Manual runs generally ignore automatic trigger matching. For a branch-context
+manual run, however, a job must have no triggers or at least one compatible commit rule: tag and
+comment rules do not qualify, while branch names embedded in commit rules remain enforced. A pull-
+request commit rule is also compatible. Prefer job filters for new configuration.
 
 Top-level `filters` are inherited by jobs. A job's own `filters` replaces them, and `filters = []`
 opts out. Filters constrain root-job eligibility independently of triggers. Use branch filters for jobs
@@ -295,6 +307,14 @@ build or image state owned by the same user.
 Informant tracks which configured repository jobs use each prepared Tart or container image.
 When the final reference moves to another image, or a repository or job is removed, idle housekeeping
 deletes the unreferenced image. `informant image prune` runs that cleanup immediately.
+
+On macOS, an Apple Container image build also schedules the shared BuildKit builder for reset during
+the next idle housekeeping pass. Informant waits until it has no active builds, then uses
+`container builder stop` followed by `container builder delete`; the next image build recreates the
+builder lazily. Deleting the builder is necessary to return its sparse filesystem's allocated blocks
+to the host. It discards build cache shared with other Apple Container clients, but it does not delete
+published images, application containers, or volumes. The reset is serialized with Informant image
+preparation, and failures are logged and retried without failing the completed job.
 
 Container runtimes can declare repository-relative files or glob patterns with `prepareInputs`.
 Informant copies matching files into the image's `/workspace`, exposes that path as

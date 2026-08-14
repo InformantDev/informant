@@ -112,7 +112,11 @@ export interface CheckRun {
   external_id?: string | null;
   started_at?: string | null;
   html_url?: string;
-  output?: { title?: string; summary?: string; text?: string };
+  output?: {
+    title?: string | null;
+    summary?: string | null;
+    text?: string | null;
+  };
 }
 
 export interface BuildRecord {

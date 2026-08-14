@@ -168,6 +168,31 @@ test("shutdown interrupts a rate limit wait before retrying", async () => {
   expect(requests).toBe(1);
 });
 
+test("stalled GitHub requests time out so polling can retry", async () => {
+  let requestSignal: AbortSignal | null | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestSignal = init?.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) return reject(new Error("expected a bounded request signal"));
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  }) as typeof globalThis.fetch;
+
+  const error = await new GitHubClient({
+    token: "installation-token",
+    fetch,
+    requestTimeoutMs: 1,
+  })
+    .defaultBranch({ owner: "timeout-test", repo: "widgets", fullName: "timeout-test/widgets" })
+    .catch((value) => value);
+
+  expect(requestSignal?.aborted).toBe(true);
+  expect(error).toBeInstanceOf(DOMException);
+  expect(error.name).toBe("TimeoutError");
+});
+
 test("suite rerun detection forwards its cancellation signal", async () => {
   let suiteSignal: AbortSignal | null | undefined;
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -196,7 +221,10 @@ test("suite rerun detection forwards its cancellation signal", async () => {
       shutdown.signal,
     ),
   ).toBe(true);
-  expect(suiteSignal).toBe(shutdown.signal);
+  expect(suiteSignal?.aborted).toBe(false);
+  shutdown.abort("Worker shutdown requested.");
+  expect(suiteSignal?.aborted).toBe(true);
+  expect(suiteSignal?.reason).toBe("Worker shutdown requested.");
 });
 
 test("post-claim election ignores admission cancellation but honors forced shutdown", async () => {
@@ -259,10 +287,13 @@ test("post-claim election ignores admission cancellation but honors forced shutd
 
   await enteredElection;
   admission.abort("Worker shutdown requested.");
-  expect(candidateSignal).toBe(execution.signal);
-  expect(electionSignal).toBe(execution.signal);
+  expect(candidateSignal?.aborted).toBe(false);
   expect(electionSignal?.aborted).toBe(false);
   execution.abort("Graceful worker shutdown timed out.");
+  expect(candidateSignal?.aborted).toBe(true);
+  expect(candidateSignal?.reason).toBe("Graceful worker shutdown timed out.");
+  expect(electionSignal?.aborted).toBe(true);
+  expect(electionSignal?.reason).toBe("Graceful worker shutdown timed out.");
 
   expect(await pending.catch((error) => error)).toBe("Graceful worker shutdown timed out.");
   expect(cleanupSignal).not.toBe(admission.signal);
@@ -320,8 +351,9 @@ test("candidate creation finishes before honoring admission cancellation", async
   );
 
   await enteredCandidate;
-  expect(candidateSignal).toBe(execution.signal);
+  expect(candidateSignal?.aborted).toBe(false);
   admission.abort("Worker shutdown requested.");
+  expect(candidateSignal?.aborted).toBe(false);
   resolveCandidate(
     githubResponse({
       id: 1,
@@ -399,6 +431,53 @@ test("uncertain candidate creation is reconciled after forced shutdown", async (
     conclusion: "cancelled",
     output: { title: "Claim interrupted" },
   });
+});
+
+test("automatic candidate promotion omits null output text returned by GitHub", async () => {
+  let candidate: CheckRun | undefined;
+  let promotion: { output?: Record<string, unknown> } | undefined;
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      candidate = {
+        id: 1,
+        ...body,
+        output: { ...body.output, text: null },
+      } as CheckRun;
+      return githubResponse(candidate);
+    }
+    if (init?.method === "PATCH") {
+      promotion = JSON.parse(String(init.body));
+      if (promotion?.output?.text === null) {
+        return githubResponse(
+          { message: "For 'properties/text', nil is not a string." },
+          { status: 422 },
+        );
+      }
+      if (candidate) Object.assign(candidate, promotion);
+      return githubResponse(candidate ?? {});
+    }
+    const checks =
+      url.searchParams.get("check_name") === MANUAL_TRIGGER_REQUEST_NAME || !candidate
+        ? []
+        : [candidate];
+    return githubResponse({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "null-output", repo: "widgets", fullName: "null-output/widgets" },
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+  );
+
+  expect(claim?.check?.id).toBe(1);
+  expect(promotion).toMatchObject({
+    status: "in_progress",
+    output: { title: "Informant CI", summary: expect.any(String) },
+  });
+  expect(promotion?.output).not.toHaveProperty("text");
 });
 
 test("an expired compact candidate is cancelled and retried in its automatic scope", async () => {
@@ -615,8 +694,9 @@ test("stale cleanup finishes before admission cancellation is honored", async ()
   );
 
   await cleanupStarted;
-  expect(cleanupSignal).toBe(execution.signal);
+  expect(cleanupSignal?.aborted).toBe(false);
   admission.abort("Worker shutdown requested.");
+  expect(cleanupSignal?.aborted).toBe(false);
   resolveCleanup(githubResponse({ ...stale, status: "completed", conclusion: "cancelled" }));
 
   expect(await pending.catch((error) => error)).toBe("Worker shutdown requested.");
@@ -680,6 +760,26 @@ test("check output strips terminal control sequences", async () => {
 
   expect(requestBody?.output).toMatchObject({ title: "test", summary: "running" });
   expect(requestBody?.output?.text).toBe("```text\nfailed\n```");
+});
+
+test("check updates omit null output text returned by GitHub", async () => {
+  let requestBody: { output?: Record<string, unknown> } | undefined;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return githubResponse({ id: 1, name: "Informant CI", status: "in_progress" });
+  }) as typeof globalThis.fetch;
+
+  await new GitHubClient({ token: "installation-token", fetch }).updateCheck(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    1,
+    {
+      title: "Informant CI",
+      summary: "Claimed",
+      text: null,
+    },
+  );
+
+  expect(requestBody?.output).toEqual({ title: "Informant CI", summary: "Claimed" });
 });
 
 test("directory files returns sorted TOML files only", async () => {

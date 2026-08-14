@@ -482,6 +482,14 @@ export async function scheduleJobs(
   return results.every(Boolean);
 }
 
+export interface RunInTartOperations {
+  reconcilePreparedImageReferences?: typeof reconcilePreparedImageReferences;
+  claimBuildWorkspace?: typeof claimBuildWorkspace;
+  requireCommand?: typeof requireCommand;
+  checkoutBuildWorkspace?: typeof checkoutBuildWorkspace;
+  runInContainer?: typeof runInContainer;
+}
+
 export async function runInTart(
   repository: Repository,
   sha: string,
@@ -493,8 +501,13 @@ export async function runInTart(
   configuredVmJobs = config.jobs
     .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name),
+  operations: RunInTartOperations = {},
 ): Promise<boolean> {
-  await reconcilePreparedImageReferences(repository.fullName, configuredVmJobs, signal);
+  await (operations.reconcilePreparedImageReferences ?? reconcilePreparedImageReferences)(
+    repository.fullName,
+    configuredVmJobs,
+    signal,
+  );
   if (config.jobs.some((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host"))
     await cleanStaleVms();
   const root = join(record.logPath, "..", "workspace");
@@ -557,11 +570,11 @@ export async function runInTart(
   let result: boolean | undefined;
   try {
     signal?.throwIfAborted();
-    await claimBuildWorkspace(root);
+    await (operations.claimBuildWorkspace ?? claimBuildWorkspace)(root);
     await mkdir(join(record.logPath, "..", "jobs"), { recursive: true });
     logHandle = await open(record.logPath, "a");
     await writeLog(`$ cloning ${repository.fullName} at ${sha}\n`);
-    await requireCommand(
+    await (operations.requireCommand ?? requireCommand)(
       [
         "gh",
         "repo",
@@ -576,7 +589,7 @@ export async function runInTart(
     );
     for (const [index, workspace] of workspaces.entries()) {
       const job = config.jobs[index];
-      const checkout = await checkoutBuildWorkspace(
+      const checkout = await (operations.checkoutBuildWorkspace ?? checkoutBuildWorkspace)(
         repositoryPath,
         workspace,
         sha,
@@ -590,7 +603,7 @@ export async function runInTart(
       }
       const trustedInputWorkspace = trustedInputWorkspaces[index];
       if (!trustedInputWorkspace || config.trustedSha === sha) continue;
-      const trustedCheckout = await checkoutBuildWorkspace(
+      const trustedCheckout = await (operations.checkoutBuildWorkspace ?? checkoutBuildWorkspace)(
         repositoryPath,
         trustedInputWorkspace,
         config.trustedSha ?? sha,
@@ -628,7 +641,7 @@ export async function runInTart(
                 signal,
               )
             : runtime.type === "container"
-              ? await runInContainer(
+              ? await (operations.runInContainer ?? runInContainer)(
                   repository,
                   sha,
                   record.branch,
