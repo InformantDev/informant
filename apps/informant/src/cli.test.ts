@@ -17,6 +17,7 @@ import {
   pruneRuntimeImages,
   runInvocationType,
   runManualHousekeeping,
+  shouldAnimateCliProgress,
   tailRemoteLog,
   updateResultMessage,
 } from "./cli.ts";
@@ -105,6 +106,17 @@ test("initial job commands preserve replacement tokens", () => {
   expect(initialJobConfig("echo $$ && echo $&")).toContain(
     'command = """\necho $$ && echo $&\n"""',
   );
+});
+
+test("progress animation is disabled for noninteractive and coding-agent runs", () => {
+  expect(shouldAnimateCliProgress({}, true, true, true)).toBe(true);
+  expect(shouldAnimateCliProgress({}, false, true, true)).toBe(false);
+  expect(shouldAnimateCliProgress({}, true, false, true)).toBe(false);
+  expect(shouldAnimateCliProgress({}, true, true, false)).toBe(false);
+  expect(shouldAnimateCliProgress({ CI: "true" }, true, true, true)).toBe(false);
+  expect(shouldAnimateCliProgress({ PI_CODING_AGENT: "true" }, true, true, true)).toBe(false);
+  expect(shouldAnimateCliProgress({ PI_WEB_MANAGED: "1" }, true, true, true)).toBe(false);
+  expect(shouldAnimateCliProgress({ TERM: "dumb" }, true, true, true)).toBe(false);
 });
 
 test("opens Tailscale Funnel approval in the platform browser", async () => {
