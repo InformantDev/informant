@@ -195,6 +195,40 @@ test("same-second revisions supersede missed transitions without accepting delay
   expect(controllerC.signal.aborted).toBe(false);
 });
 
+test("timestamp-less same-head updates preserve the expected ordering watermark", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  const shaD = "d".repeat(40);
+  runs.apply(repository, [
+    { lane: "branch:main", sha: shaB, updatedAt: 100_000, revision: "head-b" },
+  ]);
+  const enrichedRedelivery = {
+    lane: "branch:main",
+    sha: shaB,
+    updatedAt: 100_000,
+    revision: "head-b-redelivery",
+  };
+  expect(
+    runs.apply(repository, [{ lane: "branch:main", sha: shaB, revision: "head-b-redelivery" }]),
+  ).toEqual([enrichedRedelivery]);
+  expect(runs.apply(repository, [{ lane: "branch:main", sha: shaB }])).toEqual([
+    enrichedRedelivery,
+  ]);
+
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaB, controller)).toBe(true);
+  const latest = {
+    lane: "branch:main",
+    sha: shaD,
+    obsoleteShas: [shaC],
+    updatedAt: 100_000,
+    revision: "c-to-d",
+  };
+  expect(runs.apply(repository, [latest])).toEqual([{ ...latest, obsoleteShas: [shaC, shaB] }]);
+  expect(controller.signal.aborted).toBe(true);
+});
+
 test("delayed same-head updates cannot lower an evicted active ordering watermark", () => {
   const runs = new AutomaticRunRegistry();
   const shaA = "a".repeat(40);

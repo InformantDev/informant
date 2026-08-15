@@ -137,12 +137,18 @@ function mergeAutomaticLaneUpdate(
   const uniqueObsolete = [...new Set(obsoleteShas)]
     .filter((sha) => sha !== latest.sha)
     .slice(-MAX_OBSOLETE_LANE_SHAS);
+  const preservesLaneHead =
+    previous.sha === incoming.sha && Boolean(previous.closed) === Boolean(incoming.closed);
+  const updatedAt = latest.updatedAt ?? (preservesLaneHead ? older.updatedAt : undefined);
+  const revision =
+    latest.revision ??
+    (preservesLaneHead && latest.updatedAt === undefined ? older.revision : undefined);
   return {
     lane: latest.lane,
     ...(latest.sha ? { sha: latest.sha } : {}),
     ...(uniqueObsolete.length > 0 ? { obsoleteShas: uniqueObsolete } : {}),
-    ...(latest.updatedAt !== undefined ? { updatedAt: latest.updatedAt } : {}),
-    ...(latest.revision !== undefined ? { revision: latest.revision } : {}),
+    ...(updatedAt !== undefined ? { updatedAt } : {}),
+    ...(revision !== undefined ? { revision } : {}),
     ...(latest.closed ? { closed: true } : {}),
   };
 }

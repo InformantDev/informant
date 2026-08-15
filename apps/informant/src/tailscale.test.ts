@@ -631,6 +631,17 @@ test("extracts and validates bounded automatic lane updates", () => {
       [{ lane: "branch:main", closed: true, obsoleteShas: [oldSha], updatedAt: 300 }],
     ),
   ).toEqual([{ ...newer, obsoleteShas: [oldSha], updatedAt: 300 }]);
+  const timestampedHead = { ...retired, updatedAt: 300 };
+  expect(
+    mergeAutomaticLaneUpdates([timestampedHead], [{ lane: "branch:main", sha: oldSha }]),
+  ).toEqual([timestampedHead]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [timestampedHead],
+      [{ lane: "branch:main", sha: oldSha, revision: "delivery-redelivered" }],
+    ),
+  ).toEqual([{ ...timestampedHead, revision: "delivery-redelivered" }]);
+
   const sameSecondMissedTransition = {
     lane: "branch:main",
     sha: "c".repeat(40),

@@ -307,11 +307,26 @@ export class AutomaticRunRegistry {
       }
       const obsoleteShas = new Set(update.obsoleteShas ?? []);
       if (active && active.sha !== nextSha && orderedAfterActive) obsoleteShas.add(active.sha);
-      if (previous?.sha === nextSha && Boolean(previous.update.closed) === Boolean(update.closed)) {
+      const preservesExpectedHead =
+        previous?.sha === nextSha && Boolean(previous.update.closed) === Boolean(update.closed);
+      if (preservesExpectedHead) {
         for (const sha of previous.obsoleteShas) obsoleteShas.add(sha);
       }
-      const acceptedUpdate =
-        obsoleteShas.size > 0 ? { ...update, obsoleteShas: [...obsoleteShas] } : update;
+      const acceptedUpdate = {
+        ...update,
+        ...(preservesExpectedHead &&
+        update.updatedAt === undefined &&
+        previous?.update.updatedAt !== undefined
+          ? { updatedAt: previous.update.updatedAt }
+          : {}),
+        ...(preservesExpectedHead &&
+        update.updatedAt === undefined &&
+        update.revision === undefined &&
+        previous?.update.revision !== undefined
+          ? { revision: previous.update.revision }
+          : {}),
+        ...(obsoleteShas.size > 0 ? { obsoleteShas: [...obsoleteShas] } : {}),
+      };
       accepted.push(acceptedUpdate);
       this.expected.delete(key);
       this.expected.set(key, {
