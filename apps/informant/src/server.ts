@@ -157,13 +157,15 @@ export function automaticLaneUpdateIdentity(update: AutomaticLaneUpdate): string
 }
 
 export function automaticLaneUpdateSemanticIdentity(update: AutomaticLaneUpdate): string {
-  return JSON.stringify([
-    update.lane,
-    update.sha ?? null,
-    update.closed === true,
-    update.updatedAt ?? null,
-    [...(update.obsoleteShas ?? [])].sort(),
-  ]);
+  return update.revision
+    ? JSON.stringify([update.lane, "revision", update.revision])
+    : JSON.stringify([
+        update.lane,
+        "legacy",
+        update.sha ?? null,
+        update.closed === true,
+        update.updatedAt ?? null,
+      ]);
 }
 
 export function automaticLaneUpdateIsNewer(
@@ -220,11 +222,15 @@ export class AutomaticRunRegistry {
         continue;
       }
       accepted.push(update);
+      const obsoleteShas = new Set(update.obsoleteShas ?? []);
+      if (previous?.sha === nextSha && Boolean(previous.update.closed) === Boolean(update.closed)) {
+        for (const sha of previous.obsoleteShas) obsoleteShas.add(sha);
+      }
       this.expected.delete(key);
       this.expected.set(key, {
-        update,
-        sha: update.closed ? null : (update.sha ?? null),
-        obsoleteShas: new Set(update.obsoleteShas ?? []),
+        update: { ...update, obsoleteShas: [...obsoleteShas] },
+        sha: nextSha,
+        obsoleteShas,
         generation: ++this.generation,
       });
       while (this.expected.size > MAX_TRACKED_AUTOMATIC_LANES) {

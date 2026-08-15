@@ -115,18 +115,6 @@ export async function systemdPodmanSandboxConflict(
   const userProperties = await inspect("user", "informant.service");
   const user = conflict("user", "informant.service", userProperties);
   if (user) return user;
-  if (
-    userProperties?.LoadState === "loaded" &&
-    userProperties.ActiveState === "active" &&
-    Number(userProperties.MainPID)
-  ) {
-    const uid = options.uid ?? process.getuid?.();
-    if (uid !== undefined) {
-      const managerUnit = `user@${uid}.service`;
-      const manager = conflict("user-manager", managerUnit, await inspect("system", managerUnit));
-      if (manager) return manager;
-    }
-  }
 
   const workerCgroups =
     options.workerCgroups ??
@@ -135,7 +123,21 @@ export async function systemdPodmanSandboxConflict(
         await runningWorkerPids()
       ).map((pid) => readFile(`/proc/${pid}/cgroup`, "utf8").catch(() => "")),
     ));
-  for (const { scope, unit } of workerCgroups.flatMap(systemdWorkerUnitsFromCgroup)) {
+  const workerUnits = workerCgroups.flatMap(systemdWorkerUnitsFromCgroup);
+  const standardUserWorkerIsActive =
+    userProperties?.LoadState === "loaded" &&
+    userProperties.ActiveState === "active" &&
+    Boolean(Number(userProperties.MainPID));
+  if (standardUserWorkerIsActive || workerUnits.some(({ scope }) => scope === "user")) {
+    const uid = options.uid ?? process.getuid?.();
+    if (uid !== undefined) {
+      const managerUnit = `user@${uid}.service`;
+      const manager = conflict("user-manager", managerUnit, await inspect("system", managerUnit));
+      if (manager) return manager;
+    }
+  }
+
+  for (const { scope, unit } of workerUnits) {
     if (unit === "informant.service") continue;
     const discovered = conflict(scope, unit, await inspect(scope, unit));
     if (discovered) return discovered;

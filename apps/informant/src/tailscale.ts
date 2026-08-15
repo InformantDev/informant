@@ -143,6 +143,26 @@ function mergeAutomaticLaneUpdate(
   };
 }
 
+export function automaticLaneUpdatesRefreshRetention(
+  previous: AutomaticLaneUpdate[] | undefined,
+  latest: AutomaticLaneUpdate[] | undefined,
+): boolean {
+  const retained = new Map((previous ?? []).map((update) => [update.lane, update]));
+  for (const update of latest ?? []) {
+    const existing = retained.get(update.lane);
+    if (
+      !existing ||
+      (automaticLaneUpdateSemanticIdentity(existing) !==
+        automaticLaneUpdateSemanticIdentity(update) &&
+        automaticLaneUpdateIsNewer(existing, update))
+    ) {
+      return true;
+    }
+    retained.set(update.lane, mergeAutomaticLaneUpdate(existing, update));
+  }
+  return false;
+}
+
 export function mergeAutomaticLaneUpdates(
   previous: AutomaticLaneUpdate[] | undefined,
   latest: AutomaticLaneUpdate[] | undefined,
@@ -1172,9 +1192,11 @@ async function serveConfiguredWithTailscale(
     updates: AutomaticLaneUpdate[] | undefined,
   ): AutomaticLaneUpdate[] | undefined => {
     const key = repository.fullName.toLowerCase();
-    const merged = mergeAutomaticLaneUpdates(latestAutomaticUpdates.get(key), updates);
+    const retained = latestAutomaticUpdates.get(key);
+    const refreshesRetention = automaticLaneUpdatesRefreshRetention(retained, updates);
+    const merged = mergeAutomaticLaneUpdates(retained, updates);
     if (merged) {
-      latestAutomaticUpdates.delete(key);
+      if (refreshesRetention) latestAutomaticUpdates.delete(key);
       latestAutomaticUpdates.set(key, merged);
       while (latestAutomaticUpdates.size > MAX_REMEMBERED_REPOSITORIES) {
         latestAutomaticUpdates.delete(latestAutomaticUpdates.keys().next().value ?? "");

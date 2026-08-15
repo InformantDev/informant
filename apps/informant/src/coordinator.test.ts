@@ -545,6 +545,56 @@ describe("runCommit", () => {
     expect(context.jobChecks).toEqual([]);
   });
 
+  test("bounds fallback admission while another worker may claim", async () => {
+    const context = harness();
+    let claims = 0;
+    let admissionAborted = false;
+    context.github.claim = async () => {
+      claims++;
+      return undefined;
+    };
+    context.dependencies.acquireExecutionSlot = async (_config, signal) =>
+      new Promise((resolve) => {
+        const abort = () => {
+          admissionAborted = true;
+          resolve(undefined);
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+      });
+    const resources = {
+      capacity: { cpu: 4, memoryMb: 4096 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    };
+
+    const result = await runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+      { type: "commit", id: "branch:main:sha", branch: "main" },
+      undefined,
+      undefined,
+      undefined,
+      {
+        workerId: "watchdog",
+        rotation: 0,
+        staggerMs: 5,
+        claimants: [
+          { id: "blackbird", capabilities: [], resources },
+          { id: "watchdog", capabilities: [], resources },
+        ],
+      },
+    );
+
+    expect(result).toBeFalse();
+    expect(admissionAborted).toBe(true);
+    expect(claims).toBe(0);
+  });
+
   test("treats an interrupted GitHub claim as unclaimed work", async () => {
     const context = harness();
     const enteredClaim = deferred<void>();
@@ -1321,6 +1371,21 @@ describe("runCommit", () => {
       ],
     };
     const context = harness({ manualTrigger: true, requestedJobs: ["test"] });
+    const reservations: string[][] = [];
+    let releases = 0;
+    context.dependencies.acquireExecutionSlot = Object.assign(
+      async () => {
+        throw new Error("manual claims must not wait for automatic capacity");
+      },
+      {
+        reserve: (reserved: InformantConfig) => {
+          reservations.push(reserved.jobs.map((job) => job.name));
+          return () => {
+            releases++;
+          };
+        },
+      },
+    );
 
     await runCommit(
       context.github,
@@ -1333,6 +1398,8 @@ describe("runCommit", () => {
 
     expect(context.jobChecks).toEqual(["test"]);
     expect(context.receivedConfiguredVmJobs()).toEqual(["test", "macos-e2e"]);
+    expect(reservations).toEqual([["test"]]);
+    expect(releases).toBe(1);
   });
 
   test("returns without persistence when no claim is available", async () => {

@@ -263,7 +263,7 @@ test("a failed Podman job rechecks and revokes runtime readiness", async () => {
     {
       backend,
       command: async (args) => ({
-        exitCode: args[1] === "run" ? 1 : 0,
+        exitCode: args[1] === "run" ? 125 : 0,
         stdout: "",
         stderr: args[1] === "run" ? "error running container: crun failed" : "",
         timedOut: false,
@@ -274,6 +274,51 @@ test("a failed Podman job rechecks and revokes runtime readiness", async () => {
   expect(result.success).toBe(false);
   expect(probes).toBe(1);
   expect(containerBackendReadiness()?.ready).toBe(false);
+});
+
+test("workload stderr does not trigger a Podman execution probe", async () => {
+  let probes = 0;
+  const backend = {
+    ...podmanContainerBackend,
+    initialize: async () => undefined,
+    verifyExecution: async () => {
+      probes++;
+    },
+  };
+  const result = await runInContainer(
+    { owner: "owner", repo: "repo", fullName: "owner/repo" },
+    "sha",
+    "main",
+    "trusted",
+    false,
+    process.cwd(),
+    {
+      name: "workload-failure",
+      command: "false",
+      optional: false,
+      timeoutMinutes: 1,
+      environment: {},
+      secrets: [],
+      needs: [],
+      runtime: { type: "container", image: "docker.io/oven/bun:1" },
+    },
+    async () => {},
+    async () => {},
+    {},
+    undefined,
+    {
+      backend,
+      command: async (args) => ({
+        exitCode: args[1] === "run" ? 1 : 0,
+        stdout: "",
+        stderr: args[1] === "run" ? "cannot clone: netavark operation not permitted" : "",
+        timedOut: false,
+      }),
+      dataPath: temporaryContainerDataPath(),
+    },
+  );
+  expect(result.success).toBe(false);
+  expect(probes).toBe(0);
 });
 
 test("prepares and reuses a deterministic container image", async () => {
@@ -931,7 +976,7 @@ test("a failed prepared-image build rechecks and revokes Podman execution readin
         backend,
         withImageLock: passthroughImageLock,
         command: async (args) => ({
-          exitCode: args[1] === "build" ? 2 : args[2] === "inspect" ? 1 : 0,
+          exitCode: args[1] === "build" ? 125 : args[2] === "inspect" ? 1 : 0,
           stdout: "",
           stderr: args[1] === "build" ? "error running container: crun failed" : "",
           timedOut: false,
@@ -942,6 +987,38 @@ test("a failed prepared-image build rechecks and revokes Podman execution readin
   expect(executionProbes).toBe(1);
   expect(containerBackendReadiness()).toMatchObject({ ready: false });
   expect(containerBackendReadiness()?.error?.message).toBe("runtime smoke failed");
+});
+
+test("failed preparation workload output does not trigger a Podman execution probe", async () => {
+  const dataPath = temporaryContainerDataPath();
+  let executionProbes = 0;
+  const backend = {
+    ...podmanContainerBackend,
+    initialize: async () => undefined,
+    verifyExecution: async () => {
+      executionProbes++;
+    },
+  };
+  await expect(
+    ensurePreparedContainer(
+      { type: "container", image: "base", prepare: "install tools" },
+      undefined,
+      () => {},
+      undefined,
+      {
+        dataPath,
+        backend,
+        withImageLock: passthroughImageLock,
+        command: async (args) => ({
+          exitCode: args[1] === "build" ? 1 : args[2] === "inspect" ? 1 : 0,
+          stdout: "",
+          stderr: args[1] === "build" ? "cannot clone: netavark operation not permitted" : "",
+          timedOut: false,
+        }),
+      },
+    ),
+  ).rejects.toThrow("container image preparation failed");
+  expect(executionProbes).toBe(0);
 });
 
 test("prepares distinct Podman images concurrently", async () => {

@@ -112,6 +112,42 @@ describe("startup service", () => {
     expect(systemdPodmanSandboxMessage(conflict)).toContain("restart the user manager");
   });
 
+  test("detects inherited hardening for a custom user-scoped worker", async () => {
+    const cgroup =
+      "0::/user.slice/user-1000.slice/user@1000.service/app.slice/custom-informant-worker.service\n";
+    const inspected: string[] = [];
+    const conflict = await systemdPodmanSandboxConflict({
+      platform: "linux",
+      uid: 1000,
+      workerCgroups: [cgroup],
+      command: async (argv) => {
+        inspected.push(`${argv[1]}:${argv[3]}`);
+        if (argv[1] === "--system" && argv[3] === "user@1000.service") {
+          return result(
+            0,
+            "",
+            "LoadState=loaded\nActiveState=active\nMainPID=62\nProtectHostname=yes\nFragmentPath=/usr/lib/systemd/system/user@.service\n",
+          );
+        }
+        if (argv[1] === "--user" && argv[3] === "custom-informant-worker.service") {
+          return result(
+            0,
+            "",
+            "LoadState=loaded\nActiveState=active\nMainPID=72\nProtectKernelTunables=no\nProtectHostname=no\n",
+          );
+        }
+        return result(1);
+      },
+    });
+    expect(conflict).toEqual({
+      scope: "user-manager",
+      unit: "user@1000.service",
+      setting: "ProtectHostname",
+      fragmentPath: "/usr/lib/systemd/system/user@.service",
+    });
+    expect(inspected).toContain("--system:user@1000.service");
+  });
+
   test("discovers a custom systemd worker unit from its live cgroup", async () => {
     const cgroup = "0::/system.slice/custom-informant-worker.service\n";
     expect(systemdWorkerUnitsFromCgroup(cgroup)).toEqual([

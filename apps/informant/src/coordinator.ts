@@ -565,11 +565,15 @@ async function runCommitPartition(
   if (claimDelayMs > 0 && !(await waitForClaimPriority(claimDelayMs, claimDelaySignal)))
     return false;
   const executionSlots = dependencies.acquireExecutionSlot ?? acquireExecutionSlot;
-  const release = requireRunSlot
-    ? await executionSlots(config, admissionSignal)
-    : executionSlots.reserve?.(config);
+  const fallbackAdmissionTimeout =
+    requireRunSlot && claimDelayMs > 0 ? AbortSignal.timeout(claimDelayMs) : undefined;
+  const slotSignal =
+    claimDelaySignal && fallbackAdmissionTimeout
+      ? AbortSignal.any([claimDelaySignal, fallbackAdmissionTimeout])
+      : (claimDelaySignal ?? fallbackAdmissionTimeout);
+  const release = requireRunSlot ? await executionSlots(config, slotSignal) : undefined;
   if (requireRunSlot && !release) return false;
-  if (requireRunSlot && admissionSignal?.aborted) {
+  if (requireRunSlot && slotSignal?.aborted) {
     release?.();
     return false;
   }
@@ -879,6 +883,9 @@ async function runCommitPartitionWithSlot(
   let childrenReconciled = false;
   let executionFinished = false;
   let workActive = false;
+  const releaseManualResources = claim.manualTrigger
+    ? (dependencies.acquireExecutionSlot ?? acquireExecutionSlot).reserve?.(config)
+    : undefined;
   try {
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
@@ -1116,6 +1123,7 @@ async function runCommitPartitionWithSlot(
     }
     throw error;
   } finally {
+    releaseManualResources?.();
     await cancellation?.close();
     await dependencies.saveBuild(record).catch(() => undefined);
   }

@@ -58,10 +58,13 @@ function containerCommandError(action: string, result: Awaited<ReturnType<typeof
   );
 }
 
-function containerInfrastructureFailure(detail: string): boolean {
-  return /error running container|did not get container create message|\bpasta failed\b|\bnetavark\b|\bcrun\b.+(?:error|failed)|while running runtime|\/proc\/sys\/.+read-only file system|mount .+operation not permitted|cannot clone/i.test(
-    detail,
-  );
+function containerInfrastructureFailure(
+  backend: ContainerBackend,
+  result: Awaited<ReturnType<typeof command>>,
+): boolean {
+  // Podman reserves 125 for failures in Podman or its OCI runtime. Other nonzero statuses belong
+  // to the workload (including 126/127) and its output must not trigger an execution smoke test.
+  return backend.kind === "podman" && !result.timedOut && result.exitCode === 125;
 }
 
 function appleContainerBuilderIsAbsent(result: Awaited<ReturnType<typeof command>>): boolean {
@@ -1014,7 +1017,7 @@ export async function ensurePreparedContainer(
           if (
             !signal?.aborted &&
             backend.verifyExecution &&
-            containerInfrastructureFailure(preparation.stderr)
+            containerInfrastructureFailure(backend, preparation)
           ) {
             await verifyContainerBackendExecution(backend, runCommand, signal);
           }
@@ -1215,34 +1218,26 @@ export async function runInContainer(
       } catch (error) {
         redactionError = error;
       }
-      const recheckRuntime = async (detail: string) => {
+      const recheckRuntime = async (failed: Awaited<ReturnType<typeof runCommand>>) => {
         const currentBackend = backend;
         if (
           !signal?.aborted &&
           currentBackend?.verifyExecution &&
-          containerInfrastructureFailure(detail)
+          containerInfrastructureFailure(currentBackend, failed)
         ) {
           await verifyContainerBackendExecution(currentBackend, runCommand, signal);
         }
       };
       if (commandError && redactionError) {
-        await recheckRuntime(
-          commandError instanceof Error ? commandError.message : String(commandError),
-        );
         throw new AggregateError(
           [commandError, redactionError],
           "container command failed and mounted output could not be redacted",
         );
       }
-      if (commandError) {
-        await recheckRuntime(
-          commandError instanceof Error ? commandError.message : String(commandError),
-        );
-        throw commandError;
-      }
+      if (commandError) throw commandError;
       if (redactionError) throw redactionError;
       if (!result) throw new Error("container command did not return a result");
-      if (result.exitCode !== 0 || result.timedOut) await recheckRuntime(result.stderr);
+      if (result.exitCode !== 0 || result.timedOut) await recheckRuntime(result);
       return result;
     };
     const lock = operations.withImageLock ?? withImageLock;

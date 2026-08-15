@@ -54,7 +54,9 @@ test("authoritative scans retire stale lane updates without blocking newer revis
   expect(runs.prepare(repository, "branch:main", liveSha)).toBe(true);
   const reopenedController = new AbortController();
   expect(runs.activate(repository, "branch:main", liveSha, reopenedController)).toBe(true);
-  expect(runs.apply(repository, [staleClosed])).toEqual([]);
+  expect(
+    runs.apply(repository, [{ ...staleClosed, obsoleteShas: [liveSha, "c".repeat(40)] }]),
+  ).toEqual([]);
   expect(reopenedController.signal.aborted).toBe(false);
 
   runs.apply(repository, [
@@ -108,6 +110,34 @@ test("non-lineal updates cannot regress an expected head without ordering metada
     ]),
   ).toEqual([]);
   expect(runs.prepare(repository, "branch:main", currentSha)).toBe(true);
+});
+
+test("same-head updates preserve all known obsolete predecessors", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      sha: shaC,
+      obsoleteShas: [shaB],
+      updatedAt: 200,
+      revision: "b-to-c",
+    },
+  ]);
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      sha: shaC,
+      obsoleteShas: [shaA],
+      updatedAt: 200,
+      revision: "a-to-c",
+    },
+  ]);
+
+  expect(runs.prepare(repository, "branch:main", shaB)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", shaC)).toBe(true);
 });
 
 test("a webhook applied after a scan starts cannot be retired by that stale scan", () => {

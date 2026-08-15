@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   actionableWebhook,
   addedRepositoryRecoveryRequests,
+  automaticLaneUpdatesRefreshRetention,
   configureGitHubAppWebhook,
   DispatchRetryQueue,
   disableTailscale,
@@ -671,6 +672,19 @@ test("extracts and validates bounded automatic lane updates", () => {
   ]);
   expect(bounded?.some((update) => update.lane === "branch:lane-0")).toBe(false);
   expect(bounded?.some((update) => update.lane === "branch:lane-1")).toBe(true);
+
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [{ lane: "branch:main", sha: newSha, updatedAt: 200, revision: "current" }],
+      [{ lane: "branch:main", sha: oldSha, updatedAt: 100, revision: "stale" }],
+    ),
+  ).toBe(false);
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [{ lane: "branch:main", sha: newSha, updatedAt: 200, revision: "current" }],
+      [{ lane: "branch:new", sha: newSha, updatedAt: 200, revision: "new-lane" }],
+    ),
+  ).toBe(true);
 });
 
 test("verifies GitHub webhook signatures without accepting malformed values", () => {
