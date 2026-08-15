@@ -296,6 +296,8 @@ function reservationDirectory(dataPath = dataDirectory()): string {
   return join(dataPath, "execution-reservations");
 }
 
+const locallyPublishedReservations = new Set<string>();
+
 export async function publishExecutionReservation(
   config: InformantConfig,
   dataPath = dataDirectory(),
@@ -306,6 +308,7 @@ export async function publishExecutionReservation(
   const path = join(directory, `${randomUUID()}.json`);
   const temporary = `${path}.${randomUUID()}.tmp`;
   await mkdir(directory, { recursive: true });
+  locallyPublishedReservations.add(path);
   try {
     await Bun.write(
       temporary,
@@ -315,6 +318,9 @@ export async function publishExecutionReservation(
       }),
     );
     await rename(temporary, path);
+  } catch (error) {
+    locallyPublishedReservations.delete(path);
+    throw error;
   } finally {
     await rm(temporary, { force: true });
   }
@@ -322,7 +328,11 @@ export async function publishExecutionReservation(
   return () => {
     if (released) return;
     released = true;
-    rmSync(path, { force: true });
+    try {
+      rmSync(path, { force: true });
+    } finally {
+      locallyPublishedReservations.delete(path);
+    }
   };
 }
 
@@ -336,6 +346,7 @@ function publishedExecutionResources(dataPath = dataDirectory()): ExecutionResou
   }
   for (const name of entries) {
     const path = join(reservationDirectory(dataPath), name);
+    if (locallyPublishedReservations.has(path)) continue;
     try {
       const value = JSON.parse(readFileSync(path, "utf8")) as {
         owner?: unknown;

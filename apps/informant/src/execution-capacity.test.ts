@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  acquireExecutionSlot,
   claimExecutionResources,
   createExecutionSlotAcquirer,
   currentExecutionCapacity,
@@ -160,14 +161,42 @@ describe("execution capacity", () => {
     release?.();
   });
 
-  test("publishes manual reservations across process-local capacity snapshots", async () => {
+  test("publishes manual reservations across processes without counting them locally twice", async () => {
     const dataPath = await mkdtemp(join(tmpdir(), "informant-capacity-"));
+    const manualConfig = config([job("manual", 2, 3072)]);
+    let releaseLocal: (() => void) | undefined;
+    let releasePublished: (() => void) | undefined;
     try {
-      const release = await publishExecutionReservation(config([job("manual", 2, 3072)]), dataPath);
+      releaseLocal = acquireExecutionSlot.reserve?.(manualConfig);
+      releasePublished = await publishExecutionReservation(manualConfig, dataPath);
       expect(currentExecutionCapacity(dataPath).used).toEqual({ cpu: 2, memoryMb: 3072 });
-      release();
+
+      const moduleUrl = new URL("./execution-capacity.ts", import.meta.url).href;
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "-e",
+          `import { currentExecutionCapacity } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(currentExecutionCapacity(${JSON.stringify(dataPath)}).used));`,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const [output, error, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(error).toBe("");
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(output)).toEqual({ cpu: 2, memoryMb: 3072 });
+
+      releasePublished();
+      releasePublished = undefined;
+      releaseLocal?.();
+      releaseLocal = undefined;
       expect(currentExecutionCapacity(dataPath).used).toEqual({ cpu: 0, memoryMb: 0 });
     } finally {
+      releasePublished?.();
+      releaseLocal?.();
       await rm(dataPath, { recursive: true, force: true });
     }
   });
