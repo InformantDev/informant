@@ -502,6 +502,9 @@ export async function runCommit(
       }
       const jobsKey = partitionKey(jobs);
       const globalPartitionIndex = globalPartitionKeys.indexOf(jobsKey);
+      if (claimScheduling && !manualTrigger && globalPartitionIndex < 0) {
+        return Promise.resolve(undefined);
+      }
       const componentScope = `${baseScope}:jobs:${Buffer.from(jobsKey).toString("base64url")}`;
       const previousScopes = [
         ...(event ? [componentScope] : []),
@@ -536,15 +539,13 @@ export async function runCommit(
         manualTrigger ? [] : previousScopes,
         claimSignal,
         forcedShutdownSignal,
-        globalPartitionIndex < 0
-          ? 0
-          : networkClaimDelay(
-              claimScheduling,
-              selected,
-              globalPartitions,
-              globalPartitionIndex,
-              networkAssignments,
-            ),
+        networkClaimDelay(
+          claimScheduling,
+          selected,
+          globalPartitions,
+          globalPartitionIndex,
+          networkAssignments,
+        ),
       );
     }),
   );

@@ -902,6 +902,65 @@ describe("runCommit", () => {
     expect(claims[2]?.event?.id).not.toBe(claims[1]?.event?.id);
   });
 
+  test("skips capability-truncated dependency components absent from the global plan", async () => {
+    let claims = 0;
+    const github = {
+      hasPendingManualTrigger: async () => false,
+      claim: async () => {
+        claims++;
+        return undefined;
+      },
+    } as unknown as GitHubClient;
+    const baseJob = config.jobs[0];
+    if (!baseJob) throw new Error("expected test job");
+    const gpuJob = {
+      ...baseJob,
+      name: "gpu-test",
+      needs: [baseJob.name],
+      runsOn: ["gpu"],
+    };
+    const capabilityConfig = { ...config, jobs: [baseJob, gpuJob] };
+    const resources = {
+      capacity: { cpu: 4, memoryMb: 4096 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    };
+    const scheduling = {
+      workerId: "portable",
+      rotation: 0,
+      claimants: [
+        { id: "portable", capabilities: [], resources },
+        { id: "gpu", capabilities: ["gpu"], resources },
+      ],
+    };
+    expect(
+      assignNetworkPartitions(
+        scheduling,
+        capabilityConfig,
+        partitionJobGraphs(capabilityConfig.jobs),
+      ),
+    ).toEqual(["gpu"]);
+    const dependencies = harness().dependencies;
+    dependencies.workerCapabilities = () => [];
+
+    expect(
+      await runCommit(
+        github,
+        repository,
+        "sha",
+        "main",
+        capabilityConfig,
+        dependencies,
+        { type: "commit", id: "branch:main:sha", branch: "main" },
+        undefined,
+        undefined,
+        undefined,
+        scheduling,
+      ),
+    ).toBeUndefined();
+    expect(claims).toBe(0);
+  });
+
   test("admits mount-capability jobs only when the mount is usable", async () => {
     const root = await mkdtemp(join(tmpdir(), "informant-coordinator-mount-"));
     temporaryDirectories.push(root);
