@@ -254,19 +254,17 @@ describe("runCommit", () => {
     ];
     const scheduling = { workerId: "blackbird", claimants, rotation: 0, staggerMs: 100 };
 
-    expect(assignNetworkPartitions(scheduling, distributedConfig, partitions)).toEqual([
-      "blackbird",
-      "watchdog",
-      "blackbird",
-    ]);
+    const assignments = assignNetworkPartitions(scheduling, distributedConfig, partitions);
+    expect(assignments).toEqual(["blackbird", "watchdog", "blackbird"]);
     expect(
       jobs.map((_job, index) => [
-        networkClaimDelay(scheduling, distributedConfig, partitions, index),
+        networkClaimDelay(scheduling, distributedConfig, partitions, index, assignments),
         networkClaimDelay(
           { ...scheduling, workerId: "watchdog" },
           distributedConfig,
           partitions,
           index,
+          assignments,
         ),
       ]),
     ).toEqual([

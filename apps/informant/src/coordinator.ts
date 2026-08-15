@@ -160,9 +160,12 @@ export function networkClaimDelay(
   config: InformantConfig,
   partitions: JobConfig[][],
   partitionIndex: number,
+  assignments?: Array<string | undefined>,
 ): number {
   if (!scheduling || scheduling.claimants.length < 2) return 0;
-  const assigned = assignNetworkPartitions(scheduling, config, partitions)[partitionIndex];
+  const assigned = (assignments ?? assignNetworkPartitions(scheduling, config, partitions))[
+    partitionIndex
+  ];
   if (!assigned || assigned === scheduling.workerId) return 0;
   return scheduling.staggerMs ?? DEFAULT_NETWORK_CLAIM_STAGGER_MS;
 }
@@ -482,6 +485,7 @@ export async function runCommit(
     compareText(partitionKey(left), partitionKey(right)),
   );
   const globalPartitionKeys = globalPartitions.map(partitionKey);
+  const networkAssignments = assignNetworkPartitions(claimScheduling, selected, globalPartitions);
   const jobsByLabels = new Map<string, JobConfig[]>();
   for (const job of untriggeredCapable.jobs) {
     const key = [...(job.runsOn ?? [])].sort().join("\0");
@@ -534,7 +538,13 @@ export async function runCommit(
         forcedShutdownSignal,
         globalPartitionIndex < 0
           ? 0
-          : networkClaimDelay(claimScheduling, selected, globalPartitions, globalPartitionIndex),
+          : networkClaimDelay(
+              claimScheduling,
+              selected,
+              globalPartitions,
+              globalPartitionIndex,
+              networkAssignments,
+            ),
       );
     }),
   );

@@ -670,6 +670,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
   };
   do {
+    let retryDispatch = false;
     if (recoveryPending) {
       try {
         recoveryPending = await recoverBuilds(github, repository, message);
@@ -933,6 +934,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           shutdownControllers.add(shutdownController);
           const run = result
             .then((build) => {
+              if (build === false) retryDispatch = true;
               if (build)
                 message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
               if (
@@ -1098,6 +1100,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     if (options.once) {
       await drainOnce();
+      if (retryDispatch && options.throwOnPollError) {
+        throw new Error("automatic work was not claimed; retrying dispatch");
+      }
       return;
     }
     if (!(await waitForDelay(intervalSeconds * 1_000))) {

@@ -442,6 +442,28 @@ test("one-shot event scans propagate polling failures for delivery retry", async
   ).rejects.toThrow("temporary GitHub failure");
 });
 
+test("one-shot event scans propagate unclaimed work for dispatch retry", async () => {
+  const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+  let attempts = 0;
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      dependencies: dependencies(
+        github({ branches: async () => [{ name: "main", sha: "branch-sha" }] }),
+        state,
+        async () => {
+          attempts++;
+          return false;
+        },
+      ),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("automatic work was not claimed; retrying dispatch");
+  expect(attempts).toBe(1);
+});
+
 test("serveRepositories preserves caller idle notifications after housekeeping", async () => {
   const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
   const deps = dependencies(github({}), state, async () => undefined);
