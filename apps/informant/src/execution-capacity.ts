@@ -173,10 +173,17 @@ interface ExecutionWaiter {
   abort?: () => void;
 }
 
-export type AcquireExecutionSlot = (
-  config: InformantConfig,
-  signal?: AbortSignal,
-) => Promise<(() => void) | undefined>;
+export interface ExecutionCapacitySnapshot {
+  capacity: ExecutionResources;
+  used: ExecutionResources;
+  queued: ExecutionResources;
+}
+
+export interface AcquireExecutionSlot {
+  (config: InformantConfig, signal?: AbortSignal): Promise<(() => void) | undefined>;
+  reserve?: (config: InformantConfig) => () => void;
+  snapshot?: () => ExecutionCapacitySnapshot;
+}
 
 export function createExecutionSlotAcquirer(
   capacity: ExecutionResources = executionCapacity(),
@@ -218,7 +225,7 @@ export function createExecutionSlotAcquirer(
     }
   };
 
-  return async (config, signal) => {
+  const acquire: AcquireExecutionSlot = async (config, signal) => {
     if (signal?.aborted) return undefined;
     const resources = claimExecutionResources(config, config.jobs, capacity);
     if ((hasCapacity(resources) || active.cpu === 0) && waiters.length === 0) {
@@ -237,6 +244,29 @@ export function createExecutionSlotAcquirer(
       if (signal?.aborted) waiter.abort();
     });
   };
+  acquire.reserve = (config) => reserve(claimExecutionResources(config, config.jobs, capacity));
+  acquire.snapshot = () => ({
+    capacity: { ...capacity },
+    used: { ...active },
+    queued: waiters.reduce(
+      (total, waiter) => ({
+        cpu: total.cpu + waiter.resources.cpu,
+        memoryMb: total.memoryMb + waiter.resources.memoryMb,
+      }),
+      { cpu: 0, memoryMb: 0 },
+    ),
+  });
+  return acquire;
 }
 
 export const acquireExecutionSlot = createExecutionSlotAcquirer();
+
+export function currentExecutionCapacity(): ExecutionCapacitySnapshot {
+  return (
+    acquireExecutionSlot.snapshot?.() ?? {
+      capacity: executionCapacity(),
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    }
+  );
+}

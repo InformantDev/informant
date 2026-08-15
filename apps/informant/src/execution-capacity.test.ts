@@ -106,12 +106,36 @@ describe("execution capacity", () => {
     expect(first).toBeFunction();
     expect(second).toBeFunction();
     expect(thirdEntered).toBeFalse();
+    expect(acquire.snapshot?.()).toEqual({
+      capacity: { cpu: 2, memoryMb: 2048 },
+      used: { cpu: 2, memoryMb: 2048 },
+      queued: { cpu: 1, memoryMb: 1024 },
+    });
 
     first?.();
     const releaseThird = await third;
     expect(releaseThird).toBeFunction();
     second?.();
     releaseThird?.();
+    expect(acquire.snapshot?.()).toEqual({
+      capacity: { cpu: 2, memoryMb: 2048 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    });
+  });
+
+  test("tracks manually admitted work without blocking it on automatic capacity", async () => {
+    const acquire = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 });
+    const single = config([job("test", 1, 1024)]);
+    const releaseAutomatic = await acquire(single);
+    const releaseManual = acquire.reserve?.(single);
+
+    expect(releaseManual).toBeFunction();
+    expect(acquire.snapshot?.().used).toEqual({ cpu: 2, memoryMb: 2048 });
+
+    releaseManual?.();
+    releaseAutomatic?.();
+    expect(acquire.snapshot?.().used).toEqual({ cpu: 0, memoryMb: 0 });
   });
 
   test("an unspecified VM reserves full capacity until release", async () => {

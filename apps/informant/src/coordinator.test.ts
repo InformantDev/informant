@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   aggregatePartitionResults,
+  assignNetworkPartitions,
   type CoordinatorDependencies,
+  networkClaimDelay,
   partitionJobGraphs,
   readLogTail,
   runCommit,
@@ -227,6 +229,135 @@ describe("runCommit", () => {
     ]);
   });
 
+  test("balances independent claim partitions by projected worker resources", () => {
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const jobs = [base, { ...base, name: "lint" }, { ...base, name: "build" }];
+    const partitions = jobs.map((job) => [job]);
+    const distributedConfig = { ...config, jobs };
+    const idle = {
+      capacity: { cpu: 4, memoryMb: 4096 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    };
+    const claimants = [
+      {
+        id: "blackbird",
+        capabilities: ["self-hosted", "darwin", "arm64"],
+        resources: idle,
+      },
+      {
+        id: "watchdog",
+        capabilities: ["self-hosted", "linux", "x64", "container"],
+        resources: idle,
+      },
+    ];
+    const scheduling = { workerId: "blackbird", claimants, rotation: 0, staggerMs: 100 };
+
+    expect(assignNetworkPartitions(scheduling, distributedConfig, partitions)).toEqual([
+      "blackbird",
+      "watchdog",
+      "blackbird",
+    ]);
+    expect(
+      jobs.map((_job, index) => [
+        networkClaimDelay(scheduling, distributedConfig, partitions, index),
+        networkClaimDelay(
+          { ...scheduling, workerId: "watchdog" },
+          distributedConfig,
+          partitions,
+          index,
+        ),
+      ]),
+    ).toEqual([
+      [0, 100],
+      [100, 0],
+      [0, 100],
+    ]);
+  });
+
+  test("prefers available resources and respects worker capabilities", () => {
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const linuxJob = { ...base, runsOn: ["linux"] };
+    const partitions = [[base], [linuxJob]];
+    const scheduling = {
+      workerId: "watchdog",
+      rotation: 0,
+      staggerMs: 100,
+      claimants: [
+        {
+          id: "blackbird",
+          capabilities: ["darwin"],
+          resources: {
+            capacity: { cpu: 8, memoryMb: 16_384 },
+            used: { cpu: 7, memoryMb: 14_000 },
+            queued: { cpu: 0, memoryMb: 0 },
+          },
+        },
+        {
+          id: "watchdog",
+          capabilities: ["linux"],
+          resources: {
+            capacity: { cpu: 4, memoryMb: 8192 },
+            used: { cpu: 0, memoryMb: 0 },
+            queued: { cpu: 0, memoryMb: 0 },
+          },
+        },
+      ],
+    };
+
+    expect(
+      assignNetworkPartitions(scheduling, { ...config, jobs: [base, linuxJob] }, partitions),
+    ).toEqual(["watchdog", "watchdog"]);
+    expect(networkClaimDelay(scheduling, { ...config, jobs: [linuxJob] }, [[linuxJob]], 0)).toBe(0);
+  });
+
+  test("accounts for each partition's requested CPU and memory", () => {
+    const base = config.jobs[0];
+    if (!base) throw new Error("expected test job");
+    const large = {
+      ...base,
+      name: "large",
+      runtime: { type: "container" as const, image: "image", cpu: 4, memoryMb: 8192 },
+    };
+    const small = {
+      ...base,
+      name: "small",
+      runtime: { type: "container" as const, image: "image", cpu: 1, memoryMb: 1024 },
+    };
+    const scheduledConfig = { ...config, jobs: [large, small] };
+    const scheduling = {
+      workerId: "blackbird",
+      rotation: 0,
+      claimants: [
+        {
+          id: "blackbird",
+          capabilities: ["container"],
+          resources: {
+            capacity: { cpu: 8, memoryMb: 8192 },
+            used: { cpu: 0, memoryMb: 0 },
+            queued: { cpu: 0, memoryMb: 0 },
+          },
+        },
+        {
+          id: "watchdog",
+          capabilities: ["container"],
+          resources: {
+            capacity: { cpu: 4, memoryMb: 4096 },
+            used: { cpu: 0, memoryMb: 0 },
+            queued: { cpu: 0, memoryMb: 0 },
+          },
+        },
+      ],
+    };
+
+    expect(assignNetworkPartitions(scheduling, scheduledConfig, [[large], [small]])).toEqual([
+      "blackbird",
+      "watchdog",
+    ]);
+  });
+
   test("claims independent jobs concurrently while worker capacity is available", async () => {
     const context = harness();
     const base = config.jobs[0];
@@ -377,6 +508,41 @@ describe("runCommit", () => {
     expect(execution.signal.aborted).toBe(false);
     blocked.resolve();
     await activeBuild;
+  });
+
+  test("forced shutdown interrupts a non-preferred network claim delay", async () => {
+    const context = harness();
+    const controller = new AbortController();
+    const resources = {
+      capacity: { cpu: 4, memoryMb: 4096 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    };
+    const result = runCommit(
+      context.github,
+      repository,
+      "sha",
+      "main",
+      config,
+      context.dependencies,
+      { type: "commit", id: "branch:main:sha", branch: "main" },
+      undefined,
+      undefined,
+      controller.signal,
+      {
+        workerId: "watchdog",
+        rotation: 0,
+        staggerMs: 10_000,
+        claimants: [
+          { id: "blackbird", capabilities: [], resources },
+          { id: "watchdog", capabilities: [], resources },
+        ],
+      },
+    );
+    controller.abort("shutdown");
+
+    await expect(result).resolves.toBeFalse();
+    expect(context.jobChecks).toEqual([]);
   });
 
   test("treats an interrupted GitHub claim as unclaimed work", async () => {

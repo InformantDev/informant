@@ -12,6 +12,7 @@ import {
   enableTailscale,
   githubAppWebhookSettings,
   MAX_WEBHOOK_BODY_BYTES,
+  parseNetworkClaimPlan,
   parseTailscaleStatus,
   prepareTailscaleFunnel,
   RepositoryScanQueue,
@@ -453,6 +454,39 @@ test("authenticates private worker API requests with a shared token", () => {
   expect(validNetworkAuthorization(null, secret)).toBe(false);
 });
 
+test("validates bounded network claim scheduling plans", () => {
+  const resources = {
+    capacity: { cpu: 4, memoryMb: 8192 },
+    used: { cpu: 1, memoryMb: 1024 },
+    queued: { cpu: 0, memoryMb: 0 },
+  };
+  const plan = {
+    rotation: 3,
+    claimants: [
+      { id: "blackbird", capabilities: ["darwin", "container"], resources },
+      { id: "watchdog", capabilities: ["linux", "container"], resources },
+    ],
+  };
+  expect(parseNetworkClaimPlan(plan)).toEqual(plan);
+  expect(() =>
+    parseNetworkClaimPlan({ ...plan, claimants: [...plan.claimants, plan.claimants[0]] }),
+  ).toThrow("invalid claim scheduling");
+  expect(() => parseNetworkClaimPlan({ ...plan, rotation: -1 })).toThrow(
+    "invalid claim scheduling",
+  );
+  expect(() =>
+    parseNetworkClaimPlan({
+      ...plan,
+      claimants: [
+        {
+          ...plan.claimants[0],
+          resources: { ...resources, capacity: { ...resources.capacity, cpu: 0 } },
+        },
+      ],
+    }),
+  ).toThrow("invalid claim scheduling");
+});
+
 test("verifies GitHub webhook signatures without accepting malformed values", () => {
   const body = JSON.stringify({ repository: { full_name: "owner/repo" } });
   const signature = `sha256=${createHmac("sha256", "secret").update(body).digest("hex")}`;
@@ -573,8 +607,9 @@ test("repository removal cancels an active scan and suppresses queued scans", as
   await scans.stop();
 });
 
-test("runs another dispatch when an ordinary webhook arrives during an active dispatch", async () => {
+test("runs another dispatch with its latest claim plan during an active dispatch", async () => {
   const requests: boolean[] = [];
+  const plans: Array<number | undefined> = [];
   let finishFirst!: (value: boolean) => void;
   const first = new Promise<boolean>((resolve) => {
     finishFirst = resolve;
@@ -582,16 +617,69 @@ test("runs another dispatch when an ordinary webhook arrives during an active di
   const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const queue = new DispatchRetryQueue(async (request) => {
     requests.push(request.forceTagPoll);
+    plans.push(request.claimPlan?.rotation);
     return requests.length === 1 ? first : true;
   });
 
   queue.enqueue({ repository, forceTagPoll: false });
   while (requests.length === 0) await Bun.sleep(0);
-  queue.enqueue({ repository, forceTagPoll: false });
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    claimPlan: {
+      rotation: 7,
+      claimants: [
+        {
+          id: "watchdog",
+          capabilities: ["linux"],
+          resources: {
+            capacity: { cpu: 4, memoryMb: 8192 },
+            used: { cpu: 0, memoryMb: 0 },
+            queued: { cpu: 0, memoryMb: 0 },
+          },
+        },
+      ],
+    },
+  });
   finishFirst(true);
   while (queue.size > 0) await Bun.sleep(0);
 
   expect(requests).toEqual([false, false]);
+  expect(plans).toEqual([undefined, 7]);
+  await queue.stop();
+});
+
+test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
+  const plans: Array<number | undefined> = [];
+  let finishFirst!: (value: boolean) => void;
+  const first = new Promise<boolean>((resolve) => {
+    finishFirst = resolve;
+  });
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const resources = {
+    capacity: { cpu: 4, memoryMb: 8192 },
+    used: { cpu: 0, memoryMb: 0 },
+    queued: { cpu: 0, memoryMb: 0 },
+  };
+  const queue = new DispatchRetryQueue(async (request) => {
+    plans.push(request.claimPlan?.rotation);
+    return plans.length === 1 ? first : true;
+  });
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    claimPlan: {
+      rotation: 7,
+      claimants: [{ id: "watchdog", capabilities: ["linux"], resources }],
+    },
+  });
+  while (plans.length === 0) await Bun.sleep(0);
+  queue.enqueue({ repository, forceTagPoll: false });
+  finishFirst(true);
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(plans).toEqual([7, undefined]);
   await queue.stop();
 });
 

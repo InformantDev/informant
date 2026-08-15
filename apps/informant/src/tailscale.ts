@@ -1,15 +1,19 @@
 import { createHmac, createSign, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { hostname, platform } from "node:os";
 import { workerCapabilities } from "./capabilities.ts";
 import { refreshSelectedContainerBackend } from "./container-backend.ts";
+import type { ClaimScheduling, NetworkClaimant } from "./coordinator.ts";
+import { currentExecutionCapacity, type ExecutionCapacitySnapshot } from "./execution-capacity.ts";
 import {
   clearTailscaleConfig,
   type GitHubCredentials,
   getTailscaleConfig,
+  listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
+  MAX_ALLOWED_MOUNT_BYTES,
   saveTailscaleConfig,
   type TailscaleConfig,
 } from "./machine-config.ts";
@@ -30,6 +34,7 @@ export const DEFAULT_FUNNEL_PORT = 7640;
 const REQUEST_TIMEOUT_MS = 2_000;
 const PEER_REFRESH_INTERVAL_MS = 10_000;
 const MAX_DISPATCH_RETRY_MS = 60_000;
+const CLAIM_SCHEDULING_PROTOCOL = "claim-scheduling-v1";
 export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 export const REQUIRED_GITHUB_WEBHOOK_EVENTS = [
   "push",
@@ -74,6 +79,8 @@ export interface NetworkWorker {
   address: string;
   capabilities: string[];
   repositories: string[];
+  protocols?: string[];
+  resources?: ExecutionCapacitySnapshot;
   version?: string;
   local?: boolean;
 }
@@ -81,6 +88,7 @@ export interface NetworkWorker {
 export interface RepositoryDispatch {
   repository: Repository;
   forceTagPoll: boolean;
+  claimPlan?: NetworkClaimPlan;
 }
 
 export function reconcileKnownWorkers(
@@ -124,6 +132,7 @@ export class RepositoryScanQueue {
       repository: Repository,
       forceTagPoll: boolean,
       signal: AbortSignal,
+      claimScheduling?: ClaimScheduling,
     ) => Promise<void>,
     private readonly serviceSignal?: AbortSignal,
   ) {
@@ -147,7 +156,11 @@ export class RepositoryScanQueue {
     }
   }
 
-  run(repository: Repository, forceTagPoll = false): Promise<void> {
+  run(
+    repository: Repository,
+    forceTagPoll = false,
+    claimScheduling?: ClaimScheduling,
+  ): Promise<void> {
     const key = repository.fullName.toLowerCase();
     const registration = this.registrations.get(key);
     if (this.stopped || !registration) return Promise.resolve();
@@ -161,7 +174,7 @@ export class RepositoryScanQueue {
           ? AbortSignal.any([registration.controller.signal, this.serviceSignal])
           : registration.controller.signal;
         if (signal.aborted) return;
-        await this.execute(registration.repository, forceTagPoll, signal);
+        await this.execute(registration.repository, forceTagPoll, signal, claimScheduling);
       })
       .finally(() => {
         if (this.scans.get(key) === next) this.scans.delete(key);
@@ -209,6 +222,7 @@ export class DispatchRetryQueue {
     const existing = this.entries.get(key);
     if (existing) {
       existing.request.forceTagPoll ||= request.forceTagPoll;
+      existing.request.claimPlan = request.claimPlan;
       if (existing.running) existing.pending = true;
       return;
     }
@@ -391,6 +405,99 @@ export function validNetworkAuthorization(value: string | null, secret: string):
   return received.length === expected.length && timingSafeEqual(received, expected);
 }
 
+export type NetworkClaimPlan = Pick<ClaimScheduling, "claimants" | "rotation">;
+
+function parseExecutionCapacity(value: unknown): ExecutionCapacitySnapshot | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const resources = value as {
+    capacity?: { cpu?: unknown; memoryMb?: unknown };
+    used?: { cpu?: unknown; memoryMb?: unknown };
+    queued?: { cpu?: unknown; memoryMb?: unknown };
+  };
+  const values = [
+    resources.capacity?.cpu,
+    resources.capacity?.memoryMb,
+    resources.used?.cpu,
+    resources.used?.memoryMb,
+    resources.queued?.cpu,
+    resources.queued?.memoryMb,
+  ];
+  if (
+    values.some((resource) => !Number.isSafeInteger(resource)) ||
+    (resources.capacity?.cpu as number) <= 0 ||
+    (resources.capacity?.memoryMb as number) <= 0 ||
+    (resources.used?.cpu as number) < 0 ||
+    (resources.used?.memoryMb as number) < 0 ||
+    (resources.queued?.cpu as number) < 0 ||
+    (resources.queued?.memoryMb as number) < 0
+  ) {
+    return undefined;
+  }
+  return resources as ExecutionCapacitySnapshot;
+}
+
+export function parseNetworkClaimPlan(value: unknown): NetworkClaimPlan | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object") throw new Error("invalid claim scheduling");
+  const plan = value as { claimants?: unknown; rotation?: unknown };
+  if (
+    !Number.isSafeInteger(plan.rotation) ||
+    (plan.rotation as number) < 0 ||
+    !Array.isArray(plan.claimants) ||
+    plan.claimants.length === 0 ||
+    plan.claimants.length > 64
+  ) {
+    throw new Error("invalid claim scheduling");
+  }
+  const ids = new Set<string>();
+  const claimants: NetworkClaimant[] = plan.claimants.map((value) => {
+    if (!value || typeof value !== "object") throw new Error("invalid claim scheduling");
+    const claimant = value as { id?: unknown; capabilities?: unknown; resources?: unknown };
+    const resources = parseExecutionCapacity(claimant.resources);
+    if (
+      typeof claimant.id !== "string" ||
+      claimant.id.length === 0 ||
+      claimant.id.length > 256 ||
+      ids.has(claimant.id) ||
+      !Array.isArray(claimant.capabilities) ||
+      claimant.capabilities.length > 256 ||
+      claimant.capabilities.some(
+        (capability) => typeof capability !== "string" || capability.length > 256,
+      ) ||
+      !resources
+    ) {
+      throw new Error("invalid claim scheduling");
+    }
+    ids.add(claimant.id);
+    return {
+      id: claimant.id,
+      capabilities: claimant.capabilities as string[],
+      resources,
+    };
+  });
+  return { claimants, rotation: plan.rotation as number };
+}
+
+async function advertisedWorkerCapabilities(): Promise<string[]> {
+  const mounts = await listAllowedMounts();
+  const usableMounts = await Promise.all(
+    mounts.map(async (mount) => {
+      try {
+        const metadata = await lstat(await realpath(mount.source));
+        return metadata.isFile() && metadata.size <= MAX_ALLOWED_MOUNT_BYTES
+          ? mount.name
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    }),
+  );
+  return workerCapabilities(
+    Bun.env,
+    usableMounts.filter((name): name is string => name !== undefined),
+  );
+}
+
 export async function discoverNetworkWorkers(
   config: TailscaleConfig,
   status: TailscaleStatus,
@@ -417,6 +524,8 @@ export async function discoverNetworkWorkers(
                 address,
                 capabilities: result.capabilities.map(String),
                 repositories: result.repositories.map(String),
+                protocols: Array.isArray(result.protocols) ? result.protocols.map(String) : [],
+                resources: parseExecutionCapacity(result.resources),
                 version: result.version,
               } satisfies NetworkWorker;
             })
@@ -783,13 +892,14 @@ async function serveConfiguredWithTailscale(
   let configuredRepositories = repositories;
   const scans = new RepositoryScanQueue(
     repositories,
-    (repository, forceTagPoll, signal) =>
+    (repository, forceTagPoll, signal, claimScheduling) =>
       serveRepositories([repository], {
         ...options,
         once: true,
         forceTagPoll,
         signal,
         throwOnPollError: true,
+        claimScheduling,
       }),
     options.signal,
   );
@@ -805,16 +915,33 @@ async function serveConfiguredWithTailscale(
     reconcileKnownWorkers(knownWorkers, workers);
     return workers;
   };
+  let claimRotation = 0;
   const dispatch = async (request: RepositoryDispatch): Promise<boolean> => {
     await refreshWorkers();
-    const tasks: Array<{ label: string; promise: Promise<unknown> }> = [];
     const localRepository = configuredRepositories.find(
       (candidate) => candidate.fullName.toLowerCase() === request.repository.fullName.toLowerCase(),
     );
+    const targets: Array<{
+      claimant?: NetworkClaimant;
+      label: string;
+      scheduling: boolean;
+      run: (plan?: NetworkClaimPlan) => Promise<unknown>;
+    }> = [];
     if (localRepository) {
-      tasks.push({
+      targets.push({
+        claimant: {
+          id: status.self.id,
+          capabilities: await advertisedWorkerCapabilities(),
+          resources: currentExecutionCapacity(),
+        },
         label: hostname(),
-        promise: scans.run(localRepository, request.forceTagPoll),
+        scheduling: true,
+        run: (plan) =>
+          scans.run(
+            localRepository,
+            request.forceTagPoll,
+            plan ? { ...plan, workerId: status.self.id } : undefined,
+          ),
       });
     }
     if (config.mode === "lead") {
@@ -826,30 +953,49 @@ async function serveConfiguredWithTailscale(
         ) {
           continue;
         }
-        tasks.push({
+        targets.push({
+          claimant: worker.resources
+            ? { id: worker.id, capabilities: worker.capabilities, resources: worker.resources }
+            : undefined,
           label: worker.hostName,
-          promise: fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
-            method: "POST",
-            headers: {
-              ...networkRequestHeaders(config),
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              repository: request.repository.fullName,
-              forceTagPoll: request.forceTagPoll,
+          scheduling:
+            worker.protocols?.includes(CLAIM_SCHEDULING_PROTOCOL) === true &&
+            worker.resources !== undefined,
+          run: (plan) =>
+            fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
+              method: "POST",
+              headers: {
+                ...networkRequestHeaders(config),
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                repository: request.repository.fullName,
+                forceTagPoll: request.forceTagPoll,
+                claimPlan: plan,
+              }),
+            }).then((response) => {
+              if (!response.ok) throw new Error(`returned ${response.status}`);
             }),
-          }).then((response) => {
-            if (!response.ok) throw new Error(`returned ${response.status}`);
-          }),
         });
       }
     }
-    if (tasks.length === 0) {
+    if (targets.length === 0) {
       options.onMessage?.(
         `dropping ${request.repository.fullName} dispatch; no registered worker advertises it`,
       );
       return true;
     }
+    const generatedPlan =
+      !request.claimPlan &&
+      targets.length > 1 &&
+      targets.every((target) => target.scheduling && target.claimant)
+        ? {
+            claimants: targets.flatMap((target) => (target.claimant ? [target.claimant] : [])),
+            rotation: claimRotation++ % Number.MAX_SAFE_INTEGER,
+          }
+        : undefined;
+    const plan = request.claimPlan ?? generatedPlan;
+    const tasks = targets.map((target) => ({ label: target.label, promise: target.run(plan) }));
     const results = await Promise.allSettled(tasks.map((task) => task.promise));
     for (const [index, result] of results.entries()) {
       if (result.status === "rejected") {
@@ -878,8 +1024,10 @@ async function serveConfiguredWithTailscale(
         return Response.json({
           id: status.self.id,
           hostName: hostname(),
-          capabilities: await workerCapabilities(),
+          capabilities: await advertisedWorkerCapabilities(),
           repositories: configuredRepositories.map((repository) => repository.fullName),
+          protocols: [CLAIM_SCHEDULING_PROTOCOL],
+          resources: currentExecutionCapacity(),
           version: options.version,
         });
       }
@@ -912,13 +1060,19 @@ async function serveConfiguredWithTailscale(
       }
       if (request.method === "POST" && url.pathname === "/v1/dispatch") {
         const body = (await request.json().catch(() => undefined)) as
-          | { repository?: unknown; forceTagPoll?: unknown }
+          | { repository?: unknown; forceTagPoll?: unknown; claimPlan?: unknown }
           | undefined;
         if (
           typeof body?.repository !== "string" ||
           (body.forceTagPoll !== undefined && typeof body.forceTagPoll !== "boolean")
         )
           return new Response("invalid repository", { status: 400 });
+        let claimPlan: NetworkClaimPlan | undefined;
+        try {
+          claimPlan = parseNetworkClaimPlan(body.claimPlan);
+        } catch {
+          return new Response("invalid claim scheduling", { status: 400 });
+        }
         const requestedRepository = body.repository;
         const repository = configuredRepositories.find(
           (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
@@ -927,6 +1081,7 @@ async function serveConfiguredWithTailscale(
         dispatchQueue.enqueue({
           repository,
           forceTagPoll: body.forceTagPoll === true,
+          claimPlan,
         });
         return new Response(null, { status: 202 });
       }
@@ -1145,9 +1300,10 @@ export async function networkStatus(): Promise<{
   config?: TailscaleConfig;
   status?: TailscaleStatus;
   workers: NetworkWorker[];
+  localResources: ExecutionCapacitySnapshot;
 }> {
   const config = await getTailscaleConfig();
   const status = await tailscaleStatus();
   const workers = config && status?.online ? await discoverNetworkWorkers(config, status) : [];
-  return { config, status, workers };
+  return { config, status, workers, localResources: currentExecutionCapacity() };
 }

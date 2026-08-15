@@ -19,9 +19,10 @@ When Tailscale is installed and Informant is configured as a lead, the lead publ
 signed GitHub webhook endpoint through Funnel. Each machine also exposes a small worker endpoint on
 its Tailscale IPv4 address. The lead discovers online Informant peers from `tailscale status --json`
 and authenticates every private API request with the shared worker token before dispatching
-repository notifications across the tailnet. Every notified machine performs one
-GitHub synchronization and enters the existing capability-specific Checks election. Job definitions,
-GitHub credentials, and secrets are never sent between workers.
+repository notifications across the tailnet. Health responses advertise capabilities plus total,
+reserved, and queued CPU and memory. Every notified machine performs one GitHub synchronization and
+enters the existing capability-specific Checks election. Job definitions, GitHub credentials, and
+secrets are never sent between workers.
 
 A connected network worker does not run a timer or poll GitHub continuously. Every Tailscale worker
 performs one forced synchronization of its locally registered repositories at startup to recover
@@ -29,17 +30,23 @@ events received while Informant was stopped or restarting, then reacts to webhoo
 recovery also includes repositories advertised only by remote workers. Failed deliveries remain
 queued with bounded exponential retries, and the lead refreshes peer topology so workers that join or
 reconnect receive a recovery synchronization. Tag-push notifications bypass the normal tag throttle.
-If Tailscale is not configured, `informant serve` retains the polling path. A configured worker never
-silently falls back to polling when disconnected; reconnect Tailscale or explicitly run
-`informant tailscale disable`. Connecting an existing GitHub App keeps polling enabled until worker
-mode is selected explicitly with the lead's token. Funnel never exposes the private worker/build API.
+If Tailscale is not configured or network startup is unavailable, `informant serve` retains the
+polling path. Connecting an existing GitHub App keeps polling enabled until worker mode is selected
+explicitly with the lead's token. Funnel never exposes the private worker/build API.
 
-Workers advertise `self-hosted`, their operating system, architecture, hostname, and optional custom
-capabilities. A healthy selected container backend adds the dynamic `container` capability. Linux
-probes rootless Podman directly; this is daemonless and does not depend on systemd. A worker filters jobs before entering the claim election, then groups them by normalized
-`runs_on` requirements. Each requirement group is a separate claim scope. Workers with overlapping
-capabilities therefore compete for shared jobs, while Linux and macOS workers can claim different jobs
-for the same commit without stealing work from each other.
+Workers advertise `self-hosted`, their operating system, architecture, hostname, optional custom
+capabilities, and currently available execution resources. A healthy selected container backend adds
+the dynamic `container` capability. Linux probes rootless Podman directly; this is daemonless and does
+not depend on systemd.
+
+For each notification, every worker deterministically computes the same resource-aware assignment for
+each independent job/dependency partition. The scheduler filters to capable workers, accounts for
+already reserved and queued CPU and memory, and chooses the worker with the lowest projected dominant
+resource utilization. Assignments across the build reserve projected capacity so independent jobs
+spread across the lead and workers in proportion to their available resources. The assigned worker
+enters the Checks election immediately; other capable workers enter after a bounded delay, preserving
+failover if capacity or capabilities change. GitHub's canonical claim scope remains the final duplicate
+execution guard.
 
 ## Claim safety
 

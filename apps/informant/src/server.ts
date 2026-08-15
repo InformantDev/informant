@@ -4,7 +4,7 @@ import {
   type startAppleContainerSystem,
 } from "./container.ts";
 import { containerBackendReadiness, refreshSelectedContainerBackend } from "./container-backend.ts";
-import { runCommit } from "./coordinator.ts";
+import { type ClaimScheduling, runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import {
   formatHousekeepingSummary,
@@ -131,6 +131,7 @@ export interface ServerOptions {
   onMessage?: (message: string) => void;
   onIdle?: () => Promise<void> | void;
   shutdownTimeoutMs?: number;
+  claimScheduling?: ClaimScheduling;
   dependencies?: ServerDependencies;
 }
 
@@ -655,6 +656,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             controller.signal,
             admissionSignal(admissionController),
             shutdownController.signal,
+            options.claimScheduling,
           );
           shutdownControllers.add(shutdownController);
           const run = result
@@ -782,6 +784,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             controller.signal,
             admissionSignal(admissionController),
             shutdownController.signal,
+            options.claimScheduling,
           );
           shutdownControllers.add(shutdownController);
           const run = result

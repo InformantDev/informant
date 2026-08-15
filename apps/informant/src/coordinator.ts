@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { selectCapableJobs, workerCapabilities } from "./capabilities.ts";
 import { selectJobs, selectManuallyTriggeredJobs, selectTriggeredJobs } from "./config.ts";
 import { refreshSelectedContainerBackend } from "./container-backend.ts";
-import { type AcquireExecutionSlot, acquireExecutionSlot } from "./execution-capacity.ts";
+import {
+  type AcquireExecutionSlot,
+  acquireExecutionSlot,
+  claimExecutionResources,
+  type ExecutionCapacitySnapshot,
+} from "./execution-capacity.ts";
 import type { ClaimResult, GitHubClient } from "./github.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import {
@@ -20,6 +25,19 @@ import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, CheckRun, InformantConfig, JobConfig, Repository } from "./types.ts";
 
 type RunEvent = EventContext & { id: string };
+
+export interface NetworkClaimant {
+  id: string;
+  capabilities: string[];
+  resources: ExecutionCapacitySnapshot;
+}
+
+export interface ClaimScheduling {
+  workerId: string;
+  claimants: NetworkClaimant[];
+  rotation: number;
+  staggerMs?: number;
+}
 
 export interface CoordinatorDependencies {
   createBuild: typeof createBuild;
@@ -38,6 +56,132 @@ export interface CoordinatorDependencies {
 const CHECK_LOG_CHARACTERS = 55_000;
 const CHECK_LOG_BYTES = CHECK_LOG_CHARACTERS * 4;
 const CHECK_LOG_UPDATE_INTERVAL_MS = 10_000;
+export const DEFAULT_NETWORK_CLAIM_STAGGER_MS = 5_000;
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function partitionKey(jobs: JobConfig[]): string {
+  return jobs
+    .map((job) => job.name)
+    .sort()
+    .join("\0");
+}
+
+function validResources(snapshot: ExecutionCapacitySnapshot): boolean {
+  return (
+    Number.isFinite(snapshot.capacity.cpu) &&
+    snapshot.capacity.cpu > 0 &&
+    Number.isFinite(snapshot.capacity.memoryMb) &&
+    snapshot.capacity.memoryMb > 0 &&
+    Number.isFinite(snapshot.used.cpu) &&
+    snapshot.used.cpu >= 0 &&
+    Number.isFinite(snapshot.used.memoryMb) &&
+    snapshot.used.memoryMb >= 0 &&
+    Number.isFinite(snapshot.queued.cpu) &&
+    snapshot.queued.cpu >= 0 &&
+    Number.isFinite(snapshot.queued.memoryMb) &&
+    snapshot.queued.memoryMb >= 0
+  );
+}
+
+export function assignNetworkPartitions(
+  scheduling: ClaimScheduling | undefined,
+  config: InformantConfig,
+  partitions: JobConfig[][],
+): Array<string | undefined> {
+  if (!scheduling) return partitions.map(() => undefined);
+  const claimants = scheduling.claimants
+    .filter(
+      (claimant, index, all) =>
+        Boolean(claimant.id) &&
+        validResources(claimant.resources) &&
+        all.findIndex((candidate) => candidate.id === claimant.id) === index,
+    )
+    .sort((left, right) => compareText(left.id, right.id));
+
+  const projected = new Map(
+    claimants.map((claimant) => [
+      claimant.id,
+      {
+        cpu: claimant.resources.used.cpu + claimant.resources.queued.cpu,
+        memoryMb: claimant.resources.used.memoryMb + claimant.resources.queued.memoryMb,
+      },
+    ]),
+  );
+
+  return partitions.map((jobs) => {
+    const partition = { ...config, jobs };
+    const candidates = claimants.flatMap((claimant, index) => {
+      if (selectCapableJobs(partition, claimant.capabilities).jobs.length !== jobs.length)
+        return [];
+      const used = projected.get(claimant.id);
+      if (!used) return [];
+      const demand = claimExecutionResources(partition, jobs, claimant.resources.capacity);
+      const next = { cpu: used.cpu + demand.cpu, memoryMb: used.memoryMb + demand.memoryMb };
+      const fits =
+        next.cpu <= claimant.resources.capacity.cpu &&
+        next.memoryMb <= claimant.resources.capacity.memoryMb;
+      const utilization = Math.max(
+        next.cpu / claimant.resources.capacity.cpu,
+        next.memoryMb / claimant.resources.capacity.memoryMb,
+      );
+      const tie =
+        (index - (scheduling.rotation % Math.max(1, claimants.length)) + claimants.length) %
+        claimants.length;
+      return [{ claimant, demand, fits, utilization, tie }];
+    });
+    if (candidates.length === 0) return undefined;
+    const fitting = candidates.some((candidate) => candidate.fits)
+      ? candidates.filter((candidate) => candidate.fits)
+      : candidates;
+    fitting.sort(
+      (left, right) =>
+        left.utilization - right.utilization ||
+        left.tie - right.tie ||
+        compareText(left.claimant.id, right.claimant.id),
+    );
+    const selected = fitting[0];
+    if (!selected) return undefined;
+    const used = projected.get(selected.claimant.id);
+    if (used) {
+      used.cpu += selected.demand.cpu;
+      used.memoryMb += selected.demand.memoryMb;
+    }
+    return selected.claimant.id;
+  });
+}
+
+export function networkClaimDelay(
+  scheduling: ClaimScheduling | undefined,
+  config: InformantConfig,
+  partitions: JobConfig[][],
+  partitionIndex: number,
+): number {
+  if (!scheduling || scheduling.claimants.length < 2) return 0;
+  const assigned = assignNetworkPartitions(scheduling, config, partitions)[partitionIndex];
+  if (!assigned || assigned === scheduling.workerId) return 0;
+  return scheduling.staggerMs ?? DEFAULT_NETWORK_CLAIM_STAGGER_MS;
+}
+
+async function waitForClaimPriority(milliseconds: number, signal?: AbortSignal): Promise<boolean> {
+  if (milliseconds <= 0) return !signal?.aborted;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      resolve(value);
+    };
+    const abort = () => finish(false);
+    const timer = setTimeout(() => finish(true), milliseconds);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
 
 export async function readLogTail(path: string): Promise<string> {
   const file = Bun.file(path);
@@ -138,6 +282,9 @@ export async function runLocalCommit(
     .filter((job) => job.runtime?.type !== "container")
     .map((job) => job.name);
   const config = selectJobs(unselectedConfig, options.requestedJobs ?? []);
+  const releaseExecutionResources = (
+    dependencies.acquireExecutionSlot ?? acquireExecutionSlot
+  ).reserve?.(config);
   const id = crypto.randomUUID().slice(0, 12);
   const record: BuildRecord = {
     id,
@@ -211,6 +358,7 @@ export async function runLocalCommit(
     if (cancelled) return record;
     throw error;
   } finally {
+    releaseExecutionResources?.();
     await cancellation?.close();
   }
 }
@@ -226,6 +374,7 @@ export async function runCommit(
   signal?: AbortSignal,
   admissionSignal?: AbortSignal,
   forcedShutdownSignal?: AbortSignal,
+  claimScheduling?: ClaimScheduling,
 ): Promise<BuildRecord | false | undefined> {
   const manualAdmissionSignal = admissionSignal ?? signal;
   const automaticAdmissionSignal =
@@ -309,19 +458,24 @@ export async function runCommit(
     : [];
   const untriggeredCapable = usesCapabilities ? selectCapableJobs(config, capabilities) : config;
   const capable = usesCapabilities ? selectCapableJobs(selected, capabilities) : selected;
-  let partitions: JobConfig[][];
-  if (manualTrigger && usesCapabilities) {
-    const byLabels = new Map<string, JobConfig[]>();
-    for (const job of capable.jobs) {
-      const key = [...(job.runsOn ?? [])].sort().join("\0");
-      const jobs = byLabels.get(key) ?? [];
-      jobs.push(job);
-      byLabels.set(key, jobs);
+  const claimPartitions = (source: InformantConfig): JobConfig[][] => {
+    if (manualTrigger && usesCapabilities) {
+      const byLabels = new Map<string, JobConfig[]>();
+      for (const job of source.jobs) {
+        const key = [...(job.runsOn ?? [])].sort().join("\0");
+        const jobs = byLabels.get(key) ?? [];
+        jobs.push(job);
+        byLabels.set(key, jobs);
+      }
+      return [...byLabels.values()];
     }
-    partitions = [...byLabels.values()];
-  } else {
-    partitions = manualTrigger ? [capable.jobs] : partitionJobGraphs(capable.jobs);
-  }
+    return manualTrigger ? [source.jobs] : partitionJobGraphs(source.jobs);
+  };
+  const partitions = claimPartitions(capable);
+  const globalPartitions = claimPartitions(selected).sort((left, right) =>
+    compareText(partitionKey(left), partitionKey(right)),
+  );
+  const globalPartitionKeys = globalPartitions.map(partitionKey);
   const jobsByLabels = new Map<string, JobConfig[]>();
   for (const job of untriggeredCapable.jobs) {
     const key = [...(job.runsOn ?? [])].sort().join("\0");
@@ -336,12 +490,9 @@ export async function runCommit(
       for (const job of jobs) {
         labelKeys.add([...(job.runsOn ?? [])].sort().join("\0"));
       }
-      const componentScope = `${baseScope}:jobs:${Buffer.from(
-        jobs
-          .map((job) => job.name)
-          .sort()
-          .join("\0"),
-      ).toString("base64url")}`;
+      const jobsKey = partitionKey(jobs);
+      const globalPartitionIndex = globalPartitionKeys.indexOf(jobsKey);
+      const componentScope = `${baseScope}:jobs:${Buffer.from(jobsKey).toString("base64url")}`;
       const previousScopes = [
         ...(event ? [componentScope] : []),
         ...[...labelKeys].flatMap((key) => {
@@ -375,6 +526,9 @@ export async function runCommit(
         manualTrigger ? [] : previousScopes,
         claimSignal,
         forcedShutdownSignal,
+        globalPartitionIndex < 0
+          ? 0
+          : networkClaimDelay(claimScheduling, selected, globalPartitions, globalPartitionIndex),
       );
     }),
   );
@@ -395,11 +549,19 @@ async function runCommitPartition(
   legacyScopes: string[] = [],
   admissionSignal?: AbortSignal,
   forcedShutdownSignal?: AbortSignal,
+  claimDelayMs = 0,
 ): Promise<BuildRecord | false | undefined> {
   if (config.jobs.length === 0) return undefined;
+  const claimDelaySignal =
+    admissionSignal && forcedShutdownSignal
+      ? AbortSignal.any([admissionSignal, forcedShutdownSignal])
+      : (admissionSignal ?? forcedShutdownSignal);
+  if (claimDelayMs > 0 && !(await waitForClaimPriority(claimDelayMs, claimDelaySignal)))
+    return false;
+  const executionSlots = dependencies.acquireExecutionSlot ?? acquireExecutionSlot;
   const release = requireRunSlot
-    ? await (dependencies.acquireExecutionSlot ?? acquireExecutionSlot)(config, admissionSignal)
-    : undefined;
+    ? await executionSlots(config, admissionSignal)
+    : executionSlots.reserve?.(config);
   if (requireRunSlot && !release) return false;
   if (requireRunSlot && admissionSignal?.aborted) {
     release?.();

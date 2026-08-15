@@ -75,6 +75,9 @@ informant tailscale status
 informant startup enable # restart after changing the role
 ```
 
+`tailscale status` reports local and discovered-worker capacity, including reserved-plus-queued versus
+total CPU and memory. These are the resource snapshots used to distribute independent job partitions.
+
 A configured lead or worker automatically falls back to GitHub polling when Tailscale is offline,
 incomplete, or fails during network startup. It returns to authenticated tailnet coordination after a
 healthy restart. `tailscale disable` permanently removes the network role and gracefully restarts an

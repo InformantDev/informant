@@ -1028,6 +1028,7 @@ async function manageTailscale(
     const lines = [
       `Tailscale: ${current.status.online ? "online" : "offline"} · ${current.status.self.hostName}`,
       `Informant: ${current.config ? `${current.config.mode} · ${current.status.online ? "polling disabled while connected" : "polling fallback enabled"}` : "not configured · polling enabled"}`,
+      `Resources: ${current.localResources.used.cpu + current.localResources.queued.cpu}/${current.localResources.capacity.cpu} CPU · ${current.localResources.used.memoryMb + current.localResources.queued.memoryMb}/${current.localResources.capacity.memoryMb} MiB reserved or queued`,
     ];
     if (current.config?.funnelUrl)
       lines.push(`Funnel: ${current.config.funnelUrl}/webhooks/github`);
@@ -1035,8 +1036,11 @@ async function manageTailscale(
     else {
       lines.push("Workers:");
       for (const worker of current.workers) {
+        const resources = worker.resources
+          ? ` · ${worker.resources.used.cpu + worker.resources.queued.cpu}/${worker.resources.capacity.cpu} CPU · ${worker.resources.used.memoryMb + worker.resources.queued.memoryMb}/${worker.resources.capacity.memoryMb} MiB`
+          : "";
         lines.push(
-          `  ${worker.hostName} · ${worker.address} · ${worker.capabilities.join(", ")} · ${worker.repositories.length} ${worker.repositories.length === 1 ? "repository" : "repositories"}`,
+          `  ${worker.hostName} · ${worker.address} · ${worker.capabilities.join(", ")}${resources} · ${worker.repositories.length} ${worker.repositories.length === 1 ? "repository" : "repositories"}`,
         );
       }
     }
