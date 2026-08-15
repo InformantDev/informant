@@ -631,6 +631,58 @@ test("extracts and validates bounded automatic lane updates", () => {
       [{ lane: "branch:main", closed: true, obsoleteShas: [oldSha], updatedAt: 300 }],
     ),
   ).toEqual([{ ...newer, obsoleteShas: [oldSha], updatedAt: 300 }]);
+  const sameSecondMissedTransition = {
+    lane: "branch:main",
+    sha: "c".repeat(40),
+    obsoleteShas: [newSha],
+    updatedAt: 300,
+    revision: "delivery-newest",
+  };
+  const retainedSameSecondTransition = {
+    ...sameSecondMissedTransition,
+    obsoleteShas: [oldSha, newSha],
+  };
+  expect(
+    mergeAutomaticLaneUpdates([{ ...retired, updatedAt: 300 }], [sameSecondMissedTransition]),
+  ).toEqual([retainedSameSecondTransition]);
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [{ ...retired, updatedAt: 300 }],
+      [sameSecondMissedTransition],
+    ),
+  ).toBe(true);
+  const delayedSameSecondTransition = {
+    lane: "branch:main",
+    sha: newSha,
+    obsoleteShas: [oldSha],
+    updatedAt: 300,
+    revision: "delivery-delayed",
+  };
+  expect(
+    mergeAutomaticLaneUpdates([retainedSameSecondTransition], [delayedSameSecondTransition]),
+  ).toEqual([retainedSameSecondTransition]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [retainedSameSecondTransition],
+      [{ ...retired, updatedAt: 300, revision: "delivery-redelivered-a" }],
+    ),
+  ).toEqual([retainedSameSecondTransition]);
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [retainedSameSecondTransition],
+      [delayedSameSecondTransition],
+    ),
+  ).toBe(false);
+  const sameSecondRollback = {
+    lane: "branch:main",
+    sha: oldSha,
+    obsoleteShas: ["c".repeat(40)],
+    updatedAt: 300,
+    revision: "delivery-rollback",
+  };
+  expect(mergeAutomaticLaneUpdates([retainedSameSecondTransition], [sameSecondRollback])).toEqual([
+    { ...sameSecondRollback, obsoleteShas: [newSha, "c".repeat(40)] },
+  ]);
   expect(() => parseAutomaticLaneUpdates([{ lane: "branch:main", sha: "short" }])).toThrow(
     "invalid automatic lane updates",
   );
@@ -681,7 +733,7 @@ test("extracts and validates bounded automatic lane updates", () => {
     {
       lane: "branch:main",
       sha: newSha,
-      obsoleteShas: ["c".repeat(40), oldSha],
+      obsoleteShas: ["c".repeat(40), "d".repeat(40), oldSha],
       updatedAt: 200,
     },
   ]);

@@ -81,7 +81,9 @@ message to every registered worker immediately when a push or pull-request webho
 this message is independent of the queued repository scan and its retry backoff. The worker that owns
 the previous SHA aborts its commands, cleans up its runtime, and concludes its checks as cancelled.
 Recent lane transitions are retained for workers that reconnect after missing the webhook. Delivery
-revisions let an authoritative GitHub scan retire an exact stale transition, preventing later recovery
+revisions distinguish transitions whose GitHub timestamps have the same one-second precision, while
+each active run retains known-obsolete lineage so a delayed transition cannot regress it. Revisions
+also let an authoritative GitHub scan retire an exact stale transition, preventing later recovery
 dispatches from reapplying it or suppressing a reopened lane. A scan that started before a transition
 cannot retire it, while a later scan yields to GitHub's live head even for a force-push rollback. Every
 notified machine still checks the

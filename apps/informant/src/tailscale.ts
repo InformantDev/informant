@@ -129,7 +129,11 @@ function mergeAutomaticLaneUpdate(
   const incomingIsNewer = automaticLaneUpdateIsNewer(previous, incoming);
   const latest = incomingIsNewer ? incoming : previous;
   const older = incomingIsNewer ? previous : incoming;
-  const obsoleteShas = [...(older.obsoleteShas ?? []), ...(latest.obsoleteShas ?? [])];
+  const obsoleteShas = [
+    ...(older.obsoleteShas ?? []),
+    ...(older.sha && older.sha !== latest.sha ? [older.sha] : []),
+    ...(latest.obsoleteShas ?? []),
+  ];
   const uniqueObsolete = [...new Set(obsoleteShas)]
     .filter((sha) => sha !== latest.sha)
     .slice(-MAX_OBSOLETE_LANE_SHAS);

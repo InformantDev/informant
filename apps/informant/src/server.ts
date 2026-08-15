@@ -139,6 +139,8 @@ interface ActiveAutomaticRun {
   lane: string;
   sha: string;
   updatedAt?: number;
+  revision?: string;
+  obsoleteShas: Set<string>;
   controller: AbortController;
 }
 
@@ -180,10 +182,23 @@ export function automaticLaneUpdateIsNewer(
   ) {
     return incoming.updatedAt > previous.updatedAt;
   }
-  if (incoming.sha && previous.obsoleteShas?.includes(incoming.sha)) return false;
+  // Prefer an explicit transition away from the retained head, including a force-push
+  // rollback to a SHA that was previously obsolete. Otherwise reject an obsolete target.
   if (previous.sha && incoming.obsoleteShas?.includes(previous.sha)) return true;
+  if (incoming.sha && previous.obsoleteShas?.includes(incoming.sha)) return false;
   if (incoming.closed && previous.sha && !incoming.obsoleteShas?.includes(previous.sha)) {
     return false;
+  }
+  // GitHub push timestamps have one-second precision. Distinct deliveries received for the
+  // same source second are ordered by arrival after the explicit lineage checks above.
+  if (
+    previous.updatedAt !== undefined &&
+    incoming.updatedAt === previous.updatedAt &&
+    previous.revision !== undefined &&
+    incoming.revision !== undefined &&
+    incoming.revision !== previous.revision
+  ) {
+    return true;
   }
   return incoming.sha === previous.sha && incoming.closed === previous.closed;
 }
@@ -217,25 +232,71 @@ export class AutomaticRunRegistry {
       if (this.retired.has(`${key}\0${automaticLaneUpdateSemanticIdentity(update)}`)) continue;
       const previous = this.expected.get(key);
       const active = this.active.get(key);
-      const orderingPrevious =
-        previous &&
-        active &&
-        previous.sha === active.sha &&
-        previous.update.updatedAt === undefined &&
-        active.updatedAt !== undefined
-          ? { ...previous.update, updatedAt: active.updatedAt }
-          : previous?.update;
-      if (orderingPrevious && !automaticLaneUpdateIsNewer(orderingPrevious, update)) continue;
       const nextSha = update.closed ? null : (update.sha ?? null);
-      const expectedActiveUpdatedAt =
-        previous && active && previous.sha === active.sha ? previous.update.updatedAt : undefined;
-      const activeUpdatedAt = expectedActiveUpdatedAt ?? active?.updatedAt;
+      const previousTracksActive =
+        previous !== undefined && active !== undefined && previous.sha === active.sha;
+      const previousUpdatedAt = previousTracksActive ? previous.update.updatedAt : undefined;
+      const activeWatermarkWins =
+        previousTracksActive &&
+        active.updatedAt !== undefined &&
+        (previousUpdatedAt === undefined || active.updatedAt > previousUpdatedAt);
+      const orderingPrevious = previous
+        ? activeWatermarkWins
+          ? {
+              ...previous.update,
+              updatedAt: active.updatedAt,
+              revision: active.revision,
+            }
+          : previous.update
+        : undefined;
+      const activeUpdatedAt =
+        active?.updatedAt === undefined
+          ? previousUpdatedAt
+          : previousUpdatedAt === undefined
+            ? active.updatedAt
+            : Math.max(active.updatedAt, previousUpdatedAt);
+      const activeRevision = activeWatermarkWins
+        ? active?.revision
+        : previousTracksActive && previousUpdatedAt !== undefined
+          ? (previous.update.revision ?? active?.revision)
+          : active?.revision;
+      // Keep lineage on the active run even after its bounded expected entry is evicted. That
+      // lets a same-second new delivery bridge a missed transition without accepting an older
+      // transition whose target is already known to be obsolete.
+      const targetsKnownObsolete =
+        (nextSha !== null && active?.obsoleteShas.has(nextSha)) ||
+        (update.closed === true &&
+          update.obsoleteShas?.some((sha) => active?.obsoleteShas.has(sha)) === true);
+      const distinctRevisionAtSameTime =
+        active !== undefined &&
+        active.sha !== nextSha &&
+        activeUpdatedAt !== undefined &&
+        update.updatedAt === activeUpdatedAt &&
+        activeRevision !== undefined &&
+        update.revision !== undefined &&
+        update.revision !== activeRevision &&
+        !targetsKnownObsolete;
+      if (
+        active?.sha === nextSha &&
+        activeUpdatedAt !== undefined &&
+        update.updatedAt !== undefined &&
+        update.updatedAt < activeUpdatedAt
+      ) {
+        continue;
+      }
+      if (
+        orderingPrevious &&
+        !automaticLaneUpdateIsNewer(orderingPrevious, update) &&
+        !distinctRevisionAtSameTime
+      ) {
+        continue;
+      }
       const orderedAfterActive =
         active !== undefined &&
         active.sha !== nextSha &&
         activeUpdatedAt !== undefined &&
         update.updatedAt !== undefined &&
-        update.updatedAt > activeUpdatedAt;
+        (update.updatedAt > activeUpdatedAt || distinctRevisionAtSameTime);
       if (
         active &&
         active.sha !== nextSha &&
@@ -262,13 +323,15 @@ export class AutomaticRunRegistry {
       while (this.expected.size > MAX_TRACKED_AUTOMATIC_LANES) {
         this.expected.delete(this.expected.keys().next().value ?? "");
       }
-      if (
-        active &&
-        active.sha === nextSha &&
-        update.updatedAt !== undefined &&
-        (active.updatedAt === undefined || update.updatedAt > active.updatedAt)
-      ) {
-        active.updatedAt = update.updatedAt;
+      if (active && active.sha === nextSha) {
+        if (
+          update.updatedAt !== undefined &&
+          (active.updatedAt === undefined || update.updatedAt >= active.updatedAt)
+        ) {
+          active.updatedAt = update.updatedAt;
+          if (update.revision !== undefined) active.revision = update.revision;
+        }
+        for (const sha of obsoleteShas) active.obsoleteShas.add(sha);
       }
       if (active && (update.closed || active.sha !== update.sha)) {
         this.active.delete(key);
@@ -338,6 +401,10 @@ export class AutomaticRunRegistry {
       ...(expected?.sha === sha && expected.update.updatedAt !== undefined
         ? { updatedAt: expected.update.updatedAt }
         : {}),
+      ...(expected?.sha === sha && expected.update.revision !== undefined
+        ? { revision: expected.update.revision }
+        : {}),
+      obsoleteShas: new Set(expected?.sha === sha ? expected.obsoleteShas : []),
       controller,
     });
     return true;
@@ -1060,7 +1127,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           shutdownControllers.add(shutdownController);
           const run = result
             .then((result) => {
-              if (result !== false) completedComments.add(pending.id);
+              if (result === false) retryDispatch = true;
+              else completedComments.add(pending.id);
             })
             .catch((error) => {
               message(`comment ${pending.id} failed: ${errorDetail(error)}`);

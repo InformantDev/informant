@@ -148,6 +148,92 @@ test("a newer ordered update supersedes an active head across a missed transitio
   expect(runs.prepare(repository, "branch:main", shaA)).toBe(true);
 });
 
+test("same-second revisions supersede missed transitions without accepting delayed lineage", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  runs.apply(repository, [
+    { lane: "branch:main", sha: shaA, updatedAt: 100_000, revision: "head-a" },
+  ]);
+  const controllerA = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaA, controllerA)).toBe(true);
+
+  const current = {
+    lane: "branch:main",
+    sha: shaC,
+    obsoleteShas: [shaB],
+    updatedAt: 100_000,
+    revision: "b-to-c",
+  };
+  expect(runs.apply(repository, [current])).toEqual([{ ...current, obsoleteShas: [shaB, shaA] }]);
+  expect(controllerA.signal.aborted).toBe(true);
+
+  const controllerC = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaC, controllerC)).toBe(true);
+  for (let index = 0; index < 1_024; index++) {
+    runs.apply(repository, [
+      {
+        lane: `branch:other-${index}`,
+        sha: "d".repeat(40),
+        updatedAt: 200_000,
+        revision: `other-${index}`,
+      },
+    ]);
+  }
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: shaB,
+        obsoleteShas: [shaA],
+        updatedAt: 100_000,
+        revision: "delayed-a-to-b",
+      },
+    ]),
+  ).toEqual([]);
+  expect(controllerC.signal.aborted).toBe(false);
+});
+
+test("delayed same-head updates cannot lower an evicted active ordering watermark", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  runs.apply(repository, [
+    { lane: "branch:main", sha: shaA, updatedAt: 300, revision: "current-a" },
+  ]);
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaA, controller)).toBe(true);
+  for (let index = 0; index < 1_024; index++) {
+    runs.apply(repository, [
+      {
+        lane: `branch:other-${index}`,
+        sha: "d".repeat(40),
+        updatedAt: 400,
+        revision: `other-${index}`,
+      },
+    ]);
+  }
+
+  expect(
+    runs.apply(repository, [
+      { lane: "branch:main", sha: shaA, updatedAt: 100, revision: "delayed-a" },
+    ]),
+  ).toEqual([]);
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: shaB,
+        obsoleteShas: ["f".repeat(40)],
+        updatedAt: 200,
+        revision: "intermediate-b",
+      },
+    ]),
+  ).toEqual([]);
+  expect(controller.signal.aborted).toBe(false);
+});
+
 test("non-lineal updates cannot regress an expected head without ordering metadata", () => {
   const runs = new AutomaticRunRegistry();
   const currentSha = "b".repeat(40);
@@ -462,6 +548,32 @@ test("one-shot event scans propagate unclaimed work for dispatch retry", async (
     }),
   ).rejects.toThrow("automatic work was not claimed; retrying dispatch");
   expect(attempts).toBe(1);
+});
+
+test("one-shot event scans propagate unclaimed comment work for dispatch retry", async () => {
+  const state: PollState = {
+    cursor: "2026-01-01T00:00:00.000Z",
+    pending: [
+      {
+        id: 42,
+        sha: pullRequest.headSha,
+        createdAt: "2026-01-01",
+        pullRequest,
+      },
+    ],
+    seenCommentIds: [42],
+    pendingTags: [],
+  };
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      dependencies: dependencies(github({}), state, async () => false),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("automatic work was not claimed; retrying dispatch");
+  expect(state.pending.map((item) => item.id)).toEqual([42]);
 });
 
 test("serveRepositories preserves caller idle notifications after housekeeping", async () => {
