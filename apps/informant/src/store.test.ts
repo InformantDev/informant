@@ -12,6 +12,7 @@ import {
   recordWorkerVersion,
   removeOrphanedBuildWorkspaces,
   requestBuildCancellation,
+  runningWorkerPids,
   runningWorkerVersion,
   saveBuild,
 } from "./store.ts";
@@ -64,6 +65,7 @@ test("worker version state belongs to a specific live process", async () => {
 
   await recordWorkerVersion("1.2.3");
   expect(await runningWorkerVersion()).toBe("1.2.3");
+  expect(await runningWorkerPids()).toEqual([process.pid]);
 
   await Bun.write(
     dead,

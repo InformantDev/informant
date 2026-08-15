@@ -49,9 +49,12 @@ Informant will:
 
 1. Configure and verify the host container backend. On Apple Silicon this installs Apple's signed
    Container package. On Linux, setup offers to install Podman with `apt-get` or `dnf`, verifies that
-   it is rootless with cgroups v2, and runs a bounded smoke test of the default image using CPU,
-   memory, security, and writable bind-mount constraints. Podman is daemonless; Informant does not
-   start a service and does not require systemd.
+   it is rootless with cgroups v2, installs the `catatonit` init helper and Podman 5's `pasta`
+   networking helper, and runs bounded
+   container-run and prepared-image-build smoke tests using CPU, memory, security, and writable
+   bind-mount constraints. Setup also rejects an active systemd worker whose sandbox makes
+   `/proc/sys` read-only or blocks nested container hostnames. Podman is daemonless; Informant does not start a Podman service or require
+   systemd.
 2. Ask whether your account or an organization should own the App.
 3. If Tailscale is connected, enable a Funnel and open GitHub with the signed webhook and required
    events already configured. Otherwise create the App with webhooks disabled and use polling.
@@ -60,7 +63,9 @@ Informant will:
 6. Detect the installation and save its credentials without changing this machine's registered
    repositories.
 7. On the first setup, ask whether to install a six-hour automatic update check.
-8. Offer to start the worker.
+8. Offer to start the worker. The worker repeats the execution smoke test from inside its real service
+   context before advertising `container`, rechecks after infrastructure failures, and withdraws the
+   capability when a runtime probe fails.
 
 Workers that run macOS VM jobs also need Tart and `sshpass`:
 

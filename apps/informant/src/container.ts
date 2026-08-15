@@ -22,6 +22,7 @@ import {
   type ContainerRunOptions,
   requireContainerBackend,
   selectContainerBackend,
+  verifyContainerBackendExecution,
 } from "./container-backend.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import { command } from "./process.ts";
@@ -55,6 +56,15 @@ function containerCommandError(action: string, result: Awaited<ReturnType<typeof
   return new Error(
     `${action}: ${result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.exitCode}`}`,
   );
+}
+
+function containerInfrastructureFailure(
+  backend: ContainerBackend,
+  result: Awaited<ReturnType<typeof command>>,
+): boolean {
+  // Podman reserves 125 for failures in Podman or its OCI runtime. Other nonzero statuses belong
+  // to the workload (including 126/127) and its output must not trigger an execution smoke test.
+  return backend.kind === "podman" && !result.timedOut && result.exitCode === 125;
 }
 
 function appleContainerBuilderIsAbsent(result: Awaited<ReturnType<typeof command>>): boolean {
@@ -1003,10 +1013,18 @@ export async function ensurePreparedContainer(
           signal,
           onOutput: onMessage,
         });
-        if (preparation.exitCode !== 0 || preparation.timedOut)
+        if (preparation.exitCode !== 0 || preparation.timedOut) {
+          if (
+            !signal?.aborted &&
+            backend.verifyExecution &&
+            containerInfrastructureFailure(backend, preparation)
+          ) {
+            await verifyContainerBackendExecution(backend, runCommand, signal);
+          }
           throw new Error(
             `container image preparation failed: ${preparation.stderr.trim() || `exit ${preparation.exitCode}`}`,
           );
+        }
         return prepared;
       },
       signal,
@@ -1200,14 +1218,26 @@ export async function runInContainer(
       } catch (error) {
         redactionError = error;
       }
-      if (commandError && redactionError)
+      const recheckRuntime = async (failed: Awaited<ReturnType<typeof runCommand>>) => {
+        const currentBackend = backend;
+        if (
+          !signal?.aborted &&
+          currentBackend?.verifyExecution &&
+          containerInfrastructureFailure(currentBackend, failed)
+        ) {
+          await verifyContainerBackendExecution(currentBackend, runCommand, signal);
+        }
+      };
+      if (commandError && redactionError) {
         throw new AggregateError(
           [commandError, redactionError],
           "container command failed and mounted output could not be redacted",
         );
+      }
       if (commandError) throw commandError;
       if (redactionError) throw redactionError;
       if (!result) throw new Error("container command did not return a result");
+      if (result.exitCode !== 0 || result.timedOut) await recheckRuntime(result);
       return result;
     };
     const lock = operations.withImageLock ?? withImageLock;

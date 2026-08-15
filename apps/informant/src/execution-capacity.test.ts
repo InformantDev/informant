@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  acquireExecutionSlot,
   claimExecutionResources,
   createExecutionSlotAcquirer,
+  currentExecutionCapacity,
   executionCapacity,
+  publishExecutionReservation,
 } from "./execution-capacity.ts";
 import type { InformantConfig, JobConfig } from "./types.ts";
 
@@ -106,12 +112,93 @@ describe("execution capacity", () => {
     expect(first).toBeFunction();
     expect(second).toBeFunction();
     expect(thirdEntered).toBeFalse();
+    expect(acquire.snapshot?.()).toEqual({
+      capacity: { cpu: 2, memoryMb: 2048 },
+      used: { cpu: 2, memoryMb: 2048 },
+      queued: { cpu: 1, memoryMb: 1024 },
+    });
 
     first?.();
     const releaseThird = await third;
     expect(releaseThird).toBeFunction();
     second?.();
     releaseThird?.();
+    expect(acquire.snapshot?.()).toEqual({
+      capacity: { cpu: 2, memoryMb: 2048 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    });
+  });
+
+  test("tracks manually admitted work without blocking it on automatic capacity", async () => {
+    const acquire = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 });
+    const single = config([job("test", 1, 1024)]);
+    const releaseAutomatic = await acquire(single);
+    const releaseManual = acquire.reserve?.(single);
+
+    expect(releaseManual).toBeFunction();
+    expect(acquire.snapshot?.().used).toEqual({ cpu: 2, memoryMb: 2048 });
+
+    releaseManual?.();
+    releaseAutomatic?.();
+    expect(acquire.snapshot?.().used).toEqual({ cpu: 0, memoryMb: 0 });
+  });
+
+  test("waits for process-shared manual reservations before admitting automatic work", async () => {
+    const external = { cpu: 1, memoryMb: 1024 };
+    const acquire = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 }, () => external);
+    let entered = false;
+    const pending = acquire(config([job("automatic", 1, 1024)])).then((release) => {
+      entered = true;
+      return release;
+    });
+    await Bun.sleep(0);
+    expect(entered).toBe(false);
+    external.cpu = 0;
+    external.memoryMb = 0;
+    const release = await pending;
+    expect(entered).toBe(true);
+    release?.();
+  });
+
+  test("publishes manual reservations across processes without counting them locally twice", async () => {
+    const dataPath = await mkdtemp(join(tmpdir(), "informant-capacity-"));
+    const manualConfig = config([job("manual", 2, 3072)]);
+    let releaseLocal: (() => void) | undefined;
+    let releasePublished: (() => void) | undefined;
+    try {
+      releaseLocal = acquireExecutionSlot.reserve?.(manualConfig);
+      releasePublished = await publishExecutionReservation(manualConfig, dataPath);
+      expect(currentExecutionCapacity(dataPath).used).toEqual({ cpu: 2, memoryMb: 3072 });
+
+      const moduleUrl = new URL("./execution-capacity.ts", import.meta.url).href;
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          "-e",
+          `import { currentExecutionCapacity } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(currentExecutionCapacity(${JSON.stringify(dataPath)}).used));`,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const [output, error, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(error).toBe("");
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(output)).toEqual({ cpu: 2, memoryMb: 3072 });
+
+      releasePublished();
+      releasePublished = undefined;
+      releaseLocal?.();
+      releaseLocal = undefined;
+      expect(currentExecutionCapacity(dataPath).used).toEqual({ cpu: 0, memoryMb: 0 });
+    } finally {
+      releasePublished?.();
+      releaseLocal?.();
+      await rm(dataPath, { recursive: true, force: true });
+    }
   });
 
   test("an unspecified VM reserves full capacity until release", async () => {

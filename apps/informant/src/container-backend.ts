@@ -1,9 +1,13 @@
-import { arch, platform } from "node:os";
+import { randomBytes } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { arch, platform, tmpdir } from "node:os";
+import { join } from "node:path";
 import { type CommandResult, command } from "./process.ts";
 
 export type ContainerCommandRunner = typeof command;
 export const CONTAINER_READINESS_MAX_AGE_MS = 30_000;
 export const CONTAINER_READINESS_TIMEOUT_MS = 15_000;
+export const CONTAINER_EXECUTION_READINESS_MAX_AGE_MS = 5 * 60_000;
 
 export interface ContainerRunOptions {
   name: string;
@@ -24,6 +28,7 @@ export interface ContainerBackend {
   sharedStorageDescription: string;
   globalPruneCommand?: string;
   initialize(runCommand?: ContainerCommandRunner, signal?: AbortSignal): Promise<void>;
+  verifyExecution?(runCommand?: ContainerCommandRunner, signal?: AbortSignal): Promise<void>;
   runArguments(options: ContainerRunOptions): string[];
   buildArguments(image: string, cpu?: number, memoryMb?: number): string[];
   inspectImageArguments(image: string): string[];
@@ -154,6 +159,11 @@ function caseInsensitiveField(value: unknown, name: string): unknown {
   return matches.length === 1 ? matches[0]?.[1] : undefined;
 }
 
+export function podmanRequiresPasta(versionOutput: string): boolean {
+  const major = Number(versionOutput.match(/\bpodman\s+version\s+(\d+)/i)?.[1]);
+  return Number.isSafeInteger(major) && major >= 5;
+}
+
 export function validateRootlessPodmanInfo(source: string): void {
   let info: unknown;
   try {
@@ -177,6 +187,65 @@ export function validateRootlessPodmanInfo(source: string): void {
   }
 }
 
+function podmanSmokeError(action: string, result: CommandResult): Error {
+  const error = commandError(action, result);
+  if (/\/proc\/sys\/.+read-only file system/i.test(result.stderr)) {
+    return new Error(
+      `${error.message}; the worker service makes /proc/sys read-only—run \`informant doctor\` as the worker user and set ProtectKernelTunables=no on the reported service unit`,
+    );
+  }
+  return error;
+}
+
+export async function verifyPodman(
+  runCommand: ContainerCommandRunner = command,
+  signal?: AbortSignal,
+): Promise<void> {
+  const workspace = await mkdtemp(join(tmpdir(), "informant-podman-smoke-"));
+  const marker = join(workspace, "informant-smoke-test");
+  const nonce = randomBytes(8).toString("hex");
+  const image = `informant-podman-smoke:${nonce}`;
+  try {
+    signal?.throwIfAborted();
+    const runSmoke = await runCommand(
+      podmanContainerBackend.runArguments({
+        name: `informant-podman-smoke-${nonce}`,
+        image: "docker.io/oven/bun:1",
+        workspace,
+        command: "bun --version && touch /workspace/informant-smoke-test",
+        environment: {},
+        cpu: 1,
+        memoryMb: 256,
+      }),
+      { timeoutMs: 120_000, signal },
+    );
+    if (runSmoke.exitCode !== 0 || runSmoke.timedOut) {
+      throw podmanSmokeError("rootless Podman could not run the Informant default image", runSmoke);
+    }
+    if (!(await Bun.file(marker).exists())) {
+      throw new Error("rootless Podman could not write to a bind-mounted workspace");
+    }
+
+    await writeFile(
+      join(workspace, "Dockerfile"),
+      `FROM docker.io/oven/bun:1\nRUN bun --version && printf '%s' '${nonce}' > /tmp/informant-build-smoke-test\n`,
+    );
+    const buildSmoke = await runCommand(podmanContainerBackend.buildArguments(image, 1, 256), {
+      cwd: workspace,
+      timeoutMs: 120_000,
+      signal,
+    });
+    if (buildSmoke.exitCode !== 0 || buildSmoke.timedOut) {
+      throw podmanSmokeError("rootless Podman could not build a prepared job image", buildSmoke);
+    }
+  } finally {
+    await runCommand(["podman", "image", "rm", "--force", image], { timeoutMs: 30_000 }).catch(
+      () => undefined,
+    );
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
+
 export const podmanContainerBackend: ContainerBackend = {
   kind: "podman",
   name: "rootless Podman",
@@ -186,6 +255,15 @@ export const podmanContainerBackend: ContainerBackend = {
     const installed = await runCommand(["podman", "--version"], options);
     if (installed.exitCode !== 0 || installed.timedOut)
       throw commandError("Podman is not installed; run `informant setup` to install it", installed);
+    if (podmanRequiresPasta(installed.stdout)) {
+      const pasta = await runCommand(["pasta", "--version"], options);
+      if (pasta.exitCode !== 0 || pasta.timedOut) {
+        throw commandError(
+          "Podman's rootless network helper is unavailable; run `informant setup` to install passt",
+          pasta,
+        );
+      }
+    }
     const info = await runCommand(["podman", "info", "--format", "json"], options);
     if (info.exitCode !== 0 || info.timedOut)
       throw commandError(
@@ -194,6 +272,7 @@ export const podmanContainerBackend: ContainerBackend = {
       );
     validateRootlessPodmanInfo(info.stdout);
   },
+  verifyExecution: verifyPodman,
   runArguments(options) {
     const args = commonRunArguments("podman", options, "Podman", {
       workspace: "Z",
@@ -236,13 +315,26 @@ export function selectContainerBackend(
   return undefined;
 }
 
-let readiness: { backend: ContainerBackend; checkedAt: number; error?: Error } | undefined;
+interface BackendReadiness {
+  backend: ContainerBackend;
+  checkedAt: number;
+  basicError?: Error;
+  executionCheckedAt?: number;
+  executionError?: Error;
+}
+
+let readiness: BackendReadiness | undefined;
 interface ReadinessRefresh {
   backend: ContainerBackend;
   controller: AbortController;
   result: Promise<boolean>;
   settled: boolean;
   waiters: number;
+  verifyExecution: boolean;
+}
+
+function readinessError(value: BackendReadiness | undefined): Error | undefined {
+  return value?.basicError ?? value?.executionError;
 }
 let refreshInFlight: ReadinessRefresh | undefined;
 
@@ -282,25 +374,43 @@ export async function initializeContainerBackend(
   runCommand: ContainerCommandRunner = command,
   now = Date.now(),
   signal?: AbortSignal,
+  verifyExecution = false,
 ): Promise<boolean> {
   if (!backend) {
     readiness = undefined;
     return false;
   }
+  const previous = readiness?.backend === backend ? readiness : undefined;
   try {
     await backend.initialize(runCommand, signal);
     signal?.throwIfAborted();
-    readiness = { backend, checkedAt: now };
-    return true;
   } catch (error) {
     if (signal?.aborted) throw signal.reason;
     readiness = {
       backend,
       checkedAt: now,
-      error: error instanceof Error ? error : new Error(String(error)),
+      basicError: error instanceof Error ? error : new Error(String(error)),
+      executionCheckedAt: previous?.executionError ? previous.executionCheckedAt : undefined,
+      executionError: previous?.executionError,
     };
     return false;
   }
+
+  let executionCheckedAt = previous?.executionCheckedAt;
+  let executionError = previous?.executionError;
+  if (verifyExecution) {
+    executionCheckedAt = now;
+    try {
+      await backend.verifyExecution?.(runCommand, signal);
+      signal?.throwIfAborted();
+      executionError = undefined;
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      executionError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  readiness = { backend, checkedAt: now, executionCheckedAt, executionError };
+  return executionError === undefined;
 }
 
 export async function refreshContainerBackend(
@@ -309,46 +419,81 @@ export async function refreshContainerBackend(
   runCommand: ContainerCommandRunner = command,
   now = Date.now(),
   signal?: AbortSignal,
+  verifyExecution = false,
 ): Promise<boolean> {
   if (
     backend &&
     readiness?.backend === backend &&
     now - readiness.checkedAt >= 0 &&
-    now - readiness.checkedAt < maxAgeMs
+    now - readiness.checkedAt < maxAgeMs &&
+    !verifyExecution
   ) {
-    return readiness.error === undefined;
+    return readinessError(readiness) === undefined;
   }
-  if (!backend) return initializeContainerBackend(backend, runCommand, now, signal);
+  if (!backend)
+    return initializeContainerBackend(backend, runCommand, now, signal, verifyExecution);
   if (
     refreshInFlight?.backend === backend &&
     !refreshInFlight.settled &&
     !refreshInFlight.controller.signal.aborted
   ) {
-    return waitForReadiness(refreshInFlight, signal);
+    if (!verifyExecution || refreshInFlight.verifyExecution) {
+      return waitForReadiness(refreshInFlight, signal);
+    }
+    await waitForReadiness(refreshInFlight, signal);
+    return refreshContainerBackend(maxAgeMs, backend, runCommand, now, signal, true);
   }
   if (refreshInFlight?.backend === backend) refreshInFlight = undefined;
   signal?.throwIfAborted();
   const controller = new AbortController();
   let refresh!: ReadinessRefresh;
-  const result = initializeContainerBackend(backend, runCommand, now, controller.signal).finally(
-    () => {
-      refresh.settled = true;
-      if (refreshInFlight === refresh) refreshInFlight = undefined;
-    },
-  );
-  refresh = { backend, controller, result, settled: false, waiters: 0 };
+  const result = initializeContainerBackend(
+    backend,
+    runCommand,
+    now,
+    controller.signal,
+    verifyExecution,
+  ).finally(() => {
+    refresh.settled = true;
+    if (refreshInFlight === refresh) refreshInFlight = undefined;
+  });
+  refresh = { backend, controller, result, settled: false, waiters: 0, verifyExecution };
   refreshInFlight = refresh;
   return waitForReadiness(refresh, signal);
 }
 
 export function refreshSelectedContainerBackend(signal?: AbortSignal): Promise<boolean> {
+  const backend = selectContainerBackend();
+  const now = Date.now();
+  const current = readiness;
+  const executionCheckedAt =
+    current && current.backend === backend ? current.executionCheckedAt : undefined;
+  const verifyExecution =
+    Boolean(backend?.verifyExecution) &&
+    (executionCheckedAt === undefined ||
+      now - executionCheckedAt < 0 ||
+      (Boolean(current?.executionError) &&
+        now - executionCheckedAt >= CONTAINER_EXECUTION_READINESS_MAX_AGE_MS));
   return refreshContainerBackend(
     CONTAINER_READINESS_MAX_AGE_MS,
-    selectContainerBackend(),
+    backend,
     command,
-    Date.now(),
+    now,
     signal,
+    verifyExecution,
   );
+}
+
+export function verifySelectedContainerBackend(signal?: AbortSignal): Promise<boolean> {
+  return refreshContainerBackend(0, selectContainerBackend(), command, Date.now(), signal, true);
+}
+
+export function verifyContainerBackendExecution(
+  backend: ContainerBackend,
+  runCommand: ContainerCommandRunner = command,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return refreshContainerBackend(0, backend, runCommand, Date.now(), signal, true);
 }
 
 export async function requireContainerBackend(
@@ -364,7 +509,8 @@ export async function requireContainerBackend(
     Date.now(),
     signal,
   );
-  if (readiness?.error) throw readiness.error;
+  const error = readinessError(readiness);
+  if (error) throw error;
   return backend;
 }
 
@@ -375,8 +521,10 @@ export function containerBackendReadiness():
   return {
     backend: readiness.backend,
     checkedAt: readiness.checkedAt,
-    ready: readiness.error === undefined,
-    error: readiness.error,
+    ready:
+      readinessError(readiness) === undefined &&
+      (!readiness.backend.verifyExecution || readiness.executionCheckedAt !== undefined),
+    error: readinessError(readiness),
   };
 }
 

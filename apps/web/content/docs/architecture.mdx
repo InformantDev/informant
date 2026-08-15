@@ -19,9 +19,10 @@ When Tailscale is installed and Informant is configured as a lead, the lead publ
 signed GitHub webhook endpoint through Funnel. Each machine also exposes a small worker endpoint on
 its Tailscale IPv4 address. The lead discovers online Informant peers from `tailscale status --json`
 and authenticates every private API request with the shared worker token before dispatching
-repository notifications across the tailnet. Every notified machine performs one
-GitHub synchronization and enters the existing capability-specific Checks election. Job definitions,
-GitHub credentials, and secrets are never sent between workers.
+repository notifications across the tailnet. Health responses advertise capabilities plus total,
+reserved, and queued CPU and memory. Every notified machine performs one GitHub synchronization and
+enters the existing capability-specific Checks election. Job definitions, GitHub credentials, and
+secrets are never sent between workers.
 
 A connected network worker does not run a timer or poll GitHub continuously. Every Tailscale worker
 performs one forced synchronization of its locally registered repositories at startup to recover
@@ -29,17 +30,25 @@ events received while Informant was stopped or restarting, then reacts to webhoo
 recovery also includes repositories advertised only by remote workers. Failed deliveries remain
 queued with bounded exponential retries, and the lead refreshes peer topology so workers that join or
 reconnect receive a recovery synchronization. Tag-push notifications bypass the normal tag throttle.
-If Tailscale is not configured, `informant serve` retains the polling path. A configured worker never
-silently falls back to polling when disconnected; reconnect Tailscale or explicitly run
-`informant tailscale disable`. Connecting an existing GitHub App keeps polling enabled until worker
-mode is selected explicitly with the lead's token. Funnel never exposes the private worker/build API.
+If Tailscale is not configured or network startup is unavailable, `informant serve` retains the
+polling path. Connecting an existing GitHub App keeps polling enabled until worker mode is selected
+explicitly with the lead's token. Funnel never exposes the private worker/build API.
 
-Workers advertise `self-hosted`, their operating system, architecture, hostname, and optional custom
-capabilities. A healthy selected container backend adds the dynamic `container` capability. Linux
-probes rootless Podman directly; this is daemonless and does not depend on systemd. A worker filters jobs before entering the claim election, then groups them by normalized
-`runs_on` requirements. Each requirement group is a separate claim scope. Workers with overlapping
-capabilities therefore compete for shared jobs, while Linux and macOS workers can claim different jobs
-for the same commit without stealing work from each other.
+Workers advertise `self-hosted`, their operating system, architecture, hostname, optional custom
+capabilities, and currently available execution resources. Manual CLI runs publish process-shared
+reservations, so the background worker includes their CPU and memory before advertising or admitting
+automatic work. A healthy selected container backend adds the dynamic `container` capability. Linux probes rootless Podman directly; this is daemonless and does
+not depend on systemd.
+
+For each notification, every worker deterministically computes the same resource-aware assignment for
+each independent job/dependency partition. The scheduler filters to capable workers, accounts for
+already reserved and queued CPU and memory, and chooses the worker with the lowest projected dominant
+resource utilization. Assignments across the build reserve projected capacity so independent jobs
+spread across the lead and workers in proportion to their available resources. The assigned worker
+enters the Checks election immediately; other capable workers enter after a bounded delay, preserving
+failover if capacity or capabilities change. Claim plans are bounded to 64 workers; larger topologies
+fall back to an unplanned dispatch and the same GitHub Checks election rather than truncating capable
+workers. GitHub's canonical claim scope remains the final duplicate execution guard.
 
 ## Claim safety
 
@@ -67,11 +76,20 @@ the same SHA elect independently. Comment runs use the distinct `Informant CI / 
 Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
 already has an older completed result.
 
-Automatic builds are grouped into branch and pull-request lanes. When synchronization observes a new SHA in a
-lane, the worker that owns the previous SHA aborts its commands, cleans up its Tart VMs, and concludes
-its checks as cancelled. Every notified machine checks the same registered repository heads, so this cancellation
-does not depend on the machine that claims the replacement build. Manual and comment-triggered runs are
-not part of an automatic lane and are never superseded by a push.
+Automatic builds are grouped into branch and pull-request lanes. A network lead sends a supersession
+message to every registered worker immediately when a push or pull-request webhook advances a lane;
+this message is independent of the queued repository scan and its retry backoff. The worker that owns
+the previous SHA aborts its commands, cleans up its runtime, and concludes its checks as cancelled.
+Recent lane transitions are retained for workers that reconnect after missing the webhook. Delivery
+revisions distinguish transitions whose GitHub timestamps have the same one-second precision, while
+each active run retains known-obsolete lineage so a delayed transition cannot regress it. Revisions
+also let an authoritative GitHub scan retire an exact stale transition, preventing later recovery
+dispatches from reapplying it or suppressing a reopened lane. A scan that started before a transition
+cannot retire it, while a later scan yields to GitHub's live head even for a force-push rollback. Every
+notified machine still checks the
+same registered repository heads, so cancellation does not depend on the machine that claims the
+replacement build. Manual and comment-triggered runs are not part of an
+automatic lane and are never superseded by a push.
 
 GitHub UI re-runs use the same path. Clicking **Re-run** resets Informant's Check Suite to queued.
 Workers observe that state after a `check_suite` webhook or during the next polling cycle, elect one

@@ -6,18 +6,25 @@ import { join } from "node:path";
 import {
   actionableWebhook,
   addedRepositoryRecoveryRequests,
+  automaticLaneUpdatesRefreshRetention,
   configureGitHubAppWebhook,
   DispatchRetryQueue,
   disableTailscale,
   enableTailscale,
+  generatedNetworkClaimPlan,
   githubAppWebhookSettings,
+  localNetworkExecutionCapacity,
   MAX_WEBHOOK_BODY_BYTES,
+  mergeAutomaticLaneUpdates,
+  parseAutomaticLaneUpdates,
+  parseNetworkClaimPlan,
   parseTailscaleStatus,
   prepareTailscaleFunnel,
   RepositoryScanQueue,
   readWebhookBody,
   reconcileKnownWorkers,
   requireGitHubAppWebhookEvents,
+  retireAutomaticLaneUpdate,
   serveWithTailscale,
   startupRecoveryRequests,
   type TailscaleStatus,
@@ -25,6 +32,7 @@ import {
   tailscaleStatus,
   validGitHubSignature,
   validNetworkAuthorization,
+  webhookAutomaticLaneUpdates,
   webhookForcesTagPoll,
 } from "./tailscale.ts";
 
@@ -453,6 +461,320 @@ test("authenticates private worker API requests with a shared token", () => {
   expect(validNetworkAuthorization(null, secret)).toBe(false);
 });
 
+test("validates bounded network claim scheduling plans", () => {
+  const resources = {
+    capacity: { cpu: 4, memoryMb: 8192 },
+    used: { cpu: 1, memoryMb: 1024 },
+    queued: { cpu: 0, memoryMb: 0 },
+  };
+  const plan = {
+    rotation: 3,
+    claimants: [
+      { id: "blackbird", capabilities: ["darwin", "container"], resources },
+      { id: "watchdog", capabilities: ["linux", "container"], resources },
+    ],
+  };
+  expect(parseNetworkClaimPlan(plan)).toEqual(plan);
+  expect(() =>
+    parseNetworkClaimPlan({ ...plan, claimants: [...plan.claimants, plan.claimants[0]] }),
+  ).toThrow("invalid claim scheduling");
+  expect(() => parseNetworkClaimPlan({ ...plan, rotation: -1 })).toThrow(
+    "invalid claim scheduling",
+  );
+  expect(() =>
+    parseNetworkClaimPlan({
+      ...plan,
+      claimants: [
+        {
+          ...plan.claimants[0],
+          resources: { ...resources, capacity: { ...resources.capacity, cpu: 0 } },
+        },
+      ],
+    }),
+  ).toThrow("invalid claim scheduling");
+
+  const sixtyFour = Array.from({ length: 64 }, (_, index) => ({
+    id: `worker-${index}`,
+    capabilities: ["container"],
+    resources,
+  }));
+  const first = sixtyFour[0];
+  const second = sixtyFour[1];
+  if (!first || !second) throw new Error("expected claimants");
+  const sixtyFive = [...sixtyFour, { ...first, id: "worker-64" }];
+  expect(generatedNetworkClaimPlan(sixtyFour, 7)).toEqual({ claimants: sixtyFour, rotation: 7 });
+  expect(generatedNetworkClaimPlan(sixtyFive, 8)).toBeUndefined();
+  expect(() => parseNetworkClaimPlan({ claimants: sixtyFive, rotation: 8 })).toThrow(
+    "invalid claim scheduling",
+  );
+
+  const excessiveCapabilities = {
+    ...second,
+    capabilities: Array.from({ length: 257 }, (_, index) => `capability-${index}`),
+  };
+  const longCapability = {
+    ...second,
+    capabilities: ["x".repeat(257)],
+  };
+  const duplicateId = { ...second, id: first.id };
+  const longId = { ...second, id: "w".repeat(257) };
+  const invalidResources = {
+    ...second,
+    resources: { ...resources, capacity: { ...resources.capacity, cpu: 0 } },
+  };
+  for (const invalid of [
+    excessiveCapabilities,
+    longCapability,
+    duplicateId,
+    longId,
+    invalidResources,
+  ]) {
+    expect(generatedNetworkClaimPlan([first, invalid], 9)).toBeUndefined();
+  }
+});
+
+test("queries the running worker for the local resource snapshot", async () => {
+  const resources = {
+    capacity: { cpu: 8, memoryMb: 16_384 },
+    used: { cpu: 5, memoryMb: 6144 },
+    queued: { cpu: 2, memoryMb: 2048 },
+  };
+  const status: TailscaleStatus = {
+    executable: "/usr/bin/tailscale",
+    online: true,
+    self: {
+      id: "self",
+      hostName: "worker",
+      addresses: ["100.64.0.1"],
+      online: true,
+    },
+    peers: [],
+  };
+  let authorization: string | undefined;
+  const result = await localNetworkExecutionCapacity(
+    {
+      mode: "worker",
+      workerPort: 7639,
+      funnelPort: 7640,
+      networkSecret: "network-secret-that-is-at-least-32-characters",
+    },
+    status,
+    {
+      capacity: { cpu: 1, memoryMb: 1024 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    },
+    async (_url, options) => {
+      authorization = new Headers(options?.headers).get("Authorization") ?? undefined;
+      return Response.json({ resources });
+    },
+  );
+  expect(result).toEqual(resources);
+  expect(authorization).toBe("Bearer network-secret-that-is-at-least-32-characters");
+});
+
+test("extracts and validates bounded automatic lane updates", () => {
+  const oldSha = "a".repeat(40);
+  const newSha = "b".repeat(40);
+  expect(
+    webhookAutomaticLaneUpdates(
+      "push",
+      {
+        ref: "refs/heads/feature/fast",
+        before: oldSha,
+        after: newSha,
+        repository: { pushed_at: 200 },
+      },
+      "delivery-1",
+    ),
+  ).toEqual([
+    {
+      lane: "branch:feature/fast",
+      sha: newSha,
+      obsoleteShas: [oldSha],
+      updatedAt: 200_000,
+      revision: "delivery-1",
+    },
+  ]);
+  expect(
+    webhookAutomaticLaneUpdates("pull_request", {
+      action: "synchronize",
+      number: 42,
+      before: oldSha,
+      pull_request: { head: { sha: newSha }, updated_at: "2026-08-15T00:00:00Z" },
+    }),
+  ).toEqual([
+    {
+      lane: "pr:42",
+      sha: newSha,
+      obsoleteShas: [oldSha],
+      updatedAt: Date.parse("2026-08-15T00:00:00Z"),
+    },
+  ]);
+  expect(
+    webhookAutomaticLaneUpdates("pull_request", {
+      action: "closed",
+      number: 42,
+    }),
+  ).toEqual([{ lane: "pr:42", closed: true }]);
+  expect(parseAutomaticLaneUpdates([{ lane: "branch:main", sha: newSha }])).toEqual([
+    { lane: "branch:main", sha: newSha },
+  ]);
+  const retired = { lane: "branch:main", sha: oldSha, revision: "delivery-old" };
+  const newer = { lane: "branch:main", sha: newSha, revision: "delivery-new" };
+  const other = { lane: "branch:release", sha: newSha, revision: "delivery-release" };
+  expect(retireAutomaticLaneUpdate([newer, other], retired)).toEqual([newer, other]);
+  expect(retireAutomaticLaneUpdate([retired, other], retired)).toEqual([other]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [{ ...newer, updatedAt: 300 }],
+      [{ lane: "branch:main", closed: true, obsoleteShas: [oldSha], updatedAt: 300 }],
+    ),
+  ).toEqual([{ ...newer, obsoleteShas: [oldSha], updatedAt: 300 }]);
+  const timestampedHead = { ...retired, updatedAt: 300 };
+  expect(
+    mergeAutomaticLaneUpdates([timestampedHead], [{ lane: "branch:main", sha: oldSha }]),
+  ).toEqual([timestampedHead]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [timestampedHead],
+      [{ lane: "branch:main", sha: oldSha, revision: "delivery-redelivered" }],
+    ),
+  ).toEqual([{ ...timestampedHead, revision: "delivery-redelivered" }]);
+
+  const sameSecondMissedTransition = {
+    lane: "branch:main",
+    sha: "c".repeat(40),
+    obsoleteShas: [newSha],
+    updatedAt: 300,
+    revision: "delivery-newest",
+  };
+  const retainedSameSecondTransition = {
+    ...sameSecondMissedTransition,
+    obsoleteShas: [oldSha, newSha],
+  };
+  expect(
+    mergeAutomaticLaneUpdates([{ ...retired, updatedAt: 300 }], [sameSecondMissedTransition]),
+  ).toEqual([retainedSameSecondTransition]);
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [{ ...retired, updatedAt: 300 }],
+      [sameSecondMissedTransition],
+    ),
+  ).toBe(true);
+  const delayedSameSecondTransition = {
+    lane: "branch:main",
+    sha: newSha,
+    obsoleteShas: [oldSha],
+    updatedAt: 300,
+    revision: "delivery-delayed",
+  };
+  expect(
+    mergeAutomaticLaneUpdates([retainedSameSecondTransition], [delayedSameSecondTransition]),
+  ).toEqual([retainedSameSecondTransition]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [retainedSameSecondTransition],
+      [{ ...retired, updatedAt: 300, revision: "delivery-redelivered-a" }],
+    ),
+  ).toEqual([retainedSameSecondTransition]);
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [retainedSameSecondTransition],
+      [delayedSameSecondTransition],
+    ),
+  ).toBe(false);
+  const sameSecondRollback = {
+    lane: "branch:main",
+    sha: oldSha,
+    obsoleteShas: ["c".repeat(40)],
+    updatedAt: 300,
+    revision: "delivery-rollback",
+  };
+  expect(mergeAutomaticLaneUpdates([retainedSameSecondTransition], [sameSecondRollback])).toEqual([
+    { ...sameSecondRollback, obsoleteShas: [newSha, "c".repeat(40)] },
+  ]);
+  expect(() => parseAutomaticLaneUpdates([{ lane: "branch:main", sha: "short" }])).toThrow(
+    "invalid automatic lane updates",
+  );
+  expect(
+    mergeAutomaticLaneUpdates(
+      [
+        { lane: "branch:main", sha: oldSha },
+        { lane: "branch:release", sha: oldSha },
+      ],
+      [{ lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] }],
+    ),
+  ).toEqual([
+    { lane: "branch:release", sha: oldSha },
+    { lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] },
+  ]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [{ lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] }],
+      [{ lane: "branch:main", sha: oldSha, obsoleteShas: ["c".repeat(40)] }],
+    ),
+  ).toEqual([
+    {
+      lane: "branch:main",
+      sha: newSha,
+      obsoleteShas: ["c".repeat(40), oldSha],
+    },
+  ]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [
+        {
+          lane: "branch:main",
+          sha: newSha,
+          obsoleteShas: [oldSha],
+          updatedAt: 200,
+        },
+      ],
+      [
+        {
+          lane: "branch:main",
+          sha: "d".repeat(40),
+          obsoleteShas: ["c".repeat(40)],
+          updatedAt: 100,
+        },
+      ],
+    ),
+  ).toEqual([
+    {
+      lane: "branch:main",
+      sha: newSha,
+      obsoleteShas: ["c".repeat(40), "d".repeat(40), oldSha],
+      updatedAt: 200,
+    },
+  ]);
+
+  const retained = Array.from({ length: 64 }, (_, index) => ({
+    lane: `branch:lane-${index}`,
+    sha: newSha,
+    updatedAt: 200,
+  }));
+  const bounded = mergeAutomaticLaneUpdates(retained, [
+    { lane: "branch:lane-0", sha: oldSha, updatedAt: 100 },
+    { lane: "branch:lane-64", sha: newSha, updatedAt: 200 },
+  ]);
+  expect(bounded?.some((update) => update.lane === "branch:lane-0")).toBe(false);
+  expect(bounded?.some((update) => update.lane === "branch:lane-1")).toBe(true);
+
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [{ lane: "branch:main", sha: newSha, updatedAt: 200, revision: "current" }],
+      [{ lane: "branch:main", sha: oldSha, updatedAt: 100, revision: "stale" }],
+    ),
+  ).toBe(false);
+  expect(
+    automaticLaneUpdatesRefreshRetention(
+      [{ lane: "branch:main", sha: newSha, updatedAt: 200, revision: "current" }],
+      [{ lane: "branch:new", sha: newSha, updatedAt: 200, revision: "new-lane" }],
+    ),
+  ).toBe(true);
+});
+
 test("verifies GitHub webhook signatures without accepting malformed values", () => {
   const body = JSON.stringify({ repository: { full_name: "owner/repo" } });
   const signature = `sha256=${createHmac("sha256", "secret").update(body).digest("hex")}`;
@@ -573,8 +895,9 @@ test("repository removal cancels an active scan and suppresses queued scans", as
   await scans.stop();
 });
 
-test("runs another dispatch when an ordinary webhook arrives during an active dispatch", async () => {
+test("runs another dispatch with its latest claim plan during an active dispatch", async () => {
   const requests: boolean[] = [];
+  const plans: Array<number | undefined> = [];
   let finishFirst!: (value: boolean) => void;
   const first = new Promise<boolean>((resolve) => {
     finishFirst = resolve;
@@ -582,16 +905,69 @@ test("runs another dispatch when an ordinary webhook arrives during an active di
   const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const queue = new DispatchRetryQueue(async (request) => {
     requests.push(request.forceTagPoll);
+    plans.push(request.claimPlan?.rotation);
     return requests.length === 1 ? first : true;
   });
 
   queue.enqueue({ repository, forceTagPoll: false });
   while (requests.length === 0) await Bun.sleep(0);
-  queue.enqueue({ repository, forceTagPoll: false });
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    claimPlan: {
+      rotation: 7,
+      claimants: [
+        {
+          id: "watchdog",
+          capabilities: ["linux"],
+          resources: {
+            capacity: { cpu: 4, memoryMb: 8192 },
+            used: { cpu: 0, memoryMb: 0 },
+            queued: { cpu: 0, memoryMb: 0 },
+          },
+        },
+      ],
+    },
+  });
   finishFirst(true);
   while (queue.size > 0) await Bun.sleep(0);
 
   expect(requests).toEqual([false, false]);
+  expect(plans).toEqual([undefined, 7]);
+  await queue.stop();
+});
+
+test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
+  const plans: Array<number | undefined> = [];
+  let finishFirst!: (value: boolean) => void;
+  const first = new Promise<boolean>((resolve) => {
+    finishFirst = resolve;
+  });
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const resources = {
+    capacity: { cpu: 4, memoryMb: 8192 },
+    used: { cpu: 0, memoryMb: 0 },
+    queued: { cpu: 0, memoryMb: 0 },
+  };
+  const queue = new DispatchRetryQueue(async (request) => {
+    plans.push(request.claimPlan?.rotation);
+    return plans.length === 1 ? first : true;
+  });
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    claimPlan: {
+      rotation: 7,
+      claimants: [{ id: "watchdog", capabilities: ["linux"], resources }],
+    },
+  });
+  while (plans.length === 0) await Bun.sleep(0);
+  queue.enqueue({ repository, forceTagPoll: false });
+  finishFirst(true);
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(plans).toEqual([7, undefined]);
   await queue.stop();
 });
 

@@ -1,4 +1,9 @@
+import { randomUUID } from "node:crypto";
+import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdir, rename, rm } from "node:fs/promises";
 import { availableParallelism, totalmem } from "node:os";
+import { join } from "node:path";
+import { currentProcessOwner, dataDirectory, processOwnerIsLive } from "./store.ts";
 import type { InformantConfig, JobConfig, JobRuntime } from "./types.ts";
 
 export interface ExecutionResources {
@@ -173,20 +178,34 @@ interface ExecutionWaiter {
   abort?: () => void;
 }
 
-export type AcquireExecutionSlot = (
-  config: InformantConfig,
-  signal?: AbortSignal,
-) => Promise<(() => void) | undefined>;
+export interface ExecutionCapacitySnapshot {
+  capacity: ExecutionResources;
+  used: ExecutionResources;
+  queued: ExecutionResources;
+}
+
+export interface AcquireExecutionSlot {
+  (config: InformantConfig, signal?: AbortSignal): Promise<(() => void) | undefined>;
+  reserve?: (config: InformantConfig) => () => void;
+  snapshot?: () => ExecutionCapacitySnapshot;
+}
 
 export function createExecutionSlotAcquirer(
   capacity: ExecutionResources = executionCapacity(),
+  externalReservations?: () => ExecutionResources,
 ): AcquireExecutionSlot {
   const active: ExecutionResources = { cpu: 0, memoryMb: 0 };
   const waiters: ExecutionWaiter[] = [];
+  let externalRetry: ReturnType<typeof setTimeout> | undefined;
 
-  const hasCapacity = (resources: ExecutionResources) =>
-    active.cpu + resources.cpu <= capacity.cpu &&
-    active.memoryMb + resources.memoryMb <= capacity.memoryMb;
+  const external = () => externalReservations?.() ?? { cpu: 0, memoryMb: 0 };
+  const hasCapacity = (resources: ExecutionResources) => {
+    const reserved = external();
+    return (
+      active.cpu + reserved.cpu + resources.cpu <= capacity.cpu &&
+      active.memoryMb + reserved.memoryMb + resources.memoryMb <= capacity.memoryMb
+    );
+  };
 
   const reserve = (resources: ExecutionResources): (() => void) => {
     active.cpu += resources.cpu;
@@ -201,6 +220,14 @@ export function createExecutionSlotAcquirer(
     };
   };
 
+  const scheduleExternalRetry = () => {
+    if (externalRetry) return;
+    externalRetry = setTimeout(() => {
+      externalRetry = undefined;
+      dispatch();
+    }, 250);
+  };
+
   const dispatch = () => {
     while (waiters.length > 0) {
       const waiter = waiters[0];
@@ -211,17 +238,29 @@ export function createExecutionSlotAcquirer(
         waiter.resolve(undefined);
         continue;
       }
-      if (!hasCapacity(waiter.resources) && active.cpu > 0) return;
+      if (!hasCapacity(waiter.resources)) {
+        if (active.cpu > 0) return;
+        if (external().cpu > 0) {
+          scheduleExternalRetry();
+          return;
+        }
+      }
       waiters.shift();
       if (waiter.abort) waiter.signal?.removeEventListener("abort", waiter.abort);
       waiter.resolve(reserve(waiter.resources));
     }
+    if (externalRetry) clearTimeout(externalRetry);
+    externalRetry = undefined;
   };
 
-  return async (config, signal) => {
+  const acquire: AcquireExecutionSlot = async (config, signal) => {
     if (signal?.aborted) return undefined;
     const resources = claimExecutionResources(config, config.jobs, capacity);
-    if ((hasCapacity(resources) || active.cpu === 0) && waiters.length === 0) {
+    const reserved = external();
+    if (
+      (hasCapacity(resources) || (active.cpu === 0 && reserved.cpu === 0)) &&
+      waiters.length === 0
+    ) {
       return reserve(resources);
     }
     return new Promise((resolve) => {
@@ -235,8 +274,126 @@ export function createExecutionSlotAcquirer(
       signal?.addEventListener("abort", waiter.abort, { once: true });
       waiters.push(waiter);
       if (signal?.aborted) waiter.abort();
+      else dispatch();
     });
+  };
+  acquire.reserve = (config) => reserve(claimExecutionResources(config, config.jobs, capacity));
+  acquire.snapshot = () => ({
+    capacity: { ...capacity },
+    used: { ...active },
+    queued: waiters.reduce(
+      (total, waiter) => ({
+        cpu: total.cpu + waiter.resources.cpu,
+        memoryMb: total.memoryMb + waiter.resources.memoryMb,
+      }),
+      { cpu: 0, memoryMb: 0 },
+    ),
+  });
+  return acquire;
+}
+
+function reservationDirectory(dataPath = dataDirectory()): string {
+  return join(dataPath, "execution-reservations");
+}
+
+const locallyPublishedReservations = new Set<string>();
+
+export async function publishExecutionReservation(
+  config: InformantConfig,
+  dataPath = dataDirectory(),
+): Promise<() => void> {
+  const owner = currentProcessOwner();
+  if (!owner) return () => undefined;
+  const directory = reservationDirectory(dataPath);
+  const path = join(directory, `${randomUUID()}.json`);
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  await mkdir(directory, { recursive: true });
+  locallyPublishedReservations.add(path);
+  try {
+    await Bun.write(
+      temporary,
+      JSON.stringify({
+        owner,
+        resources: claimExecutionResources(config, config.jobs, executionCapacity()),
+      }),
+    );
+    await rename(temporary, path);
+  } catch (error) {
+    locallyPublishedReservations.delete(path);
+    throw error;
+  } finally {
+    await rm(temporary, { force: true });
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      rmSync(path, { force: true });
+    } finally {
+      locallyPublishedReservations.delete(path);
+    }
   };
 }
 
-export const acquireExecutionSlot = createExecutionSlotAcquirer();
+function publishedExecutionResources(dataPath = dataDirectory()): ExecutionResources {
+  const total = { cpu: 0, memoryMb: 0 };
+  let entries: string[];
+  try {
+    entries = readdirSync(reservationDirectory(dataPath)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return total;
+  }
+  for (const name of entries) {
+    const path = join(reservationDirectory(dataPath), name);
+    if (locallyPublishedReservations.has(path)) continue;
+    try {
+      const value = JSON.parse(readFileSync(path, "utf8")) as {
+        owner?: unknown;
+        resources?: { cpu?: unknown; memoryMb?: unknown };
+      };
+      if (!processOwnerIsLive(value.owner)) {
+        rmSync(path, { force: true });
+        continue;
+      }
+      const cpu = value.resources?.cpu;
+      const memoryMb = value.resources?.memoryMb;
+      if (
+        typeof cpu !== "number" ||
+        !Number.isFinite(cpu) ||
+        cpu <= 0 ||
+        typeof memoryMb !== "number" ||
+        !Number.isFinite(memoryMb) ||
+        memoryMb <= 0
+      ) {
+        rmSync(path, { force: true });
+        continue;
+      }
+      total.cpu += cpu;
+      total.memoryMb += memoryMb;
+    } catch {
+      rmSync(path, { force: true });
+    }
+  }
+  return total;
+}
+
+export const acquireExecutionSlot = createExecutionSlotAcquirer(executionCapacity(), () =>
+  publishedExecutionResources(),
+);
+
+export function currentExecutionCapacity(dataPath = dataDirectory()): ExecutionCapacitySnapshot {
+  const local = acquireExecutionSlot.snapshot?.() ?? {
+    capacity: executionCapacity(),
+    used: { cpu: 0, memoryMb: 0 },
+    queued: { cpu: 0, memoryMb: 0 },
+  };
+  const published = publishedExecutionResources(dataPath);
+  return {
+    ...local,
+    used: {
+      cpu: local.used.cpu + published.cpu,
+      memoryMb: local.used.memoryMb + published.memoryMb,
+    },
+  };
+}

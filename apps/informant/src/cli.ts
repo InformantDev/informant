@@ -40,7 +40,13 @@ import {
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
 import { setup } from "./setup.ts";
-import { disableStartup, enableStartup, restartStartupWorker } from "./startup.ts";
+import {
+  disableStartup,
+  enableStartup,
+  restartStartupWorker,
+  systemdPodmanSandboxConflict,
+  systemdPodmanSandboxMessage,
+} from "./startup.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
@@ -1063,6 +1069,7 @@ async function manageTailscale(
     const lines = [
       `Tailscale: ${current.status.online ? "online" : "offline"} · ${current.status.self.hostName}`,
       `Informant: ${current.config ? `${current.config.mode} · ${current.status.online ? "polling disabled while connected" : "polling fallback enabled"}` : "not configured · polling enabled"}`,
+      `Resources: ${current.localResources.used.cpu + current.localResources.queued.cpu}/${current.localResources.capacity.cpu} CPU · ${current.localResources.used.memoryMb + current.localResources.queued.memoryMb}/${current.localResources.capacity.memoryMb} MiB reserved or queued`,
     ];
     if (current.config?.funnelUrl)
       lines.push(`Funnel: ${current.config.funnelUrl}/webhooks/github`);
@@ -1070,8 +1077,11 @@ async function manageTailscale(
     else {
       lines.push("Workers:");
       for (const worker of current.workers) {
+        const resources = worker.resources
+          ? ` · ${worker.resources.used.cpu + worker.resources.queued.cpu}/${worker.resources.capacity.cpu} CPU · ${worker.resources.used.memoryMb + worker.resources.queued.memoryMb}/${worker.resources.capacity.memoryMb} MiB`
+          : "";
         lines.push(
-          `  ${worker.hostName} · ${worker.address} · ${worker.capabilities.join(", ")} · ${worker.repositories.length} ${worker.repositories.length === 1 ? "repository" : "repositories"}`,
+          `  ${worker.hostName} · ${worker.address} · ${worker.capabilities.join(", ")}${resources} · ${worker.repositories.length} ${worker.repositories.length === 1 ? "repository" : "repositories"}`,
         );
       }
     }
@@ -1136,15 +1146,29 @@ async function doctor(): Promise<void> {
     failed = true;
   }
   const selectedContainer = selectContainerBackend();
-  const containerReady = await initializeContainerBackend(selectedContainer);
+  const sandboxConflict = await systemdPodmanSandboxConflict();
+  if (sandboxConflict) {
+    console.log(`✗ systemd worker sandbox — ${systemdPodmanSandboxMessage(sandboxConflict)}`);
+    failed = true;
+  }
+  const containerReady = await initializeContainerBackend(
+    selectedContainer,
+    command,
+    Date.now(),
+    undefined,
+    true,
+  );
   const containerStatus = containerBackendReadiness();
+  const containerError = containerStatus?.error;
+  const containerRequired = selectedContainer?.kind === "podman";
+  if (containerRequired && !containerReady) failed = true;
   const tart = await command(["tart", "--version"]);
   const sshpass = await command(["sshpass", "-V"]);
   const tartHost = process.platform === "darwin" && process.arch === "arm64";
   const tartReady = tart.exitCode === 0 && sshpass.exitCode === 0 && tartHost;
   const hostReady = process.platform === "linux" || process.platform === "darwin";
   console.log(
-    `${containerReady ? "✓" : "○"} ${selectedContainer?.name ?? "container runtime"}${containerReady ? "" : ` — ${containerStatus?.error?.message ?? "not supported on this host"}`}`,
+    `${containerReady ? "✓" : containerRequired ? "✗" : "○"} ${selectedContainer?.name ?? "container runtime"}${containerReady ? "" : ` — ${containerError?.message ?? containerStatus?.error?.message ?? "not supported on this host"}`}`,
   );
   console.log(
     `${tart.exitCode === 0 ? "✓" : "○"} Tart${tart.exitCode === 0 ? "" : ` — ${tart.stderr.trim() || "not found"}`}`,

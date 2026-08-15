@@ -1,20 +1,32 @@
 import { createHmac, createSign, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { hostname, platform } from "node:os";
 import { workerCapabilities } from "./capabilities.ts";
 import { refreshSelectedContainerBackend } from "./container-backend.ts";
+import type { ClaimScheduling, NetworkClaimant } from "./coordinator.ts";
+import { currentExecutionCapacity, type ExecutionCapacitySnapshot } from "./execution-capacity.ts";
 import {
   clearTailscaleConfig,
   type GitHubCredentials,
   getTailscaleConfig,
+  listAllowedMounts,
   listGitHubCredentials,
   listRepositories,
+  MAX_ALLOWED_MOUNT_BYTES,
   saveTailscaleConfig,
   type TailscaleConfig,
 } from "./machine-config.ts";
 import { command } from "./process.ts";
-import { type ServerOptions, serveRepositories } from "./server.ts";
+import {
+  type AutomaticLaneUpdate,
+  AutomaticRunRegistry,
+  automaticLaneUpdateIdentity,
+  automaticLaneUpdateIsNewer,
+  automaticLaneUpdateSemanticIdentity,
+  type ServerOptions,
+  serveRepositories,
+} from "./server.ts";
 import {
   getBuild,
   jobLogPath,
@@ -30,6 +42,8 @@ export const DEFAULT_FUNNEL_PORT = 7640;
 const REQUEST_TIMEOUT_MS = 2_000;
 const PEER_REFRESH_INTERVAL_MS = 10_000;
 const MAX_DISPATCH_RETRY_MS = 60_000;
+const CLAIM_SCHEDULING_PROTOCOL = "claim-scheduling-v1";
+const AUTOMATIC_SUPERSESSION_PROTOCOL = "automatic-supersession-v1";
 export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 export const REQUIRED_GITHUB_WEBHOOK_EVENTS = [
   "push",
@@ -74,6 +88,8 @@ export interface NetworkWorker {
   address: string;
   capabilities: string[];
   repositories: string[];
+  protocols?: string[];
+  resources?: ExecutionCapacitySnapshot;
   version?: string;
   local?: boolean;
 }
@@ -81,6 +97,263 @@ export interface NetworkWorker {
 export interface RepositoryDispatch {
   repository: Repository;
   forceTagPoll: boolean;
+  claimPlan?: NetworkClaimPlan;
+  automaticUpdates?: AutomaticLaneUpdate[];
+}
+
+const MAX_NETWORK_CLAIMANTS = 64;
+const MAX_AUTOMATIC_LANE_UPDATES = 64;
+const MAX_AUTOMATIC_LANE_LENGTH = 1_024;
+const MAX_REMEMBERED_REPOSITORIES = 1_024;
+const MAX_OBSOLETE_LANE_SHAS = 16;
+const VALID_GIT_SHA = /^[0-9a-f]{40,64}$/i;
+
+function normalizedSha(value: unknown): string | undefined {
+  return typeof value === "string" && VALID_GIT_SHA.test(value) ? value.toLowerCase() : undefined;
+}
+
+function validAutomaticLane(lane: string): boolean {
+  if (/^pr:\d+$/.test(lane)) return true;
+  if (!lane.startsWith("branch:") || lane.length === "branch:".length) return false;
+  return ![...lane.slice("branch:".length)].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 32 || code === 127;
+  });
+}
+
+function mergeAutomaticLaneUpdate(
+  previous: AutomaticLaneUpdate | undefined,
+  incoming: AutomaticLaneUpdate,
+): AutomaticLaneUpdate {
+  if (!previous) return incoming;
+  const incomingIsNewer = automaticLaneUpdateIsNewer(previous, incoming);
+  const latest = incomingIsNewer ? incoming : previous;
+  const older = incomingIsNewer ? previous : incoming;
+  const obsoleteShas = [
+    ...(older.obsoleteShas ?? []),
+    ...(older.sha && older.sha !== latest.sha ? [older.sha] : []),
+    ...(latest.obsoleteShas ?? []),
+  ];
+  const uniqueObsolete = [...new Set(obsoleteShas)]
+    .filter((sha) => sha !== latest.sha)
+    .slice(-MAX_OBSOLETE_LANE_SHAS);
+  const preservesLaneHead =
+    previous.sha === incoming.sha && Boolean(previous.closed) === Boolean(incoming.closed);
+  const updatedAt = latest.updatedAt ?? (preservesLaneHead ? older.updatedAt : undefined);
+  const revision =
+    latest.revision ??
+    (preservesLaneHead && latest.updatedAt === undefined ? older.revision : undefined);
+  return {
+    lane: latest.lane,
+    ...(latest.sha ? { sha: latest.sha } : {}),
+    ...(uniqueObsolete.length > 0 ? { obsoleteShas: uniqueObsolete } : {}),
+    ...(updatedAt !== undefined ? { updatedAt } : {}),
+    ...(revision !== undefined ? { revision } : {}),
+    ...(latest.closed ? { closed: true } : {}),
+  };
+}
+
+export function automaticLaneUpdatesRefreshRetention(
+  previous: AutomaticLaneUpdate[] | undefined,
+  latest: AutomaticLaneUpdate[] | undefined,
+): boolean {
+  const retained = new Map((previous ?? []).map((update) => [update.lane, update]));
+  for (const update of latest ?? []) {
+    const existing = retained.get(update.lane);
+    if (
+      !existing ||
+      (automaticLaneUpdateSemanticIdentity(existing) !==
+        automaticLaneUpdateSemanticIdentity(update) &&
+        automaticLaneUpdateIsNewer(existing, update))
+    ) {
+      return true;
+    }
+    retained.set(update.lane, mergeAutomaticLaneUpdate(existing, update));
+  }
+  return false;
+}
+
+export function mergeAutomaticLaneUpdates(
+  previous: AutomaticLaneUpdate[] | undefined,
+  latest: AutomaticLaneUpdate[] | undefined,
+): AutomaticLaneUpdate[] | undefined {
+  if (!previous?.length && !latest?.length) return undefined;
+  const updates = new Map<string, AutomaticLaneUpdate>();
+  for (const update of [...(previous ?? []), ...(latest ?? [])]) {
+    const existing = updates.get(update.lane);
+    const merged = mergeAutomaticLaneUpdate(existing, update);
+    const refreshesLane =
+      !existing ||
+      (automaticLaneUpdateSemanticIdentity(existing) !==
+        automaticLaneUpdateSemanticIdentity(update) &&
+        automaticLaneUpdateIsNewer(existing, update));
+    if (refreshesLane) updates.delete(update.lane);
+    updates.set(update.lane, merged);
+    if (updates.size > MAX_AUTOMATIC_LANE_UPDATES) {
+      updates.delete(updates.keys().next().value ?? "");
+    }
+  }
+  return [...updates.values()];
+}
+
+export function retireAutomaticLaneUpdate(
+  retained: AutomaticLaneUpdate[] | undefined,
+  retired: AutomaticLaneUpdate,
+): AutomaticLaneUpdate[] | undefined {
+  if (!retained) return undefined;
+  const identity = automaticLaneUpdateIdentity(retired);
+  const remaining = retained.filter(
+    (candidate) =>
+      candidate.lane !== retired.lane || automaticLaneUpdateIdentity(candidate) !== identity,
+  );
+  return remaining.length > 0 ? remaining : undefined;
+}
+
+export function parseAutomaticLaneUpdates(value: unknown): AutomaticLaneUpdate[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > MAX_AUTOMATIC_LANE_UPDATES) {
+    throw new Error("invalid automatic lane updates");
+  }
+  const updates: AutomaticLaneUpdate[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") throw new Error("invalid automatic lane updates");
+    const { lane, sha, obsoleteShas, updatedAt, revision, closed } = entry as {
+      lane?: unknown;
+      sha?: unknown;
+      obsoleteShas?: unknown;
+      updatedAt?: unknown;
+      revision?: unknown;
+      closed?: unknown;
+    };
+    const parsedSha = normalizedSha(sha);
+    const parsedObsolete = Array.isArray(obsoleteShas)
+      ? obsoleteShas.map(normalizedSha)
+      : obsoleteShas === undefined
+        ? []
+        : [undefined];
+    if (
+      typeof lane !== "string" ||
+      lane.length === 0 ||
+      lane.length > MAX_AUTOMATIC_LANE_LENGTH ||
+      !validAutomaticLane(lane) ||
+      (sha !== undefined && !parsedSha) ||
+      parsedObsolete.length > MAX_OBSOLETE_LANE_SHAS ||
+      parsedObsolete.some((value) => !value) ||
+      (updatedAt !== undefined && (!Number.isSafeInteger(updatedAt) || Number(updatedAt) < 0)) ||
+      (revision !== undefined &&
+        (typeof revision !== "string" ||
+          revision.length === 0 ||
+          revision.length > 128 ||
+          !/^[A-Za-z0-9_-]+$/.test(revision))) ||
+      (closed !== undefined && closed !== true) ||
+      (closed === true ? sha !== undefined : !parsedSha)
+    ) {
+      throw new Error("invalid automatic lane updates");
+    }
+    updates.push({
+      lane,
+      ...(parsedSha ? { sha: parsedSha } : {}),
+      ...(parsedObsolete.length > 0 ? { obsoleteShas: parsedObsolete as string[] } : {}),
+      ...(typeof updatedAt === "number" ? { updatedAt } : {}),
+      ...(typeof revision === "string" ? { revision } : {}),
+      ...(closed === true ? { closed: true } : {}),
+    });
+  }
+  return mergeAutomaticLaneUpdates(undefined, updates);
+}
+
+export function webhookAutomaticLaneUpdates(
+  event: string | null,
+  payload: unknown,
+  delivery?: string,
+): AutomaticLaneUpdate[] | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const revision =
+    delivery && delivery.length <= 128 && /^[A-Za-z0-9_-]+$/.test(delivery) ? delivery : undefined;
+  if (event === "push") {
+    const { ref, before, after, deleted, repository } = payload as {
+      ref?: unknown;
+      before?: unknown;
+      after?: unknown;
+      deleted?: unknown;
+      repository?: { pushed_at?: unknown };
+    };
+    if (typeof ref !== "string" || !ref.startsWith("refs/heads/")) return undefined;
+    const branch = ref.slice("refs/heads/".length);
+    if (!branch || branch.length > MAX_AUTOMATIC_LANE_LENGTH - "branch:".length) return undefined;
+    const lane = `branch:${branch}`;
+    const previousSha = normalizedSha(before);
+    const pushedAt = repository?.pushed_at;
+    const updatedAt =
+      typeof pushedAt === "number" &&
+      Number.isSafeInteger(pushedAt) &&
+      pushedAt >= 0 &&
+      pushedAt <= Number.MAX_SAFE_INTEGER / 1_000
+        ? pushedAt * 1_000
+        : undefined;
+    if (deleted === true) {
+      return [
+        {
+          lane,
+          ...(previousSha ? { obsoleteShas: [previousSha] } : {}),
+          ...(updatedAt !== undefined ? { updatedAt } : {}),
+          ...(revision ? { revision } : {}),
+          closed: true,
+        },
+      ];
+    }
+    const sha = normalizedSha(after);
+    if (!sha) return undefined;
+    return [
+      {
+        lane,
+        sha,
+        ...(previousSha ? { obsoleteShas: [previousSha] } : {}),
+        ...(updatedAt !== undefined ? { updatedAt } : {}),
+        ...(revision ? { revision } : {}),
+      },
+    ];
+  }
+  if (event === "pull_request") {
+    const value = payload as {
+      action?: unknown;
+      number?: unknown;
+      before?: unknown;
+      pull_request?: { head?: { sha?: unknown }; updated_at?: unknown };
+    };
+    if (!Number.isSafeInteger(value.number) || Number(value.number) <= 0) return undefined;
+    const lane = `pr:${value.number}`;
+    const sha = normalizedSha(value.pull_request?.head?.sha);
+    const previousSha = normalizedSha(value.before);
+    const parsedUpdatedAt =
+      typeof value.pull_request?.updated_at === "string"
+        ? Date.parse(value.pull_request.updated_at)
+        : Number.NaN;
+    const updatedAt =
+      Number.isSafeInteger(parsedUpdatedAt) && parsedUpdatedAt >= 0 ? parsedUpdatedAt : undefined;
+    if (value.action === "closed") {
+      return [
+        {
+          lane,
+          ...(sha || previousSha ? { obsoleteShas: [sha ?? previousSha ?? ""] } : {}),
+          ...(updatedAt !== undefined ? { updatedAt } : {}),
+          ...(revision ? { revision } : {}),
+          closed: true,
+        },
+      ];
+    }
+    if (!sha) return undefined;
+    return [
+      {
+        lane,
+        sha,
+        ...(previousSha ? { obsoleteShas: [previousSha] } : {}),
+        ...(updatedAt !== undefined ? { updatedAt } : {}),
+        ...(revision ? { revision } : {}),
+      },
+    ];
+  }
+  return undefined;
 }
 
 export function reconcileKnownWorkers(
@@ -124,6 +397,7 @@ export class RepositoryScanQueue {
       repository: Repository,
       forceTagPoll: boolean,
       signal: AbortSignal,
+      claimScheduling?: ClaimScheduling,
     ) => Promise<void>,
     private readonly serviceSignal?: AbortSignal,
   ) {
@@ -147,7 +421,11 @@ export class RepositoryScanQueue {
     }
   }
 
-  run(repository: Repository, forceTagPoll = false): Promise<void> {
+  run(
+    repository: Repository,
+    forceTagPoll = false,
+    claimScheduling?: ClaimScheduling,
+  ): Promise<void> {
     const key = repository.fullName.toLowerCase();
     const registration = this.registrations.get(key);
     if (this.stopped || !registration) return Promise.resolve();
@@ -161,7 +439,7 @@ export class RepositoryScanQueue {
           ? AbortSignal.any([registration.controller.signal, this.serviceSignal])
           : registration.controller.signal;
         if (signal.aborted) return;
-        await this.execute(registration.repository, forceTagPoll, signal);
+        await this.execute(registration.repository, forceTagPoll, signal, claimScheduling);
       })
       .finally(() => {
         if (this.scans.get(key) === next) this.scans.delete(key);
@@ -209,6 +487,11 @@ export class DispatchRetryQueue {
     const existing = this.entries.get(key);
     if (existing) {
       existing.request.forceTagPoll ||= request.forceTagPoll;
+      existing.request.claimPlan = request.claimPlan;
+      existing.request.automaticUpdates = mergeAutomaticLaneUpdates(
+        existing.request.automaticUpdates,
+        request.automaticUpdates,
+      );
       if (existing.running) existing.pending = true;
       return;
     }
@@ -232,6 +515,10 @@ export class DispatchRetryQueue {
       if (!current) return;
       current.running = undefined;
       current.request.forceTagPoll ||= request.forceTagPoll;
+      current.request.automaticUpdates = mergeAutomaticLaneUpdates(
+        request.automaticUpdates,
+        current.request.automaticUpdates,
+      );
       if (this.stopped) return;
       current.attempts++;
       const delayMs = Math.min(1_000 * 2 ** (current.attempts - 1), MAX_DISPATCH_RETRY_MS);
@@ -391,6 +678,138 @@ export function validNetworkAuthorization(value: string | null, secret: string):
   return received.length === expected.length && timingSafeEqual(received, expected);
 }
 
+export type NetworkClaimPlan = Pick<ClaimScheduling, "claimants" | "rotation">;
+
+function parseExecutionCapacity(value: unknown): ExecutionCapacitySnapshot | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const resources = value as {
+    capacity?: { cpu?: unknown; memoryMb?: unknown };
+    used?: { cpu?: unknown; memoryMb?: unknown };
+    queued?: { cpu?: unknown; memoryMb?: unknown };
+  };
+  const values = [
+    resources.capacity?.cpu,
+    resources.capacity?.memoryMb,
+    resources.used?.cpu,
+    resources.used?.memoryMb,
+    resources.queued?.cpu,
+    resources.queued?.memoryMb,
+  ];
+  if (
+    values.some((resource) => !Number.isSafeInteger(resource)) ||
+    (resources.capacity?.cpu as number) <= 0 ||
+    (resources.capacity?.memoryMb as number) <= 0 ||
+    (resources.used?.cpu as number) < 0 ||
+    (resources.used?.memoryMb as number) < 0 ||
+    (resources.queued?.cpu as number) < 0 ||
+    (resources.queued?.memoryMb as number) < 0
+  ) {
+    return undefined;
+  }
+  return resources as ExecutionCapacitySnapshot;
+}
+
+export function generatedNetworkClaimPlan(
+  claimants: NetworkClaimant[],
+  rotation: number,
+): NetworkClaimPlan | undefined {
+  if (claimants.length <= 1 || claimants.length > MAX_NETWORK_CLAIMANTS) return undefined;
+  try {
+    return parseNetworkClaimPlan({
+      claimants,
+      rotation: rotation % Number.MAX_SAFE_INTEGER,
+    });
+  } catch {
+    // A peer can advertise fields outside this protocol's bounds. Dispatch without a plan so
+    // compatible workers can still use the mixed-version fallback election.
+    return undefined;
+  }
+}
+
+export function parseNetworkClaimPlan(value: unknown): NetworkClaimPlan | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object") throw new Error("invalid claim scheduling");
+  const plan = value as { claimants?: unknown; rotation?: unknown };
+  if (
+    !Number.isSafeInteger(plan.rotation) ||
+    (plan.rotation as number) < 0 ||
+    !Array.isArray(plan.claimants) ||
+    plan.claimants.length === 0 ||
+    plan.claimants.length > MAX_NETWORK_CLAIMANTS
+  ) {
+    throw new Error("invalid claim scheduling");
+  }
+  const ids = new Set<string>();
+  const claimants: NetworkClaimant[] = plan.claimants.map((value) => {
+    if (!value || typeof value !== "object") throw new Error("invalid claim scheduling");
+    const claimant = value as { id?: unknown; capabilities?: unknown; resources?: unknown };
+    const resources = parseExecutionCapacity(claimant.resources);
+    if (
+      typeof claimant.id !== "string" ||
+      claimant.id.length === 0 ||
+      claimant.id.length > 256 ||
+      ids.has(claimant.id) ||
+      !Array.isArray(claimant.capabilities) ||
+      claimant.capabilities.length > 256 ||
+      claimant.capabilities.some(
+        (capability) => typeof capability !== "string" || capability.length > 256,
+      ) ||
+      !resources
+    ) {
+      throw new Error("invalid claim scheduling");
+    }
+    ids.add(claimant.id);
+    return {
+      id: claimant.id,
+      capabilities: claimant.capabilities as string[],
+      resources,
+    };
+  });
+  return { claimants, rotation: plan.rotation as number };
+}
+
+async function advertisedWorkerCapabilities(): Promise<string[]> {
+  const mounts = await listAllowedMounts();
+  const usableMounts = await Promise.all(
+    mounts.map(async (mount) => {
+      try {
+        const metadata = await lstat(await realpath(mount.source));
+        return metadata.isFile() && metadata.size <= MAX_ALLOWED_MOUNT_BYTES
+          ? mount.name
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    }),
+  );
+  return workerCapabilities(
+    Bun.env,
+    usableMounts.filter((name): name is string => name !== undefined),
+  );
+}
+
+export async function localNetworkExecutionCapacity(
+  config: TailscaleConfig,
+  status: TailscaleStatus,
+  fallback = currentExecutionCapacity(),
+  fetcher: typeof fetchWithTimeout = fetchWithTimeout,
+): Promise<ExecutionCapacitySnapshot> {
+  const address = firstIpv4(status.self);
+  if (!status.online || !address) return fallback;
+  try {
+    const response = await fetcher(peerUrl(address, config.workerPort, "/v1/health"), {
+      headers: networkRequestHeaders(config),
+    });
+    if (!response.ok) return fallback;
+    return (
+      parseExecutionCapacity(((await response.json()) as Partial<NetworkWorker>).resources) ??
+      fallback
+    );
+  } catch {
+    return fallback;
+  }
+}
+
 export async function discoverNetworkWorkers(
   config: TailscaleConfig,
   status: TailscaleStatus,
@@ -417,6 +836,8 @@ export async function discoverNetworkWorkers(
                 address,
                 capabilities: result.capabilities.map(String),
                 repositories: result.repositories.map(String),
+                protocols: Array.isArray(result.protocols) ? result.protocols.map(String) : [],
+                resources: parseExecutionCapacity(result.resources),
                 version: result.version,
               } satisfies NetworkWorker;
             })
@@ -781,40 +1202,139 @@ async function serveConfiguredWithTailscale(
   await refreshSelectedContainerBackend(options.signal);
 
   let configuredRepositories = repositories;
+  const knownWorkers = new Map<string, NetworkWorker>();
+  let advertisedRepositories = new Set<string>();
+  const latestAutomaticUpdates = new Map<string, AutomaticLaneUpdate[]>();
+  const rememberAutomaticUpdates = (
+    repository: Repository,
+    updates: AutomaticLaneUpdate[] | undefined,
+  ): AutomaticLaneUpdate[] | undefined => {
+    const key = repository.fullName.toLowerCase();
+    const retained = latestAutomaticUpdates.get(key);
+    const refreshesRetention = automaticLaneUpdatesRefreshRetention(retained, updates);
+    const merged = mergeAutomaticLaneUpdates(retained, updates);
+    if (merged) {
+      if (refreshesRetention) latestAutomaticUpdates.delete(key);
+      latestAutomaticUpdates.set(key, merged);
+      while (latestAutomaticUpdates.size > MAX_REMEMBERED_REPOSITORIES) {
+        latestAutomaticUpdates.delete(latestAutomaticUpdates.keys().next().value ?? "");
+      }
+    }
+    return merged;
+  };
+  const retireAutomaticUpdate = (repository: Repository, update: AutomaticLaneUpdate) => {
+    const key = repository.fullName.toLowerCase();
+    const remaining = retireAutomaticLaneUpdate(latestAutomaticUpdates.get(key), update);
+    if (remaining) latestAutomaticUpdates.set(key, remaining);
+    else latestAutomaticUpdates.delete(key);
+  };
+  const automaticRuns = new AutomaticRunRegistry(retireAutomaticUpdate);
   const scans = new RepositoryScanQueue(
     repositories,
-    (repository, forceTagPoll, signal) =>
+    (repository, forceTagPoll, signal, claimScheduling) =>
       serveRepositories([repository], {
         ...options,
         once: true,
         forceTagPoll,
         signal,
         throwOnPollError: true,
+        claimScheduling,
+        automaticRuns,
       }),
     options.signal,
   );
-
-  const knownWorkers = new Map<string, NetworkWorker>();
   const refreshWorkers = async (): Promise<NetworkWorker[]> => {
+    const previousIds = new Set(knownWorkers.keys());
     const currentStatus = await tailscaleStatus();
     if (!currentStatus?.online) {
       knownWorkers.clear();
+      advertisedRepositories.clear();
       return [];
     }
     const workers = await discoverNetworkWorkers(config, currentStatus);
     reconcileKnownWorkers(knownWorkers, workers);
+    const discoveredIds = new Set(workers.map((worker) => worker.id));
+    for (const id of previousIds) {
+      if (discoveredIds.has(id)) continue;
+      for (const key of advertisedRepositories) {
+        if (key.startsWith(`${id}\0`)) advertisedRepositories.delete(key);
+      }
+    }
     return workers;
   };
+  const propagateAutomaticUpdates = async (
+    repository: Repository,
+    updates: AutomaticLaneUpdate[] | undefined,
+  ): Promise<void> => {
+    if (!updates?.length) return;
+    const localRepository = configuredRepositories.find(
+      (candidate) => candidate.fullName.toLowerCase() === repository.fullName.toLowerCase(),
+    );
+    const registeredWorkers = [...knownWorkers.values()].filter((worker) =>
+      worker.repositories.some((name) => name.toLowerCase() === repository.fullName.toLowerCase()),
+    );
+    if (!localRepository && registeredWorkers.length === 0) return;
+    const acceptedUpdates = localRepository
+      ? automaticRuns.apply(localRepository, updates)
+      : updates;
+    if (acceptedUpdates.length === 0) return;
+    const remembered = rememberAutomaticUpdates(repository, acceptedUpdates) ?? acceptedUpdates;
+    const workers = registeredWorkers.filter(
+      (worker) => worker.protocols?.includes(AUTOMATIC_SUPERSESSION_PROTOCOL) === true,
+    );
+    const results = await Promise.allSettled(
+      workers.map((worker) =>
+        fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/supersede"), {
+          method: "POST",
+          headers: {
+            ...networkRequestHeaders(config),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ repository: repository.fullName, automaticUpdates: remembered }),
+        }).then((response) => {
+          if (!response.ok) throw new Error(`returned ${response.status}`);
+        }),
+      ),
+    );
+    for (const [index, result] of results.entries()) {
+      if (result.status === "rejected") {
+        options.onMessage?.(
+          `network supersession to ${workers[index]?.hostName ?? "worker"} failed: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+        );
+      }
+    }
+  };
+  let claimRotation = 0;
   const dispatch = async (request: RepositoryDispatch): Promise<boolean> => {
     await refreshWorkers();
-    const tasks: Array<{ label: string; promise: Promise<unknown> }> = [];
+    let automaticUpdates = mergeAutomaticLaneUpdates(
+      latestAutomaticUpdates.get(request.repository.fullName.toLowerCase()),
+      request.automaticUpdates,
+    );
     const localRepository = configuredRepositories.find(
       (candidate) => candidate.fullName.toLowerCase() === request.repository.fullName.toLowerCase(),
     );
+    const targets: Array<{
+      claimant?: NetworkClaimant;
+      label: string;
+      scheduling: boolean;
+      run: (plan?: NetworkClaimPlan) => Promise<unknown>;
+    }> = [];
     if (localRepository) {
-      tasks.push({
+      targets.push({
+        claimant: {
+          id: status.self.id,
+          capabilities: await advertisedWorkerCapabilities(),
+          resources: currentExecutionCapacity(),
+        },
         label: hostname(),
-        promise: scans.run(localRepository, request.forceTagPoll),
+        scheduling: true,
+        run: (plan) =>
+          scans.run(
+            localRepository,
+            request.forceTagPoll,
+            plan ? { ...plan, workerId: status.self.id } : undefined,
+          ),
       });
     }
     if (config.mode === "lead") {
@@ -826,30 +1346,54 @@ async function serveConfiguredWithTailscale(
         ) {
           continue;
         }
-        tasks.push({
+        targets.push({
+          claimant: worker.resources
+            ? { id: worker.id, capabilities: worker.capabilities, resources: worker.resources }
+            : undefined,
           label: worker.hostName,
-          promise: fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
-            method: "POST",
-            headers: {
-              ...networkRequestHeaders(config),
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              repository: request.repository.fullName,
-              forceTagPoll: request.forceTagPoll,
+          scheduling:
+            worker.protocols?.includes(CLAIM_SCHEDULING_PROTOCOL) === true &&
+            worker.resources !== undefined,
+          run: (plan) =>
+            fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
+              method: "POST",
+              headers: {
+                ...networkRequestHeaders(config),
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                repository: request.repository.fullName,
+                forceTagPoll: request.forceTagPoll,
+                claimPlan: plan,
+                automaticUpdates,
+              }),
+            }).then((response) => {
+              if (!response.ok) throw new Error(`returned ${response.status}`);
             }),
-          }).then((response) => {
-            if (!response.ok) throw new Error(`returned ${response.status}`);
-          }),
         });
       }
     }
-    if (tasks.length === 0) {
+    if (targets.length === 0) {
       options.onMessage?.(
         `dropping ${request.repository.fullName} dispatch; no registered worker advertises it`,
       );
       return true;
     }
+    const acceptedUpdates =
+      localRepository && automaticUpdates
+        ? automaticRuns.apply(localRepository, automaticUpdates)
+        : automaticUpdates;
+    automaticUpdates = rememberAutomaticUpdates(request.repository, acceptedUpdates);
+    const generatedPlan =
+      !request.claimPlan && targets.every((target) => target.scheduling && target.claimant)
+        ? generatedNetworkClaimPlan(
+            targets.flatMap((target) => (target.claimant ? [target.claimant] : [])),
+            claimRotation,
+          )
+        : undefined;
+    if (generatedPlan) claimRotation++;
+    const plan = request.claimPlan ?? generatedPlan;
+    const tasks = targets.map((target) => ({ label: target.label, promise: target.run(plan) }));
     const results = await Promise.allSettled(tasks.map((task) => task.promise));
     for (const [index, result] of results.entries()) {
       if (result.status === "rejected") {
@@ -878,8 +1422,10 @@ async function serveConfiguredWithTailscale(
         return Response.json({
           id: status.self.id,
           hostName: hostname(),
-          capabilities: await workerCapabilities(),
+          capabilities: await advertisedWorkerCapabilities(),
           repositories: configuredRepositories.map((repository) => repository.fullName),
+          protocols: [CLAIM_SCHEDULING_PROTOCOL, AUTOMATIC_SUPERSESSION_PROTOCOL],
+          resources: currentExecutionCapacity(),
           version: options.version,
         });
       }
@@ -910,23 +1456,67 @@ async function serveConfiguredWithTailscale(
           },
         });
       }
+      if (request.method === "POST" && url.pathname === "/v1/supersede") {
+        const body = (await request.json().catch(() => undefined)) as
+          | { repository?: unknown; automaticUpdates?: unknown }
+          | undefined;
+        if (typeof body?.repository !== "string") {
+          return new Response("invalid repository", { status: 400 });
+        }
+        let automaticUpdates: AutomaticLaneUpdate[] | undefined;
+        try {
+          automaticUpdates = parseAutomaticLaneUpdates(body.automaticUpdates);
+        } catch {
+          return new Response("invalid automatic lane updates", { status: 400 });
+        }
+        if (!automaticUpdates?.length) {
+          return new Response("automatic lane updates are required", { status: 400 });
+        }
+        const requestedRepository = body.repository;
+        const repository = configuredRepositories.find(
+          (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
+        );
+        if (!repository) return new Response("repository is not registered", { status: 404 });
+        const acceptedUpdates = automaticRuns.apply(repository, automaticUpdates);
+        rememberAutomaticUpdates(repository, acceptedUpdates);
+        return new Response(null, { status: 204 });
+      }
       if (request.method === "POST" && url.pathname === "/v1/dispatch") {
         const body = (await request.json().catch(() => undefined)) as
-          | { repository?: unknown; forceTagPoll?: unknown }
+          | {
+              repository?: unknown;
+              forceTagPoll?: unknown;
+              claimPlan?: unknown;
+              automaticUpdates?: unknown;
+            }
           | undefined;
         if (
           typeof body?.repository !== "string" ||
           (body.forceTagPoll !== undefined && typeof body.forceTagPoll !== "boolean")
         )
           return new Response("invalid repository", { status: 400 });
+        let claimPlan: NetworkClaimPlan | undefined;
+        let automaticUpdates: AutomaticLaneUpdate[] | undefined;
+        try {
+          claimPlan = parseNetworkClaimPlan(body.claimPlan);
+          automaticUpdates = parseAutomaticLaneUpdates(body.automaticUpdates);
+        } catch {
+          return new Response("invalid dispatch coordination", { status: 400 });
+        }
         const requestedRepository = body.repository;
         const repository = configuredRepositories.find(
           (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
         );
         if (!repository) return new Response("repository is not registered", { status: 404 });
+        const acceptedUpdates = automaticUpdates
+          ? automaticRuns.apply(repository, automaticUpdates)
+          : undefined;
+        const rememberedUpdates = rememberAutomaticUpdates(repository, acceptedUpdates);
         dispatchQueue.enqueue({
           repository,
           forceTagPoll: body.forceTagPoll === true,
+          claimPlan,
+          automaticUpdates: rememberedUpdates,
         });
         return new Response(null, { status: 202 });
       }
@@ -937,7 +1527,6 @@ async function serveConfiguredWithTailscale(
   let funnelServer: Bun.Server<undefined> | undefined;
   const deliveries = new Set<string>();
   const loadRepositories = options.dependencies?.listRepositories ?? listRepositories;
-  let advertisedRepositories = new Set<string>();
   let refreshingTopology = false;
   const refreshTopology = async (recoverAll = false) => {
     if (refreshingTopology || config.mode !== "lead") return;
@@ -975,6 +1564,18 @@ async function serveConfiguredWithTailscale(
         configuredRepositories,
         nextRepositories,
       );
+      const nextNames = new Set(
+        nextRepositories.map((repository) => repository.fullName.toLowerCase()),
+      );
+      for (const repository of configuredRepositories) {
+        const key = repository.fullName.toLowerCase();
+        if (nextNames.has(key)) continue;
+        automaticRuns.remove(repository, `${repository.fullName} is no longer registered.`);
+        const advertisedByPeer = [...knownWorkers.values()].some((worker) =>
+          worker.repositories.some((name) => name.toLowerCase() === key),
+        );
+        if (config.mode !== "lead" || !advertisedByPeer) latestAutomaticUpdates.delete(key);
+      }
       scans.reconcile(nextRepositories);
       configuredRepositories = nextRepositories;
       for (const request of recoveryRequests) dispatchQueue.enqueue(request);
@@ -1040,9 +1641,16 @@ async function serveConfiguredWithTailscale(
           }
           const repository = payloadRepository(payload);
           if (!repository) return new Response("invalid repository", { status: 400 });
+          const automaticUpdates = webhookAutomaticLaneUpdates(
+            event,
+            payload,
+            delivery ?? undefined,
+          );
+          await propagateAutomaticUpdates(repository, automaticUpdates);
           dispatchQueue.enqueue({
             repository,
             forceTagPoll: webhookForcesTagPoll(event, payload),
+            automaticUpdates,
           });
           return new Response(null, { status: 202 });
         },
@@ -1145,9 +1753,15 @@ export async function networkStatus(): Promise<{
   config?: TailscaleConfig;
   status?: TailscaleStatus;
   workers: NetworkWorker[];
+  localResources: ExecutionCapacitySnapshot;
 }> {
   const config = await getTailscaleConfig();
   const status = await tailscaleStatus();
   const workers = config && status?.online ? await discoverNetworkWorkers(config, status) : [];
-  return { config, status, workers };
+  const fallback = currentExecutionCapacity();
+  const localResources =
+    config && status?.online
+      ? await localNetworkExecutionCapacity(config, status, fallback)
+      : fallback;
+  return { config, status, workers, localResources };
 }

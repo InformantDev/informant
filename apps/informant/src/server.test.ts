@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { GitHubApiError, type GitHubClient } from "./github.ts";
 import type { PollState } from "./poll-state.ts";
 import {
+  AutomaticRunRegistry,
   applySecretPolicy,
   recoverInterruptedBuilds,
   type ServerDependencies,
@@ -23,6 +24,328 @@ const pullRequest: PullRequest = {
   headSha: "comment-sha",
   sameRepository: true,
 };
+test("authoritative scans retire stale lane updates without blocking newer revisions", () => {
+  const retired: string[] = [];
+  const runs = new AutomaticRunRegistry((_repository, update) => {
+    if (update.revision) retired.push(update.revision);
+  });
+  const oldSha = "a".repeat(40);
+  const liveSha = "b".repeat(40);
+  const stale = { lane: "branch:main", sha: oldSha, revision: "stale-open" };
+
+  expect(runs.apply(repository, [stale])).toEqual([stale]);
+  expect(runs.prepare(repository, "branch:main", liveSha)).toBe(true);
+  expect(retired).toEqual(["stale-open"]);
+  const liveController = new AbortController();
+  expect(runs.activate(repository, "branch:main", liveSha, liveController)).toBe(true);
+  expect(runs.apply(repository, [stale])).toEqual([]);
+  expect(runs.apply(repository, [{ ...stale, revision: "same-stale-redelivery" }])).toEqual([]);
+  expect(liveController.signal.aborted).toBe(false);
+
+  const staleClosed = {
+    lane: "branch:main",
+    closed: true as const,
+    obsoleteShas: [liveSha],
+    updatedAt: 100,
+    revision: "stale-closed",
+  };
+  expect(runs.apply(repository, [staleClosed])).toEqual([staleClosed]);
+  expect(liveController.signal.aborted).toBe(true);
+  expect(runs.prepare(repository, "branch:main", liveSha)).toBe(true);
+  const reopenedController = new AbortController();
+  expect(runs.activate(repository, "branch:main", liveSha, reopenedController)).toBe(true);
+  expect(
+    runs.apply(repository, [{ ...staleClosed, obsoleteShas: [liveSha, "c".repeat(40)] }]),
+  ).toEqual([]);
+  expect(reopenedController.signal.aborted).toBe(false);
+
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      closed: true,
+      obsoleteShas: [liveSha],
+      updatedAt: 200,
+      revision: "new-close",
+    },
+  ]);
+  expect(reopenedController.signal.aborted).toBe(true);
+});
+
+test("delayed lane updates cannot abort a newer active run", () => {
+  const runs = new AutomaticRunRegistry();
+  const oldSha = "a".repeat(40);
+  const currentSha = "b".repeat(40);
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      sha: currentSha,
+      obsoleteShas: [oldSha],
+      updatedAt: 300,
+      revision: "current",
+    },
+  ]);
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", currentSha, controller)).toBe(true);
+
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: oldSha,
+        updatedAt: 200,
+        revision: "delayed",
+      },
+    ]),
+  ).toEqual([]);
+  expect(controller.signal.aborted).toBe(false);
+});
+
+test("a newer ordered update supersedes an active head across a missed transition", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  runs.apply(repository, [{ lane: "branch:main", sha: shaA, updatedAt: 100, revision: "head-a" }]);
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaA, controller)).toBe(true);
+  // The active run keeps its ordering watermark even when unrelated lanes evict its expected entry.
+  for (let index = 0; index < 1_024; index++) {
+    runs.apply(repository, [
+      {
+        lane: `branch:other-${index}`,
+        sha: "d".repeat(40),
+        updatedAt: 200,
+        revision: `other-${index}`,
+      },
+    ]);
+  }
+  // A legacy same-head update must not mask the timestamp retained by the active run.
+  runs.apply(repository, [{ lane: "branch:main", sha: shaA, revision: "head-a-redelivery" }]);
+
+  const current = {
+    lane: "branch:main",
+    sha: shaC,
+    obsoleteShas: [shaB],
+    updatedAt: 300,
+    revision: "b-to-c",
+  };
+  const staleScanGeneration = runs.snapshotGeneration();
+  expect(runs.apply(repository, [current])).toEqual([{ ...current, obsoleteShas: [shaB, shaA] }]);
+  expect(controller.signal.aborted).toBe(true);
+
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: shaB,
+        obsoleteShas: [shaA],
+        updatedAt: 200,
+        revision: "delayed-a-to-b",
+      },
+    ]),
+  ).toEqual([]);
+  expect(runs.prepare(repository, "branch:main", shaA, staleScanGeneration)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", shaA)).toBe(true);
+});
+
+test("same-second revisions supersede missed transitions without accepting delayed lineage", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  runs.apply(repository, [
+    { lane: "branch:main", sha: shaA, updatedAt: 100_000, revision: "head-a" },
+  ]);
+  const controllerA = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaA, controllerA)).toBe(true);
+
+  const current = {
+    lane: "branch:main",
+    sha: shaC,
+    obsoleteShas: [shaB],
+    updatedAt: 100_000,
+    revision: "b-to-c",
+  };
+  expect(runs.apply(repository, [current])).toEqual([{ ...current, obsoleteShas: [shaB, shaA] }]);
+  expect(controllerA.signal.aborted).toBe(true);
+
+  const controllerC = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaC, controllerC)).toBe(true);
+  for (let index = 0; index < 1_024; index++) {
+    runs.apply(repository, [
+      {
+        lane: `branch:other-${index}`,
+        sha: "d".repeat(40),
+        updatedAt: 200_000,
+        revision: `other-${index}`,
+      },
+    ]);
+  }
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: shaB,
+        obsoleteShas: [shaA],
+        updatedAt: 100_000,
+        revision: "delayed-a-to-b",
+      },
+    ]),
+  ).toEqual([]);
+  expect(controllerC.signal.aborted).toBe(false);
+});
+
+test("timestamp-less same-head updates preserve the expected ordering watermark", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  const shaD = "d".repeat(40);
+  runs.apply(repository, [
+    { lane: "branch:main", sha: shaB, updatedAt: 100_000, revision: "head-b" },
+  ]);
+  const enrichedRedelivery = {
+    lane: "branch:main",
+    sha: shaB,
+    updatedAt: 100_000,
+    revision: "head-b-redelivery",
+  };
+  expect(
+    runs.apply(repository, [{ lane: "branch:main", sha: shaB, revision: "head-b-redelivery" }]),
+  ).toEqual([enrichedRedelivery]);
+  expect(runs.apply(repository, [{ lane: "branch:main", sha: shaB }])).toEqual([
+    enrichedRedelivery,
+  ]);
+
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaB, controller)).toBe(true);
+  const latest = {
+    lane: "branch:main",
+    sha: shaD,
+    obsoleteShas: [shaC],
+    updatedAt: 100_000,
+    revision: "c-to-d",
+  };
+  expect(runs.apply(repository, [latest])).toEqual([{ ...latest, obsoleteShas: [shaC, shaB] }]);
+  expect(controller.signal.aborted).toBe(true);
+});
+
+test("delayed same-head updates cannot lower an evicted active ordering watermark", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  runs.apply(repository, [
+    { lane: "branch:main", sha: shaA, updatedAt: 300, revision: "current-a" },
+  ]);
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaA, controller)).toBe(true);
+  for (let index = 0; index < 1_024; index++) {
+    runs.apply(repository, [
+      {
+        lane: `branch:other-${index}`,
+        sha: "d".repeat(40),
+        updatedAt: 400,
+        revision: `other-${index}`,
+      },
+    ]);
+  }
+
+  expect(
+    runs.apply(repository, [
+      { lane: "branch:main", sha: shaA, updatedAt: 100, revision: "delayed-a" },
+    ]),
+  ).toEqual([]);
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: shaB,
+        obsoleteShas: ["f".repeat(40)],
+        updatedAt: 200,
+        revision: "intermediate-b",
+      },
+    ]),
+  ).toEqual([]);
+  expect(controller.signal.aborted).toBe(false);
+});
+
+test("non-lineal updates cannot regress an expected head without ordering metadata", () => {
+  const runs = new AutomaticRunRegistry();
+  const currentSha = "b".repeat(40);
+  runs.apply(repository, [{ lane: "branch:main", sha: currentSha, revision: "current" }]);
+  expect(
+    runs.apply(repository, [
+      { lane: "branch:main", sha: "a".repeat(40), revision: "unrelated-delayed" },
+    ]),
+  ).toEqual([]);
+  expect(runs.prepare(repository, "branch:main", currentSha)).toBe(true);
+});
+
+test("same-head updates preserve all known obsolete predecessors", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      sha: shaC,
+      obsoleteShas: [shaB],
+      updatedAt: 200,
+      revision: "b-to-c",
+    },
+  ]);
+  const staleScanGeneration = runs.snapshotGeneration();
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      sha: shaC,
+      obsoleteShas: [shaA],
+      updatedAt: 200,
+      revision: "a-to-c",
+    },
+  ]);
+
+  expect(runs.prepare(repository, "branch:main", shaB, staleScanGeneration)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", shaB)).toBe(true);
+  expect(runs.prepare(repository, "branch:main", shaC)).toBe(true);
+});
+
+test("a webhook applied after a scan starts cannot be retired by that stale scan", () => {
+  const retired: string[] = [];
+  const runs = new AutomaticRunRegistry((_repository, update) => {
+    if (update.revision) retired.push(update.revision);
+  });
+  const observedGeneration = runs.snapshotGeneration();
+  runs.apply(repository, [{ lane: "pr:7", closed: true, revision: "fresh-close" }]);
+
+  expect(runs.prepare(repository, "pr:7", "b".repeat(40), observedGeneration)).toBe(false);
+  expect(retired).toEqual([]);
+});
+
+test("network lane updates cancel obsolete automatic runs before the next scan", () => {
+  const runs = new AutomaticRunRegistry();
+  const oldController = new AbortController();
+  const oldSha = "a".repeat(40);
+  const newSha = "b".repeat(40);
+
+  expect(runs.activate(repository, "branch:main", oldSha, oldController)).toBe(true);
+  const staleScanGeneration = runs.snapshotGeneration();
+  runs.apply(repository, [{ lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] }]);
+
+  expect(oldController.signal.aborted).toBe(true);
+  expect(runs.prepare(repository, "branch:main", oldSha, staleScanGeneration)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", oldSha)).toBe(true);
+  expect(runs.prepare(repository, "branch:main", newSha)).toBe(true);
+
+  runs.apply(repository, [{ lane: "branch:main", sha: oldSha, obsoleteShas: ["c".repeat(40)] }]);
+  expect(runs.prepare(repository, "branch:main", newSha)).toBe(true);
+
+  const currentController = new AbortController();
+  expect(runs.activate(repository, "branch:main", newSha, currentController)).toBe(true);
+  runs.apply(repository, [{ lane: "branch:main", closed: true, obsoleteShas: [newSha] }]);
+  expect(currentController.signal.aborted).toBe(true);
+});
+
 const config: InformantConfig = {
   version: 1,
   pollIntervalSeconds: 0,
@@ -237,6 +560,54 @@ test("one-shot event scans propagate polling failures for delivery retry", async
       onMessage: () => {},
     }),
   ).rejects.toThrow("temporary GitHub failure");
+});
+
+test("one-shot event scans propagate unclaimed work for dispatch retry", async () => {
+  const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
+  let attempts = 0;
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      dependencies: dependencies(
+        github({ branches: async () => [{ name: "main", sha: "branch-sha" }] }),
+        state,
+        async () => {
+          attempts++;
+          return false;
+        },
+      ),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("automatic work was not claimed; retrying dispatch");
+  expect(attempts).toBe(1);
+});
+
+test("one-shot event scans propagate unclaimed comment work for dispatch retry", async () => {
+  const state: PollState = {
+    cursor: "2026-01-01T00:00:00.000Z",
+    pending: [
+      {
+        id: 42,
+        sha: pullRequest.headSha,
+        createdAt: "2026-01-01",
+        pullRequest,
+      },
+    ],
+    seenCommentIds: [42],
+    pendingTags: [],
+  };
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      dependencies: dependencies(github({}), state, async () => false),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("automatic work was not claimed; retrying dispatch");
+  expect(state.pending.map((item) => item.id)).toEqual([42]);
 });
 
 test("serveRepositories preserves caller idle notifications after housekeeping", async () => {

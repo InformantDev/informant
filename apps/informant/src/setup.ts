@@ -4,7 +4,12 @@ import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import { appleContainerInstalled, ensureAppleContainerSystem } from "./container.ts";
-import { podmanContainerBackend } from "./container-backend.ts";
+import {
+  containerBackendReadiness,
+  initializeContainerBackend,
+  podmanContainerBackend,
+  podmanRequiresPasta,
+} from "./container-backend.ts";
 import {
   automaticUpdatesPreference,
   getTailscaleConfig,
@@ -16,6 +21,7 @@ import {
   saveTailscaleConfig,
 } from "./machine-config.ts";
 import { command } from "./process.ts";
+import { systemdPodmanSandboxConflict, systemdPodmanSandboxMessage } from "./startup.ts";
 import {
   configureGitHubAppWebhook,
   DEFAULT_FUNNEL_PORT,
@@ -81,7 +87,7 @@ export async function installPrivilegedPackages(
   }
 }
 
-function podmanInstallCommands(osRelease: string): string[][] {
+function linuxDistributionFamily(osRelease: string): string {
   const id = osRelease
     .match(/^ID=(?:"([^"]+)"|([^\n]+))$/m)
     ?.slice(1)
@@ -92,8 +98,12 @@ function podmanInstallCommands(osRelease: string): string[][] {
       .match(/^ID_LIKE=(?:"([^"]+)"|([^\n]+))$/m)
       ?.slice(1)
       .find(Boolean) ?? "";
-  const family = `${id ?? ""} ${like}`.toLowerCase();
-  const packages = ["podman", "uidmap", "slirp4netns", "fuse-overlayfs"];
+  return `${id ?? ""} ${like}`.toLowerCase();
+}
+
+function podmanInstallCommands(osRelease: string): string[][] {
+  const family = linuxDistributionFamily(osRelease);
+  const packages = ["podman", "uidmap", "catatonit", "slirp4netns", "fuse-overlayfs"];
   if (/(debian|ubuntu)/.test(family)) {
     return [
       ["apt-get", "update"],
@@ -101,11 +111,66 @@ function podmanInstallCommands(osRelease: string): string[][] {
     ];
   }
   if (/(fedora|rhel|centos|rocky|almalinux)/.test(family)) {
-    return [["dnf", "install", "-y", "podman", "shadow-utils", "slirp4netns", "fuse-overlayfs"]];
+    return [
+      [
+        "dnf",
+        "install",
+        "-y",
+        "podman",
+        "shadow-utils",
+        "catatonit",
+        "slirp4netns",
+        "fuse-overlayfs",
+      ],
+    ];
   }
   throw new Error(
     "automatic Podman installation supports Debian/Ubuntu and Fedora/RHEL; install rootless Podman with your package manager",
   );
+}
+
+function podmanInitHelperInstallCommands(osRelease: string): string[][] {
+  const family = linuxDistributionFamily(osRelease);
+  if (/(debian|ubuntu)/.test(family)) {
+    return [
+      ["apt-get", "update"],
+      ["apt-get", "install", "-y", "catatonit"],
+    ];
+  }
+  if (/(fedora|rhel|centos|rocky|almalinux)/.test(family)) {
+    return [["dnf", "install", "-y", "catatonit"]];
+  }
+  throw new Error(
+    "automatic Podman installation supports Debian/Ubuntu and Fedora/RHEL; install catatonit with your package manager",
+  );
+}
+
+function podmanNetworkHelperInstallCommands(osRelease: string): string[][] {
+  const family = linuxDistributionFamily(osRelease);
+  if (/(debian|ubuntu)/.test(family)) {
+    return [
+      ["apt-get", "update"],
+      ["apt-get", "install", "-y", "passt"],
+    ];
+  }
+  if (/(fedora|rhel|centos|rocky|almalinux)/.test(family)) {
+    return [["dnf", "install", "-y", "passt"]];
+  }
+  throw new Error(
+    "automatic Podman installation supports Debian/Ubuntu and Fedora/RHEL; install passt with your package manager",
+  );
+}
+
+async function podmanInitHelperAvailable(runCommand: typeof command): Promise<boolean> {
+  for (const executable of [
+    "catatonit",
+    "/usr/libexec/podman/catatonit",
+    "/usr/lib/podman/catatonit",
+  ]) {
+    const result = await runCommand([executable, "--version"]);
+    if (result.exitCode === 0 && !result.timedOut) return true;
+  }
+  return false;
 }
 
 function commandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
@@ -172,51 +237,33 @@ export async function prepareAppleContainer(
 
 export async function preparePodman(operations: PodmanSetupOperations = {}): Promise<void> {
   const runCommand = operations.command ?? command;
-  const installed = await runCommand(["podman", "--version"]);
+  let installed = await runCommand(["podman", "--version"]);
+  let source: string | undefined;
+  const installPackages = operations.installPackages ?? installPrivilegedPackages;
   if (installed.exitCode !== 0) {
-    const source = operations.osRelease ?? (await readFile("/etc/os-release", "utf8"));
-    await (operations.installPackages ?? installPrivilegedPackages)(podmanInstallCommands(source));
+    source = operations.osRelease ?? (await readFile("/etc/os-release", "utf8"));
+    await installPackages(podmanInstallCommands(source));
+    installed = await runCommand(["podman", "--version"]);
   }
-  await podmanContainerBackend.initialize(runCommand);
-  const workspace = await mkdtemp(join(tmpdir(), "informant-podman-smoke-"));
-  const marker = join(workspace, "informant-smoke-test");
-  try {
-    const smokeTest = await runCommand(
-      [
-        "podman",
-        "run",
-        "--rm",
-        "--init",
-        "--ulimit",
-        "nofile=65536:65536",
-        "--workdir",
-        "/workspace",
-        "--user",
-        "0:0",
-        "--cpus",
-        "1",
-        "--memory",
-        "256M",
-        "--security-opt",
-        "no-new-privileges",
-        "--volume",
-        `${workspace}:/workspace:Z`,
-        "--entrypoint",
-        "/bin/sh",
-        "docker.io/oven/bun:1",
-        "-lc",
-        "bun --version && touch /workspace/informant-smoke-test",
-      ],
-      { timeoutMs: 120_000 },
-    );
-    if (smokeTest.exitCode !== 0 || smokeTest.timedOut)
-      throw commandError("rootless Podman could not run the Informant default image", smokeTest);
-    if (!(await Bun.file(marker).exists())) {
-      throw new Error("rootless Podman could not write to a bind-mounted workspace");
+  if (!(await podmanInitHelperAvailable(runCommand))) {
+    source ??= operations.osRelease ?? (await readFile("/etc/os-release", "utf8"));
+    await installPackages(podmanInitHelperInstallCommands(source));
+  }
+  if (podmanRequiresPasta(installed.stdout)) {
+    const pasta = await runCommand(["pasta", "--version"]);
+    if (pasta.exitCode !== 0 || pasta.timedOut) {
+      source ??= operations.osRelease ?? (await readFile("/etc/os-release", "utf8"));
+      await installPackages(podmanNetworkHelperInstallCommands(source));
     }
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
   }
+  const ready = await initializeContainerBackend(
+    podmanContainerBackend,
+    runCommand,
+    Date.now(),
+    undefined,
+    true,
+  );
+  if (!ready) throw containerBackendReadiness()?.error ?? new Error("rootless Podman is not ready");
 }
 
 async function setupAppleContainer(): Promise<void> {
@@ -233,14 +280,27 @@ async function setupAppleContainer(): Promise<void> {
 }
 
 async function setupPodman(): Promise<void> {
-  const installed = (await command(["podman", "--version"])).exitCode === 0;
-  if (!installed) {
+  const installed = await command(["podman", "--version"]);
+  const needsPodman = installed.exitCode !== 0;
+  const needsInitHelper = !needsPodman && !(await podmanInitHelperAvailable(command));
+  const needsPasta =
+    !needsPodman &&
+    podmanRequiresPasta(installed.stdout) &&
+    (await command(["pasta", "--version"])).exitCode !== 0;
+  if (needsPodman || needsInitHelper || needsPasta) {
+    const requirement = needsPodman
+      ? "rootless Podman"
+      : needsInitHelper
+        ? "Podman's container init helper"
+        : "Podman's rootless networking helper";
     const install = await confirm({
-      message: "Install rootless Podman for container jobs? (requires administrator privileges)",
+      message: `Install ${requirement} for container jobs? (requires administrator privileges)`,
       initialValue: true,
     });
     if (isCancel(install) || !install) return;
   }
+  const sandboxConflict = await systemdPodmanSandboxConflict();
+  if (sandboxConflict) throw new Error(systemdPodmanSandboxMessage(sandboxConflict));
   console.log("Preparing rootless Podman…");
   await preparePodman();
   console.log("Rootless Podman is ready.");

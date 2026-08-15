@@ -4,7 +4,7 @@ import {
   type startAppleContainerSystem,
 } from "./container.ts";
 import { containerBackendReadiness, refreshSelectedContainerBackend } from "./container-backend.ts";
-import { runCommit } from "./coordinator.ts";
+import { type ClaimScheduling, runCommit } from "./coordinator.ts";
 import { GitHubApiError, GitHubClient } from "./github.ts";
 import {
   formatHousekeepingSummary,
@@ -121,6 +121,346 @@ async function repositoryConfig(
   );
 }
 
+export interface AutomaticLaneUpdate {
+  lane: string;
+  /** The latest commit for this lane. Omitted when the branch or pull request closed. */
+  sha?: string;
+  /** Earlier heads retained so delayed webhook delivery cannot move a lane backward. */
+  obsoleteShas?: string[];
+  /** Source event time used to order delayed webhook deliveries. */
+  updatedAt?: number;
+  /** Stable delivery identity used to retire a stale coordination update. */
+  revision?: string;
+  closed?: boolean;
+}
+
+interface ActiveAutomaticRun {
+  repository: string;
+  lane: string;
+  sha: string;
+  updatedAt?: number;
+  revision?: string;
+  obsoleteShas: Set<string>;
+  controller: AbortController;
+}
+
+const MAX_TRACKED_AUTOMATIC_LANES = 1_024;
+
+export function automaticLaneUpdateIdentity(update: AutomaticLaneUpdate): string {
+  return (
+    update.revision ??
+    JSON.stringify([
+      update.lane,
+      update.sha ?? null,
+      update.closed === true,
+      update.updatedAt ?? null,
+      update.obsoleteShas ?? [],
+    ])
+  );
+}
+
+export function automaticLaneUpdateSemanticIdentity(update: AutomaticLaneUpdate): string {
+  return update.revision
+    ? JSON.stringify([update.lane, "revision", update.revision])
+    : JSON.stringify([
+        update.lane,
+        "legacy",
+        update.sha ?? null,
+        update.closed === true,
+        update.updatedAt ?? null,
+      ]);
+}
+
+export function automaticLaneUpdateIsNewer(
+  previous: AutomaticLaneUpdate,
+  incoming: AutomaticLaneUpdate,
+): boolean {
+  if (
+    previous.updatedAt !== undefined &&
+    incoming.updatedAt !== undefined &&
+    previous.updatedAt !== incoming.updatedAt
+  ) {
+    return incoming.updatedAt > previous.updatedAt;
+  }
+  // Prefer an explicit transition away from the retained head, including a force-push
+  // rollback to a SHA that was previously obsolete. Otherwise reject an obsolete target.
+  if (previous.sha && incoming.obsoleteShas?.includes(previous.sha)) return true;
+  if (incoming.sha && previous.obsoleteShas?.includes(incoming.sha)) return false;
+  if (incoming.closed && previous.sha && !incoming.obsoleteShas?.includes(previous.sha)) {
+    return false;
+  }
+  // GitHub push timestamps have one-second precision. Distinct deliveries received for the
+  // same source second are ordered by arrival after the explicit lineage checks above.
+  if (
+    previous.updatedAt !== undefined &&
+    incoming.updatedAt === previous.updatedAt &&
+    previous.revision !== undefined &&
+    incoming.revision !== undefined &&
+    incoming.revision !== previous.revision
+  ) {
+    return true;
+  }
+  return incoming.sha === previous.sha && incoming.closed === previous.closed;
+}
+
+interface ExpectedAutomaticUpdate {
+  update: AutomaticLaneUpdate;
+  sha: string | null;
+  obsoleteShas: Set<string>;
+  generation: number;
+}
+
+/** Coordinates automatic-run supersession across polling cycles and network wakeups. */
+export class AutomaticRunRegistry {
+  private readonly active = new Map<string, ActiveAutomaticRun>();
+  private readonly expected = new Map<string, ExpectedAutomaticUpdate>();
+  private readonly retired = new Set<string>();
+  private generation = 0;
+
+  constructor(
+    private readonly onRetire?: (repository: Repository, update: AutomaticLaneUpdate) => void,
+  ) {}
+
+  private key(repository: Repository, lane: string): string {
+    return `${repository.fullName.toLowerCase()}\0${lane}`;
+  }
+
+  apply(repository: Repository, updates: AutomaticLaneUpdate[]): AutomaticLaneUpdate[] {
+    const accepted: AutomaticLaneUpdate[] = [];
+    for (const update of updates) {
+      const key = this.key(repository, update.lane);
+      if (this.retired.has(`${key}\0${automaticLaneUpdateSemanticIdentity(update)}`)) continue;
+      const previous = this.expected.get(key);
+      const active = this.active.get(key);
+      const nextSha = update.closed ? null : (update.sha ?? null);
+      const previousTracksActive =
+        previous !== undefined && active !== undefined && previous.sha === active.sha;
+      const previousUpdatedAt = previousTracksActive ? previous.update.updatedAt : undefined;
+      const activeWatermarkWins =
+        previousTracksActive &&
+        active.updatedAt !== undefined &&
+        (previousUpdatedAt === undefined || active.updatedAt > previousUpdatedAt);
+      const orderingPrevious = previous
+        ? activeWatermarkWins
+          ? {
+              ...previous.update,
+              updatedAt: active.updatedAt,
+              revision: active.revision,
+            }
+          : previous.update
+        : undefined;
+      const activeUpdatedAt =
+        active?.updatedAt === undefined
+          ? previousUpdatedAt
+          : previousUpdatedAt === undefined
+            ? active.updatedAt
+            : Math.max(active.updatedAt, previousUpdatedAt);
+      const activeRevision = activeWatermarkWins
+        ? active?.revision
+        : previousTracksActive && previousUpdatedAt !== undefined
+          ? (previous.update.revision ?? active?.revision)
+          : active?.revision;
+      // Keep lineage on the active run even after its bounded expected entry is evicted. That
+      // lets a same-second new delivery bridge a missed transition without accepting an older
+      // transition whose target is already known to be obsolete.
+      const targetsKnownObsolete =
+        (nextSha !== null && active?.obsoleteShas.has(nextSha)) ||
+        (update.closed === true &&
+          update.obsoleteShas?.some((sha) => active?.obsoleteShas.has(sha)) === true);
+      const distinctRevisionAtSameTime =
+        active !== undefined &&
+        active.sha !== nextSha &&
+        activeUpdatedAt !== undefined &&
+        update.updatedAt === activeUpdatedAt &&
+        activeRevision !== undefined &&
+        update.revision !== undefined &&
+        update.revision !== activeRevision &&
+        !targetsKnownObsolete;
+      if (
+        active?.sha === nextSha &&
+        activeUpdatedAt !== undefined &&
+        update.updatedAt !== undefined &&
+        update.updatedAt < activeUpdatedAt
+      ) {
+        continue;
+      }
+      if (
+        orderingPrevious &&
+        !automaticLaneUpdateIsNewer(orderingPrevious, update) &&
+        !distinctRevisionAtSameTime
+      ) {
+        continue;
+      }
+      const orderedAfterActive =
+        active !== undefined &&
+        active.sha !== nextSha &&
+        activeUpdatedAt !== undefined &&
+        update.updatedAt !== undefined &&
+        (update.updatedAt > activeUpdatedAt || distinctRevisionAtSameTime);
+      if (
+        active &&
+        active.sha !== nextSha &&
+        !update.obsoleteShas?.includes(active.sha) &&
+        !orderedAfterActive
+      ) {
+        continue;
+      }
+      const obsoleteShas = new Set(update.obsoleteShas ?? []);
+      if (active && active.sha !== nextSha && orderedAfterActive) obsoleteShas.add(active.sha);
+      const preservesExpectedHead =
+        previous?.sha === nextSha && Boolean(previous.update.closed) === Boolean(update.closed);
+      if (preservesExpectedHead) {
+        for (const sha of previous.obsoleteShas) obsoleteShas.add(sha);
+      }
+      const acceptedUpdate = {
+        ...update,
+        ...(preservesExpectedHead &&
+        update.updatedAt === undefined &&
+        previous?.update.updatedAt !== undefined
+          ? { updatedAt: previous.update.updatedAt }
+          : {}),
+        ...(preservesExpectedHead &&
+        update.updatedAt === undefined &&
+        update.revision === undefined &&
+        previous?.update.revision !== undefined
+          ? { revision: previous.update.revision }
+          : {}),
+        ...(obsoleteShas.size > 0 ? { obsoleteShas: [...obsoleteShas] } : {}),
+      };
+      accepted.push(acceptedUpdate);
+      this.expected.delete(key);
+      this.expected.set(key, {
+        update: acceptedUpdate,
+        sha: nextSha,
+        obsoleteShas,
+        generation: ++this.generation,
+      });
+      while (this.expected.size > MAX_TRACKED_AUTOMATIC_LANES) {
+        this.expected.delete(this.expected.keys().next().value ?? "");
+      }
+      if (active && active.sha === nextSha) {
+        if (
+          update.updatedAt !== undefined &&
+          (active.updatedAt === undefined || update.updatedAt >= active.updatedAt)
+        ) {
+          active.updatedAt = update.updatedAt;
+          if (update.revision !== undefined) active.revision = update.revision;
+        }
+        for (const sha of obsoleteShas) active.obsoleteShas.add(sha);
+      }
+      if (active && (update.closed || active.sha !== update.sha)) {
+        this.active.delete(key);
+        active.controller.abort(
+          update.sha
+            ? `Superseded by ${update.lane}@${update.sha.slice(0, 7)}.`
+            : `${update.lane} is no longer active.`,
+        );
+      }
+    }
+    return accepted;
+  }
+
+  private retire(repository: Repository, key: string, expected: ExpectedAutomaticUpdate): void {
+    this.expected.delete(key);
+    const retiredKey = `${key}\0${automaticLaneUpdateSemanticIdentity(expected.update)}`;
+    this.retired.delete(retiredKey);
+    this.retired.add(retiredKey);
+    while (this.retired.size > MAX_TRACKED_AUTOMATIC_LANES) {
+      this.retired.delete(this.retired.values().next().value ?? "");
+    }
+    this.onRetire?.(repository, expected.update);
+  }
+
+  snapshotGeneration(): number {
+    return this.generation;
+  }
+
+  prepare(
+    repository: Repository,
+    lane: string,
+    sha: string,
+    observedGeneration = this.generation,
+  ): boolean {
+    const key = this.key(repository, lane);
+    const expected = this.expected.get(key);
+    if (expected) {
+      if (expected.generation > observedGeneration) return expected.sha === sha;
+      if (expected.sha !== sha) {
+        // A live branch or open pull request returned by GitHub is authoritative. Retiring
+        // this exact update prevents a stale lead from replaying it after the scan recovers.
+        this.retire(repository, key, expected);
+      }
+    }
+    const active = this.active.get(key);
+    if (active && active.sha !== sha) {
+      this.active.delete(key);
+      active.controller.abort(`Superseded by ${lane}@${sha.slice(0, 7)}.`);
+    }
+    return true;
+  }
+
+  activate(
+    repository: Repository,
+    lane: string,
+    sha: string,
+    controller: AbortController,
+    observedGeneration = this.generation,
+  ): boolean {
+    if (!this.prepare(repository, lane, sha, observedGeneration)) return false;
+    const key = this.key(repository, lane);
+    const expected = this.expected.get(key);
+    this.active.set(key, {
+      repository: repository.fullName.toLowerCase(),
+      lane,
+      sha,
+      ...(expected?.sha === sha && expected.update.updatedAt !== undefined
+        ? { updatedAt: expected.update.updatedAt }
+        : {}),
+      ...(expected?.sha === sha && expected.update.revision !== undefined
+        ? { revision: expected.update.revision }
+        : {}),
+      obsoleteShas: new Set(expected?.sha === sha ? expected.obsoleteShas : []),
+      controller,
+    });
+    return true;
+  }
+
+  release(repository: Repository, lane: string, controller: AbortController): void {
+    const key = this.key(repository, lane);
+    if (this.active.get(key)?.controller === controller) this.active.delete(key);
+  }
+
+  activeLanes(repository: Repository): Array<{ lane: string; sha: string }> {
+    const fullName = repository.fullName.toLowerCase();
+    return [...this.active.values()]
+      .filter((run) => run.repository === fullName)
+      .map(({ lane, sha }) => ({ lane, sha }));
+  }
+
+  cancel(repository: Repository, lane: string, reason: string): void {
+    const key = this.key(repository, lane);
+    const active = this.active.get(key);
+    if (!active) return;
+    this.active.delete(key);
+    active.controller.abort(reason);
+  }
+
+  remove(repository: Repository, reason: string): void {
+    const prefix = `${repository.fullName.toLowerCase()}\0`;
+    for (const key of this.expected.keys()) {
+      if (key.startsWith(prefix)) this.expected.delete(key);
+    }
+    for (const key of this.retired) {
+      if (key.startsWith(prefix)) this.retired.delete(key);
+    }
+    for (const [key, run] of this.active) {
+      if (!key.startsWith(prefix)) continue;
+      this.active.delete(key);
+      run.controller.abort(reason);
+    }
+  }
+}
+
 export interface ServerOptions {
   once?: boolean;
   /** Bypass the periodic tag throttle for a tag-push webhook synchronization. */
@@ -131,6 +471,9 @@ export interface ServerOptions {
   onMessage?: (message: string) => void;
   onIdle?: () => Promise<void> | void;
   shutdownTimeoutMs?: number;
+  claimScheduling?: ClaimScheduling;
+  /** Shared by event-driven scans so a newer dispatch can stop an older run immediately. */
+  automaticRuns?: AutomaticRunRegistry;
   dependencies?: ServerDependencies;
 }
 
@@ -281,7 +624,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   let rateLimitUntil = 0;
   const configs = new Map<string, Promise<InformantConfig | undefined>>();
   const inFlightRuns = new Map<string, Promise<void>>();
-  const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
+  const automaticRuns = options.automaticRuns ?? new AutomaticRunRegistry();
   const shutdownControllers = new Set<AbortController>();
   const admissionControllers = new Set<AbortController>();
   const admissionSignal = (controller: AbortController) =>
@@ -343,7 +686,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       controller.abort("Graceful worker shutdown timed out.");
     }
     shutdownControllers.clear();
-    automaticLanes.clear();
   };
   const abortAdmissions = () => {
     for (const controller of admissionControllers) {
@@ -410,6 +752,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
   };
   do {
+    let retryDispatch = false;
     if (recoveryPending) {
       try {
         recoveryPending = await recoverBuilds(github, repository, message);
@@ -498,6 +841,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         (options.forceTagPoll ||
           !state.tagsPolledAt ||
           Date.now() - new Date(state.tagsPolledAt).getTime() >= TAG_POLL_INTERVAL_MS);
+      const automaticGeneration = automaticRuns.snapshotGeneration();
       const [branches, tags, prs] = await Promise.all([
         github.branches(repository, options.signal),
         shouldPollTags ? github.tags(repository, options.signal) : undefined,
@@ -541,13 +885,15 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       for (const id of completedTagEvents) completedTags.delete(id);
       const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
       const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
-      for (const [lane, active] of automaticLanes) {
+      for (const { lane } of automaticRuns.activeLanes(repository)) {
         if (lane.startsWith("branch:") && !openBranchLanes.has(lane)) {
-          active.controller.abort(`Branch ${lane.slice(7)} no longer exists.`);
-          automaticLanes.delete(lane);
+          automaticRuns.cancel(repository, lane, `Branch ${lane.slice(7)} no longer exists.`);
         } else if (lane.startsWith("pr:") && !openPullRequestLanes.has(lane)) {
-          active.controller.abort(`Pull request #${lane.slice(3)} is no longer open.`);
-          automaticLanes.delete(lane);
+          automaticRuns.cancel(
+            repository,
+            lane,
+            `Pull request #${lane.slice(3)} is no longer open.`,
+          );
         }
       }
       const manualTriggers = new Map<string, Promise<boolean>>();
@@ -594,10 +940,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           await drainForShutdown();
           return;
         }
-        const previous = automaticLanes.get(target.lane);
-        if (!("tag" in target) && previous && previous.sha !== target.sha) {
-          previous.controller.abort(`Superseded by ${target.branch}@${target.sha.slice(0, 7)}.`);
-          automaticLanes.delete(target.lane);
+        if (
+          !("tag" in target) &&
+          !automaticRuns.prepare(repository, target.lane, target.sha, automaticGeneration)
+        ) {
+          continue;
         }
         if (inFlightRuns.has(target.eventId)) continue;
         const context: EventContext = {
@@ -637,10 +984,19 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           const controller = new AbortController();
           const shutdownController = new AbortController();
           const admissionController = new AbortController();
-          admissionControllers.add(admissionController);
-          if (!("tag" in target)) {
-            automaticLanes.set(target.lane, { sha: target.sha, controller });
+          if (
+            !("tag" in target) &&
+            !automaticRuns.activate(
+              repository,
+              target.lane,
+              target.sha,
+              controller,
+              automaticGeneration,
+            )
+          ) {
+            continue;
           }
+          admissionControllers.add(admissionController);
           const result = executeCommit(
             github,
             repository,
@@ -655,10 +1011,12 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             controller.signal,
             admissionSignal(admissionController),
             shutdownController.signal,
+            options.claimScheduling,
           );
           shutdownControllers.add(shutdownController);
           const run = result
             .then((build) => {
+              if (build === false) retryDispatch = true;
               if (build)
                 message(`${build.status} ${build.id} ${target.branch}@${target.sha.slice(0, 7)}`);
               if (
@@ -676,11 +1034,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               inFlightRuns.delete(target.eventId);
               shutdownControllers.delete(shutdownController);
               admissionControllers.delete(admissionController);
-              if (
-                !("tag" in target) &&
-                automaticLanes.get(target.lane)?.controller === controller
-              ) {
-                automaticLanes.delete(target.lane);
+              if (!("tag" in target)) {
+                automaticRuns.release(repository, target.lane, controller);
               }
               idle();
             });
@@ -782,11 +1137,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             controller.signal,
             admissionSignal(admissionController),
             shutdownController.signal,
+            options.claimScheduling,
           );
           shutdownControllers.add(shutdownController);
           const run = result
             .then((result) => {
-              if (result !== false) completedComments.add(pending.id);
+              if (result === false) retryDispatch = true;
+              else completedComments.add(pending.id);
             })
             .catch((error) => {
               message(`comment ${pending.id} failed: ${errorDetail(error)}`);
@@ -826,6 +1183,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     if (options.once) {
       await drainOnce();
+      if (retryDispatch && options.throwOnPollError) {
+        throw new Error("automatic work was not claimed; retrying dispatch");
+      }
       return;
     }
     if (!(await waitForDelay(intervalSeconds * 1_000))) {

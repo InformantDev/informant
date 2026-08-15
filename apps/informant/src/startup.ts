@@ -1,10 +1,10 @@
 import { existsSync } from "node:fs";
-import { chmod, mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { xdgConfigHome } from "./config-home.ts";
 import { command } from "./process.ts";
-import { dataDirectory } from "./store.ts";
+import { dataDirectory, runningWorkerPids } from "./store.ts";
 
 const LABEL = "dev.informant.worker";
 const GRACEFUL_RESTART_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
@@ -25,6 +25,141 @@ export function startupServicePath(): string {
 
 export function linuxStartupServicePath(home = homedir()): string {
   return join(home, ".config", "systemd", "user", "informant.service");
+}
+
+export interface SystemdPodmanSandboxConflict {
+  scope: "system" | "user" | "user-manager";
+  unit: string;
+  setting: "ProtectKernelTunables" | "ProtectHostname";
+  fragmentPath?: string;
+}
+
+function systemdProperties(source: string): Record<string, string> {
+  return Object.fromEntries(
+    source
+      .split("\n")
+      .map((line) => line.split("=", 2))
+      .filter((entry): entry is [string, string] => entry.length === 2 && Boolean(entry[0])),
+  );
+}
+
+export function systemdWorkerUnitsFromCgroup(
+  source: string,
+): Array<{ scope: "system" | "user"; unit: string }> {
+  const units = new Map<string, { scope: "system" | "user"; unit: string }>();
+  for (const line of source.split("\n")) {
+    const path = line.slice(line.indexOf("::") + 2);
+    if (!path.startsWith("/")) continue;
+    const scope = path.includes("/user.slice/") ? "user" : "system";
+    for (const unit of path.split("/").filter((part) => part.endsWith(".service"))) {
+      if (unit.startsWith("user@")) continue;
+      units.set(`${scope}:${unit}`, { scope, unit });
+    }
+  }
+  return [...units.values()];
+}
+
+export async function systemdPodmanSandboxConflict(
+  options: {
+    platform?: NodeJS.Platform;
+    uid?: number;
+    command?: typeof command;
+    workerCgroups?: string[];
+  } = {},
+): Promise<SystemdPodmanSandboxConflict | undefined> {
+  if ((options.platform ?? process.platform) !== "linux") return undefined;
+  const run = options.command ?? command;
+  const inspect = async (
+    scope: "system" | "user",
+    unit: string,
+  ): Promise<Record<string, string> | undefined> => {
+    const result = await run(
+      [
+        "systemctl",
+        `--${scope}`,
+        "show",
+        unit,
+        "--property=LoadState,ActiveState,MainPID,ProtectKernelTunables,ProtectHostname,FragmentPath",
+        "--no-pager",
+      ],
+      { timeoutMs: 5_000 },
+    );
+    return result.exitCode === 0 && !result.timedOut ? systemdProperties(result.stdout) : undefined;
+  };
+  const conflict = (
+    scope: SystemdPodmanSandboxConflict["scope"],
+    unit: string,
+    properties: Record<string, string> | undefined,
+  ): SystemdPodmanSandboxConflict | undefined => {
+    if (
+      properties?.LoadState !== "loaded" ||
+      properties.ActiveState !== "active" ||
+      !Number(properties.MainPID)
+    ) {
+      return undefined;
+    }
+    const setting = (["ProtectKernelTunables", "ProtectHostname"] as const).find(
+      (name) => properties[name] === "yes",
+    );
+    return setting
+      ? { scope, unit, setting, fragmentPath: properties.FragmentPath || undefined }
+      : undefined;
+  };
+
+  const system = conflict(
+    "system",
+    "informant.service",
+    await inspect("system", "informant.service"),
+  );
+  if (system) return system;
+  const userProperties = await inspect("user", "informant.service");
+  const user = conflict("user", "informant.service", userProperties);
+  if (user) return user;
+
+  const workerCgroups =
+    options.workerCgroups ??
+    (await Promise.all(
+      (
+        await runningWorkerPids()
+      ).map((pid) => readFile(`/proc/${pid}/cgroup`, "utf8").catch(() => "")),
+    ));
+  const workerUnits = workerCgroups.flatMap(systemdWorkerUnitsFromCgroup);
+  const standardUserWorkerIsActive =
+    userProperties?.LoadState === "loaded" &&
+    userProperties.ActiveState === "active" &&
+    Boolean(Number(userProperties.MainPID));
+  if (standardUserWorkerIsActive || workerUnits.some(({ scope }) => scope === "user")) {
+    const uid = options.uid ?? process.getuid?.();
+    if (uid !== undefined) {
+      const managerUnit = `user@${uid}.service`;
+      const manager = conflict("user-manager", managerUnit, await inspect("system", managerUnit));
+      if (manager) return manager;
+    }
+  }
+
+  for (const { scope, unit } of workerUnits) {
+    if (unit === "informant.service") continue;
+    const discovered = conflict(scope, unit, await inspect(scope, unit));
+    if (discovered) return discovered;
+  }
+  return undefined;
+}
+
+export function systemdPodmanSandboxMessage(conflict: SystemdPodmanSandboxConflict): string {
+  const location = conflict.fragmentPath ? ` (${conflict.fragmentPath})` : "";
+  const edit =
+    conflict.scope === "user"
+      ? `systemctl --user edit ${conflict.unit}`
+      : `sudo systemctl edit ${conflict.unit}`;
+  const restart =
+    conflict.scope === "user-manager"
+      ? "reload systemd, then restart the user manager (or log out and back in) before restarting the worker"
+      : "reload systemd and restart the worker";
+  const effect =
+    conflict.setting === "ProtectKernelTunables"
+      ? "makes /proc/sys read-only"
+      : "blocks the nested container hostname syscall";
+  return `${conflict.scope} unit ${conflict.unit}${location} sets ${conflict.setting}=yes, which ${effect} inside rootless Podman; set ${conflict.setting}=no with \`${edit}\`, ${restart}`;
 }
 
 export function renderStartupService(
