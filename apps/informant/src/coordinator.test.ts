@@ -1429,7 +1429,9 @@ describe("runCommit", () => {
     };
     const context = harness({ manualTrigger: true, requestedJobs: ["test"] });
     const reservations: string[][] = [];
+    const publishedReservations: string[][] = [];
     let releases = 0;
+    let publishedReleases = 0;
     context.dependencies.acquireExecutionSlot = Object.assign(
       async () => {
         throw new Error("manual claims must not wait for automatic capacity");
@@ -1443,6 +1445,12 @@ describe("runCommit", () => {
         },
       },
     );
+    context.dependencies.publishExecutionReservation = async (reserved) => {
+      publishedReservations.push(reserved.jobs.map((job) => job.name));
+      return () => {
+        publishedReleases++;
+      };
+    };
 
     await runCommit(
       context.github,
@@ -1456,7 +1464,9 @@ describe("runCommit", () => {
     expect(context.jobChecks).toEqual(["test"]);
     expect(context.receivedConfiguredVmJobs()).toEqual(["test", "macos-e2e"]);
     expect(reservations).toEqual([["test"]]);
+    expect(publishedReservations).toEqual([["test"]]);
     expect(releases).toBe(1);
+    expect(publishedReleases).toBe(1);
   });
 
   test("returns without persistence when no claim is available", async () => {

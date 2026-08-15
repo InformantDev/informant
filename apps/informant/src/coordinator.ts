@@ -897,7 +897,11 @@ async function runCommitPartitionWithSlot(
   const releaseManualResources = claim.manualTrigger
     ? (dependencies.acquireExecutionSlot ?? acquireExecutionSlot).reserve?.(config)
     : undefined;
+  let releasePublishedManualResources: (() => void) | undefined;
   try {
+    if (claim.manualTrigger) {
+      releasePublishedManualResources = await dependencies.publishExecutionReservation?.(config);
+    }
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));
@@ -1134,6 +1138,7 @@ async function runCommitPartitionWithSlot(
     }
     throw error;
   } finally {
+    releasePublishedManualResources?.();
     releaseManualResources?.();
     await cancellation?.close();
     await dependencies.saveBuild(record).catch(() => undefined);
