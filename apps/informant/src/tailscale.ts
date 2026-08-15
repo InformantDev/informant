@@ -703,9 +703,17 @@ export function generatedNetworkClaimPlan(
   claimants: NetworkClaimant[],
   rotation: number,
 ): NetworkClaimPlan | undefined {
-  return claimants.length > 1 && claimants.length <= MAX_NETWORK_CLAIMANTS
-    ? { claimants, rotation: rotation % Number.MAX_SAFE_INTEGER }
-    : undefined;
+  if (claimants.length <= 1 || claimants.length > MAX_NETWORK_CLAIMANTS) return undefined;
+  try {
+    return parseNetworkClaimPlan({
+      claimants,
+      rotation: rotation % Number.MAX_SAFE_INTEGER,
+    });
+  } catch {
+    // A peer can advertise fields outside this protocol's bounds. Dispatch without a plan so
+    // compatible workers can still use the mixed-version fallback election.
+    return undefined;
+  }
 }
 
 export function parseNetworkClaimPlan(value: unknown): NetworkClaimPlan | undefined {

@@ -499,13 +499,38 @@ test("validates bounded network claim scheduling plans", () => {
     resources,
   }));
   const first = sixtyFour[0];
-  if (!first) throw new Error("expected a claimant");
+  const second = sixtyFour[1];
+  if (!first || !second) throw new Error("expected claimants");
   const sixtyFive = [...sixtyFour, { ...first, id: "worker-64" }];
   expect(generatedNetworkClaimPlan(sixtyFour, 7)).toEqual({ claimants: sixtyFour, rotation: 7 });
   expect(generatedNetworkClaimPlan(sixtyFive, 8)).toBeUndefined();
   expect(() => parseNetworkClaimPlan({ claimants: sixtyFive, rotation: 8 })).toThrow(
     "invalid claim scheduling",
   );
+
+  const excessiveCapabilities = {
+    ...second,
+    capabilities: Array.from({ length: 257 }, (_, index) => `capability-${index}`),
+  };
+  const longCapability = {
+    ...second,
+    capabilities: ["x".repeat(257)],
+  };
+  const duplicateId = { ...second, id: first.id };
+  const longId = { ...second, id: "w".repeat(257) };
+  const invalidResources = {
+    ...second,
+    resources: { ...resources, capacity: { ...resources.capacity, cpu: 0 } },
+  };
+  for (const invalid of [
+    excessiveCapabilities,
+    longCapability,
+    duplicateId,
+    longId,
+    invalidResources,
+  ]) {
+    expect(generatedNetworkClaimPlan([first, invalid], 9)).toBeUndefined();
+  }
 });
 
 test("queries the running worker for the local resource snapshot", async () => {
