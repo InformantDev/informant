@@ -253,6 +253,7 @@ test("accepts healthy rootless Podman and caches readiness", async () => {
   expect(
     await initializeContainerBackend(podmanContainerBackend, async (argv) => {
       commands.push(argv);
+      if (argv[0] === "podman" && argv[1] === "--version") return result(0, "podman version 5.4.2");
       return argv[1] === "info"
         ? result(0, JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } }))
         : result();
@@ -260,12 +261,23 @@ test("accepts healthy rootless Podman and caches readiness", async () => {
   ).toBe(true);
   expect(commands).toEqual([
     ["podman", "--version"],
+    ["pasta", "--version"],
     ["podman", "info", "--format", "json"],
   ]);
   expect(containerBackendReadiness()).toMatchObject({
     backend: podmanContainerBackend,
     ready: true,
   });
+});
+
+test("rejects Podman without its default rootless network helper", async () => {
+  expect(
+    await initializeContainerBackend(podmanContainerBackend, async (argv) => {
+      if (argv[0] === "podman") return result(0, "podman version 5.4.2");
+      return argv[0] === "pasta" ? result(127, "", "not found") : result();
+    }),
+  ).toBe(false);
+  expect(containerBackendReadiness()?.error?.message).toContain("install passt");
 });
 
 test("rejects rootful and malformed Podman information", async () => {

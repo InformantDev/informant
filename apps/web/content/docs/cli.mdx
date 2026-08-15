@@ -119,9 +119,11 @@ scoped to Informant prepared images. It does not suggest or run a global Podman 
 affect unrelated images or interrupted Buildah work owned by the same user.
 
 `informant doctor` names the selected backend and verifies Apple Container readiness on macOS or
-rootless Podman health on Linux. Missing, unhealthy, or rootful Podman prevents the worker from
-claiming `runs_on = ["container"]` jobs; host-only jobs remain available. `informant setup` can install
-Podman from Debian/Ubuntu or Fedora/RHEL packages and smoke tests `docker.io/oven/bun:1`. It never uses
+rootless Podman health on Linux. Its Linux check exercises both a constrained container run and the
+prepared-image build path used by jobs. Missing `pasta` networking support or unhealthy/rootful
+Podman prevents the worker from advertising `container`; any of those failures or a failed smoke build
+also makes the doctor command fail. `informant setup` can install Podman and its networking helper from
+Debian/Ubuntu or Fedora/RHEL packages, then smoke tests `docker.io/oven/bun:1`. It never uses
 curl-to-shell or starts a systemd service.
 
 The worker runs housekeeping at startup and whenever all builds become idle. It keeps at least the

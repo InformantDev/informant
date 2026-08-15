@@ -205,7 +205,8 @@ test("installs Debian rootless Podman packages and smoke tests a qualified image
     ["apt-get", "update"],
     ["apt-get", "install", "-y", "podman", "uidmap", "slirp4netns", "fuse-overlayfs"],
   ]);
-  expect(commands.at(-1)).toEqual([
+  const runCommand = commands.find((args) => args[1] === "run") ?? [];
+  expect(runCommand).toEqual([
     "podman",
     "run",
     "--rm",
@@ -230,9 +231,51 @@ test("installs Debian rootless Podman packages and smoke tests a qualified image
     "-lc",
     "bun --version && touch /workspace/informant-smoke-test",
   ]);
-  const finalCommand = commands.at(-1) ?? [];
-  const volume = finalCommand[finalCommand.indexOf("--volume") + 1] ?? "";
+  expect(commands.find((args) => args[1] === "build")).toEqual([
+    "podman",
+    "build",
+    "--file",
+    "Dockerfile",
+    "--tag",
+    expect.stringMatching(/^informant-podman-smoke:/),
+    "--progress",
+    "plain",
+    "--force-rm",
+    "--cpu-period",
+    "100000",
+    "--cpu-quota",
+    "100000",
+    "--memory",
+    "256M",
+    ".",
+  ]);
+  const volume = runCommand[runCommand.indexOf("--volume") + 1] ?? "";
   expect(await Bun.file(volume.slice(0, volume.indexOf(":/workspace"))).exists()).toBe(false);
+});
+
+test("installs Podman's rootless network helper when Podman already exists", async () => {
+  let installCommands: string[][] = [];
+  await preparePodman({
+    osRelease: "ID=debian\n",
+    installPackages: async (value) => {
+      installCommands = value;
+    },
+    command: async (args) => {
+      if (args[0] === "podman" && args[1] === "--version") {
+        return success("podman version 5.4.2");
+      }
+      if (args[0] === "pasta" && installCommands.length === 0) {
+        return { ...success(), exitCode: 127 };
+      }
+      if (args[1] === "info") return success(rootlessPodmanInfo);
+      await completePodmanSmoke(args);
+      return success();
+    },
+  });
+  expect(installCommands).toEqual([
+    ["apt-get", "update"],
+    ["apt-get", "install", "-y", "passt"],
+  ]);
 });
 
 test("reuses healthy rootless Podman without installing packages", async () => {
@@ -301,6 +344,25 @@ test("reports a failed Podman smoke test", async () => {
     }),
   ).rejects.toThrow("rootless Podman could not run the Informant default image: pull failed");
   expect(await Bun.file(workspace).exists()).toBe(false);
+});
+
+test("reports a failed prepared-image build smoke test", async () => {
+  await expect(
+    preparePodman({
+      command: async (args) => {
+        if (args[1] === "info") return success(rootlessPodmanInfo);
+        if (args[1] === "build") {
+          return {
+            ...success(),
+            exitCode: 125,
+            stderr: "could not find pasta, the network namespace can't be configured",
+          };
+        }
+        await completePodmanSmoke(args);
+        return success();
+      },
+    }),
+  ).rejects.toThrow("rootless Podman could not build a prepared job image: could not find pasta");
 });
 
 test("bounds the Podman smoke test and reports a timeout", async () => {

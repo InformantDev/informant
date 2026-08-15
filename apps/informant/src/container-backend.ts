@@ -154,6 +154,11 @@ function caseInsensitiveField(value: unknown, name: string): unknown {
   return matches.length === 1 ? matches[0]?.[1] : undefined;
 }
 
+export function podmanRequiresPasta(versionOutput: string): boolean {
+  const major = Number(versionOutput.match(/\bpodman\s+version\s+(\d+)/i)?.[1]);
+  return Number.isSafeInteger(major) && major >= 5;
+}
+
 export function validateRootlessPodmanInfo(source: string): void {
   let info: unknown;
   try {
@@ -186,6 +191,15 @@ export const podmanContainerBackend: ContainerBackend = {
     const installed = await runCommand(["podman", "--version"], options);
     if (installed.exitCode !== 0 || installed.timedOut)
       throw commandError("Podman is not installed; run `informant setup` to install it", installed);
+    if (podmanRequiresPasta(installed.stdout)) {
+      const pasta = await runCommand(["pasta", "--version"], options);
+      if (pasta.exitCode !== 0 || pasta.timedOut) {
+        throw commandError(
+          "Podman's rootless network helper is unavailable; run `informant setup` to install passt",
+          pasta,
+        );
+      }
+    }
     const info = await runCommand(["podman", "info", "--format", "json"], options);
     if (info.exitCode !== 0 || info.timedOut)
       throw commandError(

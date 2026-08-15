@@ -49,8 +49,9 @@ Informant will:
 
 1. Configure and verify the host container backend. On Apple Silicon this installs Apple's signed
    Container package. On Linux, setup offers to install Podman with `apt-get` or `dnf`, verifies that
-   it is rootless with cgroups v2, and runs a bounded smoke test of the default image using CPU,
-   memory, security, and writable bind-mount constraints. Podman is daemonless; Informant does not
+   it is rootless with cgroups v2, installs Podman's `pasta` networking helper, and runs bounded
+   container-run and prepared-image-build smoke tests using CPU, memory, security, and writable
+   bind-mount constraints. Podman is daemonless; Informant does not
    start a service and does not require systemd.
 2. Ask whether your account or an organization should own the App.
 3. If Tailscale is connected, enable a Funnel and open GitHub with the signed webhook and required
