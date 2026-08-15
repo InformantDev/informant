@@ -103,7 +103,7 @@ function linuxDistributionFamily(osRelease: string): string {
 
 function podmanInstallCommands(osRelease: string): string[][] {
   const family = linuxDistributionFamily(osRelease);
-  const packages = ["podman", "uidmap", "slirp4netns", "fuse-overlayfs"];
+  const packages = ["podman", "uidmap", "catatonit", "slirp4netns", "fuse-overlayfs"];
   if (/(debian|ubuntu)/.test(family)) {
     return [
       ["apt-get", "update"],
@@ -111,10 +111,37 @@ function podmanInstallCommands(osRelease: string): string[][] {
     ];
   }
   if (/(fedora|rhel|centos|rocky|almalinux)/.test(family)) {
-    return [["dnf", "install", "-y", "podman", "shadow-utils", "slirp4netns", "fuse-overlayfs"]];
+    return [
+      [
+        "dnf",
+        "install",
+        "-y",
+        "podman",
+        "shadow-utils",
+        "catatonit",
+        "slirp4netns",
+        "fuse-overlayfs",
+      ],
+    ];
   }
   throw new Error(
     "automatic Podman installation supports Debian/Ubuntu and Fedora/RHEL; install rootless Podman with your package manager",
+  );
+}
+
+function podmanInitHelperInstallCommands(osRelease: string): string[][] {
+  const family = linuxDistributionFamily(osRelease);
+  if (/(debian|ubuntu)/.test(family)) {
+    return [
+      ["apt-get", "update"],
+      ["apt-get", "install", "-y", "catatonit"],
+    ];
+  }
+  if (/(fedora|rhel|centos|rocky|almalinux)/.test(family)) {
+    return [["dnf", "install", "-y", "catatonit"]];
+  }
+  throw new Error(
+    "automatic Podman installation supports Debian/Ubuntu and Fedora/RHEL; install catatonit with your package manager",
   );
 }
 
@@ -132,6 +159,18 @@ function podmanNetworkHelperInstallCommands(osRelease: string): string[][] {
   throw new Error(
     "automatic Podman installation supports Debian/Ubuntu and Fedora/RHEL; install passt with your package manager",
   );
+}
+
+async function podmanInitHelperAvailable(runCommand: typeof command): Promise<boolean> {
+  for (const executable of [
+    "catatonit",
+    "/usr/libexec/podman/catatonit",
+    "/usr/lib/podman/catatonit",
+  ]) {
+    const result = await runCommand([executable, "--version"]);
+    if (result.exitCode === 0 && !result.timedOut) return true;
+  }
+  return false;
 }
 
 function commandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
@@ -206,6 +245,10 @@ export async function preparePodman(operations: PodmanSetupOperations = {}): Pro
     await installPackages(podmanInstallCommands(source));
     installed = await runCommand(["podman", "--version"]);
   }
+  if (!(await podmanInitHelperAvailable(runCommand))) {
+    source ??= operations.osRelease ?? (await readFile("/etc/os-release", "utf8"));
+    await installPackages(podmanInitHelperInstallCommands(source));
+  }
   if (podmanRequiresPasta(installed.stdout)) {
     const pasta = await runCommand(["pasta", "--version"]);
     if (pasta.exitCode !== 0 || pasta.timedOut) {
@@ -239,13 +282,19 @@ async function setupAppleContainer(): Promise<void> {
 async function setupPodman(): Promise<void> {
   const installed = await command(["podman", "--version"]);
   const needsPodman = installed.exitCode !== 0;
+  const needsInitHelper = !needsPodman && !(await podmanInitHelperAvailable(command));
   const needsPasta =
     !needsPodman &&
     podmanRequiresPasta(installed.stdout) &&
     (await command(["pasta", "--version"])).exitCode !== 0;
-  if (needsPodman || needsPasta) {
+  if (needsPodman || needsInitHelper || needsPasta) {
+    const requirement = needsPodman
+      ? "rootless Podman"
+      : needsInitHelper
+        ? "Podman's container init helper"
+        : "Podman's rootless networking helper";
     const install = await confirm({
-      message: `${needsPodman ? "Install rootless Podman" : "Install Podman's rootless networking helper"} for container jobs? (requires administrator privileges)`,
+      message: `Install ${requirement} for container jobs? (requires administrator privileges)`,
       initialValue: true,
     });
     if (isCancel(install) || !install) return;
