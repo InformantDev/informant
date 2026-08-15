@@ -138,6 +138,7 @@ interface ActiveAutomaticRun {
   repository: string;
   lane: string;
   sha: string;
+  updatedAt?: number;
   controller: AbortController;
 }
 
@@ -218,23 +219,49 @@ export class AutomaticRunRegistry {
       if (previous && !automaticLaneUpdateIsNewer(previous.update, update)) continue;
       const active = this.active.get(key);
       const nextSha = update.closed ? null : (update.sha ?? null);
-      if (active && active.sha !== nextSha && !update.obsoleteShas?.includes(active.sha)) {
+      const activeUpdatedAt =
+        previous && active && previous.sha === active.sha
+          ? previous.update.updatedAt
+          : active?.updatedAt;
+      const orderedAfterActive =
+        active !== undefined &&
+        active.sha !== nextSha &&
+        activeUpdatedAt !== undefined &&
+        update.updatedAt !== undefined &&
+        update.updatedAt > activeUpdatedAt;
+      if (
+        active &&
+        active.sha !== nextSha &&
+        !update.obsoleteShas?.includes(active.sha) &&
+        !orderedAfterActive
+      ) {
         continue;
       }
-      accepted.push(update);
       const obsoleteShas = new Set(update.obsoleteShas ?? []);
+      if (active && active.sha !== nextSha && orderedAfterActive) obsoleteShas.add(active.sha);
       if (previous?.sha === nextSha && Boolean(previous.update.closed) === Boolean(update.closed)) {
         for (const sha of previous.obsoleteShas) obsoleteShas.add(sha);
       }
+      const acceptedUpdate =
+        obsoleteShas.size > 0 ? { ...update, obsoleteShas: [...obsoleteShas] } : update;
+      accepted.push(acceptedUpdate);
       this.expected.delete(key);
       this.expected.set(key, {
-        update: { ...update, obsoleteShas: [...obsoleteShas] },
+        update: acceptedUpdate,
         sha: nextSha,
         obsoleteShas,
         generation: ++this.generation,
       });
       while (this.expected.size > MAX_TRACKED_AUTOMATIC_LANES) {
         this.expected.delete(this.expected.keys().next().value ?? "");
+      }
+      if (
+        active &&
+        active.sha === nextSha &&
+        update.updatedAt !== undefined &&
+        (active.updatedAt === undefined || update.updatedAt > active.updatedAt)
+      ) {
+        active.updatedAt = update.updatedAt;
       }
       if (active && (update.closed || active.sha !== update.sha)) {
         this.active.delete(key);
@@ -296,10 +323,15 @@ export class AutomaticRunRegistry {
     observedGeneration = this.generation,
   ): boolean {
     if (!this.prepare(repository, lane, sha, observedGeneration)) return false;
-    this.active.set(this.key(repository, lane), {
+    const key = this.key(repository, lane);
+    const expected = this.expected.get(key);
+    this.active.set(key, {
       repository: repository.fullName.toLowerCase(),
       lane,
       sha,
+      ...(expected?.sha === sha && expected.update.updatedAt !== undefined
+        ? { updatedAt: expected.update.updatedAt }
+        : {}),
       controller,
     });
     return true;

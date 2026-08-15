@@ -100,6 +100,50 @@ test("delayed lane updates cannot abort a newer active run", () => {
   expect(controller.signal.aborted).toBe(false);
 });
 
+test("a newer ordered update supersedes an active head across a missed transition", () => {
+  const runs = new AutomaticRunRegistry();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const shaC = "c".repeat(40);
+  runs.apply(repository, [{ lane: "branch:main", sha: shaA, updatedAt: 100, revision: "head-a" }]);
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", shaA, controller)).toBe(true);
+  // The active run keeps its ordering watermark even when unrelated lanes evict its expected entry.
+  for (let index = 0; index < 1_024; index++) {
+    runs.apply(repository, [
+      {
+        lane: `branch:other-${index}`,
+        sha: "d".repeat(40),
+        updatedAt: 200,
+        revision: `other-${index}`,
+      },
+    ]);
+  }
+
+  const current = {
+    lane: "branch:main",
+    sha: shaC,
+    obsoleteShas: [shaB],
+    updatedAt: 300,
+    revision: "b-to-c",
+  };
+  expect(runs.apply(repository, [current])).toEqual([{ ...current, obsoleteShas: [shaB, shaA] }]);
+  expect(controller.signal.aborted).toBe(true);
+  expect(runs.prepare(repository, "branch:main", shaA)).toBe(false);
+
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: shaB,
+        obsoleteShas: [shaA],
+        updatedAt: 200,
+        revision: "delayed-a-to-b",
+      },
+    ]),
+  ).toEqual([]);
+});
+
 test("non-lineal updates cannot regress an expected head without ordering metadata", () => {
   const runs = new AutomaticRunRegistry();
   const currentSha = "b".repeat(40);
