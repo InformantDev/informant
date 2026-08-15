@@ -129,9 +129,9 @@ test("a newer ordered update supersedes an active head across a missed transitio
     updatedAt: 300,
     revision: "b-to-c",
   };
+  const staleScanGeneration = runs.snapshotGeneration();
   expect(runs.apply(repository, [current])).toEqual([{ ...current, obsoleteShas: [shaB, shaA] }]);
   expect(controller.signal.aborted).toBe(true);
-  expect(runs.prepare(repository, "branch:main", shaA)).toBe(false);
 
   expect(
     runs.apply(repository, [
@@ -144,6 +144,8 @@ test("a newer ordered update supersedes an active head across a missed transitio
       },
     ]),
   ).toEqual([]);
+  expect(runs.prepare(repository, "branch:main", shaA, staleScanGeneration)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", shaA)).toBe(true);
 });
 
 test("non-lineal updates cannot regress an expected head without ordering metadata", () => {
@@ -172,6 +174,7 @@ test("same-head updates preserve all known obsolete predecessors", () => {
       revision: "b-to-c",
     },
   ]);
+  const staleScanGeneration = runs.snapshotGeneration();
   runs.apply(repository, [
     {
       lane: "branch:main",
@@ -182,7 +185,8 @@ test("same-head updates preserve all known obsolete predecessors", () => {
     },
   ]);
 
-  expect(runs.prepare(repository, "branch:main", shaB)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", shaB, staleScanGeneration)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", shaB)).toBe(true);
   expect(runs.prepare(repository, "branch:main", shaC)).toBe(true);
 });
 
@@ -205,10 +209,12 @@ test("network lane updates cancel obsolete automatic runs before the next scan",
   const newSha = "b".repeat(40);
 
   expect(runs.activate(repository, "branch:main", oldSha, oldController)).toBe(true);
+  const staleScanGeneration = runs.snapshotGeneration();
   runs.apply(repository, [{ lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] }]);
 
   expect(oldController.signal.aborted).toBe(true);
-  expect(runs.prepare(repository, "branch:main", oldSha)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", oldSha, staleScanGeneration)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", oldSha)).toBe(true);
   expect(runs.prepare(repository, "branch:main", newSha)).toBe(true);
 
   runs.apply(repository, [{ lane: "branch:main", sha: oldSha, obsoleteShas: ["c".repeat(40)] }]);

@@ -306,7 +306,6 @@ export class AutomaticRunRegistry {
     const key = this.key(repository, lane);
     const expected = this.expected.get(key);
     if (expected) {
-      if (expected.sha !== null && expected.obsoleteShas.has(sha)) return false;
       if (expected.generation > observedGeneration) return expected.sha === sha;
       if (expected.sha !== sha) {
         // A live branch or open pull request returned by GitHub is authoritative. Retiring
