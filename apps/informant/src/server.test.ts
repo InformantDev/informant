@@ -119,6 +119,8 @@ test("a newer ordered update supersedes an active head across a missed transitio
       },
     ]);
   }
+  // A legacy same-head update must not mask the timestamp retained by the active run.
+  runs.apply(repository, [{ lane: "branch:main", sha: shaA, revision: "head-a-redelivery" }]);
 
   const current = {
     lane: "branch:main",

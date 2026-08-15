@@ -216,13 +216,20 @@ export class AutomaticRunRegistry {
       const key = this.key(repository, update.lane);
       if (this.retired.has(`${key}\0${automaticLaneUpdateSemanticIdentity(update)}`)) continue;
       const previous = this.expected.get(key);
-      if (previous && !automaticLaneUpdateIsNewer(previous.update, update)) continue;
       const active = this.active.get(key);
+      const orderingPrevious =
+        previous &&
+        active &&
+        previous.sha === active.sha &&
+        previous.update.updatedAt === undefined &&
+        active.updatedAt !== undefined
+          ? { ...previous.update, updatedAt: active.updatedAt }
+          : previous?.update;
+      if (orderingPrevious && !automaticLaneUpdateIsNewer(orderingPrevious, update)) continue;
       const nextSha = update.closed ? null : (update.sha ?? null);
-      const activeUpdatedAt =
-        previous && active && previous.sha === active.sha
-          ? previous.update.updatedAt
-          : active?.updatedAt;
+      const expectedActiveUpdatedAt =
+        previous && active && previous.sha === active.sha ? previous.update.updatedAt : undefined;
+      const activeUpdatedAt = expectedActiveUpdatedAt ?? active?.updatedAt;
       const orderedAfterActive =
         active !== undefined &&
         active.sha !== nextSha &&
