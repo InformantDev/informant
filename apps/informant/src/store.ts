@@ -132,6 +132,29 @@ export async function recordWorkerVersion(version: string): Promise<void> {
   }
 }
 
+export async function runningWorkerPids(): Promise<number[]> {
+  const directory = workerStateDirectory();
+  const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+  const pids = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map(async (entry) => {
+        const path = join(directory, entry.name);
+        try {
+          const value = (await Bun.file(path).json()) as { owner?: unknown };
+          if (!processOwnerIsLive(value.owner)) {
+            await rm(path, { force: true });
+            return undefined;
+          }
+          return (value.owner as { pid: number }).pid;
+        } catch {
+          return undefined;
+        }
+      }),
+  );
+  return [...new Set(pids.filter((pid): pid is number => pid !== undefined))];
+}
+
 export async function runningWorkerVersion(): Promise<string | undefined> {
   const directory = workerStateDirectory();
   const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);

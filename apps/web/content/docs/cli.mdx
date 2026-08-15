@@ -120,11 +120,16 @@ affect unrelated images or interrupted Buildah work owned by the same user.
 
 `informant doctor` names the selected backend and verifies Apple Container readiness on macOS or
 rootless Podman health on Linux. Its Linux check exercises both a constrained container run and the
-prepared-image build path used by jobs. Missing `pasta` networking support or unhealthy/rootful
-Podman prevents the worker from advertising `container`; any of those failures or a failed smoke build
-also makes the doctor command fail. `informant setup` can install Podman and its networking helper from
-Debian/Ubuntu or Fedora/RHEL packages, then smoke tests `docker.io/oven/bun:1`. It never uses
-curl-to-shell or starts a systemd service.
+prepared-image build path used by jobs. It also identifies active standard or custom worker systemd
+units with `ProtectKernelTunables=yes`, which prevents nested rootless containers from using
+`/proc/sys`, and prints the exact systemd override command. Missing required networking support, unhealthy/rootful
+Podman, an incompatible worker sandbox, or a failed smoke build makes the command fail.
+
+`informant setup` can install Podman and Podman 5's `pasta` networking helper from Debian/Ubuntu or
+Fedora/RHEL packages, rejects a known incompatible active worker sandbox, then smoke tests
+`docker.io/oven/bun:1`. The worker repeats an uncached prepared-image execution probe inside its actual
+service context before advertising `container` and rechecks after infrastructure failures. It never
+uses curl-to-shell or starts a Podman systemd service.
 
 The worker runs housekeeping at startup and whenever all builds become idle. It keeps at least the
 100 newest build records, removes additional records after 30 days, globally expires old keyed-cache

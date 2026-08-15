@@ -213,20 +213,22 @@ test("installs Debian rootless Podman packages and smoke tests a qualified image
     "--init",
     "--ulimit",
     "nofile=65536:65536",
+    "--name",
+    expect.stringMatching(/^informant-podman-smoke-/),
     "--workdir",
     "/workspace",
     "--user",
     "0:0",
+    "--entrypoint",
+    "/bin/sh",
+    "--volume",
+    expect.stringContaining(":/workspace:Z"),
     "--cpus",
     "1",
     "--memory",
     "256M",
     "--security-opt",
     "no-new-privileges",
-    "--volume",
-    expect.stringContaining(":/workspace:Z"),
-    "--entrypoint",
-    "/bin/sh",
     "docker.io/oven/bun:1",
     "-lc",
     "bun --version && touch /workspace/informant-smoke-test",
@@ -363,6 +365,25 @@ test("reports a failed prepared-image build smoke test", async () => {
       },
     }),
   ).rejects.toThrow("rootless Podman could not build a prepared job image: could not find pasta");
+});
+
+test("explains systemd hardening when a Podman build sees read-only kernel tunables", async () => {
+  await expect(
+    preparePodman({
+      command: async (args) => {
+        if (args[1] === "info") return success(rootlessPodmanInfo);
+        if (args[1] === "build") {
+          return {
+            ...success(),
+            exitCode: 125,
+            stderr: "open `/proc/sys/net/ipv4/ping_group_range`: Read-only file system",
+          };
+        }
+        await completePodmanSmoke(args);
+        return success();
+      },
+    }),
+  ).rejects.toThrow("set ProtectKernelTunables=no on the reported service unit");
 });
 
 test("bounds the Podman smoke test and reports a timeout", async () => {

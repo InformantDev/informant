@@ -39,8 +39,14 @@ import {
   type TailscaleConfig,
 } from "./machine-config.ts";
 import { command, requireCommand } from "./process.ts";
-import { setup, verifyPodman } from "./setup.ts";
-import { disableStartup, enableStartup, restartStartupWorker } from "./startup.ts";
+import { setup } from "./setup.ts";
+import {
+  disableStartup,
+  enableStartup,
+  restartStartupWorker,
+  systemdPodmanSandboxConflict,
+  systemdPodmanSandboxMessage,
+} from "./startup.ts";
 import {
   assessDiskSpace,
   collectStorageReport,
@@ -1140,17 +1146,20 @@ async function doctor(): Promise<void> {
     failed = true;
   }
   const selectedContainer = selectContainerBackend();
-  let containerReady = await initializeContainerBackend(selectedContainer);
-  let containerError = containerBackendReadiness()?.error;
-  if (containerReady && selectedContainer?.kind === "podman") {
-    try {
-      await verifyPodman();
-    } catch (error) {
-      containerReady = false;
-      containerError = error instanceof Error ? error : new Error(String(error));
-    }
+  const sandboxConflict = await systemdPodmanSandboxConflict();
+  if (sandboxConflict) {
+    console.log(`✗ systemd worker sandbox — ${systemdPodmanSandboxMessage(sandboxConflict)}`);
+    failed = true;
   }
+  const containerReady = await initializeContainerBackend(
+    selectedContainer,
+    command,
+    Date.now(),
+    undefined,
+    true,
+  );
   const containerStatus = containerBackendReadiness();
+  const containerError = containerStatus?.error;
   const containerRequired = selectedContainer?.kind === "podman";
   if (containerRequired && !containerReady) failed = true;
   const tart = await command(["tart", "--version"]);

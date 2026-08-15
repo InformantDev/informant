@@ -248,7 +248,52 @@ test("re-probes stale success and allows stale failure to recover", async () => 
   );
 });
 
-test("accepts healthy rootless Podman and caches readiness", async () => {
+test("keeps execution smoke failures unhealthy until a later execution probe passes", async () => {
+  let executionFails = true;
+  const backend = {
+    ...podmanContainerBackend,
+    initialize: async () => undefined,
+    verifyExecution: async () => {
+      if (executionFails) throw new Error("prepared image smoke failed");
+    },
+  };
+
+  expect(
+    await initializeContainerBackend(backend, async () => result(), 1_000, undefined, true),
+  ).toBe(false);
+  expect(containerBackendReadiness()?.error?.message).toBe("prepared image smoke failed");
+  expect(await initializeContainerBackend(backend, async () => result(), 2_000)).toBe(false);
+  expect(containerBackendReadiness()?.ready).toBe(false);
+
+  executionFails = false;
+  expect(
+    await initializeContainerBackend(backend, async () => result(), 3_000, undefined, true),
+  ).toBe(true);
+  expect(containerBackendReadiness()?.ready).toBe(true);
+});
+
+test("a basic runtime outage invalidates prior execution qualification", async () => {
+  let basicFails = false;
+  const backend = {
+    ...podmanContainerBackend,
+    initialize: async () => {
+      if (basicFails) throw new Error("runtime unavailable");
+    },
+    verifyExecution: async () => undefined,
+  };
+
+  expect(
+    await initializeContainerBackend(backend, async () => result(), 1_000, undefined, true),
+  ).toBe(true);
+  expect(containerBackendReadiness()?.ready).toBe(true);
+  basicFails = true;
+  expect(await initializeContainerBackend(backend, async () => result(), 2_000)).toBe(false);
+  basicFails = false;
+  expect(await initializeContainerBackend(backend, async () => result(), 3_000)).toBe(true);
+  expect(containerBackendReadiness()?.ready).toBe(false);
+});
+
+test("accepts healthy rootless Podman basic readiness without qualifying execution", async () => {
   const commands: string[][] = [];
   expect(
     await initializeContainerBackend(podmanContainerBackend, async (argv) => {
@@ -266,7 +311,7 @@ test("accepts healthy rootless Podman and caches readiness", async () => {
   ]);
   expect(containerBackendReadiness()).toMatchObject({
     backend: podmanContainerBackend,
-    ready: true,
+    ready: false,
   });
 });
 
@@ -393,7 +438,7 @@ test("keeps a shared readiness probe healthy when its initiating caller cancels"
   expect(signals[0]?.aborted).toBe(false);
   expect(containerBackendReadiness()).toMatchObject({
     backend: podmanContainerBackend,
-    ready: true,
+    ready: false,
   });
 });
 

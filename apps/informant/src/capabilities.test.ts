@@ -96,16 +96,15 @@ test("requires container readiness for container jobs regardless of explicit lab
   ).toEqual(["linux-container"]);
 });
 
-test("advertises container only after the selected backend is healthy", async () => {
+test("advertises container only after execution readiness is verified", async () => {
   expect(workerCapabilities({ INFORMANT_CAPABILITIES: "container" })).not.toContain("container");
-  await initializeContainerBackend(podmanContainerBackend, async (argv) => ({
-    exitCode: 0,
-    stdout:
-      argv[1] === "info"
-        ? JSON.stringify({ host: { security: { rootless: true }, cgroupVersion: "v2" } })
-        : "",
-    stderr: "",
-    timedOut: false,
-  }));
+  const backend = {
+    ...podmanContainerBackend,
+    initialize: async () => undefined,
+    verifyExecution: async () => undefined,
+  };
+  await initializeContainerBackend(backend);
+  expect(workerCapabilities({})).not.toContain("container");
+  await initializeContainerBackend(backend, undefined, Date.now(), undefined, true);
   expect(workerCapabilities({})).toContain("container");
 });

@@ -7,6 +7,9 @@ import {
   renderStartupService,
   restartStartupWorker,
   startupEnvironment,
+  systemdPodmanSandboxConflict,
+  systemdPodmanSandboxMessage,
+  systemdWorkerUnitsFromCgroup,
   updateInformant,
 } from "./startup.ts";
 
@@ -47,6 +50,105 @@ describe("startup service", () => {
     expect(linuxStartupServicePath("/home/worker")).toBe(
       "/home/worker/.config/systemd/user/informant.service",
     );
+  });
+
+  test("detects an active system service that makes Podman kernel tunables read-only", async () => {
+    const conflict = await systemdPodmanSandboxConflict({
+      platform: "linux",
+      uid: 1000,
+      workerCgroups: [],
+      command: async (argv) =>
+        argv[1] === "--system" && argv[3] === "informant.service"
+          ? result(
+              0,
+              "",
+              "LoadState=loaded\nActiveState=active\nMainPID=42\nProtectKernelTunables=yes\nFragmentPath=/etc/systemd/system/informant.service\n",
+            )
+          : result(1),
+    });
+    expect(conflict).toEqual({
+      scope: "system",
+      unit: "informant.service",
+      fragmentPath: "/etc/systemd/system/informant.service",
+    });
+    if (!conflict) throw new Error("expected a systemd sandbox conflict");
+    expect(systemdPodmanSandboxMessage(conflict)).toContain(
+      "sudo systemctl edit informant.service",
+    );
+  });
+
+  test("detects inherited hardening only for a live systemd user worker", async () => {
+    const inspected: string[] = [];
+    const conflict = await systemdPodmanSandboxConflict({
+      platform: "linux",
+      uid: 1000,
+      workerCgroups: [],
+      command: async (argv) => {
+        inspected.push(`${argv[1]}:${argv[3]}`);
+        if (argv[1] === "--system" && argv[3] === "informant.service") return result(1);
+        if (argv[1] === "--user") {
+          return result(
+            0,
+            "",
+            "LoadState=loaded\nActiveState=active\nMainPID=52\nProtectKernelTunables=no\n",
+          );
+        }
+        return result(
+          0,
+          "",
+          "LoadState=loaded\nActiveState=active\nMainPID=62\nProtectKernelTunables=yes\nFragmentPath=/usr/lib/systemd/system/user@.service\n",
+        );
+      },
+    });
+    expect(conflict).toEqual({
+      scope: "user-manager",
+      unit: "user@1000.service",
+      fragmentPath: "/usr/lib/systemd/system/user@.service",
+    });
+    expect(inspected).toContain("--system:user@1000.service");
+    if (!conflict) throw new Error("expected a user-manager sandbox conflict");
+    expect(systemdPodmanSandboxMessage(conflict)).toContain("restart the user manager");
+  });
+
+  test("discovers a custom systemd worker unit from its live cgroup", async () => {
+    const cgroup = "0::/system.slice/custom-informant-worker.service\n";
+    expect(systemdWorkerUnitsFromCgroup(cgroup)).toEqual([
+      { scope: "system", unit: "custom-informant-worker.service" },
+    ]);
+    const conflict = await systemdPodmanSandboxConflict({
+      platform: "linux",
+      workerCgroups: [cgroup],
+      command: async (argv) =>
+        argv[3] === "custom-informant-worker.service"
+          ? result(
+              0,
+              "",
+              "LoadState=loaded\nActiveState=active\nMainPID=72\nProtectKernelTunables=yes\nFragmentPath=/etc/systemd/system/custom-informant-worker.service\n",
+            )
+          : result(1),
+    });
+    expect(conflict).toEqual({
+      scope: "system",
+      unit: "custom-informant-worker.service",
+      fragmentPath: "/etc/systemd/system/custom-informant-worker.service",
+    });
+  });
+
+  test("ignores inactive or unavailable systemd units", async () => {
+    expect(
+      await systemdPodmanSandboxConflict({
+        platform: "linux",
+        workerCgroups: [],
+        command: async (argv) =>
+          argv[1] === "--system"
+            ? result(
+                0,
+                "",
+                "LoadState=loaded\nActiveState=inactive\nMainPID=0\nProtectKernelTunables=yes\n",
+              )
+            : result(1),
+      }),
+    ).toBeUndefined();
   });
 
   test("uses the default Linux configuration location for invalid XDG paths", () => {

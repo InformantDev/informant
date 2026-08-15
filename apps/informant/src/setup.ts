@@ -4,7 +4,12 @@ import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { confirm, intro, isCancel, outro, select, spinner, text } from "@clack/prompts";
 import { appleContainerInstalled, ensureAppleContainerSystem } from "./container.ts";
-import { podmanContainerBackend, podmanRequiresPasta } from "./container-backend.ts";
+import {
+  containerBackendReadiness,
+  initializeContainerBackend,
+  podmanContainerBackend,
+  podmanRequiresPasta,
+} from "./container-backend.ts";
 import {
   automaticUpdatesPreference,
   getTailscaleConfig,
@@ -16,6 +21,7 @@ import {
   saveTailscaleConfig,
 } from "./machine-config.ts";
 import { command } from "./process.ts";
+import { systemdPodmanSandboxConflict, systemdPodmanSandboxMessage } from "./startup.ts";
 import {
   configureGitHubAppWebhook,
   DEFAULT_FUNNEL_PORT,
@@ -190,81 +196,6 @@ export async function prepareAppleContainer(
     throw commandError("Apple Container could not run the Informant default image", smokeTest);
 }
 
-export async function verifyPodman(runCommand: typeof command = command): Promise<void> {
-  const workspace = await mkdtemp(join(tmpdir(), "informant-podman-smoke-"));
-  const marker = join(workspace, "informant-smoke-test");
-  const image = `informant-podman-smoke:${randomBytes(8).toString("hex")}`;
-  try {
-    const runSmoke = await runCommand(
-      [
-        "podman",
-        "run",
-        "--rm",
-        "--init",
-        "--ulimit",
-        "nofile=65536:65536",
-        "--workdir",
-        "/workspace",
-        "--user",
-        "0:0",
-        "--cpus",
-        "1",
-        "--memory",
-        "256M",
-        "--security-opt",
-        "no-new-privileges",
-        "--volume",
-        `${workspace}:/workspace:Z`,
-        "--entrypoint",
-        "/bin/sh",
-        "docker.io/oven/bun:1",
-        "-lc",
-        "bun --version && touch /workspace/informant-smoke-test",
-      ],
-      { timeoutMs: 120_000 },
-    );
-    if (runSmoke.exitCode !== 0 || runSmoke.timedOut)
-      throw commandError("rootless Podman could not run the Informant default image", runSmoke);
-    if (!(await Bun.file(marker).exists())) {
-      throw new Error("rootless Podman could not write to a bind-mounted workspace");
-    }
-
-    await writeFile(
-      join(workspace, "Dockerfile"),
-      "FROM docker.io/oven/bun:1\nRUN bun --version\n",
-    );
-    const buildSmoke = await runCommand(
-      [
-        "podman",
-        "build",
-        "--file",
-        "Dockerfile",
-        "--tag",
-        image,
-        "--progress",
-        "plain",
-        "--force-rm",
-        "--cpu-period",
-        "100000",
-        "--cpu-quota",
-        "100000",
-        "--memory",
-        "256M",
-        ".",
-      ],
-      { cwd: workspace, timeoutMs: 120_000 },
-    );
-    if (buildSmoke.exitCode !== 0 || buildSmoke.timedOut) {
-      throw commandError("rootless Podman could not build a prepared job image", buildSmoke);
-    }
-  } finally {
-    await runCommand(["podman", "image", "rm", "--force", image], { timeoutMs: 30_000 }).catch(
-      () => undefined,
-    );
-    await rm(workspace, { recursive: true, force: true });
-  }
-}
-
 export async function preparePodman(operations: PodmanSetupOperations = {}): Promise<void> {
   const runCommand = operations.command ?? command;
   let installed = await runCommand(["podman", "--version"]);
@@ -282,8 +213,14 @@ export async function preparePodman(operations: PodmanSetupOperations = {}): Pro
       await installPackages(podmanNetworkHelperInstallCommands(source));
     }
   }
-  await podmanContainerBackend.initialize(runCommand);
-  await verifyPodman(runCommand);
+  const ready = await initializeContainerBackend(
+    podmanContainerBackend,
+    runCommand,
+    Date.now(),
+    undefined,
+    true,
+  );
+  if (!ready) throw containerBackendReadiness()?.error ?? new Error("rootless Podman is not ready");
 }
 
 async function setupAppleContainer(): Promise<void> {
@@ -313,6 +250,8 @@ async function setupPodman(): Promise<void> {
     });
     if (isCancel(install) || !install) return;
   }
+  const sandboxConflict = await systemdPodmanSandboxConflict();
+  if (sandboxConflict) throw new Error(systemdPodmanSandboxMessage(sandboxConflict));
   console.log("Preparing rootless Podman…");
   await preparePodman();
   console.log("Rootless Podman is ready.");

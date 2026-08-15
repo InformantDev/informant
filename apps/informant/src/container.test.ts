@@ -18,6 +18,7 @@ import {
 } from "./container.ts";
 import {
   appleContainerBackend,
+  containerBackendReadiness,
   initializeContainerBackend,
   podmanContainerBackend,
   resetContainerBackendReadiness,
@@ -226,6 +227,53 @@ test("executes and force-removes jobs with rootless Podman", async () => {
   expect(run).toContain("--cpus");
   expect(run).toContain("--memory");
   expect(invocations.at(-1)?.slice(0, 3)).toEqual(["podman", "rm", "--force"]);
+});
+
+test("a failed Podman job rechecks and revokes runtime readiness", async () => {
+  let probes = 0;
+  const backend = {
+    ...podmanContainerBackend,
+    initialize: async () => undefined,
+    verifyExecution: async () => {
+      probes++;
+      throw new Error("runtime smoke failed");
+    },
+  };
+  const result = await runInContainer(
+    { owner: "owner", repo: "repo", fullName: "owner/repo" },
+    "sha",
+    "main",
+    "trusted",
+    false,
+    process.cwd(),
+    {
+      name: "podman-failure",
+      command: "false",
+      optional: false,
+      timeoutMinutes: 1,
+      environment: {},
+      secrets: [],
+      needs: [],
+      runtime: { type: "container", image: "docker.io/oven/bun:1" },
+    },
+    async () => {},
+    async () => {},
+    {},
+    undefined,
+    {
+      backend,
+      command: async (args) => ({
+        exitCode: args[1] === "run" ? 1 : 0,
+        stdout: "",
+        stderr: args[1] === "run" ? "error running container: crun failed" : "",
+        timedOut: false,
+      }),
+      dataPath: temporaryContainerDataPath(),
+    },
+  );
+  expect(result.success).toBe(false);
+  expect(probes).toBe(1);
+  expect(containerBackendReadiness()?.ready).toBe(false);
 });
 
 test("prepares and reuses a deterministic container image", async () => {
@@ -859,6 +907,41 @@ test("migrates older prepared-image history into one Apple builder reset", async
     }),
   ).toBe(true);
   expect(invocations.at(-1)).toEqual(["container", "builder", "delete"]);
+});
+
+test("a failed prepared-image build rechecks and revokes Podman execution readiness", async () => {
+  const dataPath = temporaryContainerDataPath();
+  let executionProbes = 0;
+  const backend = {
+    ...podmanContainerBackend,
+    initialize: async () => undefined,
+    verifyExecution: async () => {
+      executionProbes++;
+      throw new Error("runtime smoke failed");
+    },
+  };
+  await expect(
+    ensurePreparedContainer(
+      { type: "container", image: "base", prepare: "install tools" },
+      undefined,
+      () => {},
+      undefined,
+      {
+        dataPath,
+        backend,
+        withImageLock: passthroughImageLock,
+        command: async (args) => ({
+          exitCode: args[1] === "build" ? 2 : args[2] === "inspect" ? 1 : 0,
+          stdout: "",
+          stderr: args[1] === "build" ? "error running container: crun failed" : "",
+          timedOut: false,
+        }),
+      },
+    ),
+  ).rejects.toThrow("container image preparation failed: error running container: crun failed");
+  expect(executionProbes).toBe(1);
+  expect(containerBackendReadiness()).toMatchObject({ ready: false });
+  expect(containerBackendReadiness()?.error?.message).toBe("runtime smoke failed");
 });
 
 test("prepares distinct Podman images concurrently", async () => {

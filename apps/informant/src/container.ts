@@ -22,6 +22,7 @@ import {
   type ContainerRunOptions,
   requireContainerBackend,
   selectContainerBackend,
+  verifyContainerBackendExecution,
 } from "./container-backend.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import { command } from "./process.ts";
@@ -54,6 +55,12 @@ const WRITABLE_MOUNT_OUTPUT_MARKER =
 function containerCommandError(action: string, result: Awaited<ReturnType<typeof command>>): Error {
   return new Error(
     `${action}: ${result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.exitCode}`}`,
+  );
+}
+
+function containerInfrastructureFailure(detail: string): boolean {
+  return /error running container|did not get container create message|\bpasta failed\b|\bnetavark\b|\bcrun\b.+(?:error|failed)|while running runtime|\/proc\/sys\/.+read-only file system|mount .+operation not permitted|cannot clone/i.test(
+    detail,
   );
 }
 
@@ -1003,10 +1010,18 @@ export async function ensurePreparedContainer(
           signal,
           onOutput: onMessage,
         });
-        if (preparation.exitCode !== 0 || preparation.timedOut)
+        if (preparation.exitCode !== 0 || preparation.timedOut) {
+          if (
+            !signal?.aborted &&
+            backend.verifyExecution &&
+            containerInfrastructureFailure(preparation.stderr)
+          ) {
+            await verifyContainerBackendExecution(backend, runCommand, signal);
+          }
           throw new Error(
             `container image preparation failed: ${preparation.stderr.trim() || `exit ${preparation.exitCode}`}`,
           );
+        }
         return prepared;
       },
       signal,
@@ -1200,14 +1215,34 @@ export async function runInContainer(
       } catch (error) {
         redactionError = error;
       }
-      if (commandError && redactionError)
+      const recheckRuntime = async (detail: string) => {
+        const currentBackend = backend;
+        if (
+          !signal?.aborted &&
+          currentBackend?.verifyExecution &&
+          containerInfrastructureFailure(detail)
+        ) {
+          await verifyContainerBackendExecution(currentBackend, runCommand, signal);
+        }
+      };
+      if (commandError && redactionError) {
+        await recheckRuntime(
+          commandError instanceof Error ? commandError.message : String(commandError),
+        );
         throw new AggregateError(
           [commandError, redactionError],
           "container command failed and mounted output could not be redacted",
         );
-      if (commandError) throw commandError;
+      }
+      if (commandError) {
+        await recheckRuntime(
+          commandError instanceof Error ? commandError.message : String(commandError),
+        );
+        throw commandError;
+      }
       if (redactionError) throw redactionError;
       if (!result) throw new Error("container command did not return a result");
+      if (result.exitCode !== 0 || result.timedOut) await recheckRuntime(result.stderr);
       return result;
     };
     const lock = operations.withImageLock ?? withImageLock;
