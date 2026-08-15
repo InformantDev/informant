@@ -1845,8 +1845,16 @@ describe("runCommit", () => {
     expect(context.receivedBranches).toEqual(["v2"]);
   });
 
-  test("a local manual run bypasses job filters", async () => {
+  test("a local manual run bypasses job filters and publishes its reservation", async () => {
     const context = harness();
+    let publishedJobs: string[] = [];
+    let releases = 0;
+    context.dependencies.publishExecutionReservation = async (published) => {
+      publishedJobs = published.jobs.map((job) => job.name);
+      return () => {
+        releases++;
+      };
+    };
     const filtered = {
       ...config,
       jobs: config.jobs.map((job) => ({
@@ -1862,6 +1870,8 @@ describe("runCommit", () => {
 
     expect(record.status).toBe("success");
     expect(record.event?.type).toBe("manual_run");
+    expect(publishedJobs).toEqual(["test"]);
+    expect(releases).toBe(1);
     expect(context.jobChecks).toEqual([]);
     expect(context.updates).toEqual([]);
   });

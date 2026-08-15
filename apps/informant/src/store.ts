@@ -100,7 +100,7 @@ export function currentProcessOwner(): BuildRecord["owner"] {
   return startedAt ? { pid: process.pid, startedAt } : undefined;
 }
 
-function processOwnerIsLive(owner: unknown): boolean {
+export function processOwnerIsLive(owner: unknown): boolean {
   if (!owner || typeof owner !== "object") return false;
   const value = owner as { pid?: unknown; startedAt?: unknown };
   if (!Number.isInteger(value.pid) || (value.pid as number) <= 0) return false;

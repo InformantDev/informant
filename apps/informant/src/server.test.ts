@@ -24,6 +24,104 @@ const pullRequest: PullRequest = {
   headSha: "comment-sha",
   sameRepository: true,
 };
+test("authoritative scans retire stale lane updates without blocking newer revisions", () => {
+  const retired: string[] = [];
+  const runs = new AutomaticRunRegistry((_repository, update) => {
+    if (update.revision) retired.push(update.revision);
+  });
+  const oldSha = "a".repeat(40);
+  const liveSha = "b".repeat(40);
+  const stale = { lane: "branch:main", sha: oldSha, revision: "stale-open" };
+
+  expect(runs.apply(repository, [stale])).toEqual([stale]);
+  expect(runs.prepare(repository, "branch:main", liveSha)).toBe(true);
+  expect(retired).toEqual(["stale-open"]);
+  const liveController = new AbortController();
+  expect(runs.activate(repository, "branch:main", liveSha, liveController)).toBe(true);
+  expect(runs.apply(repository, [stale])).toEqual([]);
+  expect(runs.apply(repository, [{ ...stale, revision: "same-stale-redelivery" }])).toEqual([]);
+  expect(liveController.signal.aborted).toBe(false);
+
+  const staleClosed = {
+    lane: "branch:main",
+    closed: true as const,
+    obsoleteShas: [liveSha],
+    updatedAt: 100,
+    revision: "stale-closed",
+  };
+  expect(runs.apply(repository, [staleClosed])).toEqual([staleClosed]);
+  expect(liveController.signal.aborted).toBe(true);
+  expect(runs.prepare(repository, "branch:main", liveSha)).toBe(true);
+  const reopenedController = new AbortController();
+  expect(runs.activate(repository, "branch:main", liveSha, reopenedController)).toBe(true);
+  expect(runs.apply(repository, [staleClosed])).toEqual([]);
+  expect(reopenedController.signal.aborted).toBe(false);
+
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      closed: true,
+      obsoleteShas: [liveSha],
+      updatedAt: 200,
+      revision: "new-close",
+    },
+  ]);
+  expect(reopenedController.signal.aborted).toBe(true);
+});
+
+test("delayed lane updates cannot abort a newer active run", () => {
+  const runs = new AutomaticRunRegistry();
+  const oldSha = "a".repeat(40);
+  const currentSha = "b".repeat(40);
+  runs.apply(repository, [
+    {
+      lane: "branch:main",
+      sha: currentSha,
+      obsoleteShas: [oldSha],
+      updatedAt: 300,
+      revision: "current",
+    },
+  ]);
+  const controller = new AbortController();
+  expect(runs.activate(repository, "branch:main", currentSha, controller)).toBe(true);
+
+  expect(
+    runs.apply(repository, [
+      {
+        lane: "branch:main",
+        sha: oldSha,
+        updatedAt: 200,
+        revision: "delayed",
+      },
+    ]),
+  ).toEqual([]);
+  expect(controller.signal.aborted).toBe(false);
+});
+
+test("non-lineal updates cannot regress an expected head without ordering metadata", () => {
+  const runs = new AutomaticRunRegistry();
+  const currentSha = "b".repeat(40);
+  runs.apply(repository, [{ lane: "branch:main", sha: currentSha, revision: "current" }]);
+  expect(
+    runs.apply(repository, [
+      { lane: "branch:main", sha: "a".repeat(40), revision: "unrelated-delayed" },
+    ]),
+  ).toEqual([]);
+  expect(runs.prepare(repository, "branch:main", currentSha)).toBe(true);
+});
+
+test("a webhook applied after a scan starts cannot be retired by that stale scan", () => {
+  const retired: string[] = [];
+  const runs = new AutomaticRunRegistry((_repository, update) => {
+    if (update.revision) retired.push(update.revision);
+  });
+  const observedGeneration = runs.snapshotGeneration();
+  runs.apply(repository, [{ lane: "pr:7", closed: true, revision: "fresh-close" }]);
+
+  expect(runs.prepare(repository, "pr:7", "b".repeat(40), observedGeneration)).toBe(false);
+  expect(retired).toEqual([]);
+});
+
 test("network lane updates cancel obsolete automatic runs before the next scan", () => {
   const runs = new AutomaticRunRegistry();
   const oldController = new AbortController();
@@ -42,7 +140,7 @@ test("network lane updates cancel obsolete automatic runs before the next scan",
 
   const currentController = new AbortController();
   expect(runs.activate(repository, "branch:main", newSha, currentController)).toBe(true);
-  runs.apply(repository, [{ lane: "branch:main" }]);
+  runs.apply(repository, [{ lane: "branch:main", closed: true, obsoleteShas: [newSha] }]);
   expect(currentController.signal.aborted).toBe(true);
 });
 

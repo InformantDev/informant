@@ -10,7 +10,9 @@ import {
   DispatchRetryQueue,
   disableTailscale,
   enableTailscale,
+  generatedNetworkClaimPlan,
   githubAppWebhookSettings,
+  localNetworkExecutionCapacity,
   MAX_WEBHOOK_BODY_BYTES,
   mergeAutomaticLaneUpdates,
   parseAutomaticLaneUpdates,
@@ -21,6 +23,7 @@ import {
   readWebhookBody,
   reconcileKnownWorkers,
   requireGitHubAppWebhookEvents,
+  retireAutomaticLaneUpdate,
   serveWithTailscale,
   startupRecoveryRequests,
   type TailscaleStatus,
@@ -488,24 +491,83 @@ test("validates bounded network claim scheduling plans", () => {
       ],
     }),
   ).toThrow("invalid claim scheduling");
+
+  const sixtyFour = Array.from({ length: 64 }, (_, index) => ({
+    id: `worker-${index}`,
+    capabilities: ["container"],
+    resources,
+  }));
+  const first = sixtyFour[0];
+  if (!first) throw new Error("expected a claimant");
+  const sixtyFive = [...sixtyFour, { ...first, id: "worker-64" }];
+  expect(generatedNetworkClaimPlan(sixtyFour, 7)).toEqual({ claimants: sixtyFour, rotation: 7 });
+  expect(generatedNetworkClaimPlan(sixtyFive, 8)).toBeUndefined();
+  expect(() => parseNetworkClaimPlan({ claimants: sixtyFive, rotation: 8 })).toThrow(
+    "invalid claim scheduling",
+  );
+});
+
+test("queries the running worker for the local resource snapshot", async () => {
+  const resources = {
+    capacity: { cpu: 8, memoryMb: 16_384 },
+    used: { cpu: 5, memoryMb: 6144 },
+    queued: { cpu: 2, memoryMb: 2048 },
+  };
+  const status: TailscaleStatus = {
+    executable: "/usr/bin/tailscale",
+    online: true,
+    self: {
+      id: "self",
+      hostName: "worker",
+      addresses: ["100.64.0.1"],
+      online: true,
+    },
+    peers: [],
+  };
+  let authorization: string | undefined;
+  const result = await localNetworkExecutionCapacity(
+    {
+      mode: "worker",
+      workerPort: 7639,
+      funnelPort: 7640,
+      networkSecret: "network-secret-that-is-at-least-32-characters",
+    },
+    status,
+    {
+      capacity: { cpu: 1, memoryMb: 1024 },
+      used: { cpu: 0, memoryMb: 0 },
+      queued: { cpu: 0, memoryMb: 0 },
+    },
+    async (_url, options) => {
+      authorization = new Headers(options?.headers).get("Authorization") ?? undefined;
+      return Response.json({ resources });
+    },
+  );
+  expect(result).toEqual(resources);
+  expect(authorization).toBe("Bearer network-secret-that-is-at-least-32-characters");
 });
 
 test("extracts and validates bounded automatic lane updates", () => {
   const oldSha = "a".repeat(40);
   const newSha = "b".repeat(40);
   expect(
-    webhookAutomaticLaneUpdates("push", {
-      ref: "refs/heads/feature/fast",
-      before: oldSha,
-      after: newSha,
-      repository: { pushed_at: 200 },
-    }),
+    webhookAutomaticLaneUpdates(
+      "push",
+      {
+        ref: "refs/heads/feature/fast",
+        before: oldSha,
+        after: newSha,
+        repository: { pushed_at: 200 },
+      },
+      "delivery-1",
+    ),
   ).toEqual([
     {
       lane: "branch:feature/fast",
       sha: newSha,
       obsoleteShas: [oldSha],
       updatedAt: 200_000,
+      revision: "delivery-1",
     },
   ]);
   expect(
@@ -532,6 +594,17 @@ test("extracts and validates bounded automatic lane updates", () => {
   expect(parseAutomaticLaneUpdates([{ lane: "branch:main", sha: newSha }])).toEqual([
     { lane: "branch:main", sha: newSha },
   ]);
+  const retired = { lane: "branch:main", sha: oldSha, revision: "delivery-old" };
+  const newer = { lane: "branch:main", sha: newSha, revision: "delivery-new" };
+  const other = { lane: "branch:release", sha: newSha, revision: "delivery-release" };
+  expect(retireAutomaticLaneUpdate([newer, other], retired)).toEqual([newer, other]);
+  expect(retireAutomaticLaneUpdate([retired, other], retired)).toEqual([other]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [{ ...newer, updatedAt: 300 }],
+      [{ lane: "branch:main", closed: true, obsoleteShas: [oldSha], updatedAt: 300 }],
+    ),
+  ).toEqual([{ ...newer, obsoleteShas: [oldSha], updatedAt: 300 }]);
   expect(() => parseAutomaticLaneUpdates([{ lane: "branch:main", sha: "short" }])).toThrow(
     "invalid automatic lane updates",
   );
@@ -556,7 +629,7 @@ test("extracts and validates bounded automatic lane updates", () => {
     {
       lane: "branch:main",
       sha: newSha,
-      obsoleteShas: [oldSha, "c".repeat(40)],
+      obsoleteShas: ["c".repeat(40), oldSha],
     },
   ]);
   expect(
@@ -582,10 +655,22 @@ test("extracts and validates bounded automatic lane updates", () => {
     {
       lane: "branch:main",
       sha: newSha,
-      obsoleteShas: [oldSha, "c".repeat(40)],
+      obsoleteShas: ["c".repeat(40), oldSha],
       updatedAt: 200,
     },
   ]);
+
+  const retained = Array.from({ length: 64 }, (_, index) => ({
+    lane: `branch:lane-${index}`,
+    sha: newSha,
+    updatedAt: 200,
+  }));
+  const bounded = mergeAutomaticLaneUpdates(retained, [
+    { lane: "branch:lane-0", sha: oldSha, updatedAt: 100 },
+    { lane: "branch:lane-64", sha: newSha, updatedAt: 200 },
+  ]);
+  expect(bounded?.some((update) => update.lane === "branch:lane-0")).toBe(false);
+  expect(bounded?.some((update) => update.lane === "branch:lane-1")).toBe(true);
 });
 
 test("verifies GitHub webhook signatures without accepting malformed values", () => {

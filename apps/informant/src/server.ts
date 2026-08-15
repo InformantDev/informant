@@ -129,6 +129,8 @@ export interface AutomaticLaneUpdate {
   obsoleteShas?: string[];
   /** Source event time used to order delayed webhook deliveries. */
   updatedAt?: number;
+  /** Stable delivery identity used to retire a stale coordination update. */
+  revision?: string;
   closed?: boolean;
 }
 
@@ -141,27 +143,93 @@ interface ActiveAutomaticRun {
 
 const MAX_TRACKED_AUTOMATIC_LANES = 1_024;
 
+export function automaticLaneUpdateIdentity(update: AutomaticLaneUpdate): string {
+  return (
+    update.revision ??
+    JSON.stringify([
+      update.lane,
+      update.sha ?? null,
+      update.closed === true,
+      update.updatedAt ?? null,
+      update.obsoleteShas ?? [],
+    ])
+  );
+}
+
+export function automaticLaneUpdateSemanticIdentity(update: AutomaticLaneUpdate): string {
+  return JSON.stringify([
+    update.lane,
+    update.sha ?? null,
+    update.closed === true,
+    update.updatedAt ?? null,
+    [...(update.obsoleteShas ?? [])].sort(),
+  ]);
+}
+
+export function automaticLaneUpdateIsNewer(
+  previous: AutomaticLaneUpdate,
+  incoming: AutomaticLaneUpdate,
+): boolean {
+  if (
+    previous.updatedAt !== undefined &&
+    incoming.updatedAt !== undefined &&
+    previous.updatedAt !== incoming.updatedAt
+  ) {
+    return incoming.updatedAt > previous.updatedAt;
+  }
+  if (incoming.sha && previous.obsoleteShas?.includes(incoming.sha)) return false;
+  if (previous.sha && incoming.obsoleteShas?.includes(previous.sha)) return true;
+  if (incoming.closed && previous.sha && !incoming.obsoleteShas?.includes(previous.sha)) {
+    return false;
+  }
+  return incoming.sha === previous.sha && incoming.closed === previous.closed;
+}
+
+interface ExpectedAutomaticUpdate {
+  update: AutomaticLaneUpdate;
+  sha: string | null;
+  obsoleteShas: Set<string>;
+  generation: number;
+}
+
 /** Coordinates automatic-run supersession across polling cycles and network wakeups. */
 export class AutomaticRunRegistry {
   private readonly active = new Map<string, ActiveAutomaticRun>();
-  private readonly expected = new Map<string, { sha: string | null; obsoleteShas: Set<string> }>();
+  private readonly expected = new Map<string, ExpectedAutomaticUpdate>();
+  private readonly retired = new Set<string>();
+  private generation = 0;
+
+  constructor(
+    private readonly onRetire?: (repository: Repository, update: AutomaticLaneUpdate) => void,
+  ) {}
 
   private key(repository: Repository, lane: string): string {
     return `${repository.fullName.toLowerCase()}\0${lane}`;
   }
 
-  apply(repository: Repository, updates: AutomaticLaneUpdate[]): void {
+  apply(repository: Repository, updates: AutomaticLaneUpdate[]): AutomaticLaneUpdate[] {
+    const accepted: AutomaticLaneUpdate[] = [];
     for (const update of updates) {
       const key = this.key(repository, update.lane);
+      if (this.retired.has(`${key}\0${automaticLaneUpdateSemanticIdentity(update)}`)) continue;
+      const previous = this.expected.get(key);
+      if (previous && !automaticLaneUpdateIsNewer(previous.update, update)) continue;
+      const active = this.active.get(key);
+      const nextSha = update.closed ? null : (update.sha ?? null);
+      if (active && active.sha !== nextSha && !update.obsoleteShas?.includes(active.sha)) {
+        continue;
+      }
+      accepted.push(update);
       this.expected.delete(key);
       this.expected.set(key, {
+        update,
         sha: update.closed ? null : (update.sha ?? null),
         obsoleteShas: new Set(update.obsoleteShas ?? []),
+        generation: ++this.generation,
       });
       while (this.expected.size > MAX_TRACKED_AUTOMATIC_LANES) {
         this.expected.delete(this.expected.keys().next().value ?? "");
       }
-      const active = this.active.get(key);
       if (active && (update.closed || active.sha !== update.sha)) {
         this.active.delete(key);
         active.controller.abort(
@@ -171,16 +239,40 @@ export class AutomaticRunRegistry {
         );
       }
     }
+    return accepted;
   }
 
-  prepare(repository: Repository, lane: string, sha: string): boolean {
+  private retire(repository: Repository, key: string, expected: ExpectedAutomaticUpdate): void {
+    this.expected.delete(key);
+    const retiredKey = `${key}\0${automaticLaneUpdateSemanticIdentity(expected.update)}`;
+    this.retired.delete(retiredKey);
+    this.retired.add(retiredKey);
+    while (this.retired.size > MAX_TRACKED_AUTOMATIC_LANES) {
+      this.retired.delete(this.retired.values().next().value ?? "");
+    }
+    this.onRetire?.(repository, expected.update);
+  }
+
+  snapshotGeneration(): number {
+    return this.generation;
+  }
+
+  prepare(
+    repository: Repository,
+    lane: string,
+    sha: string,
+    observedGeneration = this.generation,
+  ): boolean {
     const key = this.key(repository, lane);
     const expected = this.expected.get(key);
     if (expected) {
-      if (expected.sha === null || expected.obsoleteShas.has(sha)) return false;
-      // The live GitHub ref is authoritative when a delayed webhook names a different,
-      // non-obsolete head. Clearing here prevents stale delivery from deadlocking the lane.
-      this.expected.delete(key);
+      if (expected.sha !== null && expected.obsoleteShas.has(sha)) return false;
+      if (expected.generation > observedGeneration) return expected.sha === sha;
+      if (expected.sha !== sha) {
+        // A live branch or open pull request returned by GitHub is authoritative. Retiring
+        // this exact update prevents a stale lead from replaying it after the scan recovers.
+        this.retire(repository, key, expected);
+      }
     }
     const active = this.active.get(key);
     if (active && active.sha !== sha) {
@@ -195,8 +287,9 @@ export class AutomaticRunRegistry {
     lane: string,
     sha: string,
     controller: AbortController,
+    observedGeneration = this.generation,
   ): boolean {
-    if (!this.prepare(repository, lane, sha)) return false;
+    if (!this.prepare(repository, lane, sha, observedGeneration)) return false;
     this.active.set(this.key(repository, lane), {
       repository: repository.fullName.toLowerCase(),
       lane,
@@ -230,6 +323,9 @@ export class AutomaticRunRegistry {
     const prefix = `${repository.fullName.toLowerCase()}\0`;
     for (const key of this.expected.keys()) {
       if (key.startsWith(prefix)) this.expected.delete(key);
+    }
+    for (const key of this.retired) {
+      if (key.startsWith(prefix)) this.retired.delete(key);
     }
     for (const [key, run] of this.active) {
       if (!key.startsWith(prefix)) continue;
@@ -618,6 +714,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         (options.forceTagPoll ||
           !state.tagsPolledAt ||
           Date.now() - new Date(state.tagsPolledAt).getTime() >= TAG_POLL_INTERVAL_MS);
+      const automaticGeneration = automaticRuns.snapshotGeneration();
       const [branches, tags, prs] = await Promise.all([
         github.branches(repository, options.signal),
         shouldPollTags ? github.tags(repository, options.signal) : undefined,
@@ -716,7 +813,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           await drainForShutdown();
           return;
         }
-        if (!("tag" in target) && !automaticRuns.prepare(repository, target.lane, target.sha)) {
+        if (
+          !("tag" in target) &&
+          !automaticRuns.prepare(repository, target.lane, target.sha, automaticGeneration)
+        ) {
           continue;
         }
         if (inFlightRuns.has(target.eventId)) continue;
@@ -759,7 +859,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           const admissionController = new AbortController();
           if (
             !("tag" in target) &&
-            !automaticRuns.activate(repository, target.lane, target.sha, controller)
+            !automaticRuns.activate(
+              repository,
+              target.lane,
+              target.sha,
+              controller,
+              automaticGeneration,
+            )
           ) {
             continue;
           }

@@ -9,6 +9,7 @@ import {
   acquireExecutionSlot,
   claimExecutionResources,
   type ExecutionCapacitySnapshot,
+  publishExecutionReservation,
 } from "./execution-capacity.ts";
 import type { ClaimResult, GitHubClient } from "./github.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
@@ -51,6 +52,7 @@ export interface CoordinatorDependencies {
   listAllowedMounts?: typeof listAllowedMounts;
   reportDiagnostic?: (message: string) => void;
   acquireExecutionSlot?: AcquireExecutionSlot;
+  publishExecutionReservation?: typeof publishExecutionReservation;
 }
 
 const CHECK_LOG_CHARACTERS = 55_000;
@@ -201,6 +203,7 @@ const defaultDependencies: CoordinatorDependencies = {
   runInTart,
   readLogTail,
   acquireExecutionSlot,
+  publishExecutionReservation,
 };
 
 async function usableAllowedMounts(
@@ -302,8 +305,10 @@ export async function runLocalCommit(
   };
 
   let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
+  let releasePublishedResources: (() => void) | undefined;
 
   try {
+    releasePublishedResources = await dependencies.publishExecutionReservation?.(config);
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));
@@ -358,6 +363,7 @@ export async function runLocalCommit(
     if (cancelled) return record;
     throw error;
   } finally {
+    releasePublishedResources?.();
     releaseExecutionResources?.();
     await cancellation?.close();
   }

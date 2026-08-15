@@ -21,6 +21,9 @@ import { command } from "./process.ts";
 import {
   type AutomaticLaneUpdate,
   AutomaticRunRegistry,
+  automaticLaneUpdateIdentity,
+  automaticLaneUpdateIsNewer,
+  automaticLaneUpdateSemanticIdentity,
   type ServerOptions,
   serveRepositories,
 } from "./server.ts";
@@ -98,6 +101,7 @@ export interface RepositoryDispatch {
   automaticUpdates?: AutomaticLaneUpdate[];
 }
 
+const MAX_NETWORK_CLAIMANTS = 64;
 const MAX_AUTOMATIC_LANE_UPDATES = 64;
 const MAX_AUTOMATIC_LANE_LENGTH = 1_024;
 const MAX_REMEMBERED_REPOSITORIES = 1_024;
@@ -122,14 +126,10 @@ function mergeAutomaticLaneUpdate(
   incoming: AutomaticLaneUpdate,
 ): AutomaticLaneUpdate {
   if (!previous) return incoming;
-  const obsoleteShas = [...(previous.obsoleteShas ?? []), ...(incoming.obsoleteShas ?? [])];
-  const previousIsNewer =
-    previous.updatedAt !== undefined &&
-    incoming.updatedAt !== undefined &&
-    previous.updatedAt !== incoming.updatedAt
-      ? previous.updatedAt > incoming.updatedAt
-      : incoming.sha !== undefined && previous.obsoleteShas?.includes(incoming.sha) === true;
-  const latest = previousIsNewer ? previous : incoming;
+  const incomingIsNewer = automaticLaneUpdateIsNewer(previous, incoming);
+  const latest = incomingIsNewer ? incoming : previous;
+  const older = incomingIsNewer ? previous : incoming;
+  const obsoleteShas = [...(older.obsoleteShas ?? []), ...(latest.obsoleteShas ?? [])];
   const uniqueObsolete = [...new Set(obsoleteShas)]
     .filter((sha) => sha !== latest.sha)
     .slice(-MAX_OBSOLETE_LANE_SHAS);
@@ -138,6 +138,7 @@ function mergeAutomaticLaneUpdate(
     ...(latest.sha ? { sha: latest.sha } : {}),
     ...(uniqueObsolete.length > 0 ? { obsoleteShas: uniqueObsolete } : {}),
     ...(latest.updatedAt !== undefined ? { updatedAt: latest.updatedAt } : {}),
+    ...(latest.revision !== undefined ? { revision: latest.revision } : {}),
     ...(latest.closed ? { closed: true } : {}),
   };
 }
@@ -149,14 +150,33 @@ export function mergeAutomaticLaneUpdates(
   if (!previous?.length && !latest?.length) return undefined;
   const updates = new Map<string, AutomaticLaneUpdate>();
   for (const update of [...(previous ?? []), ...(latest ?? [])]) {
-    const merged = mergeAutomaticLaneUpdate(updates.get(update.lane), update);
-    updates.delete(update.lane);
+    const existing = updates.get(update.lane);
+    const merged = mergeAutomaticLaneUpdate(existing, update);
+    const refreshesLane =
+      !existing ||
+      (automaticLaneUpdateSemanticIdentity(existing) !==
+        automaticLaneUpdateSemanticIdentity(update) &&
+        automaticLaneUpdateIsNewer(existing, update));
+    if (refreshesLane) updates.delete(update.lane);
     updates.set(update.lane, merged);
     if (updates.size > MAX_AUTOMATIC_LANE_UPDATES) {
       updates.delete(updates.keys().next().value ?? "");
     }
   }
   return [...updates.values()];
+}
+
+export function retireAutomaticLaneUpdate(
+  retained: AutomaticLaneUpdate[] | undefined,
+  retired: AutomaticLaneUpdate,
+): AutomaticLaneUpdate[] | undefined {
+  if (!retained) return undefined;
+  const identity = automaticLaneUpdateIdentity(retired);
+  const remaining = retained.filter(
+    (candidate) =>
+      candidate.lane !== retired.lane || automaticLaneUpdateIdentity(candidate) !== identity,
+  );
+  return remaining.length > 0 ? remaining : undefined;
 }
 
 export function parseAutomaticLaneUpdates(value: unknown): AutomaticLaneUpdate[] | undefined {
@@ -167,11 +187,12 @@ export function parseAutomaticLaneUpdates(value: unknown): AutomaticLaneUpdate[]
   const updates: AutomaticLaneUpdate[] = [];
   for (const entry of value) {
     if (!entry || typeof entry !== "object") throw new Error("invalid automatic lane updates");
-    const { lane, sha, obsoleteShas, updatedAt, closed } = entry as {
+    const { lane, sha, obsoleteShas, updatedAt, revision, closed } = entry as {
       lane?: unknown;
       sha?: unknown;
       obsoleteShas?: unknown;
       updatedAt?: unknown;
+      revision?: unknown;
       closed?: unknown;
     };
     const parsedSha = normalizedSha(sha);
@@ -189,6 +210,11 @@ export function parseAutomaticLaneUpdates(value: unknown): AutomaticLaneUpdate[]
       parsedObsolete.length > MAX_OBSOLETE_LANE_SHAS ||
       parsedObsolete.some((value) => !value) ||
       (updatedAt !== undefined && (!Number.isSafeInteger(updatedAt) || Number(updatedAt) < 0)) ||
+      (revision !== undefined &&
+        (typeof revision !== "string" ||
+          revision.length === 0 ||
+          revision.length > 128 ||
+          !/^[A-Za-z0-9_-]+$/.test(revision))) ||
       (closed !== undefined && closed !== true) ||
       (closed === true ? sha !== undefined : !parsedSha)
     ) {
@@ -199,6 +225,7 @@ export function parseAutomaticLaneUpdates(value: unknown): AutomaticLaneUpdate[]
       ...(parsedSha ? { sha: parsedSha } : {}),
       ...(parsedObsolete.length > 0 ? { obsoleteShas: parsedObsolete as string[] } : {}),
       ...(typeof updatedAt === "number" ? { updatedAt } : {}),
+      ...(typeof revision === "string" ? { revision } : {}),
       ...(closed === true ? { closed: true } : {}),
     });
   }
@@ -208,8 +235,11 @@ export function parseAutomaticLaneUpdates(value: unknown): AutomaticLaneUpdate[]
 export function webhookAutomaticLaneUpdates(
   event: string | null,
   payload: unknown,
+  delivery?: string,
 ): AutomaticLaneUpdate[] | undefined {
   if (!payload || typeof payload !== "object") return undefined;
+  const revision =
+    delivery && delivery.length <= 128 && /^[A-Za-z0-9_-]+$/.test(delivery) ? delivery : undefined;
   if (event === "push") {
     const { ref, before, after, deleted, repository } = payload as {
       ref?: unknown;
@@ -237,6 +267,7 @@ export function webhookAutomaticLaneUpdates(
           lane,
           ...(previousSha ? { obsoleteShas: [previousSha] } : {}),
           ...(updatedAt !== undefined ? { updatedAt } : {}),
+          ...(revision ? { revision } : {}),
           closed: true,
         },
       ];
@@ -249,6 +280,7 @@ export function webhookAutomaticLaneUpdates(
         sha,
         ...(previousSha ? { obsoleteShas: [previousSha] } : {}),
         ...(updatedAt !== undefined ? { updatedAt } : {}),
+        ...(revision ? { revision } : {}),
       },
     ];
   }
@@ -275,6 +307,7 @@ export function webhookAutomaticLaneUpdates(
           lane,
           ...(sha || previousSha ? { obsoleteShas: [sha ?? previousSha ?? ""] } : {}),
           ...(updatedAt !== undefined ? { updatedAt } : {}),
+          ...(revision ? { revision } : {}),
           closed: true,
         },
       ];
@@ -286,6 +319,7 @@ export function webhookAutomaticLaneUpdates(
         sha,
         ...(previousSha ? { obsoleteShas: [previousSha] } : {}),
         ...(updatedAt !== undefined ? { updatedAt } : {}),
+        ...(revision ? { revision } : {}),
       },
     ];
   }
@@ -645,6 +679,15 @@ function parseExecutionCapacity(value: unknown): ExecutionCapacitySnapshot | und
   return resources as ExecutionCapacitySnapshot;
 }
 
+export function generatedNetworkClaimPlan(
+  claimants: NetworkClaimant[],
+  rotation: number,
+): NetworkClaimPlan | undefined {
+  return claimants.length > 1 && claimants.length <= MAX_NETWORK_CLAIMANTS
+    ? { claimants, rotation: rotation % Number.MAX_SAFE_INTEGER }
+    : undefined;
+}
+
 export function parseNetworkClaimPlan(value: unknown): NetworkClaimPlan | undefined {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object") throw new Error("invalid claim scheduling");
@@ -654,7 +697,7 @@ export function parseNetworkClaimPlan(value: unknown): NetworkClaimPlan | undefi
     (plan.rotation as number) < 0 ||
     !Array.isArray(plan.claimants) ||
     plan.claimants.length === 0 ||
-    plan.claimants.length > 64
+    plan.claimants.length > MAX_NETWORK_CLAIMANTS
   ) {
     throw new Error("invalid claim scheduling");
   }
@@ -705,6 +748,28 @@ async function advertisedWorkerCapabilities(): Promise<string[]> {
     Bun.env,
     usableMounts.filter((name): name is string => name !== undefined),
   );
+}
+
+export async function localNetworkExecutionCapacity(
+  config: TailscaleConfig,
+  status: TailscaleStatus,
+  fallback = currentExecutionCapacity(),
+  fetcher: typeof fetchWithTimeout = fetchWithTimeout,
+): Promise<ExecutionCapacitySnapshot> {
+  const address = firstIpv4(status.self);
+  if (!status.online || !address) return fallback;
+  try {
+    const response = await fetcher(peerUrl(address, config.workerPort, "/v1/health"), {
+      headers: networkRequestHeaders(config),
+    });
+    if (!response.ok) return fallback;
+    return (
+      parseExecutionCapacity(((await response.json()) as Partial<NetworkWorker>).resources) ??
+      fallback
+    );
+  } catch {
+    return fallback;
+  }
 }
 
 export async function discoverNetworkWorkers(
@@ -1099,22 +1164,6 @@ async function serveConfiguredWithTailscale(
   await refreshSelectedContainerBackend(options.signal);
 
   let configuredRepositories = repositories;
-  const automaticRuns = new AutomaticRunRegistry();
-  const scans = new RepositoryScanQueue(
-    repositories,
-    (repository, forceTagPoll, signal, claimScheduling) =>
-      serveRepositories([repository], {
-        ...options,
-        once: true,
-        forceTagPoll,
-        signal,
-        throwOnPollError: true,
-        claimScheduling,
-        automaticRuns,
-      }),
-    options.signal,
-  );
-
   const knownWorkers = new Map<string, NetworkWorker>();
   let advertisedRepositories = new Set<string>();
   const latestAutomaticUpdates = new Map<string, AutomaticLaneUpdate[]>();
@@ -1133,6 +1182,27 @@ async function serveConfiguredWithTailscale(
     }
     return merged;
   };
+  const retireAutomaticUpdate = (repository: Repository, update: AutomaticLaneUpdate) => {
+    const key = repository.fullName.toLowerCase();
+    const remaining = retireAutomaticLaneUpdate(latestAutomaticUpdates.get(key), update);
+    if (remaining) latestAutomaticUpdates.set(key, remaining);
+    else latestAutomaticUpdates.delete(key);
+  };
+  const automaticRuns = new AutomaticRunRegistry(retireAutomaticUpdate);
+  const scans = new RepositoryScanQueue(
+    repositories,
+    (repository, forceTagPoll, signal, claimScheduling) =>
+      serveRepositories([repository], {
+        ...options,
+        once: true,
+        forceTagPoll,
+        signal,
+        throwOnPollError: true,
+        claimScheduling,
+        automaticRuns,
+      }),
+    options.signal,
+  );
   const refreshWorkers = async (): Promise<NetworkWorker[]> => {
     const previousIds = new Set(knownWorkers.keys());
     const currentStatus = await tailscaleStatus();
@@ -1164,8 +1234,11 @@ async function serveConfiguredWithTailscale(
       worker.repositories.some((name) => name.toLowerCase() === repository.fullName.toLowerCase()),
     );
     if (!localRepository && registeredWorkers.length === 0) return;
-    const remembered = rememberAutomaticUpdates(repository, updates) ?? updates;
-    if (localRepository) automaticRuns.apply(localRepository, remembered);
+    const acceptedUpdates = localRepository
+      ? automaticRuns.apply(localRepository, updates)
+      : updates;
+    if (acceptedUpdates.length === 0) return;
+    const remembered = rememberAutomaticUpdates(repository, acceptedUpdates) ?? acceptedUpdates;
     const workers = registeredWorkers.filter(
       (worker) => worker.protocols?.includes(AUTOMATIC_SUPERSESSION_PROTOCOL) === true,
     );
@@ -1266,17 +1339,19 @@ async function serveConfiguredWithTailscale(
       );
       return true;
     }
-    automaticUpdates = rememberAutomaticUpdates(request.repository, request.automaticUpdates);
-    if (localRepository && automaticUpdates) automaticRuns.apply(localRepository, automaticUpdates);
+    const acceptedUpdates =
+      localRepository && automaticUpdates
+        ? automaticRuns.apply(localRepository, automaticUpdates)
+        : automaticUpdates;
+    automaticUpdates = rememberAutomaticUpdates(request.repository, acceptedUpdates);
     const generatedPlan =
-      !request.claimPlan &&
-      targets.length > 1 &&
-      targets.every((target) => target.scheduling && target.claimant)
-        ? {
-            claimants: targets.flatMap((target) => (target.claimant ? [target.claimant] : [])),
-            rotation: claimRotation++ % Number.MAX_SAFE_INTEGER,
-          }
+      !request.claimPlan && targets.every((target) => target.scheduling && target.claimant)
+        ? generatedNetworkClaimPlan(
+            targets.flatMap((target) => (target.claimant ? [target.claimant] : [])),
+            claimRotation,
+          )
         : undefined;
+    if (generatedPlan) claimRotation++;
     const plan = request.claimPlan ?? generatedPlan;
     const tasks = targets.map((target) => ({ label: target.label, promise: target.run(plan) }));
     const results = await Promise.allSettled(tasks.map((task) => task.promise));
@@ -1362,9 +1437,8 @@ async function serveConfiguredWithTailscale(
           (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
         );
         if (!repository) return new Response("repository is not registered", { status: 404 });
-        const rememberedUpdates =
-          rememberAutomaticUpdates(repository, automaticUpdates) ?? automaticUpdates;
-        automaticRuns.apply(repository, rememberedUpdates);
+        const acceptedUpdates = automaticRuns.apply(repository, automaticUpdates);
+        rememberAutomaticUpdates(repository, acceptedUpdates);
         return new Response(null, { status: 204 });
       }
       if (request.method === "POST" && url.pathname === "/v1/dispatch") {
@@ -1394,8 +1468,10 @@ async function serveConfiguredWithTailscale(
           (candidate) => candidate.fullName.toLowerCase() === requestedRepository.toLowerCase(),
         );
         if (!repository) return new Response("repository is not registered", { status: 404 });
-        const rememberedUpdates = rememberAutomaticUpdates(repository, automaticUpdates);
-        if (rememberedUpdates) automaticRuns.apply(repository, rememberedUpdates);
+        const acceptedUpdates = automaticUpdates
+          ? automaticRuns.apply(repository, automaticUpdates)
+          : undefined;
+        const rememberedUpdates = rememberAutomaticUpdates(repository, acceptedUpdates);
         dispatchQueue.enqueue({
           repository,
           forceTagPoll: body.forceTagPoll === true,
@@ -1525,7 +1601,11 @@ async function serveConfiguredWithTailscale(
           }
           const repository = payloadRepository(payload);
           if (!repository) return new Response("invalid repository", { status: 400 });
-          const automaticUpdates = webhookAutomaticLaneUpdates(event, payload);
+          const automaticUpdates = webhookAutomaticLaneUpdates(
+            event,
+            payload,
+            delivery ?? undefined,
+          );
           await propagateAutomaticUpdates(repository, automaticUpdates);
           dispatchQueue.enqueue({
             repository,
@@ -1638,5 +1718,10 @@ export async function networkStatus(): Promise<{
   const config = await getTailscaleConfig();
   const status = await tailscaleStatus();
   const workers = config && status?.online ? await discoverNetworkWorkers(config, status) : [];
-  return { config, status, workers, localResources: currentExecutionCapacity() };
+  const fallback = currentExecutionCapacity();
+  const localResources =
+    config && status?.online
+      ? await localNetworkExecutionCapacity(config, status, fallback)
+      : fallback;
+  return { config, status, workers, localResources };
 }

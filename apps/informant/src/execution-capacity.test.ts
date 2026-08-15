@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   claimExecutionResources,
   createExecutionSlotAcquirer,
+  currentExecutionCapacity,
   executionCapacity,
+  publishExecutionReservation,
 } from "./execution-capacity.ts";
 import type { InformantConfig, JobConfig } from "./types.ts";
 
@@ -136,6 +141,35 @@ describe("execution capacity", () => {
     releaseManual?.();
     releaseAutomatic?.();
     expect(acquire.snapshot?.().used).toEqual({ cpu: 0, memoryMb: 0 });
+  });
+
+  test("waits for process-shared manual reservations before admitting automatic work", async () => {
+    const external = { cpu: 1, memoryMb: 1024 };
+    const acquire = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 }, () => external);
+    let entered = false;
+    const pending = acquire(config([job("automatic", 1, 1024)])).then((release) => {
+      entered = true;
+      return release;
+    });
+    await Bun.sleep(0);
+    expect(entered).toBe(false);
+    external.cpu = 0;
+    external.memoryMb = 0;
+    const release = await pending;
+    expect(entered).toBe(true);
+    release?.();
+  });
+
+  test("publishes manual reservations across process-local capacity snapshots", async () => {
+    const dataPath = await mkdtemp(join(tmpdir(), "informant-capacity-"));
+    try {
+      const release = await publishExecutionReservation(config([job("manual", 2, 3072)]), dataPath);
+      expect(currentExecutionCapacity(dataPath).used).toEqual({ cpu: 2, memoryMb: 3072 });
+      release();
+      expect(currentExecutionCapacity(dataPath).used).toEqual({ cpu: 0, memoryMb: 0 });
+    } finally {
+      await rm(dataPath, { recursive: true, force: true });
+    }
   });
 
   test("an unspecified VM reserves full capacity until release", async () => {
