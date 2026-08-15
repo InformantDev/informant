@@ -121,6 +121,124 @@ async function repositoryConfig(
   );
 }
 
+export interface AutomaticLaneUpdate {
+  lane: string;
+  /** The latest commit for this lane. Omitted when the branch or pull request closed. */
+  sha?: string;
+  /** Earlier heads retained so delayed webhook delivery cannot move a lane backward. */
+  obsoleteShas?: string[];
+  /** Source event time used to order delayed webhook deliveries. */
+  updatedAt?: number;
+  closed?: boolean;
+}
+
+interface ActiveAutomaticRun {
+  repository: string;
+  lane: string;
+  sha: string;
+  controller: AbortController;
+}
+
+const MAX_TRACKED_AUTOMATIC_LANES = 1_024;
+
+/** Coordinates automatic-run supersession across polling cycles and network wakeups. */
+export class AutomaticRunRegistry {
+  private readonly active = new Map<string, ActiveAutomaticRun>();
+  private readonly expected = new Map<string, { sha: string | null; obsoleteShas: Set<string> }>();
+
+  private key(repository: Repository, lane: string): string {
+    return `${repository.fullName.toLowerCase()}\0${lane}`;
+  }
+
+  apply(repository: Repository, updates: AutomaticLaneUpdate[]): void {
+    for (const update of updates) {
+      const key = this.key(repository, update.lane);
+      this.expected.delete(key);
+      this.expected.set(key, {
+        sha: update.closed ? null : (update.sha ?? null),
+        obsoleteShas: new Set(update.obsoleteShas ?? []),
+      });
+      while (this.expected.size > MAX_TRACKED_AUTOMATIC_LANES) {
+        this.expected.delete(this.expected.keys().next().value ?? "");
+      }
+      const active = this.active.get(key);
+      if (active && (update.closed || active.sha !== update.sha)) {
+        this.active.delete(key);
+        active.controller.abort(
+          update.sha
+            ? `Superseded by ${update.lane}@${update.sha.slice(0, 7)}.`
+            : `${update.lane} is no longer active.`,
+        );
+      }
+    }
+  }
+
+  prepare(repository: Repository, lane: string, sha: string): boolean {
+    const key = this.key(repository, lane);
+    const expected = this.expected.get(key);
+    if (expected) {
+      if (expected.sha === null || expected.obsoleteShas.has(sha)) return false;
+      // The live GitHub ref is authoritative when a delayed webhook names a different,
+      // non-obsolete head. Clearing here prevents stale delivery from deadlocking the lane.
+      this.expected.delete(key);
+    }
+    const active = this.active.get(key);
+    if (active && active.sha !== sha) {
+      this.active.delete(key);
+      active.controller.abort(`Superseded by ${lane}@${sha.slice(0, 7)}.`);
+    }
+    return true;
+  }
+
+  activate(
+    repository: Repository,
+    lane: string,
+    sha: string,
+    controller: AbortController,
+  ): boolean {
+    if (!this.prepare(repository, lane, sha)) return false;
+    this.active.set(this.key(repository, lane), {
+      repository: repository.fullName.toLowerCase(),
+      lane,
+      sha,
+      controller,
+    });
+    return true;
+  }
+
+  release(repository: Repository, lane: string, controller: AbortController): void {
+    const key = this.key(repository, lane);
+    if (this.active.get(key)?.controller === controller) this.active.delete(key);
+  }
+
+  activeLanes(repository: Repository): Array<{ lane: string; sha: string }> {
+    const fullName = repository.fullName.toLowerCase();
+    return [...this.active.values()]
+      .filter((run) => run.repository === fullName)
+      .map(({ lane, sha }) => ({ lane, sha }));
+  }
+
+  cancel(repository: Repository, lane: string, reason: string): void {
+    const key = this.key(repository, lane);
+    const active = this.active.get(key);
+    if (!active) return;
+    this.active.delete(key);
+    active.controller.abort(reason);
+  }
+
+  remove(repository: Repository, reason: string): void {
+    const prefix = `${repository.fullName.toLowerCase()}\0`;
+    for (const key of this.expected.keys()) {
+      if (key.startsWith(prefix)) this.expected.delete(key);
+    }
+    for (const [key, run] of this.active) {
+      if (!key.startsWith(prefix)) continue;
+      this.active.delete(key);
+      run.controller.abort(reason);
+    }
+  }
+}
+
 export interface ServerOptions {
   once?: boolean;
   /** Bypass the periodic tag throttle for a tag-push webhook synchronization. */
@@ -132,6 +250,8 @@ export interface ServerOptions {
   onIdle?: () => Promise<void> | void;
   shutdownTimeoutMs?: number;
   claimScheduling?: ClaimScheduling;
+  /** Shared by event-driven scans so a newer dispatch can stop an older run immediately. */
+  automaticRuns?: AutomaticRunRegistry;
   dependencies?: ServerDependencies;
 }
 
@@ -282,7 +402,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
   let rateLimitUntil = 0;
   const configs = new Map<string, Promise<InformantConfig | undefined>>();
   const inFlightRuns = new Map<string, Promise<void>>();
-  const automaticLanes = new Map<string, { sha: string; controller: AbortController }>();
+  const automaticRuns = options.automaticRuns ?? new AutomaticRunRegistry();
   const shutdownControllers = new Set<AbortController>();
   const admissionControllers = new Set<AbortController>();
   const admissionSignal = (controller: AbortController) =>
@@ -344,7 +464,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       controller.abort("Graceful worker shutdown timed out.");
     }
     shutdownControllers.clear();
-    automaticLanes.clear();
   };
   const abortAdmissions = () => {
     for (const controller of admissionControllers) {
@@ -542,13 +661,15 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       for (const id of completedTagEvents) completedTags.delete(id);
       const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
       const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
-      for (const [lane, active] of automaticLanes) {
+      for (const { lane } of automaticRuns.activeLanes(repository)) {
         if (lane.startsWith("branch:") && !openBranchLanes.has(lane)) {
-          active.controller.abort(`Branch ${lane.slice(7)} no longer exists.`);
-          automaticLanes.delete(lane);
+          automaticRuns.cancel(repository, lane, `Branch ${lane.slice(7)} no longer exists.`);
         } else if (lane.startsWith("pr:") && !openPullRequestLanes.has(lane)) {
-          active.controller.abort(`Pull request #${lane.slice(3)} is no longer open.`);
-          automaticLanes.delete(lane);
+          automaticRuns.cancel(
+            repository,
+            lane,
+            `Pull request #${lane.slice(3)} is no longer open.`,
+          );
         }
       }
       const manualTriggers = new Map<string, Promise<boolean>>();
@@ -595,10 +716,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           await drainForShutdown();
           return;
         }
-        const previous = automaticLanes.get(target.lane);
-        if (!("tag" in target) && previous && previous.sha !== target.sha) {
-          previous.controller.abort(`Superseded by ${target.branch}@${target.sha.slice(0, 7)}.`);
-          automaticLanes.delete(target.lane);
+        if (!("tag" in target) && !automaticRuns.prepare(repository, target.lane, target.sha)) {
+          continue;
         }
         if (inFlightRuns.has(target.eventId)) continue;
         const context: EventContext = {
@@ -638,10 +757,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           const controller = new AbortController();
           const shutdownController = new AbortController();
           const admissionController = new AbortController();
-          admissionControllers.add(admissionController);
-          if (!("tag" in target)) {
-            automaticLanes.set(target.lane, { sha: target.sha, controller });
+          if (
+            !("tag" in target) &&
+            !automaticRuns.activate(repository, target.lane, target.sha, controller)
+          ) {
+            continue;
           }
+          admissionControllers.add(admissionController);
           const result = executeCommit(
             github,
             repository,
@@ -678,11 +800,8 @@ export async function serve(repository: Repository, options: ServerOptions = {})
               inFlightRuns.delete(target.eventId);
               shutdownControllers.delete(shutdownController);
               admissionControllers.delete(admissionController);
-              if (
-                !("tag" in target) &&
-                automaticLanes.get(target.lane)?.controller === controller
-              ) {
-                automaticLanes.delete(target.lane);
+              if (!("tag" in target)) {
+                automaticRuns.release(repository, target.lane, controller);
               }
               idle();
             });

@@ -12,6 +12,8 @@ import {
   enableTailscale,
   githubAppWebhookSettings,
   MAX_WEBHOOK_BODY_BYTES,
+  mergeAutomaticLaneUpdates,
+  parseAutomaticLaneUpdates,
   parseNetworkClaimPlan,
   parseTailscaleStatus,
   prepareTailscaleFunnel,
@@ -26,6 +28,7 @@ import {
   tailscaleStatus,
   validGitHubSignature,
   validNetworkAuthorization,
+  webhookAutomaticLaneUpdates,
   webhookForcesTagPoll,
 } from "./tailscale.ts";
 
@@ -485,6 +488,104 @@ test("validates bounded network claim scheduling plans", () => {
       ],
     }),
   ).toThrow("invalid claim scheduling");
+});
+
+test("extracts and validates bounded automatic lane updates", () => {
+  const oldSha = "a".repeat(40);
+  const newSha = "b".repeat(40);
+  expect(
+    webhookAutomaticLaneUpdates("push", {
+      ref: "refs/heads/feature/fast",
+      before: oldSha,
+      after: newSha,
+      repository: { pushed_at: 200 },
+    }),
+  ).toEqual([
+    {
+      lane: "branch:feature/fast",
+      sha: newSha,
+      obsoleteShas: [oldSha],
+      updatedAt: 200_000,
+    },
+  ]);
+  expect(
+    webhookAutomaticLaneUpdates("pull_request", {
+      action: "synchronize",
+      number: 42,
+      before: oldSha,
+      pull_request: { head: { sha: newSha }, updated_at: "2026-08-15T00:00:00Z" },
+    }),
+  ).toEqual([
+    {
+      lane: "pr:42",
+      sha: newSha,
+      obsoleteShas: [oldSha],
+      updatedAt: Date.parse("2026-08-15T00:00:00Z"),
+    },
+  ]);
+  expect(
+    webhookAutomaticLaneUpdates("pull_request", {
+      action: "closed",
+      number: 42,
+    }),
+  ).toEqual([{ lane: "pr:42", closed: true }]);
+  expect(parseAutomaticLaneUpdates([{ lane: "branch:main", sha: newSha }])).toEqual([
+    { lane: "branch:main", sha: newSha },
+  ]);
+  expect(() => parseAutomaticLaneUpdates([{ lane: "branch:main", sha: "short" }])).toThrow(
+    "invalid automatic lane updates",
+  );
+  expect(
+    mergeAutomaticLaneUpdates(
+      [
+        { lane: "branch:main", sha: oldSha },
+        { lane: "branch:release", sha: oldSha },
+      ],
+      [{ lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] }],
+    ),
+  ).toEqual([
+    { lane: "branch:release", sha: oldSha },
+    { lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] },
+  ]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [{ lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] }],
+      [{ lane: "branch:main", sha: oldSha, obsoleteShas: ["c".repeat(40)] }],
+    ),
+  ).toEqual([
+    {
+      lane: "branch:main",
+      sha: newSha,
+      obsoleteShas: [oldSha, "c".repeat(40)],
+    },
+  ]);
+  expect(
+    mergeAutomaticLaneUpdates(
+      [
+        {
+          lane: "branch:main",
+          sha: newSha,
+          obsoleteShas: [oldSha],
+          updatedAt: 200,
+        },
+      ],
+      [
+        {
+          lane: "branch:main",
+          sha: "d".repeat(40),
+          obsoleteShas: ["c".repeat(40)],
+          updatedAt: 100,
+        },
+      ],
+    ),
+  ).toEqual([
+    {
+      lane: "branch:main",
+      sha: newSha,
+      obsoleteShas: [oldSha, "c".repeat(40)],
+      updatedAt: 200,
+    },
+  ]);
 });
 
 test("verifies GitHub webhook signatures without accepting malformed values", () => {

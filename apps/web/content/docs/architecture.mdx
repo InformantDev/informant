@@ -74,11 +74,14 @@ the same SHA elect independently. Comment runs use the distinct `Informant CI / 
 Manual runs add a queued check. The next claimant consumes that request and runs even if the commit
 already has an older completed result.
 
-Automatic builds are grouped into branch and pull-request lanes. When synchronization observes a new SHA in a
-lane, the worker that owns the previous SHA aborts its commands, cleans up its Tart VMs, and concludes
-its checks as cancelled. Every notified machine checks the same registered repository heads, so this cancellation
-does not depend on the machine that claims the replacement build. Manual and comment-triggered runs are
-not part of an automatic lane and are never superseded by a push.
+Automatic builds are grouped into branch and pull-request lanes. A network lead sends a supersession
+message to every registered worker immediately when a push or pull-request webhook advances a lane;
+this message is independent of the queued repository scan and its retry backoff. The worker that owns
+the previous SHA aborts its commands, cleans up its runtime, and concludes its checks as cancelled.
+Recent lane transitions are retained for workers that reconnect after missing the webhook. Every
+notified machine still checks the same registered repository heads, so cancellation does not depend on
+the machine that claims the replacement build. Manual and comment-triggered runs are not part of an
+automatic lane and are never superseded by a push.
 
 GitHub UI re-runs use the same path. Clicking **Re-run** resets Informant's Check Suite to queued.
 Workers observe that state after a `check_suite` webhook or during the next polling cycle, elect one

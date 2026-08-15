@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { GitHubApiError, type GitHubClient } from "./github.ts";
 import type { PollState } from "./poll-state.ts";
 import {
+  AutomaticRunRegistry,
   applySecretPolicy,
   recoverInterruptedBuilds,
   type ServerDependencies,
@@ -23,6 +24,28 @@ const pullRequest: PullRequest = {
   headSha: "comment-sha",
   sameRepository: true,
 };
+test("network lane updates cancel obsolete automatic runs before the next scan", () => {
+  const runs = new AutomaticRunRegistry();
+  const oldController = new AbortController();
+  const oldSha = "a".repeat(40);
+  const newSha = "b".repeat(40);
+
+  expect(runs.activate(repository, "branch:main", oldSha, oldController)).toBe(true);
+  runs.apply(repository, [{ lane: "branch:main", sha: newSha, obsoleteShas: [oldSha] }]);
+
+  expect(oldController.signal.aborted).toBe(true);
+  expect(runs.prepare(repository, "branch:main", oldSha)).toBe(false);
+  expect(runs.prepare(repository, "branch:main", newSha)).toBe(true);
+
+  runs.apply(repository, [{ lane: "branch:main", sha: oldSha, obsoleteShas: ["c".repeat(40)] }]);
+  expect(runs.prepare(repository, "branch:main", newSha)).toBe(true);
+
+  const currentController = new AbortController();
+  expect(runs.activate(repository, "branch:main", newSha, currentController)).toBe(true);
+  runs.apply(repository, [{ lane: "branch:main" }]);
+  expect(currentController.signal.aborted).toBe(true);
+});
+
 const config: InformantConfig = {
   version: 1,
   pollIntervalSeconds: 0,
