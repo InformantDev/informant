@@ -30,6 +30,7 @@ export function linuxStartupServicePath(home = homedir()): string {
 export interface SystemdPodmanSandboxConflict {
   scope: "system" | "user" | "user-manager";
   unit: string;
+  setting: "ProtectKernelTunables" | "ProtectHostname";
   fragmentPath?: string;
 }
 
@@ -78,7 +79,7 @@ export async function systemdPodmanSandboxConflict(
         `--${scope}`,
         "show",
         unit,
-        "--property=LoadState,ActiveState,MainPID,ProtectKernelTunables,FragmentPath",
+        "--property=LoadState,ActiveState,MainPID,ProtectKernelTunables,ProtectHostname,FragmentPath",
         "--no-pager",
       ],
       { timeoutMs: 5_000 },
@@ -93,12 +94,16 @@ export async function systemdPodmanSandboxConflict(
     if (
       properties?.LoadState !== "loaded" ||
       properties.ActiveState !== "active" ||
-      !Number(properties.MainPID) ||
-      properties.ProtectKernelTunables !== "yes"
+      !Number(properties.MainPID)
     ) {
       return undefined;
     }
-    return { scope, unit, fragmentPath: properties.FragmentPath || undefined };
+    const setting = (["ProtectKernelTunables", "ProtectHostname"] as const).find(
+      (name) => properties[name] === "yes",
+    );
+    return setting
+      ? { scope, unit, setting, fragmentPath: properties.FragmentPath || undefined }
+      : undefined;
   };
 
   const system = conflict(
@@ -148,7 +153,11 @@ export function systemdPodmanSandboxMessage(conflict: SystemdPodmanSandboxConfli
     conflict.scope === "user-manager"
       ? "reload systemd, then restart the user manager (or log out and back in) before restarting the worker"
       : "reload systemd and restart the worker";
-  return `${conflict.scope} unit ${conflict.unit}${location} sets ProtectKernelTunables=yes, which makes /proc/sys read-only inside rootless Podman; set ProtectKernelTunables=no with \`${edit}\`, ${restart}`;
+  const effect =
+    conflict.setting === "ProtectKernelTunables"
+      ? "makes /proc/sys read-only"
+      : "blocks the nested container hostname syscall";
+  return `${conflict.scope} unit ${conflict.unit}${location} sets ${conflict.setting}=yes, which ${effect} inside rootless Podman; set ${conflict.setting}=no with \`${edit}\`, ${restart}`;
 }
 
 export function renderStartupService(

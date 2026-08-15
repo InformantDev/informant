@@ -69,6 +69,7 @@ describe("startup service", () => {
     expect(conflict).toEqual({
       scope: "system",
       unit: "informant.service",
+      setting: "ProtectKernelTunables",
       fragmentPath: "/etc/systemd/system/informant.service",
     });
     if (!conflict) throw new Error("expected a systemd sandbox conflict");
@@ -103,6 +104,7 @@ describe("startup service", () => {
     expect(conflict).toEqual({
       scope: "user-manager",
       unit: "user@1000.service",
+      setting: "ProtectKernelTunables",
       fragmentPath: "/usr/lib/systemd/system/user@.service",
     });
     expect(inspected).toContain("--system:user@1000.service");
@@ -123,13 +125,14 @@ describe("startup service", () => {
           ? result(
               0,
               "",
-              "LoadState=loaded\nActiveState=active\nMainPID=72\nProtectKernelTunables=yes\nFragmentPath=/etc/systemd/system/custom-informant-worker.service\n",
+              "LoadState=loaded\nActiveState=active\nMainPID=72\nProtectKernelTunables=no\nProtectHostname=yes\nFragmentPath=/etc/systemd/system/custom-informant-worker.service\n",
             )
           : result(1),
     });
     expect(conflict).toEqual({
       scope: "system",
       unit: "custom-informant-worker.service",
+      setting: "ProtectHostname",
       fragmentPath: "/etc/systemd/system/custom-informant-worker.service",
     });
   });

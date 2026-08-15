@@ -121,8 +121,9 @@ affect unrelated images or interrupted Buildah work owned by the same user.
 `informant doctor` names the selected backend and verifies Apple Container readiness on macOS or
 rootless Podman health on Linux. Its Linux check exercises both a constrained container run and the
 prepared-image build path used by jobs. It also identifies active standard or custom worker systemd
-units with `ProtectKernelTunables=yes`, which prevents nested rootless containers from using
-`/proc/sys`, and prints the exact systemd override command. Missing required networking support, unhealthy/rootful
+units with `ProtectKernelTunables=yes` or `ProtectHostname=yes`, which prevent nested rootless
+containers from using `/proc/sys` or setting their private hostname, and prints the exact systemd
+override command. Missing required networking support, unhealthy/rootful
 Podman, an incompatible worker sandbox, or a failed smoke build makes the command fail.
 
 `informant setup` can install Podman and Podman 5's `pasta` networking helper from Debian/Ubuntu or
