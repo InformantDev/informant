@@ -198,6 +198,7 @@ describe("release updates", () => {
 
   test("waits for the Homebrew formula when it still installs the old version", async () => {
     const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    const commands: string[][] = [];
     try {
       await expect(
         updateInformantIfAvailable("0.1.2", {
@@ -205,14 +206,64 @@ describe("release updates", () => {
           uid: 501,
           pendingRestartFile: join(directory, "pending-restart"),
           fetch: async () => releaseResponse("0.2.0"),
-          command: async (argv) =>
-            argv[1] === "print"
+          command: async (argv) => {
+            commands.push(argv);
+            return argv[1] === "print"
               ? result(113)
               : argv[0] === "informant"
                 ? result(0, "", "0.1.2\n")
-                : result(),
+                : result();
+          },
         }),
       ).rejects.toThrow("formula may still be updating");
+      expect(commands).toEqual([
+        ["launchctl", "print", "gui/501/dev.informant.worker"],
+        ["brew", "upgrade", "informantdev/tap/informant"],
+        ["informant", "--version"],
+        ["brew", "update"],
+        ["brew", "upgrade", "informantdev/tap/informant"],
+        ["informant", "--version"],
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("refreshes Homebrew metadata and retries if the formula is still old", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "informant-update-test-"));
+    const commands: string[][] = [];
+    let versions = 0;
+    try {
+      expect(
+        await updateInformantIfAvailable("0.1.2", {
+          platform: "darwin",
+          uid: 501,
+          pendingRestartFile: join(directory, "pending-restart"),
+          fetch: async () => releaseResponse("0.2.0"),
+          command: async (argv) => {
+            commands.push(argv);
+            if (argv[1] === "print") return result(113);
+            if (argv[0] === "informant") {
+              versions++;
+              return result(0, "", versions === 1 ? "0.1.2\n" : "0.2.0\n");
+            }
+            return result();
+          },
+        }),
+      ).toEqual({
+        updated: true,
+        restarted: false,
+        version: "0.2.0",
+      });
+      expect(commands).toEqual([
+        ["launchctl", "print", "gui/501/dev.informant.worker"],
+        ["brew", "upgrade", "informantdev/tap/informant"],
+        ["informant", "--version"],
+        ["brew", "update"],
+        ["brew", "upgrade", "informantdev/tap/informant"],
+        ["informant", "--version"],
+        ["launchctl", "print", "gui/501/dev.informant.worker"],
+      ]);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
