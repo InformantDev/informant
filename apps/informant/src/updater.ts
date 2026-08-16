@@ -443,26 +443,43 @@ async function installHomebrewRelease(
   onOutput?: (text: string) => Promise<void> | void,
   executable = "informant",
 ): Promise<void> {
-  const upgraded = await run(["brew", "upgrade", HOMEBREW_FORMULA], {
-    onOutput,
-    timeoutMs: HOMEBREW_UPGRADE_TIMEOUT_MS,
-  });
-  if (upgraded.exitCode !== 0 || upgraded.timedOut) {
-    throw new Error(
-      `could not update Informant with Homebrew: ${upgraded.timedOut ? `timed out after ${HOMEBREW_UPGRADE_TIMEOUT_MS / 60_000} minutes` : upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
-    );
-  }
-  const installed = await run([executable, "--version"]);
-  const installedVersion = reportedInformantVersion(installed.stdout);
-  if (
-    installed.exitCode !== 0 ||
-    !installedVersion ||
-    compareVersions(installedVersion, release.version) !== 0
-  ) {
-    throw new Error(
-      `Homebrew did not install Informant ${release.version}; the formula may still be updating`,
-    );
-  }
+  const upgrade = async () => {
+    const upgraded = await run(["brew", "upgrade", HOMEBREW_FORMULA], {
+      onOutput,
+      timeoutMs: HOMEBREW_UPGRADE_TIMEOUT_MS,
+    });
+    if (upgraded.exitCode !== 0 || upgraded.timedOut) {
+      throw new Error(
+        `could not update Informant with Homebrew: ${upgraded.timedOut ? `timed out after ${HOMEBREW_UPGRADE_TIMEOUT_MS / 60_000} minutes` : upgraded.stderr.trim() || `exit ${upgraded.exitCode}`}`,
+      );
+    }
+  };
+  const currentVersion = async () => {
+    const installed = await run([executable, "--version"]);
+    return installed.exitCode === 0 ? reportedInformantVersion(installed.stdout) : undefined;
+  };
+  const installInstalled = async () => {
+    const installedVersion = await currentVersion();
+    if (installedVersion && compareVersions(installedVersion, release.version) === 0) return;
+    const updatedFormula = await run(["brew", "update"], {
+      onOutput,
+      timeoutMs: HOMEBREW_UPGRADE_TIMEOUT_MS,
+    });
+    if (updatedFormula.exitCode !== 0 || updatedFormula.timedOut) {
+      throw new Error(
+        `could not refresh Homebrew metadata: ${updatedFormula.timedOut ? `timed out after ${HOMEBREW_UPGRADE_TIMEOUT_MS / 60_000} minutes` : updatedFormula.stderr.trim() || `exit ${updatedFormula.exitCode}`}`,
+      );
+    }
+    await upgrade();
+    const refreshedVersion = await currentVersion();
+    if (!refreshedVersion || compareVersions(refreshedVersion, release.version) !== 0) {
+      throw new Error(
+        `Homebrew did not install Informant ${release.version}; the formula may still be updating`,
+      );
+    }
+  };
+  await upgrade();
+  await installInstalled();
 }
 
 export async function updateInformantIfAvailable(
