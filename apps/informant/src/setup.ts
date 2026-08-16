@@ -41,6 +41,31 @@ const CONTAINER_RELEASE = {
   sha256: "0ca1c42a2269c2557efb1d82b1b38ac553e6a3a3da1b1179c439bcee1e7d6714",
 };
 
+function shouldAnimateCliProgress(
+  environment: Record<string, string | undefined> = process.env,
+  stdinIsTTY = process.stdin.isTTY === true,
+  stdoutIsTTY = process.stdout.isTTY === true,
+  stderrIsTTY = process.stderr.isTTY === true,
+): boolean {
+  return (
+    stdinIsTTY &&
+    stdoutIsTTY &&
+    stderrIsTTY &&
+    !environment.CI &&
+    !environment.PI_CODING_AGENT &&
+    !environment.PI_WEB_MANAGED &&
+    environment.TERM !== "dumb"
+  );
+}
+
+function setupProgress(): Pick<ReturnType<typeof spinner>, "start" | "stop"> {
+  if (shouldAnimateCliProgress()) return spinner();
+  return {
+    start: (message: string) => console.log(message),
+    stop: (message: string) => console.log(message),
+  };
+}
+
 interface ContainerSetupOperations {
   command?: typeof command;
   installPackage?: (path: string) => Promise<void>;
@@ -580,7 +605,7 @@ export async function setup(): Promise<void> {
     owner = value.trim();
   }
 
-  const progress = spinner();
+  const progress = setupProgress();
   const existingTailscale = await getTailscaleConfig();
   let funnelUrl = existingTailscale?.mode === "lead" ? existingTailscale.funnelUrl : undefined;
   const tailStatus = await tailscaleStatus();

@@ -195,6 +195,31 @@ function requestedJobs(value: string | boolean | string[] | undefined): string[]
     .filter(Boolean);
 }
 
+export function shouldAnimateCliProgress(
+  environment: Record<string, string | undefined> = process.env,
+  stdinIsTTY = process.stdin.isTTY === true,
+  stdoutIsTTY = process.stdout.isTTY === true,
+  stderrIsTTY = process.stderr.isTTY === true,
+): boolean {
+  return (
+    stdinIsTTY &&
+    stdoutIsTTY &&
+    stderrIsTTY &&
+    !environment.CI &&
+    !environment.PI_CODING_AGENT &&
+    !environment.PI_WEB_MANAGED &&
+    environment.TERM !== "dumb"
+  );
+}
+
+function cliProgress(): Pick<ReturnType<typeof spinner>, "start" | "stop"> {
+  if (shouldAnimateCliProgress()) return spinner();
+  return {
+    start: (message: string) => console.log(message),
+    stop: (message: string) => console.log(message),
+  };
+}
+
 export function cleanOrphanedBuildWorkspacesInBackground(
   cleanup: () => Promise<number> = removeOrphanedBuildWorkspaces,
   onMessage: (message: string) => void = console.log,
@@ -306,7 +331,7 @@ async function localRun(ref: string, branchOverride?: string, jobs: string[] = [
   const github = new GitHubClient({ repository });
   const config = await configAtGitRef(sha);
   selectJobs(config, jobs);
-  const progress = spinner();
+  const progress = cliProgress();
   progress.start(`Running ${repository.fullName}@${sha.slice(0, 7)}`);
   const clean = () => runManualHousekeeping(repository);
   const build = await runLocalCommit(
@@ -355,7 +380,7 @@ async function manualTrigger(
   const config = await configAtGitRef(sha);
   selectJobs(config, jobs);
   await github.createManualTrigger(repository, sha, jobs, contextBranch, displayBranch);
-  const progress = spinner();
+  const progress = cliProgress();
   progress.start(`Triggering ${repository.fullName}@${sha.slice(0, 7)}`);
   const clean = () => runManualHousekeeping(repository);
   const build = await runCommit(github, repository, sha, displayBranch, config, undefined, {
