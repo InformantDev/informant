@@ -467,6 +467,7 @@ async function createApp(owner?: string, webhookUrl?: string): Promise<ManifestA
           checks: "write",
           contents: "read",
           issues: "read",
+          packages: "read",
           pull_requests: "write",
         },
         default_events: webhookUrl ? [...REQUIRED_GITHUB_WEBHOOK_EVENTS] : [],
