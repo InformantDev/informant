@@ -28,37 +28,42 @@ fi
 merge_base="$(git merge-base "$base_sha" "$head_sha")"
 staff diff --base "$merge_base" --head working-tree --json >/dev/null
 slug="$merge_base..WT"
-staff files --slug "$slug" --json > /tmp/staff-review-files.json
-bun --eval '
-import { snapshotGithubReviewThreads } from "/opt/informant/extensions/subagents.ts";
-const snapshot = await snapshotGithubReviewThreads({
-  repository: process.env.INFORMANT_REPOSITORY ?? "",
-  pullRequest: Number((process.env.INFORMANT_BRANCH ?? "").replace(/^pull\\//, "")),
-  token: process.env.GITHUB_TOKEN ?? "",
-});
-await Bun.write("/tmp/staff-review-threads.json", JSON.stringify(snapshot));
-'
 review_agents="$(staff settings get reviewAgents)"
 
-unset GITHUB_TOKEN
-unset GH_TOKEN
-unset CI
 export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
-export INFORMANT_REVIEW_ROOT="$review_root"
-export INFORMANT_STAFF_FILES=/tmp/staff-review-files.json
-export INFORMANT_STAFF_THREADS=/tmp/staff-review-threads.json
+export NODE_AUTH_TOKEN="$github_token"
+umask 077
+cat > "$HOME/.npmrc" <<'NPMRC'
+@vessup:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+NPMRC
+mkdir -p "$PI_CODING_AGENT_DIR"
+pi_settings="$PI_CODING_AGENT_DIR/settings.json"
+if [ -f "$pi_settings" ]; then
+  jq '.npmCommand = ["bun"]' "$pi_settings" > "$pi_settings.tmp"
+  mv "$pi_settings.tmp" "$pi_settings"
+else
+  printf '%s\n' '{"npmCommand":["bun"]}' > "$pi_settings"
+fi
+pi install npm:@vessup/pi-kit@0.1.1
+pi_kit_dir="$PI_CODING_AGENT_DIR/npm/node_modules/@vessup/pi-kit"
+rm -f "$HOME/.npmrc"
+unset GITHUB_TOKEN
+unset GH_TOKEN
+unset NODE_AUTH_TOKEN
+unset CI
 cd "$review_root"
 pi --print \
   --no-session \
   --no-approve \
   --no-extensions \
-  --extension /opt/informant/extensions/subagents.ts \
+  --extension "$pi_kit_dir/extensions/subagents.ts" \
   --no-skills \
   --no-prompt-templates \
   --no-context-files \
-  --tools read,grep,find,ls,staff_files,staff_threads,subagent_create,subagent_read,subagent_terminate \
-  --append-system-prompt 'Use subagent_create, subagent_read, and subagent_terminate for every find or verify worker. Require every finder to consult the immutable staff_threads snapshot and suppress issues matching either open or resolved GitHub review threads. Launch independent agents in parallel, poll active agents about every 15 seconds, and call subagent_read with completed_output=true and the specific id before consuming a completed worker JSON array. Immediately terminate it with remove=true before replacing a finder with its verifier. Use at most eight live agents and batch larger review widths. Give every agent the complete skill-based worker prompt, cwd ".", and a fresh unique name. Never review inline, execute shell commands, post comments, or let a worker delegate further. Your final response must be only the deduplicated confirmed findings JSON array specified by the Staff Review workflow; return [] when none survive.' \
+  --tools read,bash,grep,find,ls,subagent_create,subagent_read,subagent_terminate \
+  --append-system-prompt 'Use subagent_create, subagent_read, and subagent_terminate for every find or verify worker. Require every finder to consult existing Staff Review comments and suppress issues matching either open or resolved GitHub review threads. Launch independent agents in parallel, poll active agents about every 15 seconds, and call subagent_read with include_transcript=true and the specific id before consuming a completed worker JSON array. Immediately terminate it with remove=true before replacing a finder with its verifier. Use at most eight live agents and batch larger review widths. Give every agent the complete skill-based worker prompt, cwd ".", and a fresh unique name. Never review inline, mutate code, post comments, or let a worker delegate further. Use shell commands only for the read-only diff and Staff Review metadata checks required by the skills. Your final response must be only the deduplicated confirmed findings JSON array specified by the Staff Review workflow; return [] when none survive.' \
   --skill /opt/informant/skills/staff-review/SKILL.md \
   --skill /opt/informant/skills/staff-review-find/SKILL.md \
   --skill /opt/informant/skills/staff-review-verify/SKILL.md \
@@ -102,20 +107,18 @@ secrets = ["GITHUB_TOKEN"]
 environment = { PI_CODING_AGENT_DIR = "/mnt/informant-pi", PI_OFFLINE = "1" }
 mounts = [{ source = "pi-auth", target = "/mnt/informant-pi", write_back = true }]
 cache = [{ paths = ["~/.bun/install/cache"], shared = true }]
-container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, trustedPrepareInputs = true, prepareInputs = ["informant-subagents.ts", "informant-footer-events.ts", ".agents/skills/staff-review/**", ".agents/skills/staff-review-find/**", ".agents/skills/staff-review-verify/**"], prepare = """
+container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, trustedPrepareInputs = true, prepareInputs = [".agents/skills/staff-review/**", ".agents/skills/staff-review-find/**", ".agents/skills/staff-review-verify/**"], prepare = """
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git jq ripgrep
 rm -rf /var/lib/apt/lists/*
 export HOME=/root
-mkdir -p "$HOME/.bun/install/global" "$HOME/.bun/bin" /opt/informant/extensions /opt/informant/skills
-cp /workspace/informant-subagents.ts /opt/informant/extensions/subagents.ts
-cp /workspace/informant-footer-events.ts /opt/informant/extensions/informant-footer-events.ts
+mkdir -p "$HOME/.bun/install/global" "$HOME/.bun/bin" /opt/informant/skills
 cp -R /workspace/.agents/skills/staff-review /opt/informant/skills/
 cp -R /workspace/.agents/skills/staff-review-find /opt/informant/skills/
 cp -R /workspace/.agents/skills/staff-review-verify /opt/informant/skills/
-chmod -R a-w /opt/informant/extensions /opt/informant/skills
+chmod -R a-w /opt/informant/skills
 rm -rf /workspace/* /workspace/.[!.]* /workspace/..?*
 BUN_INSTALL_BIN="$HOME/.bun/bin" bun add --global --ignore-scripts \
   @earendil-works/pi-coding-agent@0.84.1
