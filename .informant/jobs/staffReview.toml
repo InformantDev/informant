@@ -43,8 +43,21 @@ cat > "$NPM_CONFIG_USERCONFIG" <<'EOF'
 @vessup:registry=https://npm.pkg.github.com
 //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
 EOF
-export PI_OFFLINE=0
-pi install npm:@vessup/pi-kit@0.1.1
+mkdir -p "$PI_CODING_AGENT_DIR"
+pi_settings="$PI_CODING_AGENT_DIR/settings.json"
+if [ -f "$pi_settings" ]; then
+  jq '.npmCommand = ["bun"]' "$pi_settings" > "$pi_settings.tmp"
+  mv "$pi_settings.tmp" "$pi_settings"
+else
+  printf '%s\n' '{"npmCommand":["bun"]}' > "$pi_settings"
+fi
+install_root="$(mktemp -d)"
+(
+  cd "$install_root"
+  export PI_OFFLINE=0
+  pi install npm:@vessup/pi-kit@0.1.1
+)
+rm -rf "$install_root"
 export PI_OFFLINE=1
 unset NODE_AUTH_TOKEN
 export INFORMANT_REVIEW_ROOT="$review_root"
@@ -63,7 +76,9 @@ pi --print \
   --skill /opt/informant/skills/staff-review/SKILL.md \
   --skill /opt/informant/skills/staff-review-find/SKILL.md \
   --skill /opt/informant/skills/staff-review-verify/SKILL.md \
-  "/skill:staff-review $slug $review_agents" > /tmp/staff-review-findings.json
+  "/skill:staff-review $slug $review_agents
+
+The trusted outer job handles posting the final findings. Return only the final deduplicated confirmed findings JSON array; do not post comments or return a prose summary." > /tmp/staff-review-findings.json
 
 jq -e 'type == "array"' /tmp/staff-review-findings.json >/dev/null
 jq -c '.[]' /tmp/staff-review-findings.json | while IFS= read -r finding; do
