@@ -33,8 +33,9 @@ review_agents="$(staff settings get reviewAgents)"
 export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
 export NODE_AUTH_TOKEN="$github_token"
+export NPM_CONFIG_USERCONFIG="$review_home/.npmrc"
 umask 077
-cat > "$HOME/.npmrc" <<'NPMRC'
+cat > "$NPM_CONFIG_USERCONFIG" <<'NPMRC'
 @vessup:registry=https://npm.pkg.github.com
 //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
 NPMRC
@@ -46,12 +47,15 @@ if [ -f "$pi_settings" ]; then
 else
   printf '%s\n' '{"npmCommand":["bun"]}' > "$pi_settings"
 fi
+export PI_OFFLINE=0
 pi install npm:@vessup/pi-kit@0.1.1
+export PI_OFFLINE=1
 pi_kit_dir="$PI_CODING_AGENT_DIR/npm/node_modules/@vessup/pi-kit"
-rm -f "$HOME/.npmrc"
+rm -f "$NPM_CONFIG_USERCONFIG"
 unset GITHUB_TOKEN
 unset GH_TOKEN
 unset NODE_AUTH_TOKEN
+unset NPM_CONFIG_USERCONFIG
 unset CI
 cd "$review_root"
 pi --print \
@@ -124,7 +128,7 @@ BUN_INSTALL_BIN="$HOME/.bun/bin" bun add --global --ignore-scripts \
   @earendil-works/pi-coding-agent@0.84.1
 ln -sf "$HOME/.bun/bin/pi" /usr/local/bin/pi
 ln -sf "$(command -v bun)" /usr/local/bin/node
-curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.10.3/staff-linux-arm64 \
+curl -fsSL https://github.com/staffreview/staffreview/releases/download/v1.10.4/staff-linux-arm64 \
   -o /usr/local/bin/staff
 chmod +x /usr/local/bin/staff
 """ }
