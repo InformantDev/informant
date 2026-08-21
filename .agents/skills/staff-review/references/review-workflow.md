@@ -122,13 +122,13 @@ exhausts the limit.
 
 **1. Verify (one verify agent per returning find agent).** When a finder reports
 `completed`, call `subagent_read` again with that finder's `id` and
-`include_transcript: true`. This read-before-remove step retrieves the complete
-retained findings transcript. Only after consuming it, call `subagent_terminate`
+`completed_output: true`. This read-before-remove step retrieves the complete,
+untruncated findings JSON. Only after consuming it, call `subagent_terminate`
 with that id and `remove: true` to dispose the session and retained record. Then
 call `subagent_create` for a verifier, seeded with *only that find agent's*
 findings. The verifier is necessarily a *different* agent than the finder — the
 point is independent eyes. If a finder returned `[]`, terminate/remove it after
-the completed transcript read and move on — nothing to verify.
+the completed-output read and move on — nothing to verify.
 
 > You are running in `<repo dir>`. Read `/opt/informant/skills/staff-review-verify/SKILL.md`
 > and follow that trusted image-baked skill exactly. Your parameters:
@@ -140,7 +140,7 @@ the completed transcript read and move on — nothing to verify.
 > spawn agents, or modify code.
 
 **2. Collect survivors (as each verify agent completes).** Retrieve its full
-verdict transcript with `subagent_read { id, include_transcript: true }` before calling
+verdict JSON with `subagent_read { id, completed_output: true }` before calling
 `subagent_terminate { id, remove: true }`. Keep only **confirmed** findings. When
 a verdict carries a `correctedAnchor`, replace that finding's
 `file`/`line`/`endLine`/`side` with it wholesale (a relocated single-line
@@ -226,9 +226,9 @@ following `/staff-resolve`.
   **nothing is posted unverified**. A find agent's verifier starts as soon as
   that finder returns; posting waits for every verify chain to drain so the final
   survivor list can be deduped once.
-- **Read the completed transcript before reaping each background agent.** Poll with
-  `subagent_read`; once an agent is completed, retrieve its retained protocol transcript
-  with `subagent_read { id, include_transcript: true }`, then call
+- **Read completed output before reaping each background agent.** Poll with
+  `subagent_read`; once an agent is completed, retrieve its exact protocol result
+  with `subagent_read { id, completed_output: true }`, then call
   `subagent_terminate { id, remove: true }`. Do this for each finder before
   starting its verifier and for each verifier after consuming its verdicts.
   Completed agents left retained keep holding slots in a **limited pool** and
