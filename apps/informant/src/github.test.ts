@@ -38,7 +38,7 @@ test("job access tokens are freshly minted and downscoped to one repository", as
   expect(await github.createJobAccessToken(repository)).toBe("job-token");
   expect(requestBody).toEqual({
     repositories: ["widgets"],
-    permissions: { pull_requests: "write" },
+    permissions: { packages: "read", pull_requests: "write" },
   });
 });
 

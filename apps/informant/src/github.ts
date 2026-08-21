@@ -395,7 +395,7 @@ export class GitHubClient {
         },
         body: JSON.stringify({
           repositories: [repository.repo],
-          permissions: { pull_requests: "write" },
+          permissions: { packages: "read", pull_requests: "write" },
         }),
       },
     );

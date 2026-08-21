@@ -42,17 +42,18 @@ saved by `informant setup`:
 
 ## Manual App creation
 
-[Open GitHub with Informant's permissions preselected →](https://github.com/settings/apps/new?name=Informant%20Local%20CI&description=Runs%20private%20CI%20on%20your%20local%20machines&url=https%3A%2F%2Fgithub.com%2FInformantDev%2Finformant&public=false&checks=write&contents=read&pull_requests=write&webhook_active=false)
+[Open GitHub with Informant's permissions preselected →](https://github.com/settings/apps/new?name=Informant%20Local%20CI&description=Runs%20private%20CI%20on%20your%20local%20machines&url=https%3A%2F%2Fgithub.com%2FInformantDev%2Finformant&public=false&checks=write&contents=read&packages=read&pull_requests=write&webhook_active=false)
 
-The registration URL requests **Checks: read/write**, **Contents: read**, and **Pull requests:
-read/write**, and disables webhooks. Pull-request write access lets CI jobs use the short-lived App
+The registration URL requests **Checks: read/write**, **Contents: read**, **Packages: read**, and
+**Pull requests: read/write**, and disables webhooks. Packages read access lets Staff Review install
+pi-kit from GitHub Packages. Pull-request write access lets CI jobs use the short-lived App
 token to publish review comments. This manual configuration uses polling. To use Tailscale, also grant
 **Issues: read**, subscribe to **Push**, **Pull request**, **Issue comment**, and **Check suite**, then
 run `informant tailscale enable --lead` to configure and activate the Funnel URL.
 
 Apps created before pull-request review jobs were introduced may still have read-only access. Open
-the App's **Permissions & events** settings, change **Pull requests** to **Read and write**, save, and
-approve the requested permission change on each installation.
+the App's **Permissions & events** settings, change **Packages** to **Read** and **Pull requests** to
+**Read and write**, save, and approve the requested permission change on each installation.
 
 PR conversation comments are discovered by polling. Historical comments are seeded rather than
 replayed on first enable; a durable per-machine cursor and pending event snapshot prevent restart

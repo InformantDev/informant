@@ -38,6 +38,7 @@ export HOME="$review_home"
 export XDG_CONFIG_HOME="$review_home/.config"
 export NODE_AUTH_TOKEN="$github_token"
 export NPM_CONFIG_USERCONFIG="$review_home/.npmrc"
+export BUN_INSTALL_CACHE_DIR="/home/root/.bun/install/cache"
 cat > "$NPM_CONFIG_USERCONFIG" <<'EOF'
 @vessup:registry=https://npm.pkg.github.com
 //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
