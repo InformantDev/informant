@@ -476,6 +476,8 @@ export interface ServerOptions {
   automaticRuns?: AutomaticRunRegistry;
   /** Signed webhook heads that this one-shot scan must observe exactly. */
   scanUpdates?: AutomaticLaneUpdate[];
+  /** Process every current lane while still validating scanUpdates. */
+  scanAllTargets?: boolean;
   dependencies?: ServerDependencies;
 }
 
@@ -946,7 +948,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         })),
       ]) {
         const expectedScanSha = scanUpdates?.get(target.lane);
-        if (scanUpdates && expectedScanSha === undefined) continue;
+        if (scanUpdates && !options.scanAllTargets && expectedScanSha === undefined) continue;
         if (expectedScanSha !== undefined && expectedScanSha !== target.sha) continue;
         if (expectedScanSha !== undefined) observedScanUpdates.add(target.lane);
         if (options.signal?.aborted) {

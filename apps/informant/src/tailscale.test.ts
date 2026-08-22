@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  acceptedAutomaticLaneUpdates,
   actionableWebhook,
   addedRepositoryRecoveryRequests,
   automaticLaneUpdatesRefreshRetention,
@@ -776,6 +777,32 @@ test("extracts and validates bounded automatic lane updates", () => {
       [{ lane: "branch:new", sha: newSha, updatedAt: 200, revision: "new-lane" }],
     ),
   ).toBe(true);
+});
+
+test("rejects delayed webhook heads against retained remote ordering", () => {
+  const current = {
+    lane: "pr:90",
+    sha: "b".repeat(40),
+    obsoleteShas: ["a".repeat(40)],
+    updatedAt: 200,
+    revision: "current",
+  };
+  const delayed = {
+    lane: "pr:90",
+    sha: "a".repeat(40),
+    updatedAt: 100,
+    revision: "delayed",
+  };
+  const newer = {
+    lane: "pr:90",
+    sha: "c".repeat(40),
+    obsoleteShas: [current.sha],
+    updatedAt: 300,
+    revision: "newer",
+  };
+
+  expect(acceptedAutomaticLaneUpdates([current], [delayed])).toEqual([]);
+  expect(acceptedAutomaticLaneUpdates([current], [newer])).toEqual([newer]);
 });
 
 test("targets signed same-repository webhook heads", () => {

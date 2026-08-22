@@ -590,6 +590,37 @@ test("webhook scans run only the exact pull request head", async () => {
   expect(attempts).toEqual([{ sha: changedSha, branch: "pull/90" }]);
 });
 
+test("full scans continue to validate coalesced webhook heads", async () => {
+  const deliveredSha = "a".repeat(40);
+  const staleSha = "b".repeat(40);
+  const unrelatedSha = "c".repeat(40);
+  const attempts: Array<{ sha: string; branch: string }> = [];
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      scanUpdates: [{ lane: "pr:90", sha: deliveredSha, revision: "delivery-90" }],
+      scanAllTargets: true,
+      dependencies: dependencies(
+        github({
+          pullRequests: async () => [
+            { ...pullRequest, number: 90, headSha: staleSha },
+            { ...pullRequest, number: 92, headSha: unrelatedSha },
+          ],
+        }),
+        { pending: [], seenCommentIds: [], pendingTags: [] },
+        async (_github, _repository, sha, branch) => {
+          attempts.push({ sha, branch });
+          return undefined;
+        },
+      ),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("GitHub has not exposed webhook heads for pr:90; retrying dispatch");
+  expect(attempts).toEqual([{ sha: unrelatedSha, branch: "pull/92" }]);
+});
+
 test("webhook scans retry until GitHub exposes the delivered head", async () => {
   const deliveredSha = "a".repeat(40);
   const staleSha = "b".repeat(40);

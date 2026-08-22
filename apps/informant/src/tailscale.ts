@@ -201,6 +201,20 @@ export function mergeAutomaticLaneUpdates(
   return [...updates.values()];
 }
 
+export function acceptedAutomaticLaneUpdates(
+  retained: AutomaticLaneUpdate[] | undefined,
+  incoming: AutomaticLaneUpdate[] | undefined,
+): AutomaticLaneUpdate[] {
+  const previous = new Map((retained ?? []).map((update) => [update.lane, update]));
+  const accepted: AutomaticLaneUpdate[] = [];
+  for (const update of incoming ?? []) {
+    const existing = previous.get(update.lane);
+    if (!existing || automaticLaneUpdateIsNewer(existing, update)) accepted.push(update);
+    previous.set(update.lane, mergeAutomaticLaneUpdate(existing, update));
+  }
+  return accepted;
+}
+
 export function retireAutomaticLaneUpdate(
   retained: AutomaticLaneUpdate[] | undefined,
   retired: AutomaticLaneUpdate,
@@ -447,6 +461,7 @@ export class RepositoryScanQueue {
       signal: AbortSignal,
       claimScheduling?: ClaimScheduling,
       scanUpdates?: AutomaticLaneUpdate[],
+      scanAllTargets?: boolean,
     ) => Promise<void>,
     private readonly serviceSignal?: AbortSignal,
   ) {
@@ -475,6 +490,7 @@ export class RepositoryScanQueue {
     forceTagPoll = false,
     claimScheduling?: ClaimScheduling,
     scanUpdates?: AutomaticLaneUpdate[],
+    scanAllTargets = false,
   ): Promise<void> {
     const key = repository.fullName.toLowerCase();
     const registration = this.registrations.get(key);
@@ -495,6 +511,7 @@ export class RepositoryScanQueue {
           signal,
           claimScheduling,
           scanUpdates,
+          scanAllTargets,
         );
       })
       .finally(() => {
@@ -1301,7 +1318,7 @@ async function serveConfiguredWithTailscale(
   const automaticRuns = new AutomaticRunRegistry(retireAutomaticUpdate);
   const scans = new RepositoryScanQueue(
     repositories,
-    (repository, forceTagPoll, signal, claimScheduling, scanUpdates) =>
+    (repository, forceTagPoll, signal, claimScheduling, scanUpdates, scanAllTargets) =>
       serveRepositories([repository], {
         ...options,
         once: true,
@@ -1311,6 +1328,7 @@ async function serveConfiguredWithTailscale(
         claimScheduling,
         automaticRuns,
         scanUpdates,
+        scanAllTargets,
       }),
     options.signal,
   );
@@ -1336,19 +1354,20 @@ async function serveConfiguredWithTailscale(
   const propagateAutomaticUpdates = async (
     repository: Repository,
     updates: AutomaticLaneUpdate[] | undefined,
-  ): Promise<void> => {
-    if (!updates?.length) return;
+  ): Promise<AutomaticLaneUpdate[]> => {
+    if (!updates?.length) return [];
     const localRepository = configuredRepositories.find(
       (candidate) => candidate.fullName.toLowerCase() === repository.fullName.toLowerCase(),
     );
     const registeredWorkers = [...knownWorkers.values()].filter((worker) =>
       worker.repositories.some((name) => name.toLowerCase() === repository.fullName.toLowerCase()),
     );
-    if (!localRepository && registeredWorkers.length === 0) return;
+    if (!localRepository && registeredWorkers.length === 0) return [];
+    const retained = latestAutomaticUpdates.get(repository.fullName.toLowerCase());
     const acceptedUpdates = localRepository
       ? automaticRuns.apply(localRepository, updates)
-      : updates;
-    if (acceptedUpdates.length === 0) return;
+      : acceptedAutomaticLaneUpdates(retained, updates);
+    if (acceptedUpdates.length === 0) return [];
     const remembered = rememberAutomaticUpdates(repository, acceptedUpdates) ?? acceptedUpdates;
     const workers = registeredWorkers.filter(
       (worker) => worker.protocols?.includes(AUTOMATIC_SUPERSESSION_PROTOCOL) === true,
@@ -1374,6 +1393,7 @@ async function serveConfiguredWithTailscale(
         );
       }
     }
+    return acceptedUpdates;
   };
   let claimRotation = 0;
   const dispatch = async (request: RepositoryDispatch): Promise<boolean> => {
@@ -1405,7 +1425,8 @@ async function serveConfiguredWithTailscale(
             localRepository,
             request.forceTagPoll,
             plan ? { ...plan, workerId: status.self.id } : undefined,
-            request.fullScan ? undefined : request.scanUpdates,
+            request.scanUpdates,
+            request.fullScan,
           ),
       });
     }
@@ -1738,13 +1759,16 @@ async function serveConfiguredWithTailscale(
             payload,
             delivery ?? undefined,
           );
-          await propagateAutomaticUpdates(repository, automaticUpdates);
-          const scanUpdates = webhookScanUpdates(event, payload, repository, automaticUpdates);
+          const acceptedUpdates = await propagateAutomaticUpdates(repository, automaticUpdates);
+          if (automaticUpdates?.length && acceptedUpdates.length === 0) {
+            return new Response(null, { status: 202 });
+          }
+          const scanUpdates = webhookScanUpdates(event, payload, repository, acceptedUpdates);
           dispatchQueue.enqueue({
             repository,
             forceTagPoll: webhookForcesTagPoll(event, payload),
             fullScan: !scanUpdates?.length,
-            automaticUpdates,
+            automaticUpdates: acceptedUpdates,
             scanUpdates,
           });
           return new Response(null, { status: 202 });
