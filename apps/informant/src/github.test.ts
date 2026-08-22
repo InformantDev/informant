@@ -1012,6 +1012,35 @@ test("claim does not fall back to automatic work when manual mode is required", 
   expect(posts).toBe(0);
 });
 
+test("claim preflight reports new work without creating an election candidate", async () => {
+  let posts = 0;
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") posts++;
+    return githubResponse({ check_runs: [] });
+  }) as typeof globalThis.fetch;
+
+  const claim = await new GitHubClient({ token: "installation-token", fetch }).claim(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    "worker",
+    { type: "commit", id: "branch:main:abc123", branch: "main" },
+    undefined,
+    false,
+    [],
+    false,
+    undefined,
+    undefined,
+    true,
+  );
+
+  expect(claim).toEqual({
+    requestedJobs: [],
+    manualTrigger: false,
+    preflight: true,
+  });
+  expect(posts).toBe(0);
+});
+
 test("job checks are separate queued runs correlated to the aggregate claim", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
