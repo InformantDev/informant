@@ -61,7 +61,7 @@ fi
 staff review post --slug "$slug" --pr "$pr_number" \
   --github-repo "$INFORMANT_REPOSITORY" --commit "$head_sha"
 """
-triggers = [{ pull_request = { state = "open", draft = false } }]
+triggers = [{ event = "commit", pull_request = { state = "open", draft = false } }]
 secrets = ["GITHUB_TOKEN"]
 environment = { PI_OFFLINE = "1" }
 mounts = [{ source = "pi-auth", target = "/mnt/informant-pi", write_back = false }]
