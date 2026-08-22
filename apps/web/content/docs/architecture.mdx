@@ -24,12 +24,14 @@ reserved, and queued CPU and memory. Every notified machine performs one GitHub 
 enters the existing capability-specific Checks election. Job definitions, GitHub credentials, and
 secrets are never sent between workers.
 
-A connected network worker does not run a timer or poll GitHub continuously. Every Tailscale worker
-performs one forced synchronization of its locally registered repositories at startup to recover
-events received while Informant was stopped or restarting, then reacts to webhooks. Lead startup
-recovery also includes repositories advertised only by remote workers. Failed deliveries remain
-queued with bounded exponential retries, and the lead refreshes peer topology so workers that join or
-reconnect receive a recovery synchronization. Tag-push notifications bypass the normal tag throttle.
+A connected network worker does not poll GitHub independently. Every Tailscale worker performs one
+forced synchronization of its locally registered repositories at startup to recover events received
+while Informant was stopped or restarting, then reacts to webhooks. The lead also dispatches a
+periodic reconciliation for its local repositories and repositories advertised only by remote
+workers, so a webhook or in-memory dispatch lost during a restart cannot leave connected workers
+permanently stale. Failed deliveries remain queued with bounded exponential retries, and the lead
+refreshes peer topology so workers that join or reconnect receive an immediate recovery
+synchronization. Tag-push notifications bypass the normal tag throttle.
 If Tailscale is not configured or network startup is unavailable, `informant serve` retains the
 polling path. Connecting an existing GitHub App keeps polling enabled until worker mode is selected
 explicitly with the lead's token. Funnel never exposes the private worker/build API.
@@ -41,12 +43,18 @@ automatic work. A healthy selected container backend adds the dynamic `container
 not depend on systemd.
 
 For each notification, every worker deterministically computes the same resource-aware assignment for
-each independent job/dependency partition. The scheduler filters to capable workers, accounts for
-already reserved and queued CPU and memory, and chooses the worker with the lowest projected dominant
-resource utilization. Assignments across the build reserve projected capacity so independent jobs
-spread across the lead and workers in proportion to their available resources. The assigned worker
-enters the Checks election immediately; other capable workers enter after a bounded delay, preserving
-failover if capacity or capabilities change. Claim plans are bounded to 64 workers; larger topologies
+each independent job/dependency partition. Signed push and pull-request webhook heads are reconciled
+as targeted lanes; if GitHub's list API has not exposed the delivered head yet, the dispatch is
+retried instead of accepting a stale listing. Full repository scans remain the recovery path. The
+scheduler filters to capable workers, accounts for already reserved and queued CPU and memory, and
+chooses the worker with the lowest projected dominant resource utilization. Assignments across the
+build reserve projected capacity so independent jobs spread across the lead and workers in proportion
+to their available resources. Before reserving local execution capacity, each contender performs the
+non-candidate portion of the Checks claim to discard completed or already-active event scopes. Only
+work that can still win enters the capacity queue. The assigned worker enters the actual Checks
+election when it has capacity; other capable workers enter after a bounded delay, preserving failover
+if capacity or capabilities change. Superseding a capacity-waiting run removes its reservation before
+it can claim the obsolete head. Claim plans are bounded to 64 workers; larger topologies
 fall back to an unplanned dispatch and the same GitHub Checks election rather than truncating capable
 workers. GitHub's canonical claim scope remains the final duplicate execution guard.
 

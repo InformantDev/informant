@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { arch, platform, tmpdir } from "node:os";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { arch, platform } from "node:os";
 import { join } from "node:path";
 import { type CommandResult, command } from "./process.ts";
+import { dataDirectory } from "./store.ts";
 
 export type ContainerCommandRunner = typeof command;
 export const CONTAINER_READINESS_MAX_AGE_MS = 30_000;
@@ -200,8 +201,13 @@ function podmanSmokeError(action: string, result: CommandResult): Error {
 export async function verifyPodman(
   runCommand: ContainerCommandRunner = command,
   signal?: AbortSignal,
+  dataPath = dataDirectory(),
 ): Promise<void> {
-  const workspace = await mkdtemp(join(tmpdir(), "informant-podman-smoke-"));
+  // Rootless Podman may run outside a systemd service's private /tmp mount. Keep the bind-mounted
+  // smoke workspace in Informant's persistent data directory so both namespaces resolve it.
+  const smokeRoot = join(dataPath, "container-smoke");
+  await mkdir(smokeRoot, { recursive: true, mode: 0o700 });
+  const workspace = await mkdtemp(join(smokeRoot, "podman-"));
   const marker = join(workspace, "informant-smoke-test");
   const nonce = randomBytes(8).toString("hex");
   const image = `informant-podman-smoke:${nonce}`;

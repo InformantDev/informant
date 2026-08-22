@@ -562,6 +562,91 @@ test("one-shot event scans propagate polling failures for delivery retry", async
   ).rejects.toThrow("temporary GitHub failure");
 });
 
+test("webhook scans run only the exact pull request head", async () => {
+  const changedSha = "a".repeat(40);
+  const unrelatedSha = "b".repeat(40);
+  const changed = { ...pullRequest, number: 90, headSha: changedSha };
+  const unrelated = { ...pullRequest, number: 92, headSha: unrelatedSha };
+  const attempts: Array<{ sha: string; branch: string }> = [];
+
+  await serve(repository, {
+    once: true,
+    throwOnPollError: true,
+    scanUpdates: [{ lane: "pr:90", sha: changedSha, revision: "delivery-90" }],
+    dependencies: dependencies(
+      github({
+        branches: async () => [{ name: "main", sha: "default-sha" }],
+        pullRequests: async () => [unrelated, changed],
+      }),
+      { pending: [], seenCommentIds: [], pendingTags: [] },
+      async (_github, _repository, sha, branch) => {
+        attempts.push({ sha, branch });
+        return undefined;
+      },
+    ),
+    onMessage: () => {},
+  });
+
+  expect(attempts).toEqual([{ sha: changedSha, branch: "pull/90" }]);
+});
+
+test("full scans continue to validate coalesced webhook heads", async () => {
+  const deliveredSha = "a".repeat(40);
+  const staleSha = "b".repeat(40);
+  const unrelatedSha = "c".repeat(40);
+  const attempts: Array<{ sha: string; branch: string }> = [];
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      scanUpdates: [{ lane: "pr:90", sha: deliveredSha, revision: "delivery-90" }],
+      scanAllTargets: true,
+      dependencies: dependencies(
+        github({
+          pullRequests: async () => [
+            { ...pullRequest, number: 90, headSha: staleSha },
+            { ...pullRequest, number: 92, headSha: unrelatedSha },
+          ],
+        }),
+        { pending: [], seenCommentIds: [], pendingTags: [] },
+        async (_github, _repository, sha, branch) => {
+          attempts.push({ sha, branch });
+          return undefined;
+        },
+      ),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("GitHub has not exposed webhook heads for pr:90; retrying dispatch");
+  expect(attempts).toEqual([{ sha: unrelatedSha, branch: "pull/92" }]);
+});
+
+test("webhook scans retry until GitHub exposes the delivered head", async () => {
+  const deliveredSha = "a".repeat(40);
+  const staleSha = "b".repeat(40);
+  let attempts = 0;
+
+  await expect(
+    serve(repository, {
+      once: true,
+      throwOnPollError: true,
+      scanUpdates: [{ lane: "pr:90", sha: deliveredSha, revision: "delivery-90" }],
+      dependencies: dependencies(
+        github({
+          pullRequests: async () => [{ ...pullRequest, number: 90, headSha: staleSha }],
+        }),
+        { pending: [], seenCommentIds: [], pendingTags: [] },
+        async () => {
+          attempts++;
+          return undefined;
+        },
+      ),
+      onMessage: () => {},
+    }),
+  ).rejects.toThrow("GitHub has not exposed webhook heads for pr:90; retrying dispatch");
+  expect(attempts).toBe(0);
+});
+
 test("one-shot event scans propagate unclaimed work for dispatch retry", async () => {
   const state: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
   let attempts = 0;

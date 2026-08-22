@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  acceptedAutomaticLaneUpdates,
   actionableWebhook,
   addedRepositoryRecoveryRequests,
   automaticLaneUpdatesRefreshRetention,
@@ -16,6 +17,8 @@ import {
   localNetworkExecutionCapacity,
   MAX_WEBHOOK_BODY_BYTES,
   mergeAutomaticLaneUpdates,
+  NETWORK_RECONCILIATION_INTERVAL_MS,
+  networkReconciliationRequests,
   parseAutomaticLaneUpdates,
   parseNetworkClaimPlan,
   parseTailscaleStatus,
@@ -34,6 +37,7 @@ import {
   validNetworkAuthorization,
   webhookAutomaticLaneUpdates,
   webhookForcesTagPoll,
+  webhookScanUpdates,
 } from "./tailscale.ts";
 
 test("uses a Tailscale executable available on PATH", () => {
@@ -775,6 +779,55 @@ test("extracts and validates bounded automatic lane updates", () => {
   ).toBe(true);
 });
 
+test("rejects delayed webhook heads against retained remote ordering", () => {
+  const current = {
+    lane: "pr:90",
+    sha: "b".repeat(40),
+    obsoleteShas: ["a".repeat(40)],
+    updatedAt: 200,
+    revision: "current",
+  };
+  const delayed = {
+    lane: "pr:90",
+    sha: "a".repeat(40),
+    updatedAt: 100,
+    revision: "delayed",
+  };
+  const newer = {
+    lane: "pr:90",
+    sha: "c".repeat(40),
+    obsoleteShas: [current.sha],
+    updatedAt: 300,
+    revision: "newer",
+  };
+
+  expect(acceptedAutomaticLaneUpdates([current], [delayed])).toEqual([]);
+  expect(acceptedAutomaticLaneUpdates([current], [newer])).toEqual([newer]);
+});
+
+test("targets signed same-repository webhook heads", () => {
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const update = { lane: "pr:90", sha: "a".repeat(40) };
+  const payload = {
+    pull_request: { head: { repo: { full_name: "OWNER/REPO" } } },
+  };
+
+  expect(webhookScanUpdates("pull_request", payload, repository, [update])).toEqual([update]);
+  expect(
+    webhookScanUpdates(
+      "pull_request",
+      { pull_request: { head: { repo: { full_name: "fork/repo" } } } },
+      repository,
+      [update],
+    ),
+  ).toBeUndefined();
+  expect(
+    webhookScanUpdates("pull_request", payload, repository, [
+      { lane: "pr:90", closed: true as const },
+    ]),
+  ).toBeUndefined();
+});
+
 test("verifies GitHub webhook signatures without accepting malformed values", () => {
   const body = JSON.stringify({ repository: { full_name: "owner/repo" } });
   const signature = `sha256=${createHmac("sha256", "secret").update(body).digest("hex")}`;
@@ -789,6 +842,7 @@ test("dispatches only webhook actions that can create trigger work", () => {
   expect(actionableWebhook("pull_request", { action: "synchronize" })).toBe(true);
   expect(actionableWebhook("issue_comment", { action: "created" })).toBe(true);
   expect(actionableWebhook("issue_comment", { action: "edited" })).toBe(false);
+  expect(actionableWebhook("check_suite", { action: "requested" })).toBe(false);
   expect(actionableWebhook("check_suite", { action: "rerequested" })).toBe(true);
   expect(actionableWebhook("check_suite", { action: "completed" })).toBe(false);
   expect(actionableWebhook("installation", { action: "created" })).toBe(false);
@@ -871,6 +925,27 @@ test("repository refresh recovers only newly registered repositories", () => {
   expect(addedRepositoryRecoveryRequests([one, two], [one, two])).toEqual([]);
 });
 
+test("periodic reconciliation covers local and remote-only repositories", () => {
+  expect(NETWORK_RECONCILIATION_INTERVAL_MS).toBe(5 * 60_000);
+  const local = { owner: "owner", repo: "local", fullName: "owner/local" };
+  const remote = {
+    id: "remote",
+    hostName: "remote",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: ["OWNER/LOCAL", "owner/remote"],
+  };
+
+  expect(networkReconciliationRequests([local], [remote])).toEqual([
+    { repository: local, forceTagPoll: false, fullScan: true },
+    {
+      repository: { owner: "owner", repo: "remote", fullName: "owner/remote" },
+      forceTagPoll: false,
+      fullScan: true,
+    },
+  ]);
+});
+
 test("repository removal cancels an active scan and suppresses queued scans", async () => {
   const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const signals: AbortSignal[] = [];
@@ -937,6 +1012,36 @@ test("runs another dispatch with its latest claim plan during an active dispatch
   await queue.stop();
 });
 
+test("a successful dispatch does not replay consumed webhook heads", async () => {
+  const requests: string[][] = [];
+  let finishFirst!: (value: boolean) => void;
+  const first = new Promise<boolean>((resolve) => {
+    finishFirst = resolve;
+  });
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(async (request) => {
+    requests.push(request.scanUpdates?.map((update) => update.lane) ?? []);
+    return requests.length === 1 ? first : true;
+  });
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
+  while (requests.length === 0) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
+  });
+  finishFirst(true);
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toEqual([["pr:90"], ["branch:main"]]);
+  await queue.stop();
+});
+
 test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
   const plans: Array<number | undefined> = [];
   let finishFirst!: (value: boolean) => void;
@@ -971,9 +1076,47 @@ test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
   await queue.stop();
 });
 
-test("retains failed dispatches and preserves a queued tag refresh", async () => {
+test("fresh dispatches bypass a retained retry backoff", async () => {
+  let retry: (() => void) | undefined;
+  let cancellations = 0;
+  const lanes: string[][] = [];
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      lanes.push(request.scanUpdates?.map((update) => update.lane) ?? []);
+      return lanes.length > 1;
+    },
+    () => {},
+    (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {
+      cancellations++;
+    },
+  );
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
+  while (!retry) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
+  });
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(lanes).toEqual([["pr:90"], ["pr:90", "branch:main"]]);
+  expect(cancellations).toBe(1);
+  await queue.stop();
+});
+
+test("a queued webhook retries immediately after an active dispatch fails", async () => {
   const callbacks: Array<() => void> = [];
-  const requests: boolean[] = [];
+  const requests: Array<{ forceTagPoll: boolean; fullScan: boolean; lanes: string[] }> = [];
   let finishFirst!: (value: boolean) => void;
   const first = new Promise<boolean>((resolve) => {
     finishFirst = resolve;
@@ -981,7 +1124,11 @@ test("retains failed dispatches and preserves a queued tag refresh", async () =>
   const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const queue = new DispatchRetryQueue(
     async (request) => {
-      requests.push(request.forceTagPoll);
+      requests.push({
+        forceTagPoll: request.forceTagPoll,
+        fullScan: request.fullScan === true,
+        lanes: request.scanUpdates?.map((update) => update.lane) ?? [],
+      });
       return requests.length === 1 ? first : true;
     },
     () => {},
@@ -992,14 +1139,25 @@ test("retains failed dispatches and preserves a queued tag refresh", async () =>
     () => {},
   );
 
-  queue.enqueue({ repository, forceTagPoll: false });
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
   while (requests.length === 0) await Bun.sleep(0);
-  queue.enqueue({ repository, forceTagPoll: true });
+  queue.enqueue({
+    repository,
+    forceTagPoll: true,
+    fullScan: true,
+    scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
+  });
   finishFirst(false);
-  while (callbacks.length === 0) await Bun.sleep(0);
-  callbacks.shift()?.();
   while (queue.size > 0) await Bun.sleep(0);
 
-  expect(requests).toEqual([false, true]);
+  expect(requests).toEqual([
+    { forceTagPoll: false, fullScan: false, lanes: ["pr:90"] },
+    { forceTagPoll: true, fullScan: true, lanes: ["pr:90", "branch:main"] },
+  ]);
+  expect(callbacks).toEqual([]);
   await queue.stop();
 });
