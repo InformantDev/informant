@@ -1076,7 +1076,45 @@ test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
   await queue.stop();
 });
 
-test("retains failed dispatches and preserves queued webhook heads", async () => {
+test("fresh dispatches bypass a retained retry backoff", async () => {
+  let retry: (() => void) | undefined;
+  let cancellations = 0;
+  const lanes: string[][] = [];
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      lanes.push(request.scanUpdates?.map((update) => update.lane) ?? []);
+      return lanes.length > 1;
+    },
+    () => {},
+    (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {
+      cancellations++;
+    },
+  );
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
+  while (!retry) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
+  });
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(lanes).toEqual([["pr:90"], ["pr:90", "branch:main"]]);
+  expect(cancellations).toBe(1);
+  await queue.stop();
+});
+
+test("a queued webhook retries immediately after an active dispatch fails", async () => {
   const callbacks: Array<() => void> = [];
   const requests: Array<{ forceTagPoll: boolean; fullScan: boolean; lanes: string[] }> = [];
   let finishFirst!: (value: boolean) => void;
@@ -1114,13 +1152,12 @@ test("retains failed dispatches and preserves queued webhook heads", async () =>
     scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
   });
   finishFirst(false);
-  while (callbacks.length === 0) await Bun.sleep(0);
-  callbacks.shift()?.();
   while (queue.size > 0) await Bun.sleep(0);
 
   expect(requests).toEqual([
     { forceTagPoll: false, fullScan: false, lanes: ["pr:90"] },
     { forceTagPoll: true, fullScan: true, lanes: ["pr:90", "branch:main"] },
   ]);
+  expect(callbacks).toEqual([]);
   await queue.stop();
 });

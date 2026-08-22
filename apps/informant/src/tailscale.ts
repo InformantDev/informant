@@ -570,7 +570,14 @@ export class DispatchRetryQueue {
         existing.request.scanUpdates,
         request.scanUpdates,
       );
-      if (existing.running) existing.pending = true;
+      if (existing.running) {
+        existing.pending = true;
+      } else if (existing.timer) {
+        this.cancel(existing.timer);
+        existing.timer = undefined;
+        existing.attempts = 0;
+        this.run(key);
+      }
       return;
     }
     this.entries.set(key, { request, attempts: 0, pending: false });
@@ -605,6 +612,11 @@ export class DispatchRetryQueue {
         current.request.scanUpdates,
       );
       if (this.stopped) return;
+      if (current.pending) {
+        current.attempts = 0;
+        this.run(key);
+        return;
+      }
       current.attempts++;
       const delayMs = Math.min(1_000 * 2 ** (current.attempts - 1), MAX_DISPATCH_RETRY_MS);
       this.onRetry(current.request, delayMs);
