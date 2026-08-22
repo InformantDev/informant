@@ -215,6 +215,26 @@ export function acceptedAutomaticLaneUpdates(
   return accepted;
 }
 
+export function filterAcceptedScanUpdates(
+  scanUpdates: AutomaticLaneUpdate[] | undefined,
+  propagatedUpdates: AutomaticLaneUpdate[] | undefined,
+  acceptedUpdates: AutomaticLaneUpdate[] | undefined,
+): AutomaticLaneUpdate[] | undefined {
+  if (!scanUpdates?.length || !propagatedUpdates?.length) return scanUpdates;
+  const propagatedLanes = new Set(propagatedUpdates.map((update) => update.lane));
+  const acceptedHeads = new Set(
+    (acceptedUpdates ?? []).map((update) =>
+      JSON.stringify([update.lane, update.sha ?? null, update.closed === true]),
+    ),
+  );
+  const filtered = scanUpdates.filter(
+    (update) =>
+      !propagatedLanes.has(update.lane) ||
+      acceptedHeads.has(JSON.stringify([update.lane, update.sha ?? null, update.closed === true])),
+  );
+  return filtered.length > 0 ? filtered : undefined;
+}
+
 export function retireAutomaticLaneUpdate(
   retained: AutomaticLaneUpdate[] | undefined,
   retired: AutomaticLaneUpdate,
@@ -428,7 +448,7 @@ export function networkReconciliationRequests(
   }
   return [...repositories.values()].map((repository) => ({
     repository,
-    forceTagPoll: false,
+    forceTagPoll: true,
     fullScan: true,
   }));
 }
@@ -1366,15 +1386,23 @@ async function serveConfiguredWithTailscale(
   const propagateAutomaticUpdates = async (
     repository: Repository,
     updates: AutomaticLaneUpdate[] | undefined,
-  ): Promise<AutomaticLaneUpdate[]> => {
-    if (!updates?.length) return [];
+  ): Promise<AutomaticLaneUpdate[] | undefined> => {
+    if (!updates?.length) return undefined;
     const localRepository = configuredRepositories.find(
       (candidate) => candidate.fullName.toLowerCase() === repository.fullName.toLowerCase(),
     );
-    const registeredWorkers = [...knownWorkers.values()].filter((worker) =>
+    let registeredWorkers = [...knownWorkers.values()].filter((worker) =>
       worker.repositories.some((name) => name.toLowerCase() === repository.fullName.toLowerCase()),
     );
-    if (!localRepository && registeredWorkers.length === 0) return [];
+    if (!localRepository && registeredWorkers.length === 0 && config.mode === "lead") {
+      await refreshWorkers();
+      registeredWorkers = [...knownWorkers.values()].filter((worker) =>
+        worker.repositories.some(
+          (name) => name.toLowerCase() === repository.fullName.toLowerCase(),
+        ),
+      );
+    }
+    if (!localRepository && registeredWorkers.length === 0) return undefined;
     const retained = latestAutomaticUpdates.get(repository.fullName.toLowerCase());
     const acceptedUpdates = localRepository
       ? automaticRuns.apply(localRepository, updates)
@@ -1624,13 +1652,21 @@ async function serveConfiguredWithTailscale(
           ? automaticRuns.apply(repository, automaticUpdates)
           : undefined;
         const rememberedUpdates = rememberAutomaticUpdates(repository, acceptedUpdates);
+        const acceptedScanUpdates = filterAcceptedScanUpdates(
+          scanUpdates,
+          automaticUpdates,
+          acceptedUpdates,
+        );
+        if (scanUpdates?.length && !acceptedScanUpdates?.length && body.fullScan !== true) {
+          return new Response(null, { status: 202 });
+        }
         dispatchQueue.enqueue({
           repository,
           forceTagPoll: body.forceTagPoll === true,
           fullScan: body.fullScan === true,
           claimPlan,
           automaticUpdates: rememberedUpdates,
-          scanUpdates,
+          scanUpdates: acceptedScanUpdates,
         });
         return new Response(null, { status: 202 });
       }
@@ -1772,15 +1808,16 @@ async function serveConfiguredWithTailscale(
             delivery ?? undefined,
           );
           const acceptedUpdates = await propagateAutomaticUpdates(repository, automaticUpdates);
-          if (automaticUpdates?.length && acceptedUpdates.length === 0) {
+          if (automaticUpdates?.length && acceptedUpdates && acceptedUpdates.length === 0) {
             return new Response(null, { status: 202 });
           }
-          const scanUpdates = webhookScanUpdates(event, payload, repository, acceptedUpdates);
+          const dispatchUpdates = acceptedUpdates ?? automaticUpdates;
+          const scanUpdates = webhookScanUpdates(event, payload, repository, dispatchUpdates);
           dispatchQueue.enqueue({
             repository,
             forceTagPoll: webhookForcesTagPoll(event, payload),
             fullScan: !scanUpdates?.length,
-            automaticUpdates: acceptedUpdates,
+            automaticUpdates: dispatchUpdates,
             scanUpdates,
           });
           return new Response(null, { status: 202 });

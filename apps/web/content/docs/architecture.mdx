@@ -29,7 +29,8 @@ forced synchronization of its locally registered repositories at startup to reco
 while Informant was stopped or restarting, then reacts to webhooks. The lead also dispatches a
 periodic reconciliation for its local repositories and repositories advertised only by remote
 workers, so a webhook or in-memory dispatch lost during a restart cannot leave connected workers
-permanently stale. Failed deliveries remain queued with bounded exponential retries, and the lead
+permanently stale. Reconciliation forces tag enumeration as well as scanning branches and pull
+requests. Failed deliveries remain queued with bounded exponential retries, and the lead
 refreshes peer topology so workers that join or reconnect receive an immediate recovery
 synchronization. Tag-push notifications bypass the normal tag throttle.
 If Tailscale is not configured or network startup is unavailable, `informant serve` retains the

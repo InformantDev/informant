@@ -12,6 +12,7 @@ import {
   DispatchRetryQueue,
   disableTailscale,
   enableTailscale,
+  filterAcceptedScanUpdates,
   generatedNetworkClaimPlan,
   githubAppWebhookSettings,
   localNetworkExecutionCapacity,
@@ -805,6 +806,27 @@ test("rejects delayed webhook heads against retained remote ordering", () => {
   expect(acceptedAutomaticLaneUpdates([current], [newer])).toEqual([newer]);
 });
 
+test("drops remote scan assertions rejected by worker ordering", () => {
+  const stale = {
+    lane: "pr:90",
+    sha: "a".repeat(40),
+    updatedAt: 100,
+    revision: "stale",
+  };
+  const current = {
+    lane: "pr:90",
+    sha: "b".repeat(40),
+    obsoleteShas: [stale.sha],
+    updatedAt: 200,
+    revision: "current",
+  };
+
+  expect(filterAcceptedScanUpdates([stale], [stale], [])).toBeUndefined();
+  expect(filterAcceptedScanUpdates([stale], [current], [current])).toBeUndefined();
+  expect(filterAcceptedScanUpdates([current], [current], [current])).toEqual([current]);
+  expect(filterAcceptedScanUpdates([current], undefined, undefined)).toEqual([current]);
+});
+
 test("targets signed same-repository webhook heads", () => {
   const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const update = { lane: "pr:90", sha: "a".repeat(40) };
@@ -937,10 +959,10 @@ test("periodic reconciliation covers local and remote-only repositories", () => 
   };
 
   expect(networkReconciliationRequests([local], [remote])).toEqual([
-    { repository: local, forceTagPoll: false, fullScan: true },
+    { repository: local, forceTagPoll: true, fullScan: true },
     {
       repository: { owner: "owner", repo: "remote", fullName: "owner/remote" },
-      forceTagPoll: false,
+      forceTagPoll: true,
       fullScan: true,
     },
   ]);
