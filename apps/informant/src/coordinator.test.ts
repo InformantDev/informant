@@ -1466,8 +1466,12 @@ describe("runCommit", () => {
       status,
       logPath: `/tmp/${status}.log`,
     });
-    const result = aggregatePartitionResults([record("success"), record("failure")]);
+    const result = aggregatePartitionResults([
+      { ...record("cancelled"), interrupted: true },
+      record("failure"),
+    ]);
     expect(typeof result === "object" ? result.status : result).toBe("failure");
+    expect(typeof result === "object" ? result.interrupted : false).toBe(true);
   });
 
   test("keeps the complete VM job inventory when selecting one manually triggered job", async () => {

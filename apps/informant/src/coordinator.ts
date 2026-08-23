@@ -240,11 +240,13 @@ export function aggregatePartitionResults(
 ): BuildRecord | false | undefined {
   if (results.includes(false)) return false;
   const records = results.filter((result): result is BuildRecord => typeof result === "object");
-  return (
+  const selected =
     records.find((record) => record.status === "failure") ??
     records.find((record) => record.status === "cancelled") ??
-    records[0]
-  );
+    records[0];
+  return selected && records.some((record) => record.interrupted)
+    ? { ...selected, interrupted: true }
+    : selected;
 }
 
 export function partitionJobGraphs(jobs: JobConfig[]): JobConfig[][] {
@@ -695,6 +697,9 @@ async function runCommitPartitionWithSlot(
             ? { branch: promoted.manualTriggerBranch }
             : {}),
           label: promoted.manualTriggerLabel ?? recordBranch,
+          ...(promoted.originalPullRequest !== undefined
+            ? { pullRequest: promoted.originalPullRequest }
+            : {}),
         }
       : undefined;
     return {
@@ -773,6 +778,8 @@ async function runCommitPartitionWithSlot(
             retryManual.jobs,
             retryManual.branch,
             retryManual.label,
+            undefined,
+            retryManual.pullRequest,
           )
           .then(async () => {
             persisted.retryManual = undefined;
@@ -802,6 +809,9 @@ async function runCommitPartitionWithSlot(
             ? { branch: claim.manualTriggerBranch }
             : {}),
           label: claim.manualTriggerLabel ?? branch,
+          ...(claim.originalPullRequest !== undefined
+            ? { pullRequest: claim.originalPullRequest }
+            : {}),
         }
       : undefined;
   // Automatic-lane supersession must not cancel manually claimed work. Forced worker shutdown is

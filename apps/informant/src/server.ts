@@ -608,6 +608,7 @@ export async function recoverInterruptedBuilds(
                 jobs: build.jobs?.map((job) => job.name) ?? [],
                 ...(build.pullRequest === undefined ? { branch: build.branch } : {}),
                 label: build.branch,
+                ...(build.pullRequest !== undefined ? { pullRequest: build.pullRequest } : {}),
               }
             : undefined))
         : undefined;
@@ -622,6 +623,7 @@ export async function recoverInterruptedBuilds(
             manualRequest.branch,
             manualRequest.label,
             signal,
+            manualRequest.pullRequest,
           );
         build.retryManual = undefined;
         build.manualRetryRequeuedAt = new Date().toISOString();

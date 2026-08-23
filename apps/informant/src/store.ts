@@ -230,11 +230,8 @@ export async function persistClaim(record: BuildRecord): Promise<void> {
 
 export async function createBuild(record: BuildRecord): Promise<void> {
   await mkdir(buildDirectory(record.id), { recursive: true });
-  await rm(cancellationDirectory(record.id), { recursive: true, force: true });
-  await rm(join(buildDirectory(record.id), "cancellation-acknowledgements"), {
-    recursive: true,
-    force: true,
-  });
+  // persistClaim may already have exposed this build to cancellation while it waited on
+  // housekeeping. Preserve those requests for monitorBuildCancellation to consume.
   await saveBuild(record);
   await Bun.write(record.logPath, "");
 }

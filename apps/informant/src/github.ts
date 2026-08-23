@@ -112,6 +112,7 @@ export interface ClaimResult {
 interface ManualTriggerContext {
   branch: string | null;
   label?: string;
+  pullRequest?: number;
 }
 
 interface ManualTriggerRequest {
@@ -126,7 +127,7 @@ function manualTriggerRequest(check: CheckRun): ManualTriggerRequest | undefined
   if (!encoded) return undefined;
   try {
     const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
-      context?: { branch?: unknown; label?: unknown };
+      context?: { branch?: unknown; label?: unknown; pullRequest?: unknown };
       jobs?: unknown;
     };
     if (!value.context || !Array.isArray(value.jobs)) return undefined;
@@ -134,6 +135,10 @@ function manualTriggerRequest(check: CheckRun): ManualTriggerRequest | undefined
       context: {
         branch: typeof value.context.branch === "string" ? value.context.branch : null,
         label: typeof value.context.label === "string" ? value.context.label : undefined,
+        pullRequest:
+          Number.isSafeInteger(value.context.pullRequest) && Number(value.context.pullRequest) > 0
+            ? Number(value.context.pullRequest)
+            : undefined,
       },
       jobs: value.jobs.map(String),
     };
@@ -1026,8 +1031,9 @@ export class GitHubClient {
     requestedJobs: string[],
     branch: string | undefined,
     label: string,
+    pullRequest?: number,
   ): Promise<CheckRun> {
-    const context = { branch: branch ?? null, label };
+    const context = { branch: branch ?? null, label, pullRequest };
     return this.createCheck(
       repository,
       sha,
@@ -1047,13 +1053,14 @@ export class GitHubClient {
     branch: string | undefined,
     label: string,
     signal?: AbortSignal,
+    pullRequest?: number,
   ): Promise<CheckRun> {
     const externalId = `manual-retry:${identity}`;
     const existing = (await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME, signal)).find(
       (check) => check.external_id === externalId,
     );
     if (existing) return existing;
-    const context = { branch: branch ?? null, label };
+    const context = { branch: branch ?? null, label, pullRequest };
     return this.createCheck(
       repository,
       sha,
@@ -1196,7 +1203,7 @@ export class GitHubClient {
       /:event:commit:pr:(\d+):([^:]+)(?::(?:job-set|jobs):[^:]+)*$/,
     );
     const originalPullRequestNumber = Number(originalPullRequestMatch?.[1]);
-    const originalPullRequest =
+    const suitePullRequest =
       Number.isSafeInteger(originalPullRequestNumber) &&
       originalPullRequestNumber > 0 &&
       originalPullRequestMatch?.[2] === sha
@@ -1242,6 +1249,7 @@ export class GitHubClient {
       ? previousTriggerContext(previousAggregate, sha)
       : undefined;
     const context = requestedContext ?? recoveredContext;
+    const originalPullRequest = context?.pullRequest ?? suitePullRequest;
     const legacyManualRequest = requestedChecks.some(
       (check) =>
         manualTriggerRequest(check) === undefined && manualTriggerContext(check) !== undefined,
