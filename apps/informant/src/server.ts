@@ -474,6 +474,10 @@ export interface ServerOptions {
   claimScheduling?: ClaimScheduling;
   /** Shared by event-driven scans so a newer dispatch can stop an older run immediately. */
   automaticRuns?: AutomaticRunRegistry;
+  /** Signed webhook heads that this one-shot scan must observe exactly. */
+  scanUpdates?: AutomaticLaneUpdate[];
+  /** Process every current lane while still validating scanUpdates. */
+  scanAllTargets?: boolean;
   dependencies?: ServerDependencies;
 }
 
@@ -906,6 +910,14 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         }
         return pending;
       };
+      const scanUpdates = options.scanUpdates?.length
+        ? new Map(
+            options.scanUpdates.flatMap((update) =>
+              update.sha && !update.closed ? [[update.lane, update.sha] as const] : [],
+            ),
+          )
+        : undefined;
+      const observedScanUpdates = new Set<string>();
       for (const target of [
         // Pull requests are the latency-sensitive CI lane. Branch discovery can
         // require loading many distinct configs and checking manual requests,
@@ -935,6 +947,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           lane: `tag:${tag.name}`,
         })),
       ]) {
+        const expectedScanSha = scanUpdates?.get(target.lane);
+        if (scanUpdates && !options.scanAllTargets && expectedScanSha === undefined) continue;
+        if (expectedScanSha !== undefined && expectedScanSha !== target.sha) continue;
+        if (expectedScanSha !== undefined) observedScanUpdates.add(target.lane);
         if (options.signal?.aborted) {
           await flushMissingConfigs();
           await drainForShutdown();
@@ -1045,6 +1061,14 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         }
       }
       await flushMissingConfigs();
+      const missingScanUpdates = scanUpdates
+        ? [...scanUpdates.keys()].filter((lane) => !observedScanUpdates.has(lane))
+        : [];
+      if (missingScanUpdates.length > 0) {
+        throw new Error(
+          `GitHub has not exposed webhook heads for ${missingScanUpdates.join(", ")}; retrying dispatch`,
+        );
+      }
 
       if (completedComments.size > 0) {
         const completed = new Set(completedComments);

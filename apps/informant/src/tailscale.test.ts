@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  acceptedAutomaticLaneUpdates,
   actionableWebhook,
   addedRepositoryRecoveryRequests,
   automaticLaneUpdatesRefreshRetention,
@@ -11,11 +12,15 @@ import {
   DispatchRetryQueue,
   disableTailscale,
   enableTailscale,
+  filterAcceptedScanUpdates,
   generatedNetworkClaimPlan,
   githubAppWebhookSettings,
   localNetworkExecutionCapacity,
   MAX_WEBHOOK_BODY_BYTES,
   mergeAutomaticLaneUpdates,
+  NETWORK_RECONCILIATION_INTERVAL_MS,
+  networkReconciliationRequests,
+  networkScanDispatchPolicy,
   parseAutomaticLaneUpdates,
   parseNetworkClaimPlan,
   parseTailscaleStatus,
@@ -27,6 +32,7 @@ import {
   retireAutomaticLaneUpdate,
   serveWithTailscale,
   startupRecoveryRequests,
+  TARGETED_SCAN_RETENTION_MS,
   type TailscaleStatus,
   tailscaleExecutable,
   tailscaleStatus,
@@ -34,6 +40,7 @@ import {
   validNetworkAuthorization,
   webhookAutomaticLaneUpdates,
   webhookForcesTagPoll,
+  webhookScanUpdates,
 } from "./tailscale.ts";
 
 test("uses a Tailscale executable available on PATH", () => {
@@ -775,6 +782,76 @@ test("extracts and validates bounded automatic lane updates", () => {
   ).toBe(true);
 });
 
+test("rejects delayed webhook heads against retained remote ordering", () => {
+  const current = {
+    lane: "pr:90",
+    sha: "b".repeat(40),
+    obsoleteShas: ["a".repeat(40)],
+    updatedAt: 200,
+    revision: "current",
+  };
+  const delayed = {
+    lane: "pr:90",
+    sha: "a".repeat(40),
+    updatedAt: 100,
+    revision: "delayed",
+  };
+  const newer = {
+    lane: "pr:90",
+    sha: "c".repeat(40),
+    obsoleteShas: [current.sha],
+    updatedAt: 300,
+    revision: "newer",
+  };
+
+  expect(acceptedAutomaticLaneUpdates([current], [delayed])).toEqual([]);
+  expect(acceptedAutomaticLaneUpdates([current], [newer])).toEqual([newer]);
+});
+
+test("drops remote scan assertions rejected by worker ordering", () => {
+  const stale = {
+    lane: "pr:90",
+    sha: "a".repeat(40),
+    updatedAt: 100,
+    revision: "stale",
+  };
+  const current = {
+    lane: "pr:90",
+    sha: "b".repeat(40),
+    obsoleteShas: [stale.sha],
+    updatedAt: 200,
+    revision: "current",
+  };
+
+  expect(filterAcceptedScanUpdates([stale], [stale], [])).toBeUndefined();
+  expect(filterAcceptedScanUpdates([stale], [current], [current])).toBeUndefined();
+  expect(filterAcceptedScanUpdates([current], [current], [current])).toEqual([current]);
+  expect(filterAcceptedScanUpdates([current], undefined, undefined)).toEqual([current]);
+});
+
+test("targets signed same-repository webhook heads", () => {
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const update = { lane: "pr:90", sha: "a".repeat(40) };
+  const payload = {
+    pull_request: { head: { repo: { full_name: "OWNER/REPO" } } },
+  };
+
+  expect(webhookScanUpdates("pull_request", payload, repository, [update])).toEqual([update]);
+  expect(
+    webhookScanUpdates(
+      "pull_request",
+      { pull_request: { head: { repo: { full_name: "fork/repo" } } } },
+      repository,
+      [update],
+    ),
+  ).toBeUndefined();
+  expect(
+    webhookScanUpdates("pull_request", payload, repository, [
+      { lane: "pr:90", closed: true as const },
+    ]),
+  ).toBeUndefined();
+});
+
 test("verifies GitHub webhook signatures without accepting malformed values", () => {
   const body = JSON.stringify({ repository: { full_name: "owner/repo" } });
   const signature = `sha256=${createHmac("sha256", "secret").update(body).digest("hex")}`;
@@ -789,6 +866,7 @@ test("dispatches only webhook actions that can create trigger work", () => {
   expect(actionableWebhook("pull_request", { action: "synchronize" })).toBe(true);
   expect(actionableWebhook("issue_comment", { action: "created" })).toBe(true);
   expect(actionableWebhook("issue_comment", { action: "edited" })).toBe(false);
+  expect(actionableWebhook("check_suite", { action: "requested" })).toBe(true);
   expect(actionableWebhook("check_suite", { action: "rerequested" })).toBe(true);
   expect(actionableWebhook("check_suite", { action: "completed" })).toBe(false);
   expect(actionableWebhook("installation", { action: "created" })).toBe(false);
@@ -835,8 +913,8 @@ test("startup recovery forces a synchronization for every local repository", () 
   const repositories = [one, two];
 
   expect(startupRecoveryRequests(repositories)).toEqual([
-    { repository: one, forceTagPoll: true },
-    { repository: two, forceTagPoll: true },
+    { repository: one, forceTagPoll: true, fullScan: true },
+    { repository: two, forceTagPoll: true, fullScan: true },
   ]);
 });
 
@@ -866,9 +944,36 @@ test("repository refresh recovers only newly registered repositories", () => {
   const two = { owner: "owner", repo: "two", fullName: "OWNER/TWO" };
 
   expect(addedRepositoryRecoveryRequests([one], [one, two])).toEqual([
-    { repository: two, forceTagPoll: true },
+    { repository: two, forceTagPoll: true, fullScan: true },
   ]);
   expect(addedRepositoryRecoveryRequests([one, two], [one, two])).toEqual([]);
+});
+
+test("periodic reconciliation covers local and remote-only repositories", () => {
+  expect(NETWORK_RECONCILIATION_INTERVAL_MS).toBe(5 * 60_000);
+  const local = { owner: "owner", repo: "local", fullName: "owner/local" };
+  const remote = {
+    id: "remote",
+    hostName: "remote",
+    address: "100.64.0.2",
+    capabilities: [],
+    repositories: ["OWNER/LOCAL", "owner/remote"],
+  };
+
+  expect(networkReconciliationRequests([local], [remote])).toEqual([
+    {
+      repository: local,
+      forceTagPoll: true,
+      fullScan: true,
+      retireSupersededScanUpdates: true,
+    },
+    {
+      repository: { owner: "owner", repo: "remote", fullName: "owner/remote" },
+      forceTagPoll: true,
+      fullScan: true,
+      retireSupersededScanUpdates: true,
+    },
+  ]);
 });
 
 test("repository removal cancels an active scan and suppresses queued scans", async () => {
@@ -937,6 +1042,36 @@ test("runs another dispatch with its latest claim plan during an active dispatch
   await queue.stop();
 });
 
+test("a successful dispatch does not replay consumed webhook heads", async () => {
+  const requests: string[][] = [];
+  let finishFirst!: (value: boolean) => void;
+  const first = new Promise<boolean>((resolve) => {
+    finishFirst = resolve;
+  });
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(async (request) => {
+    requests.push(request.scanUpdates?.map((update) => update.lane) ?? []);
+    return requests.length === 1 ? first : true;
+  });
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
+  while (requests.length === 0) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
+  });
+  finishFirst(true);
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toEqual([["pr:90"], ["branch:main"]]);
+  await queue.stop();
+});
+
 test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
   const plans: Array<number | undefined> = [];
   let finishFirst!: (value: boolean) => void;
@@ -971,9 +1106,210 @@ test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
   await queue.stop();
 });
 
-test("retains failed dispatches and preserves a queued tag refresh", async () => {
+test("periodic recovery expires permanently missed head assertions after a bounded delay", async () => {
+  let now = 0;
+  let retry: (() => void) | undefined;
+  const scans: string[][] = [];
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const update = { lane: "pr:90", sha: "a".repeat(40), revision: "delivery-90" };
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      scans.push(request.scanUpdates?.map((candidate) => candidate.sha ?? "") ?? []);
+      return scans.length > 2;
+    },
+    () => {},
+    (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {},
+    () => now,
+  );
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    automaticUpdates: [update],
+    scanUpdates: [update],
+  });
+  while (!retry) await Bun.sleep(0);
+  const initialRetry = retry;
+  now = TARGETED_SCAN_RETENTION_MS - 1;
+  queue.enqueue({
+    repository,
+    forceTagPoll: true,
+    fullScan: true,
+    retireSupersededScanUpdates: true,
+  });
+  while (scans.length < 2 || retry === initialRetry) await Bun.sleep(0);
+  const expire = retry;
+  now = TARGETED_SCAN_RETENTION_MS;
+  expire?.();
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(scans).toEqual([[update.sha], [update.sha], []]);
+  await queue.stop();
+});
+
+test("targeted scans remain retryable across older network workers", () => {
+  const update = { lane: "pr:90", sha: "a".repeat(40) };
+
+  expect(networkScanDispatchPolicy([], { scanUpdates: [update] })).toEqual({
+    fullScan: true,
+    scanUpdates: undefined,
+    retryForTargetedScan: true,
+  });
+  expect(
+    networkScanDispatchPolicy(["targeted-scan-v1"], {
+      fullScan: false,
+      scanUpdates: [update],
+    }),
+  ).toEqual({
+    fullScan: false,
+    scanUpdates: [update],
+    retryForTargetedScan: false,
+  });
+  expect(networkScanDispatchPolicy([], {})).toEqual({
+    fullScan: false,
+    scanUpdates: undefined,
+    retryForTargetedScan: false,
+  });
+});
+
+test("targeted scan overflow promotes the retained dispatch to a full scan", async () => {
+  const requests: Array<{ fullScan: boolean; lanes: string[] }> = [];
+  let finishFirst!: (value: boolean) => void;
+  const first = new Promise<boolean>((resolve) => {
+    finishFirst = resolve;
+  });
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(async (request) => {
+    requests.push({
+      fullScan: request.fullScan === true,
+      lanes: request.scanUpdates?.map((update) => update.lane) ?? [],
+    });
+    return requests.length === 1 ? first : true;
+  });
+  const update = (index: number) => ({
+    lane: `pr:${index}`,
+    sha: index.toString(16).padStart(40, "0"),
+    updatedAt: index,
+  });
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    automaticUpdates: [update(1)],
+    scanUpdates: [update(1)],
+  });
+  while (requests.length === 0) await Bun.sleep(0);
+  for (let index = 2; index <= 65; index++) {
+    queue.enqueue({
+      repository,
+      forceTagPoll: false,
+      automaticUpdates: [update(index)],
+      scanUpdates: [update(index)],
+    });
+  }
+  finishFirst(false);
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toHaveLength(2);
+  expect(requests[0]).toEqual({ fullScan: false, lanes: ["pr:1"] });
+  expect(requests[1]?.fullScan).toBe(true);
+  expect(requests[1]?.lanes).toHaveLength(64);
+  await queue.stop();
+});
+
+test("a lane closure discards its coalesced head assertion", async () => {
+  let retry: (() => void) | undefined;
+  let cancellations = 0;
+  const requests: Array<{ closed: boolean; scans: string[] }> = [];
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const lane = "pr:90";
+  const sha = "a".repeat(40);
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      requests.push({
+        closed: request.automaticUpdates?.some((update) => update.closed === true) ?? false,
+        scans: request.scanUpdates?.map((update) => update.sha ?? "") ?? [],
+      });
+      return requests.length > 1;
+    },
+    () => {},
+    (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {
+      cancellations++;
+    },
+  );
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    automaticUpdates: [{ lane, sha, updatedAt: 1 }],
+    scanUpdates: [{ lane, sha, updatedAt: 1 }],
+  });
+  while (!retry) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    fullScan: true,
+    automaticUpdates: [{ lane, obsoleteShas: [sha], updatedAt: 2, closed: true }],
+  });
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toEqual([
+    { closed: false, scans: [sha] },
+    { closed: true, scans: [] },
+  ]);
+  expect(cancellations).toBe(1);
+  await queue.stop();
+});
+
+test("fresh dispatches bypass a retained retry backoff", async () => {
+  let retry: (() => void) | undefined;
+  let cancellations = 0;
+  const lanes: string[][] = [];
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      lanes.push(request.scanUpdates?.map((update) => update.lane) ?? []);
+      return lanes.length > 1;
+    },
+    () => {},
+    (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {
+      cancellations++;
+    },
+  );
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
+  while (!retry) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
+  });
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(lanes).toEqual([["pr:90"], ["pr:90", "branch:main"]]);
+  expect(cancellations).toBe(1);
+  await queue.stop();
+});
+
+test("a queued webhook retries immediately after an active dispatch fails", async () => {
   const callbacks: Array<() => void> = [];
-  const requests: boolean[] = [];
+  const requests: Array<{ forceTagPoll: boolean; fullScan: boolean; lanes: string[] }> = [];
   let finishFirst!: (value: boolean) => void;
   const first = new Promise<boolean>((resolve) => {
     finishFirst = resolve;
@@ -981,7 +1317,11 @@ test("retains failed dispatches and preserves a queued tag refresh", async () =>
   const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
   const queue = new DispatchRetryQueue(
     async (request) => {
-      requests.push(request.forceTagPoll);
+      requests.push({
+        forceTagPoll: request.forceTagPoll,
+        fullScan: request.fullScan === true,
+        lanes: request.scanUpdates?.map((update) => update.lane) ?? [],
+      });
       return requests.length === 1 ? first : true;
     },
     () => {},
@@ -992,14 +1332,25 @@ test("retains failed dispatches and preserves a queued tag refresh", async () =>
     () => {},
   );
 
-  queue.enqueue({ repository, forceTagPoll: false });
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
   while (requests.length === 0) await Bun.sleep(0);
-  queue.enqueue({ repository, forceTagPoll: true });
+  queue.enqueue({
+    repository,
+    forceTagPoll: true,
+    fullScan: true,
+    scanUpdates: [{ lane: "branch:main", sha: "b".repeat(40) }],
+  });
   finishFirst(false);
-  while (callbacks.length === 0) await Bun.sleep(0);
-  callbacks.shift()?.();
   while (queue.size > 0) await Bun.sleep(0);
 
-  expect(requests).toEqual([false, true]);
+  expect(requests).toEqual([
+    { forceTagPoll: false, fullScan: false, lanes: ["pr:90"] },
+    { forceTagPoll: true, fullScan: true, lanes: ["pr:90", "branch:main"] },
+  ]);
+  expect(callbacks).toEqual([]);
   await queue.stop();
 });

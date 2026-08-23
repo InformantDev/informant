@@ -94,17 +94,26 @@ function harness(
   let nextCheckId = 100;
   const github = {
     hasPendingManualTrigger: async () => options.manualTrigger ?? false,
-    claim: async () =>
+    claim: async (...args: unknown[]) =>
       options.claim === false
         ? undefined
-        : {
-            check: aggregateCheck,
-            requestedJobs: options.requestedJobs ?? [],
-            manualTrigger: options.manualTrigger ?? false,
-            manualTriggerBranch: options.manualTriggerBranch,
-            manualTriggerLabel: options.manualTriggerLabel,
-            originalPullRequest: options.originalPullRequest,
-          },
+        : args[10] === true
+          ? {
+              requestedJobs: options.requestedJobs ?? [],
+              manualTrigger: options.manualTrigger ?? false,
+              manualTriggerBranch: options.manualTriggerBranch,
+              manualTriggerLabel: options.manualTriggerLabel,
+              originalPullRequest: options.originalPullRequest,
+              preflight: true,
+            }
+          : {
+              check: aggregateCheck,
+              requestedJobs: options.requestedJobs ?? [],
+              manualTrigger: options.manualTrigger ?? false,
+              manualTriggerBranch: options.manualTriggerBranch,
+              manualTriggerLabel: options.manualTriggerLabel,
+              originalPullRequest: options.originalPullRequest,
+            },
     createJobCheck: async (
       _repository: Repository,
       _sha: string,
@@ -395,16 +404,16 @@ describe("runCommit", () => {
     await entered.promise;
     try {
       await Bun.sleep(0);
-      expect(claims).toBe(2);
+      expect(claims).toBe(4);
       expect(context.jobChecks.sort()).toEqual(["lint", "test"]);
     } finally {
       blocked.resolve();
     }
     await build;
-    expect(claims).toBe(2);
+    expect(claims).toBe(4);
   });
 
-  test("does not claim another suite until the worker has an available run slot", async () => {
+  test("preflights another suite before waiting for an available run slot", async () => {
     const first = harness();
     const second = harness();
     const entered = deferred<void>();
@@ -444,14 +453,53 @@ describe("runCommit", () => {
     );
     await Bun.sleep(0);
 
-    expect(secondClaims).toBe(0);
+    expect(secondClaims).toBe(1);
     expect(second.jobChecks).toEqual([]);
 
     blocked.resolve();
     await firstBuild;
     await secondBuild;
-    expect(secondClaims).toBe(1);
+    expect(secondClaims).toBe(2);
     expect(second.jobChecks).toEqual(["test"]);
+  });
+
+  test("does not queue completed heads behind active work", async () => {
+    const active = harness();
+    const completed = harness({ claim: false });
+    const entered = deferred<void>();
+    const blocked = deferred<void>();
+    const activeRun = active.dependencies.runInTart;
+    const acquireExecutionSlot = createExecutionSlotAcquirer({ cpu: 1, memoryMb: 1024 });
+    active.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    completed.dependencies.acquireExecutionSlot = acquireExecutionSlot;
+    active.dependencies.runInTart = async (...args) => {
+      entered.resolve();
+      await blocked.promise;
+      return activeRun(...args);
+    };
+
+    const activeBuild = runCommit(
+      active.github,
+      repository,
+      "active-sha",
+      "main",
+      config,
+      active.dependencies,
+    );
+    await entered.promise;
+    const completedBuild = runCommit(
+      completed.github,
+      repository,
+      "completed-sha",
+      "feature",
+      config,
+      completed.dependencies,
+    );
+
+    await expect(completedBuild).resolves.toBeUndefined();
+    expect(acquireExecutionSlot.snapshot?.().queued).toEqual({ cpu: 0, memoryMb: 0 });
+    blocked.resolve();
+    await activeBuild;
   });
 
   test("drops unclaimed suites immediately when worker shutdown starts", async () => {
@@ -502,7 +550,7 @@ describe("runCommit", () => {
     admission.abort("Worker shutdown requested.");
 
     expect(await waitingBuild).toBeFalse();
-    expect(waitingClaims).toBe(0);
+    expect(waitingClaims).toBe(1);
     expect(execution.signal.aborted).toBe(false);
     blocked.resolve();
     await activeBuild;
@@ -543,7 +591,7 @@ describe("runCommit", () => {
     expect(context.jobChecks).toEqual([]);
   });
 
-  test("bounds fallback admission while another worker may claim", async () => {
+  test("completed scopes do not enter the fallback capacity queue", async () => {
     const context = harness();
     let claims = 0;
     let admissionAborted = false;
@@ -588,9 +636,9 @@ describe("runCommit", () => {
       },
     );
 
-    expect(result).toBeFalse();
-    expect(admissionAborted).toBe(true);
-    expect(claims).toBe(0);
+    expect(result).toBeUndefined();
+    expect(admissionAborted).toBe(false);
+    expect(claims).toBe(1);
   });
 
   test("treats an interrupted GitHub claim as unclaimed work", async () => {
@@ -723,7 +771,7 @@ describe("runCommit", () => {
     controller.abort("Superseded by feature@current-sha.");
 
     expect(await oldBuild).toBeFalse();
-    expect(supersededClaims).toBe(0);
+    expect(supersededClaims).toBe(1);
     blocked.resolve();
     await Promise.all([firstBuild, currentBuild]);
     expect(current.jobChecks).toEqual(["test"]);
@@ -758,7 +806,7 @@ describe("runCommit", () => {
         controller.signal,
       ),
     ).toBeFalse();
-    expect(claims).toBe(0);
+    expect(claims).toBe(1);
     expect(releases).toBe(1);
   });
 

@@ -552,6 +552,15 @@ export async function runCommit(
   return aggregatePartitionResults(results);
 }
 
+function scopedClaimEvent(event: RunEvent | undefined, scopeJobs: string[] | undefined) {
+  return event && scopeJobs
+    ? {
+        ...event,
+        id: `${event.id}:job-set:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
+      }
+    : event;
+}
+
 async function runCommitPartition(
   github: GitHubClient,
   repository: Repository,
@@ -575,6 +584,41 @@ async function runCommitPartition(
       : (admissionSignal ?? forcedShutdownSignal);
   if (claimDelayMs > 0 && !(await waitForClaimPriority(claimDelayMs, claimDelaySignal)))
     return false;
+  if (requireRunSlot) {
+    const automaticExecutionSignal =
+      signal && forcedShutdownSignal
+        ? AbortSignal.any([signal, forcedShutdownSignal])
+        : (forcedShutdownSignal ?? signal);
+    let preflight: ClaimResult | undefined;
+    try {
+      const scopedEvent = scopedClaimEvent(event, scopeJobs);
+      preflight = await github.claim(
+        repository,
+        sha,
+        `${hostname()}:${process.pid}:preflight`,
+        scopedEvent
+          ? {
+              type: scopedEvent.type,
+              id: scopedEvent.id,
+              branch: scopedEvent.branch,
+              label: branch,
+            }
+          : undefined,
+        scopeJobs,
+        false,
+        legacyScopes,
+        false,
+        admissionSignal,
+        automaticExecutionSignal,
+        true,
+      );
+    } catch (error) {
+      if (admissionSignal?.aborted || automaticExecutionSignal?.aborted) return false;
+      throw error;
+    }
+    if (preflight?.retry) return false;
+    if (!preflight?.preflight) return undefined;
+  }
   const executionSlots = dependencies.acquireExecutionSlot ?? acquireExecutionSlot;
   const fallbackAdmissionTimeout =
     requireRunSlot && claimDelayMs > 0 ? AbortSignal.timeout(claimDelayMs) : undefined;
@@ -629,13 +673,7 @@ async function runCommitPartitionWithSlot(
   const configuredVmJobs = config.jobs
     .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name);
-  const scopedEvent =
-    event && scopeJobs
-      ? {
-          ...event,
-          id: `${event.id}:job-set:${Buffer.from([...scopeJobs].sort().join("\0")).toString("base64url")}`,
-        }
-      : event;
+  const scopedEvent = scopedClaimEvent(event, scopeJobs);
   let claim: ClaimResult | undefined;
   const automaticExecutionSignal =
     signal && forcedShutdownSignal

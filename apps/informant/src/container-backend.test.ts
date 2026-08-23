@@ -1,4 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   appleContainerBackend,
   containerBackendReadiness,
@@ -9,6 +12,7 @@ import {
   resetContainerBackendReadiness,
   selectContainerBackend,
   validateRootlessPodmanInfo,
+  verifyPodman,
 } from "./container-backend.ts";
 
 const result = (exitCode = 0, stdout = "", stderr = "") => ({
@@ -99,6 +103,31 @@ test("builds Podman run and image lifecycle commands", () => {
     "--format",
     "json",
   ]);
+});
+
+test("keeps Podman smoke bind mounts outside a service-private temporary directory", async () => {
+  const dataPath = await mkdtemp(join(tmpdir(), "informant-podman-data-"));
+  let workspace: string | undefined;
+  try {
+    await verifyPodman(
+      async (argv) => {
+        if (argv[0] === "podman" && argv[1] === "run") {
+          const volume = argv.find((value) => value.endsWith(":/workspace:Z"));
+          if (!volume) throw new Error("missing smoke workspace mount");
+          workspace = volume.slice(0, -":/workspace:Z".length);
+          await Bun.write(join(workspace, "informant-smoke-test"), "ready");
+        }
+        return result();
+      },
+      undefined,
+      dataPath,
+    );
+
+    expect(workspace?.startsWith(join(dataPath, "container-smoke", "podman-"))).toBe(true);
+    expect(workspace && (await Bun.file(workspace).exists())).toBe(false);
+  } finally {
+    await rm(dataPath, { recursive: true, force: true });
+  }
 });
 
 test("refreshes cached readiness only after the maximum age", async () => {

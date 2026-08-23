@@ -103,6 +103,8 @@ export interface ClaimResult {
   manualTriggerLabel?: string;
   originalPullRequest?: number;
   retry?: boolean;
+  /** The claim scope has work, but no election candidate was created. */
+  preflight?: boolean;
 }
 
 interface ManualTriggerContext {
@@ -984,6 +986,7 @@ export class GitHubClient {
     requireManualTrigger = false,
     signal?: AbortSignal,
     executionSignal?: AbortSignal,
+    preflightOnly = false,
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName, signal);
@@ -1248,6 +1251,19 @@ export class GitHubClient {
     const candidateExternalId = `${machineId}:event:${scope}`;
     if (this.githubServerTime() === undefined) {
       return { requestedJobs: [], manualTrigger, retry: true };
+    }
+    if (preflightOnly) {
+      const requestedJobs = eligible
+        ? targetedManualJobs.filter((job) => eligible.has(job))
+        : targetedManualJobs;
+      return {
+        requestedJobs,
+        manualTrigger,
+        manualTriggerBranch: context?.branch,
+        manualTriggerLabel: context?.label,
+        originalPullRequest,
+        preflight: true,
+      };
     }
     let candidateAttemptExternalId = "";
     const candidateAttempt = () => {
