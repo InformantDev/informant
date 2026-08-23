@@ -3,6 +3,7 @@ import { createHmac, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { InvalidRepositoryConfigError } from "./server.ts";
 import {
   acceptedAutomaticLaneUpdates,
   actionableWebhook,
@@ -19,6 +20,7 @@ import {
   MAX_WEBHOOK_BODY_BYTES,
   mergeAutomaticLaneUpdates,
   NETWORK_RECONCILIATION_INTERVAL_MS,
+  networkDispatchSucceeded,
   networkReconciliationRequests,
   networkScanDispatchPolicy,
   parseAutomaticLaneUpdates,
@@ -53,10 +55,13 @@ test("uses a Tailscale executable available on PATH", () => {
 test("bounds status and forces Tailscale's CLI mode in background workers", async () => {
   let term: string | undefined;
   let timeoutMs: number | undefined;
+  let signal: AbortSignal | undefined;
+  const controller = new AbortController();
   await tailscaleStatus(
     async (_argv, options) => {
       term = options?.env?.TERM;
       timeoutMs = options?.timeoutMs;
+      signal = options?.signal;
       return {
         exitCode: 0,
         stdout: JSON.stringify({
@@ -68,9 +73,11 @@ test("bounds status and forces Tailscale's CLI mode in background workers", asyn
       };
     },
     () => "/usr/bin/tailscale",
+    controller.signal,
   );
   expect(term).toBe(Bun.env.TERM ?? "dumb");
   expect(timeoutMs).toBe(10_000);
+  expect(signal).toBe(controller.signal);
 });
 
 test("opens Funnel authorization and times out with Tailscale's actionable output", async () => {
@@ -659,6 +666,17 @@ test("extracts and validates bounded automatic lane updates", () => {
   ]);
   expect(
     webhookAutomaticLaneUpdates("check_suite", {
+      action: "requested",
+      repository: { id: 10 },
+      check_suite: {
+        head_sha: newSha,
+        head_branch: "fork-branch",
+        pull_requests: [{ number: 44, head: { sha: newSha, repo: { id: 11 } } }],
+      },
+    }),
+  ).toBeUndefined();
+  expect(
+    webhookAutomaticLaneUpdates("check_suite", {
       action: "rerequested",
       repository: { id: 10 },
       check_suite: { head_sha: oldSha, head_branch: "feature/fast" },
@@ -1235,6 +1253,17 @@ test("periodic recovery expires permanently missed head assertions after a bound
   await queue.stop();
 });
 
+test("invalid repository configuration stops deterministic dispatch retries", () => {
+  expect(
+    networkDispatchSucceeded([
+      { status: "rejected", reason: new InvalidRepositoryConfigError("invalid trigger") },
+    ]),
+  ).toBe(true);
+  expect(
+    networkDispatchSucceeded([{ status: "rejected", reason: new Error("temporary failure") }]),
+  ).toBe(false);
+});
+
 test("reconciliation priority is negotiated during rolling upgrades", () => {
   expect(supportsReconciliationPriority(undefined)).toBe(false);
   expect(supportsReconciliationPriority(["targeted-scan-v1"])).toBe(false);
@@ -1356,6 +1385,48 @@ test("a lane closure discards its coalesced head assertion", async () => {
     { closed: true, scans: [] },
   ]);
   expect(cancellations).toBe(1);
+  await queue.stop();
+});
+
+test("a webhook drops full-scan flags from a queued reconciliation retry", async () => {
+  let retry: (() => void) | undefined;
+  const requests: Array<{ fullScan: boolean; forceTagPoll: boolean; reconciliation: boolean }> = [];
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      requests.push({
+        fullScan: request.fullScan === true,
+        forceTagPoll: request.forceTagPoll,
+        reconciliation: request.reconciliation === true,
+      });
+      return requests.length > 1;
+    },
+    () => {},
+    (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {},
+  );
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: true,
+    fullScan: true,
+    reconciliation: true,
+  });
+  while (!retry) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toEqual([
+    { fullScan: true, forceTagPoll: true, reconciliation: true },
+    { fullScan: false, forceTagPoll: false, reconciliation: false },
+  ]);
   await queue.stop();
 });
 
