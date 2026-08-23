@@ -813,12 +813,33 @@ export class GitHubClient {
       {},
       signal,
     );
+    const cancelChildren = async () => {
+      const jobs = (await this.jobChecks(repository, sha, claimId, signal)).filter(
+        (job) => job.status !== "completed",
+      );
+      await Promise.all(
+        jobs.map((job) =>
+          this.updateCheck(
+            repository,
+            job.id,
+            {
+              status: "completed",
+              conclusion: "cancelled",
+              title: "Interrupted worker job",
+              summary: "The worker stopped before this job completed.",
+            },
+            signal,
+          ),
+        ),
+      );
+    };
     if (aggregate.status === "completed") {
       if (
         retryable &&
         aggregate.conclusion === "cancelled" &&
         aggregate.output?.title === INTERRUPTED_CLAIM_TITLE
       ) {
+        await cancelChildren();
         return true;
       }
       const legacyInterrupted = new Set([
@@ -830,6 +851,7 @@ export class GitHubClient {
         aggregate.conclusion === "cancelled" &&
         legacyInterrupted.has(aggregate.output?.title ?? "")
       ) {
+        await cancelChildren();
         await this.updateCheck(
           repository,
           claimId,
@@ -847,24 +869,7 @@ export class GitHubClient {
       return false;
     }
 
-    const jobs = (await this.jobChecks(repository, sha, claimId, signal)).filter(
-      (job) => job.status !== "completed",
-    );
-    await Promise.all(
-      jobs.map((job) =>
-        this.updateCheck(
-          repository,
-          job.id,
-          {
-            status: "completed",
-            conclusion: "cancelled",
-            title: "Interrupted worker job",
-            summary: "The worker stopped before this job completed.",
-          },
-          signal,
-        ),
-      ),
-    );
+    await cancelChildren();
     await this.updateCheck(
       repository,
       claimId,

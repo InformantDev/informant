@@ -1588,6 +1588,17 @@ test("interrupted build recovery cancels only correlated children before the agg
   });
   expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(false);
   expect(updates).toEqual([3, 2]);
+
+  checks.push({
+    id: 5,
+    name: "Informant / retry",
+    status: "in_progress",
+    external_id: "informant-job:2:cmV0cnk",
+  });
+  expect(
+    await github.recoverInterruptedCheck(repository, "abc123", 2, "cancelled", undefined, true),
+  ).toBe(true);
+  expect(updates).toEqual([3, 2, 5]);
 });
 
 test("recovery retitles a legacy update interruption for retry", async () => {
@@ -1598,7 +1609,8 @@ test("recovery retitles a legacy update interruption for retry", async () => {
     conclusion: "cancelled",
     output: { title: "Superseded by a newer commit", summary: "old worker stopped" },
   };
-  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).includes("/commits/")) return githubResponse({ check_runs: [] });
     if (init?.method === "PATCH") {
       aggregate = { ...aggregate, ...JSON.parse(String(init.body)) };
     }

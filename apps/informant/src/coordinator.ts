@@ -43,6 +43,7 @@ export interface ClaimScheduling {
 export interface CoordinatorDependencies {
   createBuild: typeof createBuild;
   saveBuild: typeof saveBuild;
+  persistClaim?: typeof saveBuild;
   runInTart: typeof runInTart;
   readLogTail: (path: string) => Promise<string>;
   monitorBuildCancellation?: typeof monitorBuildCancellation;
@@ -950,6 +951,9 @@ async function runCommitPartitionWithSlot(
     if (claim.manualTrigger) {
       releasePublishedManualResources = await dependencies.publishExecutionReservation?.(config);
     }
+    // Persist the promoted claim before waiting on housekeeping so a bounded worker replacement
+    // can recover it even if the old process is killed while this barrier is held.
+    await (dependencies.persistClaim ?? dependencies.saveBuild)(record);
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));

@@ -167,6 +167,7 @@ function harness(
     saveBuild: async (record) => {
       saved.push({ ...record });
     },
+    persistClaim: async () => {},
     monitorBuildCancellation: (_id, jobs) => {
       const build = new AbortController();
       const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
