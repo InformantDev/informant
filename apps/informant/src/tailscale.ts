@@ -586,9 +586,10 @@ export class DispatchRetryQueue {
         existing.request.automaticUpdates,
         request.automaticUpdates,
       );
-      existing.request.scanUpdates = mergeAutomaticLaneUpdates(
-        existing.request.scanUpdates,
-        request.scanUpdates,
+      existing.request.scanUpdates = filterAcceptedScanUpdates(
+        mergeAutomaticLaneUpdates(existing.request.scanUpdates, request.scanUpdates),
+        existing.request.automaticUpdates,
+        existing.request.automaticUpdates,
       );
       if (existing.running) {
         existing.pending = true;
@@ -627,9 +628,10 @@ export class DispatchRetryQueue {
         request.automaticUpdates,
         current.request.automaticUpdates,
       );
-      current.request.scanUpdates = mergeAutomaticLaneUpdates(
-        request.scanUpdates,
-        current.request.scanUpdates,
+      current.request.scanUpdates = filterAcceptedScanUpdates(
+        mergeAutomaticLaneUpdates(request.scanUpdates, current.request.scanUpdates),
+        current.request.automaticUpdates,
+        current.request.automaticUpdates,
       );
       if (this.stopped) return;
       if (current.pending) {
@@ -1232,9 +1234,9 @@ export function actionableWebhook(event: string | null, payload: unknown): boole
   if (event === "push") return true;
   if (event === "pull_request") return typeof action === "string";
   if (event === "issue_comment") return action === "created";
-  // Push and pull_request webhooks already carry every newly requested suite head. Processing the
-  // accompanying `requested` event would replace that targeted dispatch with a full scan.
-  if (event === "check_suite") return action === "rerequested";
+  // A requested suite is an independent recovery signal when its push or pull-request delivery
+  // was lost. The retry queue coalesces its full scan without dropping targeted head assertions.
+  if (event === "check_suite") return action === "requested" || action === "rerequested";
   return false;
 }
 
@@ -1442,6 +1444,11 @@ async function serveConfiguredWithTailscale(
       latestAutomaticUpdates.get(request.repository.fullName.toLowerCase()),
       request.automaticUpdates,
     );
+    const scanUpdates = filterAcceptedScanUpdates(
+      request.scanUpdates,
+      automaticUpdates,
+      automaticUpdates,
+    );
     const localRepository = configuredRepositories.find(
       (candidate) => candidate.fullName.toLowerCase() === request.repository.fullName.toLowerCase(),
     );
@@ -1465,7 +1472,7 @@ async function serveConfiguredWithTailscale(
             localRepository,
             request.forceTagPoll,
             plan ? { ...plan, workerId: status.self.id } : undefined,
-            request.scanUpdates,
+            scanUpdates,
             request.fullScan,
           ),
       });
@@ -1500,7 +1507,7 @@ async function serveConfiguredWithTailscale(
                 fullScan: request.fullScan,
                 claimPlan: plan,
                 automaticUpdates,
-                scanUpdates: request.scanUpdates,
+                scanUpdates,
               }),
             }).then((response) => {
               if (!response.ok) throw new Error(`returned ${response.status}`);

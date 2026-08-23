@@ -864,7 +864,7 @@ test("dispatches only webhook actions that can create trigger work", () => {
   expect(actionableWebhook("pull_request", { action: "synchronize" })).toBe(true);
   expect(actionableWebhook("issue_comment", { action: "created" })).toBe(true);
   expect(actionableWebhook("issue_comment", { action: "edited" })).toBe(false);
-  expect(actionableWebhook("check_suite", { action: "requested" })).toBe(false);
+  expect(actionableWebhook("check_suite", { action: "requested" })).toBe(true);
   expect(actionableWebhook("check_suite", { action: "rerequested" })).toBe(true);
   expect(actionableWebhook("check_suite", { action: "completed" })).toBe(false);
   expect(actionableWebhook("installation", { action: "created" })).toBe(false);
@@ -1095,6 +1095,54 @@ test("an unplanned dispatch clears a coalesced stale claim plan", async () => {
   while (queue.size > 0) await Bun.sleep(0);
 
   expect(plans).toEqual([7, undefined]);
+  await queue.stop();
+});
+
+test("a lane closure discards its coalesced head assertion", async () => {
+  let retry: (() => void) | undefined;
+  let cancellations = 0;
+  const requests: Array<{ closed: boolean; scans: string[] }> = [];
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const lane = "pr:90";
+  const sha = "a".repeat(40);
+  const queue = new DispatchRetryQueue(
+    async (request) => {
+      requests.push({
+        closed: request.automaticUpdates?.some((update) => update.closed === true) ?? false,
+        scans: request.scanUpdates?.map((update) => update.sha ?? "") ?? [],
+      });
+      return requests.length > 1;
+    },
+    () => {},
+    (callback) => {
+      retry = callback;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    },
+    () => {
+      cancellations++;
+    },
+  );
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    automaticUpdates: [{ lane, sha, updatedAt: 1 }],
+    scanUpdates: [{ lane, sha, updatedAt: 1 }],
+  });
+  while (!retry) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    fullScan: true,
+    automaticUpdates: [{ lane, obsoleteShas: [sha], updatedAt: 2, closed: true }],
+  });
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(requests).toEqual([
+    { closed: false, scans: [sha] },
+    { closed: true, scans: [] },
+  ]);
+  expect(cancellations).toBe(1);
   await queue.stop();
 });
 
