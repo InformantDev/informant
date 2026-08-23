@@ -563,7 +563,16 @@ export async function recoverInterruptedBuilds(
       now - completedAt <= LEGACY_INTERRUPTED_RECOVERY_MS
     );
   };
-  const builds = (await dependencies.listAllBuilds()).filter(
+  const allBuilds = await dependencies.listAllBuilds();
+  for (const build of allBuilds) {
+    if (build.status !== "running" || processOwnerIsLive(build.owner)) continue;
+    build.status = "cancelled";
+    build.interrupted = true;
+    build.completedAt = new Date().toISOString();
+    build.runningJobs = [];
+    await dependencies.saveBuild(build);
+  }
+  const builds = allBuilds.filter(
     (build) =>
       build.repo.toLowerCase() === repository.fullName.toLowerCase() &&
       build.status !== "running" &&

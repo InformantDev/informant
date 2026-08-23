@@ -9,6 +9,7 @@ import {
   serve,
   serveRepositories,
 } from "./server.ts";
+import { currentProcessOwner } from "./store.ts";
 import type { BuildRecord, InformantConfig, JobConfig, PullRequest, Repository } from "./types.ts";
 
 const repository: Repository = {
@@ -1034,6 +1035,7 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
       machine: "machine",
       startedAt: new Date().toISOString(),
       status: "running",
+      owner: currentProcessOwner(),
       logPath: "/tmp/live.log",
       checkId: 789,
     },

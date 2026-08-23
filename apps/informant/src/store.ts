@@ -211,8 +211,21 @@ async function workspaceHasLiveOwner(workspace: string): Promise<boolean> {
 }
 
 export async function persistClaim(record: BuildRecord): Promise<void> {
-  await mkdir(buildDirectory(record.id), { recursive: true });
-  await saveBuild(record);
+  const directory = buildDirectory(record.id);
+  const path = join(directory, "build.json");
+  const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
+  await Promise.all([
+    mkdir(directory, { recursive: true }),
+    mkdir(activeBuildDirectory(), { recursive: true }),
+  ]);
+  try {
+    await Bun.write(temporaryPath, JSON.stringify(record, null, 2));
+    await rename(temporaryPath, path);
+    // Publish liveness only after the claim record is atomically readable.
+    await Bun.write(activeBuildPath(record.id), "");
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
 }
 
 export async function createBuild(record: BuildRecord): Promise<void> {

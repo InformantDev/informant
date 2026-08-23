@@ -792,6 +792,7 @@ async function runCommitPartitionWithSlot(
     logPath: join(dataDirectory(), "builds", id, "build.log"),
     checkId: check.id,
     checkUrl: check.html_url,
+    retryManual: interruptedManualRequest(),
     event: claim.manualTrigger
       ? { type: "manual_trigger", id: check.id.toString() }
       : event
@@ -1147,6 +1148,7 @@ async function runCommitPartitionWithSlot(
     const skipped = outcomes.filter((outcome) => outcome === "skipped").length;
     const cancelled = outcomes.filter((outcome) => outcome === "cancelled").length;
     record.status = cancelled > 0 ? "cancelled" : success ? "success" : "failure";
+    record.retryManual = undefined;
     record.completedAt = new Date().toISOString();
     executionFinished = true;
     await dependencies.saveBuild(record).catch(() => undefined);
@@ -1166,6 +1168,7 @@ async function runCommitPartitionWithSlot(
   } catch (error) {
     if (executionFinished) throw error;
     record.status = "failure";
+    record.retryManual = undefined;
     record.runningJobs = [];
     record.jobs = record.jobs?.map((job) => {
       if (job.status !== "queued" && job.status !== "running") return job;
