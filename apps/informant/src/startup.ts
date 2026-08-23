@@ -7,7 +7,8 @@ import { command } from "./process.ts";
 import { dataDirectory, runningWorkerPids } from "./store.ts";
 
 const LABEL = "dev.informant.worker";
-const GRACEFUL_RESTART_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const GRACEFUL_RESTART_TIMEOUT_MS = 45_000;
+const FORCED_RESTART_TIMEOUT_MS = 15_000;
 const RESTART_POLL_INTERVAL_MS = 1_000;
 
 function escapeXml(value: string): string {
@@ -243,7 +244,7 @@ ExecStart="${escapeSystemd(executable)}" serve
 ${environmentLines}
 Restart=always
 RestartSec=10
-TimeoutStopSec=24h
+TimeoutStopSec=30s
 LimitNOFILE=65536
 StandardOutput=append:${escapeSystemd(join(logs, "worker.stdout.log"))}
 StandardError=append:${escapeSystemd(join(logs, "worker.stderr.log"))}
@@ -542,13 +543,33 @@ export async function updateInformant(
     elapsed += delay;
   }
   if (previousPid && timedOutPid === previousPid) {
-    await run(
+    const killed = await run(
       currentPlatform === "darwin"
         ? ["launchctl", "kill", "SIGKILL", service]
         : ["systemctl", "--user", "kill", "--kill-whom=main", "--signal=SIGKILL", service],
     );
+    if (killed.exitCode !== 0) {
+      throw new Error(
+        `Informant was updated but its previous worker could not be stopped: ${killed.stderr.trim() || `exit ${killed.exitCode}`}`,
+      );
+    }
+    let forcedElapsed = 0;
+    while (forcedElapsed <= FORCED_RESTART_TIMEOUT_MS) {
+      const current = await serviceStatus();
+      const currentPid =
+        current.exitCode === 0
+          ? currentPlatform === "darwin"
+            ? servicePid(current.stdout)
+            : Number(current.stdout.trim()) || undefined
+          : undefined;
+      if (currentPid && currentPid !== previousPid) return { restarted: true };
+      if (forcedElapsed === FORCED_RESTART_TIMEOUT_MS) break;
+      const delay = Math.min(RESTART_POLL_INTERVAL_MS, FORCED_RESTART_TIMEOUT_MS - forcedElapsed);
+      await sleep(delay);
+      forcedElapsed += delay;
+    }
   }
   throw new Error(
-    `Informant was updated but its graceful restart did not complete within ${Math.ceil(timeoutMs / 1_000)} seconds`,
+    `Informant was updated but its replacement worker did not start within ${Math.ceil(timeoutMs / 1_000)} seconds`,
   );
 }

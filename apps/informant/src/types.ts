@@ -139,6 +139,11 @@ export interface BuildRecord {
   checkId?: number;
   checkUrl?: string;
   checksCompletedAt?: string;
+  /** The owning worker died or was replaced, so a cancelled claim may be reclaimed. */
+  interrupted?: boolean;
+  /** Manual request metadata persisted across a worker replacement. */
+  retryManual?: { jobs: string[]; branch?: string; label: string; pullRequest?: number };
+  manualRetryRequeuedAt?: string;
   event?: {
     type: TriggerEvent | "manual" | "manual_trigger" | "manual_run";
     id: string;

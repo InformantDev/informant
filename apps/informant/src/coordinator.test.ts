@@ -68,6 +68,7 @@ function harness(
 ) {
   const updates: Array<{ id: number; values: Record<string, unknown> }> = [];
   const jobChecks: string[] = [];
+  const manualRequests: Array<{ jobs: string[]; branch?: string; label: string }> = [];
   const remoteChecks: Array<{
     id: number;
     name: string;
@@ -135,6 +136,16 @@ function harness(
     },
     checks: async () => [aggregateCheck],
     createJobAccessToken: async () => "installation-token",
+    createManualTrigger: async (
+      _repository: Repository,
+      _sha: string,
+      jobs: string[],
+      branch: string | undefined,
+      label: string,
+    ) => {
+      manualRequests.push({ jobs, branch, label });
+      return { id: 999 };
+    },
     updateCheck: async (_repository: Repository, id: number, values: Record<string, unknown>) => {
       updates.push({ id, values });
       const jobCheck = remoteChecks.find((item) => item.id === id);
@@ -156,6 +167,7 @@ function harness(
     saveBuild: async (record) => {
       saved.push({ ...record });
     },
+    persistClaim: async () => {},
     monitorBuildCancellation: (_id, jobs) => {
       const build = new AbortController();
       const jobControllers = new Map(jobs.map((job) => [job, new AbortController()]));
@@ -205,6 +217,7 @@ function harness(
     dependencies,
     updates,
     jobChecks,
+    manualRequests,
     saved,
     receivedRuntimeSecrets: () => receivedRuntimeSecrets,
     receivedConfiguredVmJobs: () => receivedConfiguredVmJobs,
@@ -1453,8 +1466,12 @@ describe("runCommit", () => {
       status,
       logPath: `/tmp/${status}.log`,
     });
-    const result = aggregatePartitionResults([record("success"), record("failure")]);
+    const result = aggregatePartitionResults([
+      { ...record("cancelled"), interrupted: true },
+      record("failure"),
+    ]);
     expect(typeof result === "object" ? result.status : result).toBe("failure");
+    expect(typeof result === "object" ? result.interrupted : false).toBe(true);
   });
 
   test("keeps the complete VM job inventory when selecting one manually triggered job", async () => {
@@ -2927,5 +2944,12 @@ describe("runCommit", () => {
     expect(runtimeSignal?.aborted).toBeTrue();
     expect(runtimeSignal?.reason).toBe("Graceful worker shutdown timed out.");
     expect(record.status).toBe("cancelled");
+    expect(record.interrupted).toBe(true);
+    expect(record.retryManual).toEqual({ jobs: [], label: "main" });
+    expect(context.manualRequests).toEqual([]);
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Claim interrupted",
+    });
   });
 });

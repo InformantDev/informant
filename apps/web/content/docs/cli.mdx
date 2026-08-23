@@ -171,8 +171,11 @@ changing any `INFORMANT_*` environment-variable overrides so the service capture
 upgrade path. For standalone Linux installations, it downloads the matching release binary, verifies
 it against the release's `SHA256SUMS`, and atomically replaces the installed executable; the
 executable and its parent directory must be writable by the worker user. If the startup worker was
-already running, the command gracefully stops it and waits for launchd or systemd to start the new
-version. It does not start a worker that was stopped or never enabled.
+already running, the command requests a bounded shutdown and waits up to 45 seconds for launchd or
+systemd to start the new version, including the supervisor's restart delay. After 10 seconds the old worker cancels remaining runtimes instead
+of delaying the update for long jobs. Startup marks interrupted claims as retryable and immediately
+reconciles registered repositories, so the replacement can reclaim their work. The updater does not
+start a worker that was stopped or never enabled.
 
 The first-run automatic-update choice in `informant setup` installs a launchd agent or persistent
 systemd user timer that performs the same version check every six hours. The updater only installs a

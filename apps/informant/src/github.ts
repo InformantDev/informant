@@ -20,7 +20,7 @@ const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
 const CLAIM_CANDIDATE_LEASE_MS = 60_000;
 const CLAIM_CLEANUP_TIMEOUT_MS = 5_000;
 const GITHUB_REQUEST_TIMEOUT_MS = 30_000;
-const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
+export const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
 const EXPIRED_CANDIDATE_TITLE = "Expired claim candidate";
 const RETRYABLE_CLAIM_TITLES = new Set([
   INTERRUPTED_CLAIM_TITLE,
@@ -112,6 +112,7 @@ export interface ClaimResult {
 interface ManualTriggerContext {
   branch: string | null;
   label?: string;
+  pullRequest?: number;
 }
 
 interface ManualTriggerRequest {
@@ -126,7 +127,7 @@ function manualTriggerRequest(check: CheckRun): ManualTriggerRequest | undefined
   if (!encoded) return undefined;
   try {
     const value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
-      context?: { branch?: unknown; label?: unknown };
+      context?: { branch?: unknown; label?: unknown; pullRequest?: unknown };
       jobs?: unknown;
     };
     if (!value.context || !Array.isArray(value.jobs)) return undefined;
@@ -134,6 +135,10 @@ function manualTriggerRequest(check: CheckRun): ManualTriggerRequest | undefined
       context: {
         branch: typeof value.context.branch === "string" ? value.context.branch : null,
         label: typeof value.context.label === "string" ? value.context.label : undefined,
+        pullRequest:
+          Number.isSafeInteger(value.context.pullRequest) && Number(value.context.pullRequest) > 0
+            ? Number(value.context.pullRequest)
+            : undefined,
       },
       jobs: value.jobs.map(String),
     };
@@ -806,32 +811,70 @@ export class GitHubClient {
     claimId: number,
     conclusion: "success" | "failure" | "cancelled" = "cancelled",
     signal?: AbortSignal,
+    retryable = false,
   ): Promise<boolean> {
     const aggregate = await this.api<CheckRun>(
       `/repos/${repository.fullName}/check-runs/${claimId}`,
       {},
       signal,
     );
-    if (aggregate.status === "completed") return false;
-
-    const jobs = (await this.jobChecks(repository, sha, claimId, signal)).filter(
-      (job) => job.status !== "completed",
-    );
-    await Promise.all(
-      jobs.map((job) =>
-        this.updateCheck(
+    const cancelChildren = async () => {
+      const jobs = (await this.jobChecks(repository, sha, claimId, signal)).filter(
+        (job) => job.status !== "completed",
+      );
+      await Promise.all(
+        jobs.map((job) =>
+          this.updateCheck(
+            repository,
+            job.id,
+            {
+              status: "completed",
+              conclusion: "cancelled",
+              title: "Interrupted worker job",
+              summary: "The worker stopped before this job completed.",
+            },
+            signal,
+          ),
+        ),
+      );
+    };
+    if (aggregate.status === "completed") {
+      if (
+        retryable &&
+        aggregate.conclusion === "cancelled" &&
+        aggregate.output?.title === INTERRUPTED_CLAIM_TITLE
+      ) {
+        await cancelChildren();
+        return true;
+      }
+      const legacyInterrupted = new Set([
+        "Interrupted worker build",
+        "Superseded by a newer commit",
+      ]);
+      if (
+        retryable &&
+        aggregate.conclusion === "cancelled" &&
+        legacyInterrupted.has(aggregate.output?.title ?? "")
+      ) {
+        await cancelChildren();
+        await this.updateCheck(
           repository,
-          job.id,
+          claimId,
           {
             status: "completed",
             conclusion: "cancelled",
-            title: "Interrupted worker job",
-            summary: "The worker stopped before this job completed.",
+            title: INTERRUPTED_CLAIM_TITLE,
+            summary: aggregate.output?.summary ?? "The worker stopped before this build completed.",
+            text: aggregate.output?.text,
           },
           signal,
-        ),
-      ),
-    );
+        );
+        return true;
+      }
+      return false;
+    }
+
+    await cancelChildren();
     await this.updateCheck(
       repository,
       claimId,
@@ -843,7 +886,9 @@ export class GitHubClient {
             ? "All jobs passed"
             : conclusion === "failure"
               ? "A job failed"
-              : "Interrupted worker build",
+              : retryable
+                ? INTERRUPTED_CLAIM_TITLE
+                : "Build cancelled",
         summary:
           conclusion === "cancelled"
             ? "The worker stopped before this build completed."
@@ -852,7 +897,7 @@ export class GitHubClient {
       },
       signal,
     );
-    return true;
+    return retryable;
   }
 
   async checkSuiteStatus(
@@ -986,8 +1031,9 @@ export class GitHubClient {
     requestedJobs: string[],
     branch: string | undefined,
     label: string,
+    pullRequest?: number,
   ): Promise<CheckRun> {
-    const context = { branch: branch ?? null, label };
+    const context = { branch: branch ?? null, label, pullRequest };
     return this.createCheck(
       repository,
       sha,
@@ -996,6 +1042,34 @@ export class GitHubClient {
       [],
       MANUAL_TRIGGER_REQUEST_NAME,
       manualTriggerRequestMetadata({ context, jobs: requestedJobs }),
+    );
+  }
+
+  async ensureManualTrigger(
+    repository: Repository,
+    sha: string,
+    identity: string,
+    requestedJobs: string[],
+    branch: string | undefined,
+    label: string,
+    signal?: AbortSignal,
+    pullRequest?: number,
+  ): Promise<CheckRun> {
+    const externalId = `manual-retry:${identity}`;
+    const existing = (await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME, signal)).find(
+      (check) => check.external_id === externalId,
+    );
+    if (existing) return existing;
+    const context = { branch: branch ?? null, label, pullRequest };
+    return this.createCheck(
+      repository,
+      sha,
+      externalId,
+      "in_progress",
+      [],
+      MANUAL_TRIGGER_REQUEST_NAME,
+      manualTriggerRequestMetadata({ context, jobs: requestedJobs }),
+      signal,
     );
   }
 
@@ -1069,6 +1143,7 @@ export class GitHubClient {
     signal?: AbortSignal,
     executionSignal?: AbortSignal,
     preflightOnly = false,
+    onPromoted?: (claim: ClaimResult) => Promise<void>,
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName, signal);
@@ -1128,7 +1203,7 @@ export class GitHubClient {
       /:event:commit:pr:(\d+):([^:]+)(?::(?:job-set|jobs):[^:]+)*$/,
     );
     const originalPullRequestNumber = Number(originalPullRequestMatch?.[1]);
-    const originalPullRequest =
+    const suitePullRequest =
       Number.isSafeInteger(originalPullRequestNumber) &&
       originalPullRequestNumber > 0 &&
       originalPullRequestMatch?.[2] === sha
@@ -1174,6 +1249,7 @@ export class GitHubClient {
       ? previousTriggerContext(previousAggregate, sha)
       : undefined;
     const context = requestedContext ?? recoveredContext;
+    const originalPullRequest = context?.pullRequest ?? suitePullRequest;
     const legacyManualRequest = requestedChecks.some(
       (check) =>
         manualTriggerRequest(check) === undefined && manualTriggerContext(check) !== undefined,
@@ -1402,19 +1478,6 @@ export class GitHubClient {
           return legacyOrder || a.id - b.id;
         });
       if (!completed && contenders[0]?.id === candidate.id) {
-        await this.updateCheck(
-          repository,
-          candidate.id,
-          {
-            status: "in_progress",
-            externalId: candidateExternalId,
-            title: "Informant CI",
-            summary: `Claimed by ${hostname()}`,
-            text: candidate.output?.text,
-          },
-          executionSignal,
-        );
-        candidate = promotedClaim(candidate, candidateExternalId);
         const jobRequests = pendingRequests.map(requestedJobsFor);
         const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
           ? []
@@ -1427,6 +1490,31 @@ export class GitHubClient {
           const supported = requestedJobs.filter((job) => eligible.has(job));
           requestedJobs.splice(0, requestedJobs.length, ...supported);
         }
+        const promotedCheck = promotedClaim(candidate, candidateExternalId);
+        const promoted = {
+          check: promotedCheck,
+          requestedJobs,
+          manualTrigger,
+          manualTriggerBranch: context?.branch,
+          manualTriggerLabel: context?.label,
+          originalPullRequest,
+        } satisfies ClaimResult;
+        // Persist local recovery intent before the non-atomic remote promotion and request
+        // acceptance writes. A replacement can then reconcile any crash point below.
+        await onPromoted?.(promoted);
+        await this.updateCheck(
+          repository,
+          candidate.id,
+          {
+            status: "in_progress",
+            externalId: candidateExternalId,
+            title: "Informant CI",
+            summary: `Claimed by ${hostname()}`,
+            text: candidate.output?.text,
+          },
+          executionSignal,
+        );
+        candidate = promotedCheck;
         await Promise.all(
           pendingRequests.map((check) =>
             this.updateCheck(
@@ -1443,14 +1531,7 @@ export class GitHubClient {
             ),
           ),
         );
-        return {
-          check: candidate,
-          requestedJobs,
-          manualTrigger,
-          manualTriggerBranch: context?.branch,
-          manualTriggerLabel: context?.label,
-          originalPullRequest,
-        };
+        return promoted;
       }
 
       await this.updateCheck(

@@ -11,13 +11,14 @@ import {
   type ExecutionCapacitySnapshot,
   publishExecutionReservation,
 } from "./execution-capacity.ts";
-import type { ClaimResult, GitHubClient } from "./github.ts";
+import { type ClaimResult, type GitHubClient, INTERRUPTED_CLAIM_TITLE } from "./github.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import {
   createBuild,
   currentProcessOwner,
   dataDirectory,
   monitorBuildCancellation,
+  persistClaim,
   saveBuild,
 } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
@@ -43,6 +44,7 @@ export interface ClaimScheduling {
 export interface CoordinatorDependencies {
   createBuild: typeof createBuild;
   saveBuild: typeof saveBuild;
+  persistClaim?: typeof persistClaim;
   runInTart: typeof runInTart;
   readLogTail: (path: string) => Promise<string>;
   monitorBuildCancellation?: typeof monitorBuildCancellation;
@@ -203,6 +205,7 @@ export async function readLogTail(path: string): Promise<string> {
 const defaultDependencies: CoordinatorDependencies = {
   createBuild,
   saveBuild,
+  persistClaim,
   runInTart,
   readLogTail,
   acquireExecutionSlot,
@@ -237,11 +240,13 @@ export function aggregatePartitionResults(
 ): BuildRecord | false | undefined {
   if (results.includes(false)) return false;
   const records = results.filter((result): result is BuildRecord => typeof result === "object");
-  return (
+  const selected =
     records.find((record) => record.status === "failure") ??
     records.find((record) => record.status === "cancelled") ??
-    records[0]
-  );
+    records[0];
+  return selected && records.some((record) => record.interrupted)
+    ? { ...selected, interrupted: true }
+    : selected;
 }
 
 export function partitionJobGraphs(jobs: JobConfig[]): JobConfig[][] {
@@ -674,6 +679,52 @@ async function runCommitPartitionWithSlot(
     .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name);
   const scopedEvent = scopedClaimEvent(event, scopeJobs);
+  let promotedRecord: BuildRecord | undefined;
+  const recordForClaim = (promoted: ClaimResult): BuildRecord | undefined => {
+    const check = promoted.check;
+    if (!check) return undefined;
+    const recordBranch =
+      promoted.originalPullRequest !== undefined
+        ? `pull/${promoted.originalPullRequest}`
+        : (promoted.manualTriggerLabel ??
+          (typeof promoted.manualTriggerBranch === "string"
+            ? promoted.manualTriggerBranch
+            : branch));
+    const retryManual = promoted.manualTrigger
+      ? {
+          jobs: promoted.requestedJobs,
+          ...(typeof promoted.manualTriggerBranch === "string"
+            ? { branch: promoted.manualTriggerBranch }
+            : {}),
+          label: promoted.manualTriggerLabel ?? recordBranch,
+          ...(promoted.originalPullRequest !== undefined
+            ? { pullRequest: promoted.originalPullRequest }
+            : {}),
+        }
+      : undefined;
+    return {
+      id,
+      repo: repository.fullName,
+      sha,
+      branch: recordBranch,
+      machine: hostname(),
+      startedAt: new Date().toISOString(),
+      status: "running",
+      runningJobs: [],
+      jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
+      owner: currentProcessOwner(),
+      pullRequest: promoted.originalPullRequest ?? event?.pullRequest?.number,
+      logPath: join(dataDirectory(), "builds", id, "build.log"),
+      checkId: check.id,
+      checkUrl: check.html_url,
+      retryManual,
+      event: promoted.manualTrigger
+        ? { type: "manual_trigger", id: check.id.toString() }
+        : event
+          ? { type: event.type, id: event.id }
+          : { type: "manual", id: check.id.toString() },
+    };
+  };
   let claim: ClaimResult | undefined;
   const automaticExecutionSignal =
     signal && forcedShutdownSignal
@@ -698,8 +749,46 @@ async function runCommitPartitionWithSlot(
       acceptManualTrigger,
       admissionSignal,
       claimExecutionSignal,
+      false,
+      async (promoted) => {
+        const record = recordForClaim(promoted);
+        if (!record) return;
+        promotedRecord = record;
+        await (dependencies.persistClaim ?? persistClaim)(record);
+      },
     );
   } catch (error) {
+    if (promotedRecord) {
+      const persisted = promotedRecord;
+      persisted.status = "cancelled";
+      persisted.interrupted = true;
+      persisted.completedAt = new Date().toISOString();
+      persisted.runningJobs = [];
+      persisted.jobs = persisted.jobs?.map((job) =>
+        job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
+      );
+      await dependencies.saveBuild(persisted).catch(() => undefined);
+      const retryManual = persisted.retryManual;
+      if (retryManual) {
+        await github
+          .ensureManualTrigger(
+            repository,
+            sha,
+            persisted.id,
+            retryManual.jobs,
+            retryManual.branch,
+            retryManual.label,
+            undefined,
+            retryManual.pullRequest,
+          )
+          .then(async () => {
+            persisted.retryManual = undefined;
+            persisted.manualRetryRequeuedAt = new Date().toISOString();
+            await dependencies.saveBuild(persisted).catch(() => undefined);
+          })
+          .catch(() => undefined);
+      }
+    }
     if (admissionSignal?.aborted) return false;
     throw error;
   }
@@ -712,6 +801,19 @@ async function runCommitPartitionWithSlot(
   else if (claim.manualTrigger && claim.manualTriggerLabel) branch = claim.manualTriggerLabel;
   else if (claim.manualTrigger && typeof claim.manualTriggerBranch === "string")
     branch = claim.manualTriggerBranch;
+  const interruptedManualRequest = () =>
+    claim.manualTrigger
+      ? {
+          jobs: claim.requestedJobs,
+          ...(typeof claim.manualTriggerBranch === "string"
+            ? { branch: claim.manualTriggerBranch }
+            : {}),
+          label: claim.manualTriggerLabel ?? branch,
+          ...(claim.originalPullRequest !== undefined
+            ? { pullRequest: claim.originalPullRequest }
+            : {}),
+        }
+      : undefined;
   // Automatic-lane supersession must not cancel manually claimed work. Forced worker shutdown is
   // independent of supersession and must always reach the selected runtime.
   let executionSignal = claim.manualTrigger ? forcedShutdownSignal : automaticExecutionSignal;
@@ -740,14 +842,30 @@ async function runCommitPartitionWithSlot(
         : config;
   }
   if (config.jobs.length === 0) {
-    await github.updateCheck(repository, check.id, {
-      status: "completed",
-      conclusion: "neutral",
-      title: "No jobs matched",
-      summary: `No jobs are configured for this ${event?.type ?? "manual"} event.`,
-      text: check.output?.text,
-    });
-    return undefined;
+    const emptyRecord = promotedRecord ?? recordForClaim(claim);
+    if (!emptyRecord) throw new Error("promoted claims require a persisted build record");
+    try {
+      await github.updateCheck(repository, check.id, {
+        status: "completed",
+        conclusion: "neutral",
+        title: "No jobs matched",
+        summary: `No jobs are configured for this ${event?.type ?? "manual"} event.`,
+        text: check.output?.text,
+      });
+      emptyRecord.status = "success";
+      emptyRecord.jobs = [];
+      emptyRecord.retryManual = undefined;
+      emptyRecord.completedAt = new Date().toISOString();
+      emptyRecord.checksCompletedAt = emptyRecord.completedAt;
+      await dependencies.saveBuild(emptyRecord);
+      return undefined;
+    } catch (error) {
+      emptyRecord.status = "failure";
+      emptyRecord.retryManual = undefined;
+      emptyRecord.completedAt = new Date().toISOString();
+      await dependencies.saveBuild(emptyRecord).catch(() => undefined);
+      throw error;
+    }
   }
 
   type CheckUpdate = Parameters<GitHubClient["updateCheck"]>[2];
@@ -764,27 +882,12 @@ async function runCommitPartitionWithSlot(
   const jobChecks = new Map<string, JobCheckState>();
   let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
 
-  const record: BuildRecord = {
-    id,
-    repo: repository.fullName,
-    sha,
-    branch,
-    machine: hostname(),
-    startedAt: new Date().toISOString(),
-    status: "running",
-    runningJobs: [],
-    jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
-    owner: currentProcessOwner(),
-    pullRequest: rerunPullRequest ?? event?.pullRequest?.number,
-    logPath: join(dataDirectory(), "builds", id, "build.log"),
-    checkId: check.id,
-    checkUrl: check.html_url,
-    event: claim.manualTrigger
-      ? { type: "manual_trigger", id: check.id.toString() }
-      : event
-        ? { type: event.type, id: event.id }
-        : { type: "manual", id: check.id.toString() },
-  };
+  const record = promotedRecord ?? recordForClaim(claim);
+  if (!record) throw new Error("promoted claims require a persisted build record");
+  record.branch = branch;
+  record.jobs = config.jobs.map((job) => ({ name: job.name, status: "queued" }));
+  record.pullRequest = rerunPullRequest ?? event?.pullRequest?.number;
+  record.retryManual = interruptedManualRequest();
   const cancellationSummary = (name: string, fallback: string): string => {
     const jobCancellation = cancellation?.jobSignal(name);
     if (jobCancellation?.aborted) return String(jobCancellation.reason || fallback);
@@ -940,6 +1043,9 @@ async function runCommitPartitionWithSlot(
     if (claim.manualTrigger) {
       releasePublishedManualResources = await dependencies.publishExecutionReservation?.(config);
     }
+    // Persist the promoted claim before waiting on housekeeping so a bounded worker replacement
+    // can recover it even if the old process is killed while this barrier is held.
+    if (!promotedRecord) await (dependencies.persistClaim ?? persistClaim)(record);
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));
@@ -1034,12 +1140,16 @@ async function runCommitPartitionWithSlot(
     }
 
     if (executionSignal?.aborted) {
+      const workerInterrupted =
+        forcedShutdownSignal?.aborted === true && !cancellation.signal.aborted;
       const unfinishedJobs = new Set(
         record.jobs
           ?.filter((job) => job.status === "queued" || job.status === "running")
           .map((job) => job.name),
       );
       record.status = "cancelled";
+      record.interrupted = workerInterrupted || undefined;
+      record.retryManual = workerInterrupted ? interruptedManualRequest() : undefined;
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
         job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
@@ -1064,7 +1174,11 @@ async function runCommitPartitionWithSlot(
         await completeAggregate({
           status: "completed",
           conclusion: "cancelled",
-          title: cancellation.signal.aborted ? "Build cancelled" : "Superseded by a newer commit",
+          title: cancellation.signal.aborted
+            ? "Build cancelled"
+            : workerInterrupted
+              ? INTERRUPTED_CLAIM_TITLE
+              : "Superseded by a newer commit",
           summary: String(executionSignal.reason || "This build was cancelled."),
         });
       } catch (error) {
@@ -1081,7 +1195,11 @@ async function runCommitPartitionWithSlot(
     await reconcileJobChecks().catch(() => reconcileJobChecks());
     childrenReconciled = true;
     if (executionSignal.aborted) {
+      const workerInterrupted =
+        forcedShutdownSignal?.aborted === true && !cancellation.signal.aborted;
       record.status = "cancelled";
+      record.interrupted = workerInterrupted || undefined;
+      record.retryManual = workerInterrupted ? interruptedManualRequest() : undefined;
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
         job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
@@ -1101,7 +1219,11 @@ async function runCommitPartitionWithSlot(
       await completeAggregate({
         status: "completed",
         conclusion: "cancelled",
-        title: cancellation.signal.aborted ? "Build cancelled" : "Superseded by a newer commit",
+        title: cancellation.signal.aborted
+          ? "Build cancelled"
+          : workerInterrupted
+            ? INTERRUPTED_CLAIM_TITLE
+            : "Superseded by a newer commit",
         summary: String(executionSignal.reason || "This build was cancelled."),
       });
       return record;
@@ -1115,6 +1237,7 @@ async function runCommitPartitionWithSlot(
     const skipped = outcomes.filter((outcome) => outcome === "skipped").length;
     const cancelled = outcomes.filter((outcome) => outcome === "cancelled").length;
     record.status = cancelled > 0 ? "cancelled" : success ? "success" : "failure";
+    record.retryManual = undefined;
     record.completedAt = new Date().toISOString();
     executionFinished = true;
     await dependencies.saveBuild(record).catch(() => undefined);
@@ -1134,6 +1257,7 @@ async function runCommitPartitionWithSlot(
   } catch (error) {
     if (executionFinished) throw error;
     record.status = "failure";
+    record.retryManual = undefined;
     record.runningJobs = [];
     record.jobs = record.jobs?.map((job) => {
       if (job.status !== "queued" && job.status !== "running") return job;

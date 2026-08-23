@@ -9,6 +9,7 @@ import {
   jobLogPath,
   listActiveBuilds,
   monitorBuildCancellation,
+  persistClaim,
   recordWorkerVersion,
   removeOrphanedBuildWorkspaces,
   requestBuildCancellation,
@@ -54,6 +55,26 @@ test("build saves preserve invocation order and complete JSON", async () => {
   await Promise.all([first, second]);
 
   expect((await getBuild(record.id))?.runningJobs).toEqual(["second"]);
+});
+
+test("claim persistence creates storage before housekeeping initialization", async () => {
+  const root = join(import.meta.dir, `.store-test-${crypto.randomUUID()}`);
+  roots.push(root);
+  Bun.env.INFORMANT_DATA_DIR = root;
+  const record: BuildRecord = {
+    id: "promoted",
+    repo: "owner/repo",
+    sha: "sha",
+    branch: "main",
+    machine: "machine",
+    startedAt: new Date().toISOString(),
+    status: "running",
+    logPath: join(root, "builds", "promoted", "build.log"),
+  };
+
+  await persistClaim(record);
+
+  expect(await getBuild(record.id)).toEqual(record);
 });
 
 test("worker version state belongs to a specific live process", async () => {
