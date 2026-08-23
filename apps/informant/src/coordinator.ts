@@ -748,35 +748,36 @@ async function runCommitPartitionWithSlot(
       async (promoted) => {
         const record = recordForClaim(promoted);
         if (!record) return;
-        await (dependencies.persistClaim ?? persistClaim)(record);
         promotedRecord = record;
+        await (dependencies.persistClaim ?? persistClaim)(record);
       },
     );
   } catch (error) {
     if (promotedRecord) {
-      promotedRecord.status = "cancelled";
-      promotedRecord.interrupted = true;
-      promotedRecord.completedAt = new Date().toISOString();
-      promotedRecord.runningJobs = [];
-      promotedRecord.jobs = promotedRecord.jobs?.map((job) =>
+      const persisted = promotedRecord;
+      persisted.status = "cancelled";
+      persisted.interrupted = true;
+      persisted.completedAt = new Date().toISOString();
+      persisted.runningJobs = [];
+      persisted.jobs = persisted.jobs?.map((job) =>
         job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
       );
-      await dependencies.saveBuild(promotedRecord).catch(() => undefined);
-      const retryManual = promotedRecord.retryManual;
+      await dependencies.saveBuild(persisted).catch(() => undefined);
+      const retryManual = persisted.retryManual;
       if (retryManual) {
         await github
           .ensureManualTrigger(
             repository,
             sha,
-            promotedRecord.id,
+            persisted.id,
             retryManual.jobs,
             retryManual.branch,
             retryManual.label,
           )
           .then(async () => {
-            promotedRecord.retryManual = undefined;
-            promotedRecord.manualRetryRequeuedAt = new Date().toISOString();
-            await dependencies.saveBuild(promotedRecord).catch(() => undefined);
+            persisted.retryManual = undefined;
+            persisted.manualRetryRequeuedAt = new Date().toISOString();
+            await dependencies.saveBuild(persisted).catch(() => undefined);
           })
           .catch(() => undefined);
       }

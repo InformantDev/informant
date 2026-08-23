@@ -599,17 +599,18 @@ export async function recoverInterruptedBuilds(
         signal,
         build.interrupted === true || legacyInterrupted(build),
       );
-      const manualRequest =
-        build.retryManual ??
-        ((build.interrupted === true || (legacyInterrupted(build) && retryableCheck)) &&
-        build.event?.type === "manual_trigger" &&
-        !build.manualRetryRequeuedAt
-          ? {
-              jobs: build.jobs?.map((job) => job.name) ?? [],
-              ...(build.pullRequest === undefined ? { branch: build.branch } : {}),
-              label: build.branch,
-            }
-          : undefined);
+      const manualRequest = retryableCheck
+        ? (build.retryManual ??
+          ((build.interrupted === true || legacyInterrupted(build)) &&
+          build.event?.type === "manual_trigger" &&
+          !build.manualRetryRequeuedAt
+            ? {
+                jobs: build.jobs?.map((job) => job.name) ?? [],
+                ...(build.pullRequest === undefined ? { branch: build.branch } : {}),
+                label: build.branch,
+              }
+            : undefined))
+        : undefined;
       if (manualRequest) {
         await github
           .priorityClient()
