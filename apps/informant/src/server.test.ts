@@ -624,6 +624,67 @@ test("webhook scans query only the exact pull request head", async () => {
   expect(recoveries).toBe(0);
 });
 
+test("dispatch preemption detaches an already-running build", async () => {
+  const preemption = new AbortController();
+  const service = new AbortController();
+  const execution = deferred<undefined>();
+  let forcedShutdownSignal: AbortSignal | undefined;
+  let detachedDrain: Promise<void> | undefined;
+  let started = false;
+  let completed = false;
+  const serving = serve(repository, {
+    once: true,
+    throwOnPollError: true,
+    scanUpdates: [{ lane: "branch:main", sha: "default-sha" }],
+    signal: AbortSignal.any([preemption.signal, service.signal]),
+    detachRunsSignal: preemption.signal,
+    serviceShutdownSignal: service.signal,
+    onDetachedDrain: (drain) => {
+      detachedDrain = drain;
+    },
+    shutdownTimeoutMs: 1,
+    dependencies: dependencies(
+      github({}),
+      { pending: [], seenCommentIds: [], pendingTags: [] },
+      async (
+        _github,
+        _repository,
+        _sha,
+        _branch,
+        _config,
+        _dependencies,
+        _event,
+        _signal,
+        _admissionSignal,
+        shutdownSignal,
+      ) => {
+        started = true;
+        forcedShutdownSignal = shutdownSignal;
+        return execution.promise;
+      },
+    ),
+    onMessage: () => {},
+  }).then(() => {
+    completed = true;
+  });
+
+  while (!started) await Bun.sleep(0);
+  preemption.abort("Webhook dispatch superseded reconciliation.");
+  for (let attempt = 0; attempt < 20 && !completed; attempt++) await Bun.sleep(0);
+
+  expect(completed).toBe(true);
+  expect(detachedDrain).toBeDefined();
+  expect(forcedShutdownSignal?.aborted).toBe(false);
+
+  service.abort("Worker shutdown requested.");
+  for (let attempt = 0; attempt < 20 && !forcedShutdownSignal?.aborted; attempt++) {
+    await Bun.sleep(1);
+  }
+  expect(forcedShutdownSignal?.aborted).toBe(true);
+  execution.resolve(undefined);
+  await Promise.all([serving, detachedDrain]);
+});
+
 test("full scans continue to validate coalesced webhook heads", async () => {
   const deliveredSha = "a".repeat(40);
   const staleSha = "b".repeat(40);

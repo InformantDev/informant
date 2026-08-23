@@ -24,6 +24,7 @@ import {
   automaticLaneUpdateIdentity,
   automaticLaneUpdateIsNewer,
   automaticLaneUpdateSemanticIdentity,
+  InvalidRepositoryConfigError,
   type ServerOptions,
   serveRepositories,
 } from "./server.ts";
@@ -263,6 +264,13 @@ export function supportsReconciliationPriority(protocols: string[] | undefined):
   return protocols?.includes(RECONCILIATION_PRIORITY_PROTOCOL) === true;
 }
 
+export function networkDispatchSucceeded(results: PromiseSettledResult<unknown>[]): boolean {
+  return results.every(
+    (result) =>
+      result.status === "fulfilled" || result.reason instanceof InvalidRepositoryConfigError,
+  );
+}
+
 export function networkScanDispatchPolicy(
   protocols: string[] | undefined,
   request: Pick<RepositoryDispatch, "fullScan" | "scanUpdates">,
@@ -467,22 +475,22 @@ export function webhookAutomaticLaneUpdates(
       ...(revision ? { revision } : {}),
     });
     const updates: AutomaticLaneUpdate[] = [];
+    const pullRequests = suite?.pull_requests ?? [];
+    const sameRepositoryPullRequests = pullRequests.filter(
+      (pullRequest) =>
+        normalizedSha(pullRequest.head?.sha) === sha &&
+        (value.repository?.id === undefined || pullRequest.head?.repo?.id === value.repository.id),
+    );
     if (
+      (pullRequests.length === 0 || sameRepositoryPullRequests.length > 0) &&
       typeof suite?.head_branch === "string" &&
       suite.head_branch.length > 0 &&
       suite.head_branch.length <= MAX_AUTOMATIC_LANE_LENGTH - "branch:".length
     ) {
       updates.push(update(`branch:${suite.head_branch}`));
     }
-    for (const pullRequest of suite?.pull_requests ?? []) {
-      if (
-        !Number.isSafeInteger(pullRequest.number) ||
-        Number(pullRequest.number) <= 0 ||
-        normalizedSha(pullRequest.head?.sha) !== sha ||
-        (value.repository?.id !== undefined && pullRequest.head?.repo?.id !== value.repository.id)
-      ) {
-        continue;
-      }
+    for (const pullRequest of sameRepositoryPullRequests) {
+      if (!Number.isSafeInteger(pullRequest.number) || Number(pullRequest.number) <= 0) continue;
       updates.push(update(`pr:${pullRequest.number}`));
     }
     return mergeAutomaticLaneUpdates(undefined, updates);
@@ -596,6 +604,7 @@ export class RepositoryScanQueue {
       scanUpdates?: AutomaticLaneUpdate[],
       scanAllTargets?: boolean,
       reconciliation?: boolean,
+      detachRunsSignal?: AbortSignal,
     ) => Promise<void>,
     private readonly serviceSignal?: AbortSignal,
   ) {
@@ -651,6 +660,7 @@ export class RepositoryScanQueue {
           scanUpdates,
           scanAllTargets,
           reconciliation,
+          requestSignal,
         );
       })
       .finally(() => {
@@ -708,6 +718,11 @@ export class DispatchRetryQueue {
     const existing = this.entries.get(key);
     if (existing) {
       this.rememberScanUpdates(existing, request.scanUpdates);
+      if (existing.request.reconciliation === true && request.reconciliation !== true) {
+        existing.request.forceTagPoll = false;
+        existing.request.fullScan = false;
+        existing.request.retireSupersededScanUpdates = false;
+      }
       existing.request.forceTagPoll ||= request.forceTagPoll;
       existing.request.fullScan ||= request.fullScan;
       existing.request.retireSupersededScanUpdates ||= request.retireSupersededScanUpdates;
@@ -933,12 +948,14 @@ export function parseTailscaleStatus(executable: string, output: string): Tailsc
 export async function tailscaleStatus(
   runCommand: typeof command = command,
   resolveExecutable: () => string | undefined = tailscaleExecutable,
+  signal?: AbortSignal,
 ): Promise<TailscaleStatus | undefined> {
   const executable = resolveExecutable();
   if (!executable) return undefined;
   const result = await runCommand([executable, "status", "--json"], {
     env: { TERM: Bun.env.TERM ?? "dumb" },
     timeoutMs: 10_000,
+    signal,
   });
   if (result.exitCode !== 0) return undefined;
   return parseTailscaleStatus(executable, result.stdout);
@@ -953,7 +970,9 @@ function peerUrl(address: string, port: number, path: string): string {
 }
 
 async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+  return fetch(url, { ...init, signal });
 }
 
 function requireNetworkSecret(config: TailscaleConfig): string {
@@ -1111,6 +1130,7 @@ export async function localNetworkExecutionCapacity(
 export async function discoverNetworkWorkers(
   config: TailscaleConfig,
   status: TailscaleStatus,
+  signal?: AbortSignal,
 ): Promise<NetworkWorker[]> {
   const workers = await Promise.all(
     status.peers
@@ -1121,6 +1141,7 @@ export async function discoverNetworkWorkers(
         return [
           fetchWithTimeout(peerUrl(address, config.workerPort, "/v1/health"), {
             headers: networkRequestHeaders(config),
+            signal,
           })
             .then(async (response) => {
               if (!response.ok) return undefined;
@@ -1139,7 +1160,10 @@ export async function discoverNetworkWorkers(
                 version: result.version,
               } satisfies NetworkWorker;
             })
-            .catch(() => undefined),
+            .catch(() => {
+              signal?.throwIfAborted();
+              return undefined;
+            }),
         ];
       }),
   );
@@ -1529,6 +1553,19 @@ async function serveConfiguredWithTailscale(
     else latestAutomaticUpdates.delete(key);
   };
   const automaticRuns = new AutomaticRunRegistry(retireAutomaticUpdate);
+  const detachedDrains = new Set<Promise<void>>();
+  const trackDetachedDrain = (drain: Promise<void>) => {
+    detachedDrains.add(drain);
+    void drain.then(
+      () => detachedDrains.delete(drain),
+      (error) => {
+        detachedDrains.delete(drain);
+        options.onMessage?.(
+          `detached build cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    );
+  };
   const scans = new RepositoryScanQueue(
     repositories,
     (
@@ -1539,6 +1576,7 @@ async function serveConfiguredWithTailscale(
       scanUpdates,
       scanAllTargets,
       reconciliation,
+      detachRunsSignal,
     ) =>
       serveRepositories([repository], {
         ...options,
@@ -1551,18 +1589,21 @@ async function serveConfiguredWithTailscale(
         scanUpdates,
         scanAllTargets,
         reconciliation,
+        detachRunsSignal,
+        serviceShutdownSignal: options.signal,
+        onDetachedDrain: trackDetachedDrain,
       }),
     options.signal,
   );
-  const refreshWorkers = async (): Promise<NetworkWorker[]> => {
+  const refreshWorkers = async (signal?: AbortSignal): Promise<NetworkWorker[]> => {
     const previousIds = new Set(knownWorkers.keys());
-    const currentStatus = await tailscaleStatus();
+    const currentStatus = await tailscaleStatus(command, tailscaleExecutable, signal);
     if (!currentStatus?.online) {
       knownWorkers.clear();
       advertisedRepositories.clear();
       return [];
     }
-    const workers = await discoverNetworkWorkers(config, currentStatus);
+    const workers = await discoverNetworkWorkers(config, currentStatus, signal);
     reconcileKnownWorkers(knownWorkers, workers);
     const discoveredIds = new Set(workers.map((worker) => worker.id));
     for (const id of previousIds) {
@@ -1628,7 +1669,7 @@ async function serveConfiguredWithTailscale(
   let claimRotation = 0;
   const dispatch = async (request: RepositoryDispatch, signal?: AbortSignal): Promise<boolean> => {
     signal?.throwIfAborted();
-    await refreshWorkers();
+    await refreshWorkers(signal);
     signal?.throwIfAborted();
     let automaticUpdates = mergeAutomaticLaneUpdates(
       latestAutomaticUpdates.get(request.repository.fullName.toLowerCase()),
@@ -1694,6 +1735,7 @@ async function serveConfiguredWithTailscale(
           run: (plan) =>
             fetchWithTimeout(peerUrl(worker.address, config.workerPort, "/v1/dispatch"), {
               method: "POST",
+              signal,
               headers: {
                 ...networkRequestHeaders(config),
                 "Content-Type": "application/json",
@@ -1746,7 +1788,7 @@ async function serveConfiguredWithTailscale(
         );
       }
     }
-    return results.every((result) => result.status === "fulfilled");
+    return networkDispatchSucceeded(results);
   };
   const dispatchQueue = new DispatchRetryQueue(dispatch, (request, delayMs) => {
     options.onMessage?.(
@@ -2067,6 +2109,7 @@ async function serveConfiguredWithTailscale(
       dispatchQueue.stop(),
       scans.stop(options.signal?.reason ?? "Worker shutdown requested."),
     ]);
+    await Promise.allSettled(detachedDrains);
   }
 }
 
