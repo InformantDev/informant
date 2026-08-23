@@ -621,6 +621,39 @@ test("full scans continue to validate coalesced webhook heads", async () => {
   expect(attempts).toEqual([{ sha: unrelatedSha, branch: "pull/92" }]);
 });
 
+test("reconciliation processes the current head after an exact assertion expires", async () => {
+  const deliveredSha = "a".repeat(40);
+  const currentSha = "b".repeat(40);
+  const update = { lane: "pr:90", sha: deliveredSha, revision: "delivery-90" };
+  const retired: string[] = [];
+  const automaticRuns = new AutomaticRunRegistry((_repository, retiredUpdate) => {
+    if (retiredUpdate.revision) retired.push(retiredUpdate.revision);
+  });
+  automaticRuns.apply(repository, [update]);
+  const attempts: Array<{ sha: string; branch: string }> = [];
+
+  await serve(repository, {
+    once: true,
+    throwOnPollError: true,
+    automaticRuns,
+    scanAllTargets: true,
+    dependencies: dependencies(
+      github({
+        pullRequests: async () => [{ ...pullRequest, number: 90, headSha: currentSha }],
+      }),
+      { pending: [], seenCommentIds: [], pendingTags: [] },
+      async (_github, _repository, sha, branch) => {
+        attempts.push({ sha, branch });
+        return undefined;
+      },
+    ),
+    onMessage: () => {},
+  });
+
+  expect(attempts).toEqual([{ sha: currentSha, branch: "pull/90" }]);
+  expect(retired).toEqual(["delivery-90"]);
+});
+
 test("webhook scans retry until GitHub exposes the delivered head", async () => {
   const deliveredSha = "a".repeat(40);
   const staleSha = "b".repeat(40);

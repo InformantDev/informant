@@ -42,9 +42,11 @@ export const DEFAULT_FUNNEL_PORT = 7640;
 const REQUEST_TIMEOUT_MS = 2_000;
 const PEER_REFRESH_INTERVAL_MS = 10_000;
 export const NETWORK_RECONCILIATION_INTERVAL_MS = 5 * 60_000;
+export const TARGETED_SCAN_RETENTION_MS = NETWORK_RECONCILIATION_INTERVAL_MS;
 const MAX_DISPATCH_RETRY_MS = 60_000;
 const CLAIM_SCHEDULING_PROTOCOL = "claim-scheduling-v1";
 const AUTOMATIC_SUPERSESSION_PROTOCOL = "automatic-supersession-v1";
+const TARGETED_SCAN_PROTOCOL = "targeted-scan-v1";
 export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 export const REQUIRED_GITHUB_WEBHOOK_EVENTS = [
   "push",
@@ -104,6 +106,8 @@ export interface RepositoryDispatch {
   automaticUpdates?: AutomaticLaneUpdate[];
   /** Fresh webhook heads this dispatch must reconcile exactly. */
   scanUpdates?: AutomaticLaneUpdate[];
+  /** Allow a recovery scan to expire exact assertions after their bounded retention period. */
+  retireSupersededScanUpdates?: boolean;
 }
 
 const MAX_NETWORK_CLAIMANTS = 64;
@@ -233,6 +237,41 @@ export function filterAcceptedScanUpdates(
       acceptedHeads.has(JSON.stringify([update.lane, update.sha ?? null, update.closed === true])),
   );
   return filtered.length > 0 ? filtered : undefined;
+}
+
+function mergeDispatchScanUpdates(
+  previous: AutomaticLaneUpdate[] | undefined,
+  latest: AutomaticLaneUpdate[] | undefined,
+  automaticUpdates: AutomaticLaneUpdate[] | undefined,
+): { scanUpdates: AutomaticLaneUpdate[] | undefined; overflowed: boolean } {
+  const candidates = filterAcceptedScanUpdates(
+    [...(previous ?? []), ...(latest ?? [])],
+    automaticUpdates,
+    automaticUpdates,
+  );
+  return {
+    scanUpdates: mergeAutomaticLaneUpdates(undefined, candidates),
+    overflowed:
+      new Set((candidates ?? []).map((update) => update.lane)).size > MAX_AUTOMATIC_LANE_UPDATES,
+  };
+}
+
+export function networkScanDispatchPolicy(
+  protocols: string[] | undefined,
+  request: Pick<RepositoryDispatch, "fullScan" | "scanUpdates">,
+): {
+  fullScan: boolean;
+  scanUpdates: AutomaticLaneUpdate[] | undefined;
+  retryForTargetedScan: boolean;
+} {
+  const hasTargetedScan = Boolean(request.scanUpdates?.length);
+  const supportsTargetedScan = protocols?.includes(TARGETED_SCAN_PROTOCOL) === true;
+  const retryForTargetedScan = hasTargetedScan && !supportsTargetedScan;
+  return {
+    fullScan: request.fullScan === true || retryForTargetedScan,
+    scanUpdates: supportsTargetedScan ? request.scanUpdates : undefined,
+    retryForTargetedScan,
+  };
 }
 
 export function retireAutomaticLaneUpdate(
@@ -427,8 +466,12 @@ export function reconcileKnownWorkers(
   for (const worker of discoveredWorkers) knownWorkers.set(worker.id, worker);
 }
 
+function repositoryRecoveryRequest(repository: Repository): RepositoryDispatch {
+  return { repository, forceTagPoll: true, fullScan: true };
+}
+
 export function startupRecoveryRequests(repositories: Repository[]): RepositoryDispatch[] {
-  return repositories.map((repository) => ({ repository, forceTagPoll: true }));
+  return repositories.map(repositoryRecoveryRequest);
 }
 
 export function networkReconciliationRequests(
@@ -450,6 +493,7 @@ export function networkReconciliationRequests(
     repository,
     forceTagPoll: true,
     fullScan: true,
+    retireSupersededScanUpdates: true,
   }));
 }
 
@@ -464,6 +508,15 @@ export function addedRepositoryRecoveryRequests(
 }
 
 type RetryTimer = ReturnType<typeof setTimeout>;
+
+interface DispatchRetryEntry {
+  request: RepositoryDispatch;
+  attempts: number;
+  pending: boolean;
+  scanUpdateSeenAt: Map<string, number>;
+  running?: Promise<void>;
+  timer?: RetryTimer;
+}
 
 export class RepositoryScanQueue {
   private readonly registrations = new Map<
@@ -555,16 +608,7 @@ export class RepositoryScanQueue {
 }
 
 export class DispatchRetryQueue {
-  private readonly entries = new Map<
-    string,
-    {
-      request: RepositoryDispatch;
-      attempts: number;
-      pending: boolean;
-      running?: Promise<void>;
-      timer?: RetryTimer;
-    }
-  >();
+  private readonly entries = new Map<string, DispatchRetryEntry>();
   private stopped = false;
 
   constructor(
@@ -572,25 +616,44 @@ export class DispatchRetryQueue {
     private readonly onRetry: (request: RepositoryDispatch, delayMs: number) => void = () => {},
     private readonly schedule: (callback: () => void, delayMs: number) => RetryTimer = setTimeout,
     private readonly cancel: (timer: RetryTimer) => void = clearTimeout,
+    private readonly now: () => number = Date.now,
   ) {}
+
+  private rememberScanUpdates(
+    entry: DispatchRetryEntry,
+    updates: AutomaticLaneUpdate[] | undefined,
+  ): void {
+    const now = this.now();
+    for (const update of updates ?? []) {
+      const identity = automaticLaneUpdateSemanticIdentity(update);
+      if (!entry.scanUpdateSeenAt.has(identity)) entry.scanUpdateSeenAt.set(identity, now);
+    }
+    while (entry.scanUpdateSeenAt.size > MAX_AUTOMATIC_LANE_UPDATES * 2) {
+      entry.scanUpdateSeenAt.delete(entry.scanUpdateSeenAt.keys().next().value ?? "");
+    }
+  }
 
   enqueue(request: RepositoryDispatch): void {
     if (this.stopped) return;
     const key = request.repository.fullName.toLowerCase();
     const existing = this.entries.get(key);
     if (existing) {
+      this.rememberScanUpdates(existing, request.scanUpdates);
       existing.request.forceTagPoll ||= request.forceTagPoll;
       existing.request.fullScan ||= request.fullScan;
+      existing.request.retireSupersededScanUpdates ||= request.retireSupersededScanUpdates;
       existing.request.claimPlan = request.claimPlan;
       existing.request.automaticUpdates = mergeAutomaticLaneUpdates(
         existing.request.automaticUpdates,
         request.automaticUpdates,
       );
-      existing.request.scanUpdates = filterAcceptedScanUpdates(
-        mergeAutomaticLaneUpdates(existing.request.scanUpdates, request.scanUpdates),
-        existing.request.automaticUpdates,
+      const mergedScan = mergeDispatchScanUpdates(
+        existing.request.scanUpdates,
+        request.scanUpdates,
         existing.request.automaticUpdates,
       );
+      existing.request.scanUpdates = mergedScan.scanUpdates;
+      existing.request.fullScan ||= mergedScan.overflowed;
       if (existing.running) {
         existing.pending = true;
       } else if (existing.timer) {
@@ -601,7 +664,14 @@ export class DispatchRetryQueue {
       }
       return;
     }
-    this.entries.set(key, { request, attempts: 0, pending: false });
+    const entry: DispatchRetryEntry = {
+      request,
+      attempts: 0,
+      pending: false,
+      scanUpdateSeenAt: new Map(),
+    };
+    this.rememberScanUpdates(entry, request.scanUpdates);
+    this.entries.set(key, entry);
     this.run(key);
   }
 
@@ -614,9 +684,21 @@ export class DispatchRetryQueue {
     if (!entry || entry.running) return;
     entry.timer = undefined;
     entry.pending = false;
+    if (entry.request.retireSupersededScanUpdates && entry.request.scanUpdates?.length) {
+      const now = this.now();
+      entry.request.scanUpdates = entry.request.scanUpdates.filter((update) => {
+        const identity = automaticLaneUpdateSemanticIdentity(update);
+        const seenAt = entry.scanUpdateSeenAt.get(identity);
+        if (seenAt !== undefined) return now - seenAt < TARGETED_SCAN_RETENTION_MS;
+        entry.scanUpdateSeenAt.set(identity, now);
+        return true;
+      });
+      if (entry.request.scanUpdates.length === 0) entry.request.scanUpdates = undefined;
+    }
     const request = { ...entry.request };
     entry.request.forceTagPoll = false;
     entry.request.fullScan = false;
+    entry.request.retireSupersededScanUpdates = false;
     entry.request.scanUpdates = undefined;
     const retry = () => {
       const current = this.entries.get(key);
@@ -624,15 +706,18 @@ export class DispatchRetryQueue {
       current.running = undefined;
       current.request.forceTagPoll ||= request.forceTagPoll;
       current.request.fullScan ||= request.fullScan;
+      current.request.retireSupersededScanUpdates ||= request.retireSupersededScanUpdates;
       current.request.automaticUpdates = mergeAutomaticLaneUpdates(
         request.automaticUpdates,
         current.request.automaticUpdates,
       );
-      current.request.scanUpdates = filterAcceptedScanUpdates(
-        mergeAutomaticLaneUpdates(request.scanUpdates, current.request.scanUpdates),
-        current.request.automaticUpdates,
+      const mergedScan = mergeDispatchScanUpdates(
+        request.scanUpdates,
+        current.request.scanUpdates,
         current.request.automaticUpdates,
       );
+      current.request.scanUpdates = mergedScan.scanUpdates;
+      current.request.fullScan ||= mergedScan.overflowed;
       if (this.stopped) return;
       if (current.pending) {
         current.attempts = 0;
@@ -1486,6 +1571,10 @@ async function serveConfiguredWithTailscale(
         ) {
           continue;
         }
+        const scanPolicy = networkScanDispatchPolicy(worker.protocols, {
+          fullScan: request.fullScan,
+          scanUpdates,
+        });
         targets.push({
           claimant: worker.resources
             ? { id: worker.id, capabilities: worker.capabilities, resources: worker.resources }
@@ -1504,13 +1593,17 @@ async function serveConfiguredWithTailscale(
               body: JSON.stringify({
                 repository: request.repository.fullName,
                 forceTagPoll: request.forceTagPoll,
-                fullScan: request.fullScan,
+                fullScan: scanPolicy.fullScan,
+                retireSupersededScanUpdates: request.retireSupersededScanUpdates,
                 claimPlan: plan,
                 automaticUpdates,
-                scanUpdates,
+                scanUpdates: scanPolicy.scanUpdates,
               }),
             }).then((response) => {
               if (!response.ok) throw new Error(`returned ${response.status}`);
+              if (scanPolicy.retryForTargetedScan) {
+                throw new Error("worker does not support targeted scan assertions");
+              }
             }),
         });
       }
@@ -1566,7 +1659,11 @@ async function serveConfiguredWithTailscale(
           hostName: hostname(),
           capabilities: await advertisedWorkerCapabilities(),
           repositories: configuredRepositories.map((repository) => repository.fullName),
-          protocols: [CLAIM_SCHEDULING_PROTOCOL, AUTOMATIC_SUPERSESSION_PROTOCOL],
+          protocols: [
+            CLAIM_SCHEDULING_PROTOCOL,
+            AUTOMATIC_SUPERSESSION_PROTOCOL,
+            TARGETED_SCAN_PROTOCOL,
+          ],
           resources: currentExecutionCapacity(),
           version: options.version,
         });
@@ -1629,6 +1726,7 @@ async function serveConfiguredWithTailscale(
               repository?: unknown;
               forceTagPoll?: unknown;
               fullScan?: unknown;
+              retireSupersededScanUpdates?: unknown;
               claimPlan?: unknown;
               automaticUpdates?: unknown;
               scanUpdates?: unknown;
@@ -1637,7 +1735,9 @@ async function serveConfiguredWithTailscale(
         if (
           typeof body?.repository !== "string" ||
           (body.forceTagPoll !== undefined && typeof body.forceTagPoll !== "boolean") ||
-          (body.fullScan !== undefined && typeof body.fullScan !== "boolean")
+          (body.fullScan !== undefined && typeof body.fullScan !== "boolean") ||
+          (body.retireSupersededScanUpdates !== undefined &&
+            typeof body.retireSupersededScanUpdates !== "boolean")
         )
           return new Response("invalid repository", { status: 400 });
         let claimPlan: NetworkClaimPlan | undefined;
@@ -1671,6 +1771,7 @@ async function serveConfiguredWithTailscale(
           repository,
           forceTagPoll: body.forceTagPoll === true,
           fullScan: body.fullScan === true,
+          retireSupersededScanUpdates: body.retireSupersededScanUpdates === true,
           claimPlan,
           automaticUpdates: rememberedUpdates,
           scanUpdates: acceptedScanUpdates,
@@ -1703,7 +1804,7 @@ async function serveConfiguredWithTailscale(
           const key = `${worker.id}\0${repository.fullName.toLowerCase()}`;
           next.add(key);
           if (recoverAll || !advertisedRepositories.has(key)) {
-            dispatchQueue.enqueue({ repository, forceTagPoll: true });
+            dispatchQueue.enqueue(repositoryRecoveryRequest(repository));
           }
         }
       }

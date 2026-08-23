@@ -30,9 +30,12 @@ while Informant was stopped or restarting, then reacts to webhooks. The lead als
 periodic reconciliation for its local repositories and repositories advertised only by remote
 workers, so a webhook or in-memory dispatch lost during a restart cannot leave connected workers
 permanently stale. Reconciliation forces tag enumeration as well as scanning branches and pull
-requests. Failed deliveries remain queued with bounded exponential retries, and the lead
-refreshes peer topology so workers that join or reconnect receive an immediate recovery
-synchronization. Tag-push notifications bypass the normal tag throttle.
+requests. Fresh webhook-head assertions remain exact while GitHub's listings converge; the
+five-minute authoritative reconciliation can retire an assertion that has been superseded or
+removed, bounding recovery when a later webhook was also lost. Failed deliveries remain queued with
+bounded exponential retries, and the lead refreshes peer topology so workers that join or reconnect
+receive an immediate full recovery synchronization. Tag-push notifications bypass the normal tag
+throttle.
 If Tailscale is not configured or network startup is unavailable, `informant serve` retains the
 polling path. Connecting an existing GitHub App keeps polling enabled until worker mode is selected
 explicitly with the lead's token. Funnel never exposes the private worker/build API.
@@ -46,8 +49,12 @@ not depend on systemd.
 For each notification, every worker deterministically computes the same resource-aware assignment for
 each independent job/dependency partition. Signed push and pull-request webhook heads are reconciled
 as targeted lanes; if GitHub's list API has not exposed the delivered head yet, the dispatch is
-retried instead of accepting a stale listing. Full repository scans remain the recovery path. The
-scheduler filters to capable workers, accounts for already reserved and queued CPU and memory, and
+retried instead of accepting a stale listing. Workers advertise targeted-scan protocol support, so a
+lead never treats an older worker's broad-scan acknowledgement as acceptance of an exact head; it
+sends that worker a best-effort full scan while retaining the targeted request for an upgraded peer.
+If more than 64 exact lanes coalesce, the bounded assertion set is paired with a full scan rather than
+silently omitting the overflowed lane. Full repository scans remain the recovery path. The scheduler
+filters to capable workers, accounts for already reserved and queued CPU and memory, and
 chooses the worker with the lowest projected dominant resource utilization. Assignments across the
 build reserve projected capacity so independent jobs spread across the lead and workers in proportion
 to their available resources. Before reserving local execution capacity, each contender performs the
