@@ -1136,6 +1136,7 @@ export class GitHubClient {
     signal?: AbortSignal,
     executionSignal?: AbortSignal,
     preflightOnly = false,
+    onPromoted?: (claim: ClaimResult) => Promise<void>,
   ): Promise<ClaimResult | undefined> {
     const initialName = event.type === "comment" ? COMMENT_CLAIM_NAME : CLAIM_NAME;
     const initialChecks = await this.checks(repository, sha, initialName, signal);
@@ -1494,6 +1495,15 @@ export class GitHubClient {
           const supported = requestedJobs.filter((job) => eligible.has(job));
           requestedJobs.splice(0, requestedJobs.length, ...supported);
         }
+        const promoted = {
+          check: candidate,
+          requestedJobs,
+          manualTrigger,
+          manualTriggerBranch: context?.branch,
+          manualTriggerLabel: context?.label,
+          originalPullRequest,
+        } satisfies ClaimResult;
+        await onPromoted?.(promoted);
         await Promise.all(
           pendingRequests.map((check) =>
             this.updateCheck(
@@ -1510,14 +1520,7 @@ export class GitHubClient {
             ),
           ),
         );
-        return {
-          check: candidate,
-          requestedJobs,
-          manualTrigger,
-          manualTriggerBranch: context?.branch,
-          manualTriggerLabel: context?.label,
-          originalPullRequest,
-        };
+        return promoted;
       }
 
       await this.updateCheck(

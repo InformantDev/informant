@@ -677,6 +677,49 @@ async function runCommitPartitionWithSlot(
     .filter((job) => job.runtime?.type !== "container" && job.runtime?.type !== "host")
     .map((job) => job.name);
   const scopedEvent = scopedClaimEvent(event, scopeJobs);
+  let promotedRecord: BuildRecord | undefined;
+  const recordForClaim = (promoted: ClaimResult): BuildRecord | undefined => {
+    const check = promoted.check;
+    if (!check) return undefined;
+    const recordBranch =
+      promoted.originalPullRequest !== undefined
+        ? `pull/${promoted.originalPullRequest}`
+        : (promoted.manualTriggerLabel ??
+          (typeof promoted.manualTriggerBranch === "string"
+            ? promoted.manualTriggerBranch
+            : branch));
+    const retryManual = promoted.manualTrigger
+      ? {
+          jobs: promoted.requestedJobs,
+          ...(typeof promoted.manualTriggerBranch === "string"
+            ? { branch: promoted.manualTriggerBranch }
+            : {}),
+          label: promoted.manualTriggerLabel ?? recordBranch,
+        }
+      : undefined;
+    return {
+      id,
+      repo: repository.fullName,
+      sha,
+      branch: recordBranch,
+      machine: hostname(),
+      startedAt: new Date().toISOString(),
+      status: "running",
+      runningJobs: [],
+      jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
+      owner: currentProcessOwner(),
+      pullRequest: promoted.originalPullRequest ?? event?.pullRequest?.number,
+      logPath: join(dataDirectory(), "builds", id, "build.log"),
+      checkId: check.id,
+      checkUrl: check.html_url,
+      retryManual,
+      event: promoted.manualTrigger
+        ? { type: "manual_trigger", id: check.id.toString() }
+        : event
+          ? { type: event.type, id: event.id }
+          : { type: "manual", id: check.id.toString() },
+    };
+  };
   let claim: ClaimResult | undefined;
   const automaticExecutionSignal =
     signal && forcedShutdownSignal
@@ -701,6 +744,13 @@ async function runCommitPartitionWithSlot(
       acceptManualTrigger,
       admissionSignal,
       claimExecutionSignal,
+      false,
+      async (promoted) => {
+        const record = recordForClaim(promoted);
+        if (!record) return;
+        await (dependencies.persistClaim ?? persistClaim)(record);
+        promotedRecord = record;
+      },
     );
   } catch (error) {
     if (admissionSignal?.aborted) return false;
@@ -777,28 +827,12 @@ async function runCommitPartitionWithSlot(
   const jobChecks = new Map<string, JobCheckState>();
   let cancellation: ReturnType<typeof monitorBuildCancellation> | undefined;
 
-  const record: BuildRecord = {
-    id,
-    repo: repository.fullName,
-    sha,
-    branch,
-    machine: hostname(),
-    startedAt: new Date().toISOString(),
-    status: "running",
-    runningJobs: [],
-    jobs: config.jobs.map((job) => ({ name: job.name, status: "queued" })),
-    owner: currentProcessOwner(),
-    pullRequest: rerunPullRequest ?? event?.pullRequest?.number,
-    logPath: join(dataDirectory(), "builds", id, "build.log"),
-    checkId: check.id,
-    checkUrl: check.html_url,
-    retryManual: interruptedManualRequest(),
-    event: claim.manualTrigger
-      ? { type: "manual_trigger", id: check.id.toString() }
-      : event
-        ? { type: event.type, id: event.id }
-        : { type: "manual", id: check.id.toString() },
-  };
+  const record = promotedRecord ?? recordForClaim(claim);
+  if (!record) throw new Error("promoted claims require a persisted build record");
+  record.branch = branch;
+  record.jobs = config.jobs.map((job) => ({ name: job.name, status: "queued" }));
+  record.pullRequest = rerunPullRequest ?? event?.pullRequest?.number;
+  record.retryManual = interruptedManualRequest();
   const cancellationSummary = (name: string, fallback: string): string => {
     const jobCancellation = cancellation?.jobSignal(name);
     if (jobCancellation?.aborted) return String(jobCancellation.reason || fallback);
@@ -956,7 +990,7 @@ async function runCommitPartitionWithSlot(
     }
     // Persist the promoted claim before waiting on housekeeping so a bounded worker replacement
     // can recover it even if the old process is killed while this barrier is held.
-    await (dependencies.persistClaim ?? persistClaim)(record);
+    if (!promotedRecord) await (dependencies.persistClaim ?? persistClaim)(record);
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));
