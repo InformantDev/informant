@@ -712,6 +712,16 @@ async function runCommitPartitionWithSlot(
   else if (claim.manualTrigger && claim.manualTriggerLabel) branch = claim.manualTriggerLabel;
   else if (claim.manualTrigger && typeof claim.manualTriggerBranch === "string")
     branch = claim.manualTriggerBranch;
+  const interruptedManualRequest = () =>
+    claim.manualTrigger
+      ? {
+          jobs: claim.requestedJobs,
+          ...(typeof claim.manualTriggerBranch === "string"
+            ? { branch: claim.manualTriggerBranch }
+            : {}),
+          label: claim.manualTriggerLabel ?? branch,
+        }
+      : undefined;
   // Automatic-lane supersession must not cancel manually claimed work. Forced worker shutdown is
   // independent of supersession and must always reach the selected runtime.
   let executionSignal = claim.manualTrigger ? forcedShutdownSignal : automaticExecutionSignal;
@@ -1043,6 +1053,7 @@ async function runCommitPartitionWithSlot(
       );
       record.status = "cancelled";
       record.interrupted = workerInterrupted || undefined;
+      record.retryManual = workerInterrupted ? interruptedManualRequest() : undefined;
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
         job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
@@ -1092,6 +1103,7 @@ async function runCommitPartitionWithSlot(
         forcedShutdownSignal?.aborted === true && !cancellation.signal.aborted;
       record.status = "cancelled";
       record.interrupted = workerInterrupted || undefined;
+      record.retryManual = workerInterrupted ? interruptedManualRequest() : undefined;
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
         job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,

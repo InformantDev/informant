@@ -7,7 +7,7 @@ import { command } from "./process.ts";
 import { dataDirectory, runningWorkerPids } from "./store.ts";
 
 const LABEL = "dev.informant.worker";
-const GRACEFUL_RESTART_TIMEOUT_MS = 30_000;
+const GRACEFUL_RESTART_TIMEOUT_MS = 45_000;
 const RESTART_POLL_INTERVAL_MS = 1_000;
 
 function escapeXml(value: string): string {

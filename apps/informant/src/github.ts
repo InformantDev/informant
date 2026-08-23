@@ -813,7 +813,39 @@ export class GitHubClient {
       {},
       signal,
     );
-    if (aggregate.status === "completed") return false;
+    if (aggregate.status === "completed") {
+      if (
+        retryable &&
+        aggregate.conclusion === "cancelled" &&
+        aggregate.output?.title === INTERRUPTED_CLAIM_TITLE
+      ) {
+        return true;
+      }
+      const legacyInterrupted = new Set([
+        "Interrupted worker build",
+        "Superseded by a newer commit",
+      ]);
+      if (
+        retryable &&
+        aggregate.conclusion === "cancelled" &&
+        legacyInterrupted.has(aggregate.output?.title ?? "")
+      ) {
+        await this.updateCheck(
+          repository,
+          claimId,
+          {
+            status: "completed",
+            conclusion: "cancelled",
+            title: INTERRUPTED_CLAIM_TITLE,
+            summary: aggregate.output?.summary ?? "The worker stopped before this build completed.",
+            text: aggregate.output?.text,
+          },
+          signal,
+        );
+        return true;
+      }
+      return false;
+    }
 
     const jobs = (await this.jobChecks(repository, sha, claimId, signal)).filter(
       (job) => job.status !== "completed",
@@ -855,7 +887,7 @@ export class GitHubClient {
       },
       signal,
     );
-    return true;
+    return retryable;
   }
 
   async checkSuiteStatus(
@@ -999,6 +1031,33 @@ export class GitHubClient {
       [],
       MANUAL_TRIGGER_REQUEST_NAME,
       manualTriggerRequestMetadata({ context, jobs: requestedJobs }),
+    );
+  }
+
+  async ensureManualTrigger(
+    repository: Repository,
+    sha: string,
+    identity: string,
+    requestedJobs: string[],
+    branch: string | undefined,
+    label: string,
+    signal?: AbortSignal,
+  ): Promise<CheckRun> {
+    const externalId = `manual-retry:${identity}`;
+    const existing = (await this.checks(repository, sha, MANUAL_TRIGGER_REQUEST_NAME, signal)).find(
+      (check) => check.external_id === externalId,
+    );
+    if (existing) return existing;
+    const context = { branch: branch ?? null, label };
+    return this.createCheck(
+      repository,
+      sha,
+      externalId,
+      "in_progress",
+      [],
+      MANUAL_TRIGGER_REQUEST_NAME,
+      manualTriggerRequestMetadata({ context, jobs: requestedJobs }),
+      signal,
     );
   }
 

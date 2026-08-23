@@ -976,6 +976,28 @@ test("queued checks encode selected jobs in the request", async () => {
   expect(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"))).toEqual(["test", "lint"]);
 });
 
+test("interrupted manual retries use a stable reconciled request", async () => {
+  let posts = 0;
+  const checks: CheckRun[] = [];
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      posts++;
+      const check = { id: posts, ...JSON.parse(String(init.body)) } as CheckRun;
+      checks.push(check);
+      return githubResponse(check);
+    }
+    return githubResponse({ check_runs: checks });
+  }) as typeof globalThis.fetch;
+  const github = new GitHubClient({ token: "installation-token", fetch });
+  const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
+
+  await github.ensureManualTrigger(repository, "abc123", "build-1", ["test"], "main", "main");
+  await github.ensureManualTrigger(repository, "abc123", "build-1", ["test"], "main", "main");
+
+  expect(posts).toBe(1);
+  expect(checks[0]?.external_id).toBe("manual-retry:build-1");
+});
+
 test("manual trigger context and jobs stay within GitHub's external ID limit", async () => {
   let nextId = 1;
   const checks: CheckRun[] = [];
@@ -1566,6 +1588,34 @@ test("interrupted build recovery cancels only correlated children before the agg
   });
   expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(false);
   expect(updates).toEqual([3, 2]);
+});
+
+test("recovery retitles a legacy update interruption for retry", async () => {
+  let aggregate: Record<string, unknown> = {
+    id: 2,
+    name: "Informant CI",
+    status: "completed",
+    conclusion: "cancelled",
+    output: { title: "Superseded by a newer commit", summary: "old worker stopped" },
+  };
+  const fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "PATCH") {
+      aggregate = { ...aggregate, ...JSON.parse(String(init.body)) };
+    }
+    return githubResponse(aggregate);
+  }) as typeof globalThis.fetch;
+
+  expect(
+    await new GitHubClient({ token: "installation-token", fetch }).recoverInterruptedCheck(
+      { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+      "abc123",
+      2,
+      "cancelled",
+      undefined,
+      true,
+    ),
+  ).toBe(true);
+  expect(aggregate).toMatchObject({ output: { title: "Claim interrupted" } });
 });
 
 test("recovery leaves an intentional cancellation non-retryable", async () => {

@@ -903,7 +903,9 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
   const recovered: number[] = [];
   const retryable: boolean[] = [];
   const saved: BuildRecord[] = [];
+  const manualRequests: Array<{ sha: string; branch?: string; label: string }> = [];
   const messages: string[] = [];
+  const commentState: PollState = { pending: [], seenCommentIds: [], pendingTags: [] };
   const builds: BuildRecord[] = [
     {
       id: "interrupted",
@@ -931,6 +933,100 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
       checkId: 456,
     },
     {
+      id: "legacy-update-interruption",
+      repo: repository.fullName,
+      sha: "sha-legacy",
+      branch: "main",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      owner: { pid: 999_999_999, startedAt: "dead" },
+      logPath: "/tmp/legacy.log",
+      checkId: 790,
+      checksCompletedAt: new Date().toISOString(),
+    },
+    {
+      id: "interrupted-manual",
+      repo: repository.fullName,
+      sha: "sha-manual",
+      branch: "pull/42",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      interrupted: true,
+      retryManual: { jobs: ["test"], label: "pull/42" },
+      logPath: "/tmp/manual.log",
+      checkId: 791,
+      checksCompletedAt: new Date().toISOString(),
+    },
+    {
+      id: "dead-manual",
+      repo: repository.fullName,
+      sha: "sha-dead-manual",
+      branch: "feature",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      interrupted: true,
+      event: { type: "manual_trigger", id: "manual" },
+      jobs: [{ name: "test", status: "cancelled" }],
+      logPath: "/tmp/dead-manual.log",
+      checkId: 792,
+      checksCompletedAt: new Date().toISOString(),
+    },
+    {
+      id: "legacy-manual",
+      repo: repository.fullName,
+      sha: "sha-legacy-manual",
+      branch: "feature",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      owner: { pid: 999_999_997, startedAt: "dead" },
+      event: { type: "manual_trigger", id: "manual" },
+      jobs: [{ name: "test", status: "cancelled" }],
+      logPath: "/tmp/legacy-manual.log",
+      checkId: 794,
+      checksCompletedAt: new Date().toISOString(),
+    },
+    {
+      id: "legacy-comment",
+      repo: repository.fullName,
+      sha: "sha-legacy-comment",
+      branch: "pull/42",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      owner: { pid: 999_999_996, startedAt: "dead" },
+      event: { type: "comment", id: "pr:42:comment:4242" },
+      pullRequest: 42,
+      jobs: [{ name: "review", status: "cancelled" }],
+      logPath: "/tmp/legacy-comment.log",
+      checkId: 795,
+      checksCompletedAt: new Date().toISOString(),
+    },
+    {
+      id: "intentional-manual",
+      repo: repository.fullName,
+      sha: "sha-intentional-manual",
+      branch: "feature",
+      machine: "machine",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      status: "cancelled",
+      owner: { pid: 999_999_998, startedAt: "dead" },
+      event: { type: "manual_trigger", id: "manual" },
+      jobs: [{ name: "test", status: "cancelled" }],
+      logPath: "/tmp/intentional-manual.log",
+      checkId: 793,
+      checksCompletedAt: new Date().toISOString(),
+    },
+    {
       id: "live",
       repo: repository.fullName,
       sha: "sha-3",
@@ -943,6 +1039,19 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
     },
   ];
   const client = {
+    priorityClient: () => client,
+    ensureManualTrigger: async (
+      _repository: Repository,
+      sha: string,
+      _identity: string,
+      _jobs: string[],
+      _branch: string | undefined,
+      _label: string,
+    ) => {
+      manualRequests.push({ sha, ...(_branch ? { branch: _branch } : {}), label: _label });
+      return {};
+    },
+    pullRequest: async () => pullRequest,
     recoverInterruptedCheck: async (
       _repository: Repository,
       _sha: string,
@@ -954,7 +1063,7 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
       recovered.push(id);
       retryable.push(canRetry === true);
       if (id === 456) throw new Error("temporary outage");
-      return true;
+      return id !== 793;
     },
   } as unknown as GitHubClient;
 
@@ -968,18 +1077,46 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
       saveBuild: async (build) => {
         saved.push({ ...build });
       },
+      readPollState: async () => commentState,
+      savePollState: async () => {},
     },
   );
 
   expect(retry).toBe(true);
-  expect(recovered).toEqual([123, 456]);
-  expect(retryable).toEqual([true, false]);
-  expect(saved.map((build) => build.id)).toEqual(["interrupted"]);
+  expect(recovered).toEqual([123, 456, 790, 791, 792, 794, 795, 793]);
+  expect(retryable).toEqual([true, false, true, true, true, true, true, true]);
+  expect(manualRequests).toEqual([
+    { sha: "sha-manual", label: "pull/42" },
+    { sha: "sha-dead-manual", branch: "feature", label: "feature" },
+    { sha: "sha-legacy-manual", branch: "feature", label: "feature" },
+  ]);
+  expect(commentState.pending).toEqual([
+    expect.objectContaining({ id: 4242, sha: "sha-legacy-comment", pullRequest }),
+  ]);
+  expect(saved.map((build) => build.id)).toEqual([
+    "interrupted",
+    "legacy-update-interruption",
+    "interrupted-manual",
+    "dead-manual",
+    "legacy-manual",
+    "legacy-comment",
+    "intentional-manual",
+  ]);
   expect(saved[0]).toMatchObject({ checkId: 123 });
   expect(saved[0]?.checksCompletedAt).toBeDefined();
   expect(messages).toContain("recovered interrupted build interrupted");
   expect(messages.some((message) => message.includes("temporary outage"))).toBe(true);
   expect(builds[1]?.checksCompletedAt).toBeUndefined();
+
+  await recoverInterruptedBuilds(client, repository, () => {}, {
+    listActiveBuilds: async () => [],
+    listAllBuilds: async () => builds,
+    saveBuild: async () => {},
+    readPollState: async () => commentState,
+    savePollState: async () => {},
+  });
+  expect(manualRequests).toHaveLength(3);
+  expect(commentState.pending).toHaveLength(1);
 });
 
 describe("serve polling orchestration", () => {
@@ -2253,6 +2390,7 @@ describe("serve polling orchestration", () => {
   test("retains retryable comments and removes successful comments after draining", async () => {
     for (const [result, retained] of [
       [false, true],
+      [{ interrupted: true } as BuildRecord, true],
       [undefined, false],
     ] as const) {
       const state: PollState = {

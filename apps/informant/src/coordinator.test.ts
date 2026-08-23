@@ -68,6 +68,7 @@ function harness(
 ) {
   const updates: Array<{ id: number; values: Record<string, unknown> }> = [];
   const jobChecks: string[] = [];
+  const manualRequests: Array<{ jobs: string[]; branch?: string; label: string }> = [];
   const remoteChecks: Array<{
     id: number;
     name: string;
@@ -135,6 +136,16 @@ function harness(
     },
     checks: async () => [aggregateCheck],
     createJobAccessToken: async () => "installation-token",
+    createManualTrigger: async (
+      _repository: Repository,
+      _sha: string,
+      jobs: string[],
+      branch: string | undefined,
+      label: string,
+    ) => {
+      manualRequests.push({ jobs, branch, label });
+      return { id: 999 };
+    },
     updateCheck: async (_repository: Repository, id: number, values: Record<string, unknown>) => {
       updates.push({ id, values });
       const jobCheck = remoteChecks.find((item) => item.id === id);
@@ -205,6 +216,7 @@ function harness(
     dependencies,
     updates,
     jobChecks,
+    manualRequests,
     saved,
     receivedRuntimeSecrets: () => receivedRuntimeSecrets,
     receivedConfiguredVmJobs: () => receivedConfiguredVmJobs,
@@ -2928,6 +2940,8 @@ describe("runCommit", () => {
     expect(runtimeSignal?.reason).toBe("Graceful worker shutdown timed out.");
     expect(record.status).toBe("cancelled");
     expect(record.interrupted).toBe(true);
+    expect(record.retryManual).toEqual({ jobs: [], label: "main" });
+    expect(context.manualRequests).toEqual([]);
     expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
       conclusion: "cancelled",
       title: "Claim interrupted",

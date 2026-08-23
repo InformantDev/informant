@@ -13,7 +13,7 @@ import {
 } from "./housekeeping.ts";
 import { listRepositories } from "./machine-config.ts";
 import { readPollState, savePollState } from "./poll-state.ts";
-import { listActiveBuilds, listAllBuilds, saveBuild } from "./store.ts";
+import { listActiveBuilds, listAllBuilds, processOwnerIsLive, saveBuild } from "./store.ts";
 import { reconcilePreparedImageReferences } from "./tart/images.ts";
 import { type EventContext, triggerMatches } from "./triggers.ts";
 import type { BuildRecord, InformantConfig, PullRequest, Repository } from "./types.ts";
@@ -26,6 +26,7 @@ const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
 const MISSING_CONFIG_TTL_MS = 24 * 60 * 60_000;
 const MISSING_CONFIG_LIMIT = 256;
 const DELETED_TAG_HISTORY_LIMIT = 2_048;
+const LEGACY_INTERRUPTED_RECOVERY_MS = 24 * 60 * 60_000;
 
 class MissingRepositoryConfigError extends Error {}
 
@@ -542,16 +543,36 @@ export async function recoverInterruptedBuilds(
     listActiveBuilds: typeof listActiveBuilds;
     listAllBuilds: typeof listAllBuilds;
     saveBuild: typeof saveBuild;
+    readPollState?: typeof readPollState;
+    savePollState?: typeof savePollState;
   } = { listActiveBuilds, listAllBuilds, saveBuild },
   signal?: AbortSignal,
 ): Promise<boolean> {
   signal?.throwIfAborted();
   await dependencies.listActiveBuilds();
+  const now = Date.now();
+  const legacyInterrupted = (build: BuildRecord) => {
+    const completedAt = new Date(build.completedAt ?? "").getTime();
+    return (
+      build.interrupted !== true &&
+      build.status === "cancelled" &&
+      build.checksCompletedAt !== undefined &&
+      build.owner !== undefined &&
+      !processOwnerIsLive(build.owner) &&
+      Number.isFinite(completedAt) &&
+      now - completedAt <= LEGACY_INTERRUPTED_RECOVERY_MS
+    );
+  };
   const builds = (await dependencies.listAllBuilds()).filter(
     (build) =>
       build.repo.toLowerCase() === repository.fullName.toLowerCase() &&
       build.status !== "running" &&
-      !build.checksCompletedAt &&
+      (!build.checksCompletedAt ||
+        build.retryManual !== undefined ||
+        (build.interrupted === true &&
+          build.event?.type === "manual_trigger" &&
+          !build.manualRetryRequeuedAt) ||
+        legacyInterrupted(build)) &&
       persistedCheckId(build) !== undefined,
   );
   let retry = false;
@@ -561,18 +582,65 @@ export async function recoverInterruptedBuilds(
     const checkId = persistedCheckId(build);
     if (!checkId) continue;
     try {
-      const recovered = await github.recoverInterruptedCheck(
+      const retryableCheck = await github.recoverInterruptedCheck(
         repository,
         build.sha,
         checkId,
         build.status,
         signal,
-        build.interrupted === true,
+        build.interrupted === true || legacyInterrupted(build),
       );
+      const manualRequest =
+        build.retryManual ??
+        ((build.interrupted === true || (legacyInterrupted(build) && retryableCheck)) &&
+        build.event?.type === "manual_trigger" &&
+        !build.manualRetryRequeuedAt
+          ? {
+              jobs: build.jobs?.map((job) => job.name) ?? [],
+              ...(build.pullRequest === undefined ? { branch: build.branch } : {}),
+              label: build.branch,
+            }
+          : undefined);
+      if (manualRequest) {
+        await github
+          .priorityClient()
+          .ensureManualTrigger(
+            repository,
+            build.sha,
+            build.id,
+            manualRequest.jobs,
+            manualRequest.branch,
+            manualRequest.label,
+            signal,
+          );
+        build.retryManual = undefined;
+        build.manualRetryRequeuedAt = new Date().toISOString();
+      }
+      const legacyComment =
+        retryableCheck && legacyInterrupted(build) && build.event?.type === "comment"
+          ? build.event.id.match(/^pr:(\d+):comment:(\d+)$/)
+          : undefined;
+      if (legacyComment) {
+        const pullRequestNumber = Number(legacyComment[1]);
+        const commentId = Number(legacyComment[2]);
+        const state = await (dependencies.readPollState ?? readPollState)(repository.fullName);
+        if (!state.pending.some((comment) => comment.id === commentId)) {
+          const pullRequest = await github
+            .priorityClient()
+            .pullRequest(repository, pullRequestNumber, signal);
+          state.pending.push({
+            id: commentId,
+            sha: build.sha,
+            createdAt: build.startedAt,
+            pullRequest,
+          });
+          await (dependencies.savePollState ?? savePollState)(repository.fullName, state);
+        }
+      }
       build.checkId = checkId;
       build.checksCompletedAt = new Date().toISOString();
       await dependencies.saveBuild(build);
-      if (recovered) onMessage(`recovered interrupted build ${build.id}`);
+      if (retryableCheck) onMessage(`recovered interrupted build ${build.id}`);
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
       retry = true;
@@ -1275,7 +1343,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             shutdownControllers.add(shutdownController);
             const run = result
               .then((result) => {
-                if (result === false) retryDispatch = true;
+                if (result === false || result?.interrupted) retryDispatch = true;
                 else completedComments.add(pending.id);
               })
               .catch((error) => {
