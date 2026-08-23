@@ -139,6 +139,8 @@ export interface BuildRecord {
   checkId?: number;
   checkUrl?: string;
   checksCompletedAt?: string;
+  /** The owning worker died or was replaced, so a cancelled claim may be reclaimed. */
+  interrupted?: boolean;
   event?: {
     type: TriggerEvent | "manual" | "manual_trigger" | "manual_run";
     id: string;

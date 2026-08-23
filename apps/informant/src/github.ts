@@ -20,7 +20,7 @@ const STALE_CLAIM_MS = 24 * 60 * 60 * 1_000;
 const CLAIM_CANDIDATE_LEASE_MS = 60_000;
 const CLAIM_CLEANUP_TIMEOUT_MS = 5_000;
 const GITHUB_REQUEST_TIMEOUT_MS = 30_000;
-const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
+export const INTERRUPTED_CLAIM_TITLE = "Claim interrupted";
 const EXPIRED_CANDIDATE_TITLE = "Expired claim candidate";
 const RETRYABLE_CLAIM_TITLES = new Set([
   INTERRUPTED_CLAIM_TITLE,
@@ -806,6 +806,7 @@ export class GitHubClient {
     claimId: number,
     conclusion: "success" | "failure" | "cancelled" = "cancelled",
     signal?: AbortSignal,
+    retryable = false,
   ): Promise<boolean> {
     const aggregate = await this.api<CheckRun>(
       `/repos/${repository.fullName}/check-runs/${claimId}`,
@@ -843,7 +844,9 @@ export class GitHubClient {
             ? "All jobs passed"
             : conclusion === "failure"
               ? "A job failed"
-              : "Interrupted worker build",
+              : retryable
+                ? INTERRUPTED_CLAIM_TITLE
+                : "Build cancelled",
         summary:
           conclusion === "cancelled"
             ? "The worker stopped before this build completed."

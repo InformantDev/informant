@@ -901,6 +901,7 @@ test("serveRepositories reruns housekeeping requested while the current run sett
 
 test("startup recovers old URL-only cancelled builds and leaves failures retryable", async () => {
   const recovered: number[] = [];
+  const retryable: boolean[] = [];
   const saved: BuildRecord[] = [];
   const messages: string[] = [];
   const builds: BuildRecord[] = [
@@ -913,6 +914,7 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
       startedAt: new Date().toISOString(),
       completedAt: new Date().toISOString(),
       status: "cancelled",
+      interrupted: true,
       logPath: "/tmp/interrupted.log",
       checkUrl: "https://github.com/owner/repo/runs/123",
     },
@@ -946,8 +948,11 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
       _sha: string,
       id: number,
       _conclusion: "success" | "failure" | "cancelled",
+      _signal?: AbortSignal,
+      canRetry?: boolean,
     ) => {
       recovered.push(id);
+      retryable.push(canRetry === true);
       if (id === 456) throw new Error("temporary outage");
       return true;
     },
@@ -968,6 +973,7 @@ test("startup recovers old URL-only cancelled builds and leaves failures retryab
 
   expect(retry).toBe(true);
   expect(recovered).toEqual([123, 456]);
+  expect(retryable).toEqual([true, false]);
   expect(saved.map((build) => build.id)).toEqual(["interrupted"]);
   expect(saved[0]).toMatchObject({ checkId: 123 });
   expect(saved[0]?.checksCompletedAt).toBeDefined();

@@ -237,7 +237,7 @@ describe("startup service", () => {
       'Environment="INFORMANT_GITHUB_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\\nline\\tvalue\\r\\n-----END PRIVATE KEY-----"',
     );
     expect(service).toContain("Restart=always\nRestartSec=10");
-    expect(service).toContain("TimeoutStopSec=24h");
+    expect(service).toContain("TimeoutStopSec=30s");
     expect(service).toContain("LimitNOFILE=65536");
     expect(service).toContain("StandardOutput=append:/tmp/informant logs/worker.stdout.log");
     expect(service).toContain("StandardError=append:/tmp/informant logs/worker.stderr.log");
@@ -410,7 +410,7 @@ describe("startup service", () => {
     expect(invocations).toContainEqual(["launchctl", "kickstart", "gui/501/dev.informant.worker"]);
   });
 
-  test("fails when the replacement worker does not start before the graceful restart deadline", async () => {
+  test("fails when the replacement worker does not start before the restart deadline", async () => {
     const invocations: string[][] = [];
     await expect(
       updateInformant({
@@ -428,7 +428,7 @@ describe("startup service", () => {
         restartTimeoutMs: 2_000,
         writeStartupService: async () => {},
       }),
-    ).rejects.toThrow("graceful restart did not complete within 2 seconds");
+    ).rejects.toThrow("replacement worker did not start within 2 seconds");
     expect(invocations).toContainEqual([
       "launchctl",
       "kill",
@@ -457,7 +457,7 @@ describe("startup service", () => {
         restartTimeoutMs: 1_000,
         writeStartupService: async () => {},
       }),
-    ).rejects.toThrow("graceful restart did not complete within 1 seconds");
+    ).rejects.toThrow("replacement worker did not start within 1 seconds");
     expect(invocations).not.toContainEqual(["kill", "-KILL", "100"]);
     expect(invocations).not.toContainEqual([
       "launchctl",

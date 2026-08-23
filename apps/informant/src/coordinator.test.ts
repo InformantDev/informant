@@ -2927,5 +2927,10 @@ describe("runCommit", () => {
     expect(runtimeSignal?.aborted).toBeTrue();
     expect(runtimeSignal?.reason).toBe("Graceful worker shutdown timed out.");
     expect(record.status).toBe("cancelled");
+    expect(record.interrupted).toBe(true);
+    expect(context.updates.find((update) => update.id === 42)?.values).toMatchObject({
+      conclusion: "cancelled",
+      title: "Claim interrupted",
+    });
   });
 });

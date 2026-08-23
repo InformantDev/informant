@@ -1556,11 +1556,44 @@ test("interrupted build recovery cancels only correlated children before the agg
   const github = new GitHubClient({ token: "installation-token", fetch });
   const repository = { owner: "acme", repo: "widgets", fullName: "acme/widgets" };
 
-  expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(true);
+  expect(
+    await github.recoverInterruptedCheck(repository, "abc123", 2, "cancelled", undefined, true),
+  ).toBe(true);
   expect(updates).toEqual([3, 2]);
-  expect(checks[0]?.output).toMatchObject({ text: metadata });
+  expect(checks[0]).toMatchObject({
+    conclusion: "cancelled",
+    output: { title: "Claim interrupted", text: metadata },
+  });
   expect(await github.recoverInterruptedCheck(repository, "abc123", 2)).toBe(false);
   expect(updates).toEqual([3, 2]);
+});
+
+test("recovery leaves an intentional cancellation non-retryable", async () => {
+  let aggregate: Record<string, unknown> = {
+    id: 2,
+    name: "Informant CI",
+    status: "in_progress",
+  };
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (init?.method === "PATCH") {
+      aggregate = { ...aggregate, ...JSON.parse(String(init.body)) };
+      return githubResponse(aggregate);
+    }
+    if (/\/check-runs\/2$/.test(url)) return githubResponse(aggregate);
+    return githubResponse({ check_runs: [] });
+  }) as typeof globalThis.fetch;
+
+  await new GitHubClient({ token: "installation-token", fetch }).recoverInterruptedCheck(
+    { owner: "acme", repo: "widgets", fullName: "acme/widgets" },
+    "abc123",
+    2,
+  );
+
+  expect(aggregate).toMatchObject({
+    conclusion: "cancelled",
+    output: { title: "Build cancelled" },
+  });
 });
 
 test("claim treats a queued failed check suite as a failed-jobs re-run request", async () => {

@@ -292,6 +292,7 @@ export async function listAllBuilds(): Promise<BuildRecord[]> {
 export async function reconcileBuildLiveness(build: BuildRecord): Promise<BuildRecord> {
   if (build.status !== "running" || processOwnerIsLive(build.owner)) return build;
   build.status = "cancelled";
+  build.interrupted = true;
   build.completedAt = new Date().toISOString();
   build.runningJobs = [];
   await saveBuild(build);

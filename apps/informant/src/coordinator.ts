@@ -11,7 +11,7 @@ import {
   type ExecutionCapacitySnapshot,
   publishExecutionReservation,
 } from "./execution-capacity.ts";
-import type { ClaimResult, GitHubClient } from "./github.ts";
+import { type ClaimResult, type GitHubClient, INTERRUPTED_CLAIM_TITLE } from "./github.ts";
 import { listAllowedMounts, MAX_ALLOWED_MOUNT_BYTES } from "./machine-config.ts";
 import {
   createBuild,
@@ -1034,12 +1034,15 @@ async function runCommitPartitionWithSlot(
     }
 
     if (executionSignal?.aborted) {
+      const workerInterrupted =
+        forcedShutdownSignal?.aborted === true && !cancellation.signal.aborted;
       const unfinishedJobs = new Set(
         record.jobs
           ?.filter((job) => job.status === "queued" || job.status === "running")
           .map((job) => job.name),
       );
       record.status = "cancelled";
+      record.interrupted = workerInterrupted || undefined;
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
         job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
@@ -1064,7 +1067,11 @@ async function runCommitPartitionWithSlot(
         await completeAggregate({
           status: "completed",
           conclusion: "cancelled",
-          title: cancellation.signal.aborted ? "Build cancelled" : "Superseded by a newer commit",
+          title: cancellation.signal.aborted
+            ? "Build cancelled"
+            : workerInterrupted
+              ? INTERRUPTED_CLAIM_TITLE
+              : "Superseded by a newer commit",
           summary: String(executionSignal.reason || "This build was cancelled."),
         });
       } catch (error) {
@@ -1081,7 +1088,10 @@ async function runCommitPartitionWithSlot(
     await reconcileJobChecks().catch(() => reconcileJobChecks());
     childrenReconciled = true;
     if (executionSignal.aborted) {
+      const workerInterrupted =
+        forcedShutdownSignal?.aborted === true && !cancellation.signal.aborted;
       record.status = "cancelled";
+      record.interrupted = workerInterrupted || undefined;
       record.runningJobs = [];
       record.jobs = record.jobs?.map((job) =>
         job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
@@ -1101,7 +1111,11 @@ async function runCommitPartitionWithSlot(
       await completeAggregate({
         status: "completed",
         conclusion: "cancelled",
-        title: cancellation.signal.aborted ? "Build cancelled" : "Superseded by a newer commit",
+        title: cancellation.signal.aborted
+          ? "Build cancelled"
+          : workerInterrupted
+            ? INTERRUPTED_CLAIM_TITLE
+            : "Superseded by a newer commit",
         summary: String(executionSignal.reason || "This build was cancelled."),
       });
       return record;

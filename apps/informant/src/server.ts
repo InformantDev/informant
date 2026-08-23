@@ -22,7 +22,7 @@ const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
 const TAG_POLL_INTERVAL_MS = 5 * 60_000;
 const REPOSITORY_REFRESH_INTERVAL_MS = 5_000;
-const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 24 * 60 * 60_000;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
 const MISSING_CONFIG_TTL_MS = 24 * 60 * 60_000;
 const MISSING_CONFIG_LIMIT = 256;
 const DELETED_TAG_HISTORY_LIMIT = 2_048;
@@ -567,6 +567,7 @@ export async function recoverInterruptedBuilds(
         checkId,
         build.status,
         signal,
+        build.interrupted === true,
       );
       build.checkId = checkId;
       build.checksCompletedAt = new Date().toISOString();
