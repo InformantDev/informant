@@ -29,6 +29,13 @@ const DELETED_TAG_HISTORY_LIMIT = 2_048;
 
 class MissingRepositoryConfigError extends Error {}
 
+export class InvalidRepositoryConfigError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "InvalidRepositoryConfigError";
+  }
+}
+
 async function waitForAbortableDelay(
   milliseconds: number,
   signal?: AbortSignal,
@@ -109,16 +116,23 @@ async function repositoryConfig(
 ) {
   const source = await github.fileContent(repository, sha, CONFIG_FILE, signal);
   const paths = await github.directoryFiles(repository, sha, JOBS_DIRECTORY, signal);
-  return parseConfigFiles(
-    source,
-    await Promise.all(
-      paths.map(async (path) => ({
-        path,
-        source: await github.fileContent(repository, sha, path, signal),
-      })),
-    ),
-    `${repository.fullName}/${CONFIG_FILE}@${sha.slice(0, 7)}`,
+  const files = await Promise.all(
+    paths.map(async (path) => ({
+      path,
+      source: await github.fileContent(repository, sha, path, signal),
+    })),
   );
+  try {
+    return parseConfigFiles(
+      source,
+      files,
+      `${repository.fullName}/${CONFIG_FILE}@${sha.slice(0, 7)}`,
+    );
+  } catch (error) {
+    throw new InvalidRepositoryConfigError(error instanceof Error ? error.message : String(error), {
+      cause: error,
+    });
+  }
 }
 
 export interface AutomaticLaneUpdate {
@@ -480,6 +494,12 @@ export interface ServerOptions {
   scanAllTargets?: boolean;
   /** Safety-net scan that preserves GitHub API quota for webhook-triggered work. */
   reconciliation?: boolean;
+  /** Dispatch-only abort that may detach already-running work instead of draining it. */
+  detachRunsSignal?: AbortSignal;
+  /** Owning service signal; unlike dispatch preemption, this always drains running work. */
+  serviceShutdownSignal?: AbortSignal;
+  /** Registers detached work so the owning service can await it during shutdown. */
+  onDetachedDrain?: (drain: Promise<void>) => void;
   dependencies?: ServerDependencies;
 }
 
@@ -697,6 +717,11 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     }
     return error instanceof Error ? error.message : String(error);
   };
+  const shouldDetachRuns = () =>
+    options.detachRunsSignal?.aborted === true &&
+    options.serviceShutdownSignal !== undefined &&
+    !options.serviceShutdownSignal.aborted &&
+    options.onDetachedDrain !== undefined;
   const abortInFlightRuns = () => {
     for (const controller of shutdownControllers) {
       controller.abort("Graceful worker shutdown timed out.");
@@ -743,7 +768,36 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     abortInFlightRuns();
     await draining;
   };
+  let detachedLifecycle: Promise<void> | undefined;
+  const detachRunningWork = (draining?: Promise<void>): boolean => {
+    if (!shouldDetachRuns()) return false;
+    if (!detachedLifecycle) {
+      const detachedDrain = draining ?? drainRuns();
+      const serviceSignal = options.serviceShutdownSignal;
+      if (!serviceSignal || !options.onDetachedDrain) return false;
+      detachedLifecycle = (async () => {
+        let onShutdown = () => {};
+        const shutdown = new Promise<"shutdown">((resolve) => {
+          onShutdown = () => resolve("shutdown");
+          serviceSignal.addEventListener("abort", onShutdown, { once: true });
+          if (serviceSignal.aborted) onShutdown();
+        });
+        try {
+          const outcome = await Promise.race([
+            detachedDrain.then(() => "complete" as const),
+            shutdown,
+          ]);
+          if (outcome === "shutdown") await drainForShutdown(detachedDrain);
+        } finally {
+          serviceSignal.removeEventListener("abort", onShutdown);
+        }
+      })();
+      options.onDetachedDrain(detachedLifecycle);
+    }
+    return true;
+  };
   const drainOnce = async () => {
+    if (detachRunningWork()) return;
     const draining = drainRuns();
     const signal = options.signal;
     if (!signal) {
@@ -751,7 +805,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       return;
     }
     if (signal.aborted) {
-      await drainForShutdown(draining);
+      if (!detachRunningWork(draining)) await drainForShutdown(draining);
       return;
     }
     let onAbort = () => {};
@@ -761,7 +815,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     });
     try {
       if (await Promise.race([draining.then(() => false as const), shutdownRequested])) {
-        await drainForShutdown(draining);
+        if (!detachRunningWork(draining)) await drainForShutdown(draining);
       }
     } finally {
       signal.removeEventListener("abort", onAbort);
@@ -780,7 +834,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         );
       } catch (error) {
         if (options.signal?.aborted) {
-          await drainForShutdown();
+          if (!detachRunningWork()) await drainForShutdown();
           return;
         }
         message(
@@ -1002,7 +1056,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         if (expectedScanSha !== undefined) observedScanUpdates.add(target.lane);
         if (options.signal?.aborted) {
           await flushMissingConfigs();
-          await drainForShutdown();
+          if (!detachRunningWork()) await drainForShutdown();
           return;
         }
         if (
@@ -1043,7 +1097,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           }
           if (options.signal?.aborted) {
             await flushMissingConfigs();
-            await drainForShutdown();
+            if (!detachRunningWork()) await drainForShutdown();
             return;
           }
           const controller = new AbortController();
@@ -1197,7 +1251,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
             }
             if (options.signal?.aborted) {
               await flushMissingConfigs();
-              await drainForShutdown();
+              if (!detachRunningWork()) await drainForShutdown();
               return;
             }
             const controller = new AbortController();
@@ -1242,7 +1296,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       lastPollError = undefined;
     } catch (error) {
       if (options.signal?.aborted) {
-        await drainForShutdown();
+        if (!detachRunningWork()) await drainForShutdown();
         return;
       }
       const detail = errorDetail(error);
