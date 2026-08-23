@@ -1676,6 +1676,11 @@ async function serveConfiguredWithTailscale(
 
   let funnelServer: Bun.Server<undefined> | undefined;
   const deliveries = new Set<string>();
+  const rememberDelivery = (delivery: string | undefined) => {
+    if (!delivery) return;
+    deliveries.add(delivery);
+    if (deliveries.size > 1_000) deliveries.delete(deliveries.values().next().value ?? "");
+  };
   const loadRepositories = options.dependencies?.listRepositories ?? listRepositories;
   let refreshingTopology = false;
   const refreshTopology = async (recoverAll = false) => {
@@ -1796,10 +1801,6 @@ async function serveConfiguredWithTailscale(
           }
           const delivery = request.headers.get("X-GitHub-Delivery");
           if (delivery && deliveries.has(delivery)) return new Response(null, { status: 202 });
-          if (delivery) {
-            deliveries.add(delivery);
-            if (deliveries.size > 1_000) deliveries.delete(deliveries.values().next().value ?? "");
-          }
           const repository = payloadRepository(payload);
           if (!repository) return new Response("invalid repository", { status: 400 });
           const automaticUpdates = webhookAutomaticLaneUpdates(
@@ -1809,6 +1810,7 @@ async function serveConfiguredWithTailscale(
           );
           const acceptedUpdates = await propagateAutomaticUpdates(repository, automaticUpdates);
           if (automaticUpdates?.length && acceptedUpdates && acceptedUpdates.length === 0) {
+            rememberDelivery(delivery ?? undefined);
             return new Response(null, { status: 202 });
           }
           const dispatchUpdates = acceptedUpdates ?? automaticUpdates;
@@ -1820,6 +1822,8 @@ async function serveConfiguredWithTailscale(
             automaticUpdates: dispatchUpdates,
             scanUpdates,
           });
+          // Failed topology refreshes must remain retryable with the same GitHub delivery ID.
+          rememberDelivery(delivery ?? undefined);
           return new Response(null, { status: 202 });
         },
       });
