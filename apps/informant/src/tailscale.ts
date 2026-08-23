@@ -47,6 +47,7 @@ const MAX_DISPATCH_RETRY_MS = 60_000;
 const CLAIM_SCHEDULING_PROTOCOL = "claim-scheduling-v1";
 const AUTOMATIC_SUPERSESSION_PROTOCOL = "automatic-supersession-v1";
 const TARGETED_SCAN_PROTOCOL = "targeted-scan-v1";
+const RECONCILIATION_PRIORITY_PROTOCOL = "reconciliation-priority-v1";
 export const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 export const REQUIRED_GITHUB_WEBHOOK_EVENTS = [
   "push",
@@ -108,6 +109,8 @@ export interface RepositoryDispatch {
   scanUpdates?: AutomaticLaneUpdate[];
   /** Allow a recovery scan to expire exact assertions after their bounded retention period. */
   retireSupersededScanUpdates?: boolean;
+  /** Lower-priority safety-net work that must yield to signed webhook dispatches. */
+  reconciliation?: boolean;
 }
 
 const MAX_NETWORK_CLAIMANTS = 64;
@@ -254,6 +257,10 @@ function mergeDispatchScanUpdates(
     overflowed:
       new Set((candidates ?? []).map((update) => update.lane)).size > MAX_AUTOMATIC_LANE_UPDATES,
   };
+}
+
+export function supportsReconciliationPriority(protocols: string[] | undefined): boolean {
+  return protocols?.includes(RECONCILIATION_PRIORITY_PROTOCOL) === true;
 }
 
 export function networkScanDispatchPolicy(
@@ -431,6 +438,55 @@ export function webhookAutomaticLaneUpdates(
       },
     ];
   }
+  if (event === "check_suite") {
+    const value = payload as {
+      action?: unknown;
+      repository?: { id?: unknown };
+      check_suite?: {
+        head_sha?: unknown;
+        head_branch?: unknown;
+        updated_at?: unknown;
+        pull_requests?: Array<{
+          number?: unknown;
+          head?: { sha?: unknown; repo?: { id?: unknown } };
+        }>;
+      };
+    };
+    if (value.action !== "requested") return undefined;
+    const suite = value.check_suite;
+    const sha = normalizedSha(suite?.head_sha);
+    if (!sha) return undefined;
+    const parsedUpdatedAt =
+      typeof suite?.updated_at === "string" ? Date.parse(suite.updated_at) : Number.NaN;
+    const updatedAt =
+      Number.isSafeInteger(parsedUpdatedAt) && parsedUpdatedAt >= 0 ? parsedUpdatedAt : undefined;
+    const update = (lane: string): AutomaticLaneUpdate => ({
+      lane,
+      sha,
+      ...(updatedAt !== undefined ? { updatedAt } : {}),
+      ...(revision ? { revision } : {}),
+    });
+    const updates: AutomaticLaneUpdate[] = [];
+    if (
+      typeof suite?.head_branch === "string" &&
+      suite.head_branch.length > 0 &&
+      suite.head_branch.length <= MAX_AUTOMATIC_LANE_LENGTH - "branch:".length
+    ) {
+      updates.push(update(`branch:${suite.head_branch}`));
+    }
+    for (const pullRequest of suite?.pull_requests ?? []) {
+      if (
+        !Number.isSafeInteger(pullRequest.number) ||
+        Number(pullRequest.number) <= 0 ||
+        normalizedSha(pullRequest.head?.sha) !== sha ||
+        (value.repository?.id !== undefined && pullRequest.head?.repo?.id !== value.repository.id)
+      ) {
+        continue;
+      }
+      updates.push(update(`pr:${pullRequest.number}`));
+    }
+    return mergeAutomaticLaneUpdates(undefined, updates);
+  }
   return undefined;
 }
 
@@ -467,7 +523,7 @@ export function reconcileKnownWorkers(
 }
 
 function repositoryRecoveryRequest(repository: Repository): RepositoryDispatch {
-  return { repository, forceTagPoll: true, fullScan: true };
+  return { repository, forceTagPoll: true, fullScan: true, reconciliation: true };
 }
 
 export function startupRecoveryRequests(repositories: Repository[]): RepositoryDispatch[] {
@@ -494,6 +550,7 @@ export function networkReconciliationRequests(
     forceTagPoll: true,
     fullScan: true,
     retireSupersededScanUpdates: true,
+    reconciliation: true,
   }));
 }
 
@@ -515,6 +572,9 @@ interface DispatchRetryEntry {
   pending: boolean;
   scanUpdateSeenAt: Map<string, number>;
   running?: Promise<void>;
+  runningController?: AbortController;
+  runningReconciliation?: boolean;
+  preempted?: boolean;
   timer?: RetryTimer;
 }
 
@@ -535,6 +595,7 @@ export class RepositoryScanQueue {
       claimScheduling?: ClaimScheduling,
       scanUpdates?: AutomaticLaneUpdate[],
       scanAllTargets?: boolean,
+      reconciliation?: boolean,
     ) => Promise<void>,
     private readonly serviceSignal?: AbortSignal,
   ) {
@@ -564,6 +625,8 @@ export class RepositoryScanQueue {
     claimScheduling?: ClaimScheduling,
     scanUpdates?: AutomaticLaneUpdate[],
     scanAllTargets = false,
+    reconciliation = false,
+    requestSignal?: AbortSignal,
   ): Promise<void> {
     const key = repository.fullName.toLowerCase();
     const registration = this.registrations.get(key);
@@ -574,9 +637,11 @@ export class RepositoryScanQueue {
       .catch(() => undefined)
       .then(async () => {
         if (this.stopped || registration.controller.signal.aborted) return;
-        const signal = this.serviceSignal
-          ? AbortSignal.any([registration.controller.signal, this.serviceSignal])
-          : registration.controller.signal;
+        const signals = [registration.controller.signal, this.serviceSignal, requestSignal].filter(
+          (candidate): candidate is AbortSignal => candidate !== undefined,
+        );
+        const signal =
+          signals.length > 1 ? AbortSignal.any(signals) : registration.controller.signal;
         if (signal.aborted) return;
         await this.execute(
           registration.repository,
@@ -585,6 +650,7 @@ export class RepositoryScanQueue {
           claimScheduling,
           scanUpdates,
           scanAllTargets,
+          reconciliation,
         );
       })
       .finally(() => {
@@ -612,7 +678,10 @@ export class DispatchRetryQueue {
   private stopped = false;
 
   constructor(
-    private readonly dispatch: (request: RepositoryDispatch) => Promise<boolean>,
+    private readonly dispatch: (
+      request: RepositoryDispatch,
+      signal?: AbortSignal,
+    ) => Promise<boolean>,
     private readonly onRetry: (request: RepositoryDispatch, delayMs: number) => void = () => {},
     private readonly schedule: (callback: () => void, delayMs: number) => RetryTimer = setTimeout,
     private readonly cancel: (timer: RetryTimer) => void = clearTimeout,
@@ -642,6 +711,8 @@ export class DispatchRetryQueue {
       existing.request.forceTagPoll ||= request.forceTagPoll;
       existing.request.fullScan ||= request.fullScan;
       existing.request.retireSupersededScanUpdates ||= request.retireSupersededScanUpdates;
+      existing.request.reconciliation =
+        existing.request.reconciliation === true && request.reconciliation === true;
       existing.request.claimPlan = request.claimPlan;
       existing.request.automaticUpdates = mergeAutomaticLaneUpdates(
         existing.request.automaticUpdates,
@@ -656,6 +727,10 @@ export class DispatchRetryQueue {
       existing.request.fullScan ||= mergedScan.overflowed;
       if (existing.running) {
         existing.pending = true;
+        if (existing.runningReconciliation && request.reconciliation !== true) {
+          existing.preempted = true;
+          existing.runningController?.abort("Webhook dispatch superseded reconciliation.");
+        }
       } else if (existing.timer) {
         this.cancel(existing.timer);
         existing.timer = undefined;
@@ -699,14 +774,29 @@ export class DispatchRetryQueue {
     entry.request.forceTagPoll = false;
     entry.request.fullScan = false;
     entry.request.retireSupersededScanUpdates = false;
+    entry.request.reconciliation = true;
     entry.request.scanUpdates = undefined;
+    const controller = new AbortController();
+    entry.runningController = controller;
+    entry.runningReconciliation = request.reconciliation === true;
+    entry.preempted = false;
     const retry = () => {
       const current = this.entries.get(key);
       if (!current) return;
       current.running = undefined;
+      current.runningController = undefined;
+      current.runningReconciliation = undefined;
+      if (current.preempted) {
+        current.preempted = false;
+        current.attempts = 0;
+        if (!this.stopped) this.run(key);
+        return;
+      }
       current.request.forceTagPoll ||= request.forceTagPoll;
       current.request.fullScan ||= request.fullScan;
       current.request.retireSupersededScanUpdates ||= request.retireSupersededScanUpdates;
+      current.request.reconciliation =
+        current.request.reconciliation === true && request.reconciliation === true;
       current.request.automaticUpdates = mergeAutomaticLaneUpdates(
         request.automaticUpdates,
         current.request.automaticUpdates,
@@ -729,12 +819,15 @@ export class DispatchRetryQueue {
       this.onRetry(current.request, delayMs);
       current.timer = this.schedule(() => this.run(key), delayMs);
     };
-    entry.running = this.dispatch(request)
+    entry.running = this.dispatch(request, controller.signal)
       .then((succeeded) => {
         if (!succeeded) return retry();
         const current = this.entries.get(key);
         if (!current) return;
         current.running = undefined;
+        current.runningController = undefined;
+        current.runningReconciliation = undefined;
+        current.preempted = false;
         current.attempts = 0;
         if (current.pending && !this.stopped) {
           this.run(key);
@@ -750,6 +843,7 @@ export class DispatchRetryQueue {
     const running: Promise<void>[] = [];
     for (const entry of this.entries.values()) {
       if (entry.timer) this.cancel(entry.timer);
+      entry.runningController?.abort("Dispatch queue stopped.");
       if (entry.running) running.push(entry.running);
     }
     await Promise.allSettled(running);
@@ -1437,7 +1531,15 @@ async function serveConfiguredWithTailscale(
   const automaticRuns = new AutomaticRunRegistry(retireAutomaticUpdate);
   const scans = new RepositoryScanQueue(
     repositories,
-    (repository, forceTagPoll, signal, claimScheduling, scanUpdates, scanAllTargets) =>
+    (
+      repository,
+      forceTagPoll,
+      signal,
+      claimScheduling,
+      scanUpdates,
+      scanAllTargets,
+      reconciliation,
+    ) =>
       serveRepositories([repository], {
         ...options,
         once: true,
@@ -1448,6 +1550,7 @@ async function serveConfiguredWithTailscale(
         automaticRuns,
         scanUpdates,
         scanAllTargets,
+        reconciliation,
       }),
     options.signal,
   );
@@ -1523,8 +1626,10 @@ async function serveConfiguredWithTailscale(
     return acceptedUpdates;
   };
   let claimRotation = 0;
-  const dispatch = async (request: RepositoryDispatch): Promise<boolean> => {
+  const dispatch = async (request: RepositoryDispatch, signal?: AbortSignal): Promise<boolean> => {
+    signal?.throwIfAborted();
     await refreshWorkers();
+    signal?.throwIfAborted();
     let automaticUpdates = mergeAutomaticLaneUpdates(
       latestAutomaticUpdates.get(request.repository.fullName.toLowerCase()),
       request.automaticUpdates,
@@ -1559,6 +1664,8 @@ async function serveConfiguredWithTailscale(
             plan ? { ...plan, workerId: status.self.id } : undefined,
             scanUpdates,
             request.fullScan,
+            request.reconciliation,
+            signal,
           ),
       });
     }
@@ -1567,7 +1674,8 @@ async function serveConfiguredWithTailscale(
         if (
           !worker.repositories.some(
             (name) => name.toLowerCase() === request.repository.fullName.toLowerCase(),
-          )
+          ) ||
+          (request.reconciliation && !supportsReconciliationPriority(worker.protocols))
         ) {
           continue;
         }
@@ -1595,6 +1703,7 @@ async function serveConfiguredWithTailscale(
                 forceTagPoll: request.forceTagPoll,
                 fullScan: scanPolicy.fullScan,
                 retireSupersededScanUpdates: request.retireSupersededScanUpdates,
+                reconciliation: request.reconciliation,
                 claimPlan: plan,
                 automaticUpdates,
                 scanUpdates: scanPolicy.scanUpdates,
@@ -1663,6 +1772,7 @@ async function serveConfiguredWithTailscale(
             CLAIM_SCHEDULING_PROTOCOL,
             AUTOMATIC_SUPERSESSION_PROTOCOL,
             TARGETED_SCAN_PROTOCOL,
+            RECONCILIATION_PRIORITY_PROTOCOL,
           ],
           resources: currentExecutionCapacity(),
           version: options.version,
@@ -1730,6 +1840,7 @@ async function serveConfiguredWithTailscale(
               claimPlan?: unknown;
               automaticUpdates?: unknown;
               scanUpdates?: unknown;
+              reconciliation?: unknown;
             }
           | undefined;
         if (
@@ -1737,7 +1848,8 @@ async function serveConfiguredWithTailscale(
           (body.forceTagPoll !== undefined && typeof body.forceTagPoll !== "boolean") ||
           (body.fullScan !== undefined && typeof body.fullScan !== "boolean") ||
           (body.retireSupersededScanUpdates !== undefined &&
-            typeof body.retireSupersededScanUpdates !== "boolean")
+            typeof body.retireSupersededScanUpdates !== "boolean") ||
+          (body.reconciliation !== undefined && typeof body.reconciliation !== "boolean")
         )
           return new Response("invalid repository", { status: 400 });
         let claimPlan: NetworkClaimPlan | undefined;
@@ -1772,6 +1884,7 @@ async function serveConfiguredWithTailscale(
           forceTagPoll: body.forceTagPoll === true,
           fullScan: body.fullScan === true,
           retireSupersededScanUpdates: body.retireSupersededScanUpdates === true,
+          reconciliation: body.reconciliation === true,
           claimPlan,
           automaticUpdates: rememberedUpdates,
           scanUpdates: acceptedScanUpdates,

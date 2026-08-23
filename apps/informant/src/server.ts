@@ -16,7 +16,7 @@ import { readPollState, savePollState } from "./poll-state.ts";
 import { listActiveBuilds, listAllBuilds, saveBuild } from "./store.ts";
 import { reconcilePreparedImageReferences } from "./tart/images.ts";
 import { type EventContext, triggerMatches } from "./triggers.ts";
-import type { BuildRecord, InformantConfig, Repository } from "./types.ts";
+import type { BuildRecord, InformantConfig, PullRequest, Repository } from "./types.ts";
 
 const COMMENT_CURSOR_OVERLAP_MS = 1_000;
 const SEEN_COMMENT_LIMIT = 1_000;
@@ -478,6 +478,8 @@ export interface ServerOptions {
   scanUpdates?: AutomaticLaneUpdate[];
   /** Process every current lane while still validating scanUpdates. */
   scanAllTargets?: boolean;
+  /** Safety-net scan that preserves GitHub API quota for webhook-triggered work. */
+  reconciliation?: boolean;
   dependencies?: ServerDependencies;
 }
 
@@ -521,7 +523,9 @@ export async function recoverInterruptedBuilds(
     listAllBuilds: typeof listAllBuilds;
     saveBuild: typeof saveBuild;
   } = { listActiveBuilds, listAllBuilds, saveBuild },
+  signal?: AbortSignal,
 ): Promise<boolean> {
+  signal?.throwIfAborted();
   await dependencies.listActiveBuilds();
   const builds = (await dependencies.listAllBuilds()).filter(
     (build) =>
@@ -532,6 +536,7 @@ export async function recoverInterruptedBuilds(
   );
   let retry = false;
   for (const build of builds) {
+    signal?.throwIfAborted();
     if (build.status === "running") continue;
     const checkId = persistedCheckId(build);
     if (!checkId) continue;
@@ -541,12 +546,14 @@ export async function recoverInterruptedBuilds(
         build.sha,
         checkId,
         build.status,
+        signal,
       );
       build.checkId = checkId;
       build.checksCompletedAt = new Date().toISOString();
       await dependencies.saveBuild(build);
       if (recovered) onMessage(`recovered interrupted build ${build.id}`);
     } catch (error) {
+      if (signal?.aborted) throw signal.reason;
       retry = true;
       onMessage(
         `could not recover interrupted build ${build.id}: ${error instanceof Error ? error.message : String(error)}`,
@@ -617,7 +624,9 @@ export function applySecretPolicy(
 
 export async function serve(repository: Repository, options: ServerOptions = {}): Promise<void> {
   const dependencies = options.dependencies ?? {};
-  const github = dependencies.github ?? new GitHubClient({ repository });
+  const github =
+    dependencies.github ?? new GitHubClient({ repository, reconciliation: options.reconciliation });
+  const executionGithub = options.reconciliation ? github.priorityClient() : github;
   const loadRepositoryConfig = dependencies.repositoryConfig ?? repositoryConfig;
   const executeCommit = dependencies.runCommit ?? runCommit;
   const loadPollState = dependencies.readPollState ?? readPollState;
@@ -642,7 +651,10 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       message(`housekeeping failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   };
-  let recoveryPending = true;
+  const targetedScanRequested =
+    options.scanUpdates?.some((update) => update.sha && !update.closed) === true &&
+    !options.scanAllTargets;
+  let recoveryPending = !targetedScanRequested;
   const configAt = (
     sha: string,
     state: Awaited<ReturnType<typeof readPollState>>,
@@ -759,7 +771,13 @@ export async function serve(repository: Repository, options: ServerOptions = {})
     let retryDispatch = false;
     if (recoveryPending) {
       try {
-        recoveryPending = await recoverBuilds(github, repository, message);
+        recoveryPending = await recoverBuilds(
+          github,
+          repository,
+          message,
+          undefined,
+          options.signal,
+        );
       } catch (error) {
         if (options.signal?.aborted) {
           await drainForShutdown();
@@ -845,12 +863,46 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         (options.forceTagPoll ||
           !state.tagsPolledAt ||
           Date.now() - new Date(state.tagsPolledAt).getTime() >= TAG_POLL_INTERVAL_MS);
+      const scanUpdates = options.scanUpdates?.length
+        ? new Map(
+            options.scanUpdates.flatMap((update) =>
+              update.sha && !update.closed ? [[update.lane, update.sha] as const] : [],
+            ),
+          )
+        : undefined;
+      const targetedScan = scanUpdates !== undefined && !options.scanAllTargets;
       const automaticGeneration = automaticRuns.snapshotGeneration();
-      const [branches, tags, prs] = await Promise.all([
-        github.branches(repository, options.signal),
-        shouldPollTags ? github.tags(repository, options.signal) : undefined,
-        github.pullRequests(repository, options.signal),
-      ]);
+      let branches: Array<{ name: string; sha: string }>;
+      let tags: Array<{ name: string; sha: string }> | undefined;
+      let prs: PullRequest[];
+      if (targetedScan) {
+        const branchLanes = [...scanUpdates.keys()].filter((lane) => lane.startsWith("branch:"));
+        const pullRequestLanes = [...scanUpdates.keys()].filter((lane) => lane.startsWith("pr:"));
+        [branches, prs] = await Promise.all([
+          Promise.all(
+            branchLanes.map(async (lane) => ({
+              name: lane.slice("branch:".length),
+              sha: await github.branchHead(
+                repository,
+                lane.slice("branch:".length),
+                options.signal,
+              ),
+            })),
+          ),
+          Promise.all(
+            pullRequestLanes.map((lane) =>
+              github.pullRequest(repository, Number(lane.slice("pr:".length)), options.signal),
+            ),
+          ),
+        ]);
+        tags = undefined;
+      } else {
+        [branches, tags, prs] = await Promise.all([
+          github.branches(repository, options.signal),
+          shouldPollTags ? github.tags(repository, options.signal) : undefined,
+          github.pullRequests(repository, options.signal),
+        ]);
+      }
       const retainedConfigShas = new Set([
         defaultSha,
         ...branches.map((branch) => branch.sha),
@@ -858,7 +910,9 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         ...state.pendingTags.map((tag) => tag.sha),
         ...state.pending.map((comment) => comment.sha),
       ]);
-      state.missingConfigs = boundMissingConfigs(state.missingConfigs, retainedConfigShas);
+      if (!targetedScan) {
+        state.missingConfigs = boundMissingConfigs(state.missingConfigs, retainedConfigShas);
+      }
       missingConfigShas.clear();
       for (const entry of state.missingConfigs) missingConfigShas.add(entry.sha);
       const completedTagEvents = new Set(completedTags);
@@ -887,17 +941,19 @@ export async function serve(repository: Repository, options: ServerOptions = {})
       }
       await persistState();
       for (const id of completedTagEvents) completedTags.delete(id);
-      const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
-      const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
-      for (const { lane } of automaticRuns.activeLanes(repository)) {
-        if (lane.startsWith("branch:") && !openBranchLanes.has(lane)) {
-          automaticRuns.cancel(repository, lane, `Branch ${lane.slice(7)} no longer exists.`);
-        } else if (lane.startsWith("pr:") && !openPullRequestLanes.has(lane)) {
-          automaticRuns.cancel(
-            repository,
-            lane,
-            `Pull request #${lane.slice(3)} is no longer open.`,
-          );
+      if (!targetedScan) {
+        const openBranchLanes = new Set(branches.map((branch) => `branch:${branch.name}`));
+        const openPullRequestLanes = new Set(prs.map((pr) => `pr:${pr.number}`));
+        for (const { lane } of automaticRuns.activeLanes(repository)) {
+          if (lane.startsWith("branch:") && !openBranchLanes.has(lane)) {
+            automaticRuns.cancel(repository, lane, `Branch ${lane.slice(7)} no longer exists.`);
+          } else if (lane.startsWith("pr:") && !openPullRequestLanes.has(lane)) {
+            automaticRuns.cancel(
+              repository,
+              lane,
+              `Pull request #${lane.slice(3)} is no longer open.`,
+            );
+          }
         }
       }
       const manualTriggers = new Map<string, Promise<boolean>>();
@@ -910,13 +966,6 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         }
         return pending;
       };
-      const scanUpdates = options.scanUpdates?.length
-        ? new Map(
-            options.scanUpdates.flatMap((update) =>
-              update.sha && !update.closed ? [[update.lane, update.sha] as const] : [],
-            ),
-          )
-        : undefined;
       const observedScanUpdates = new Set<string>();
       for (const target of [
         // Pull requests are the latency-sensitive CI lane. Branch discovery can
@@ -1014,7 +1063,7 @@ export async function serve(repository: Repository, options: ServerOptions = {})
           }
           admissionControllers.add(admissionController);
           const result = executeCommit(
-            github,
+            executionGithub,
             repository,
             target.sha,
             target.branch,
@@ -1070,120 +1119,126 @@ export async function serve(repository: Repository, options: ServerOptions = {})
         );
       }
 
-      if (completedComments.size > 0) {
-        const completed = new Set(completedComments);
-        state.pending = state.pending.filter((item) => !completed.has(item.id));
-        await persistState();
-        for (const id of completed) completedComments.delete(id);
-      }
-      if (!state.cursor) {
-        const latest = await github.latestPullRequestComments(repository, 100, options.signal);
-        state.cursor = latest.reduce(
-          (cursor, comment) => (comment.updatedAt > cursor ? comment.updatedAt : cursor),
-          new Date(0).toISOString(),
-        );
-        state.seenCommentIds = latest.map((comment) => comment.id);
-        await persistState();
-      } else {
-        const previousCursor = state.cursor;
-        const overlap = new Date(
-          new Date(previousCursor).getTime() - COMMENT_CURSOR_OVERLAP_MS,
-        ).toISOString();
-        const comments = await github.pullRequestComments(repository, overlap, options.signal);
-        const known = new Set([...state.seenCommentIds, ...state.pending.map((item) => item.id)]);
-        for (const comment of comments) {
-          if (comment.updatedAt > state.cursor) state.cursor = comment.updatedAt;
-          if (known.has(comment.id) || comment.createdAt < overlap) continue;
-          known.add(comment.id);
-          state.seenCommentIds.push(comment.id);
-          let pr = prs.find((item) => item.number === comment.pullRequestNumber);
-          if (!pr) {
-            try {
-              pr = await github.pullRequest(repository, comment.pullRequestNumber, options.signal);
-            } catch (error) {
-              if (error instanceof Error && error.message.startsWith("GitHub 404")) continue;
-              throw error;
+      if (!targetedScan) {
+        if (completedComments.size > 0) {
+          const completed = new Set(completedComments);
+          state.pending = state.pending.filter((item) => !completed.has(item.id));
+          await persistState();
+          for (const id of completed) completedComments.delete(id);
+        }
+        if (!state.cursor) {
+          const latest = await github.latestPullRequestComments(repository, 100, options.signal);
+          state.cursor = latest.reduce(
+            (cursor, comment) => (comment.updatedAt > cursor ? comment.updatedAt : cursor),
+            new Date(0).toISOString(),
+          );
+          state.seenCommentIds = latest.map((comment) => comment.id);
+          await persistState();
+        } else {
+          const previousCursor = state.cursor;
+          const overlap = new Date(
+            new Date(previousCursor).getTime() - COMMENT_CURSOR_OVERLAP_MS,
+          ).toISOString();
+          const comments = await github.pullRequestComments(repository, overlap, options.signal);
+          const known = new Set([...state.seenCommentIds, ...state.pending.map((item) => item.id)]);
+          for (const comment of comments) {
+            if (comment.updatedAt > state.cursor) state.cursor = comment.updatedAt;
+            if (known.has(comment.id) || comment.createdAt < overlap) continue;
+            known.add(comment.id);
+            state.seenCommentIds.push(comment.id);
+            let pr = prs.find((item) => item.number === comment.pullRequestNumber);
+            if (!pr) {
+              try {
+                pr = await github.pullRequest(
+                  repository,
+                  comment.pullRequestNumber,
+                  options.signal,
+                );
+              } catch (error) {
+                if (error instanceof Error && error.message.startsWith("GitHub 404")) continue;
+                throw error;
+              }
             }
+            if (pr.sameRepository)
+              state.pending.push({
+                id: comment.id,
+                sha: pr.headSha,
+                createdAt: comment.createdAt,
+                pullRequest: pr,
+              });
           }
-          if (pr.sameRepository)
-            state.pending.push({
-              id: comment.id,
-              sha: pr.headSha,
-              createdAt: comment.createdAt,
-              pullRequest: pr,
-            });
+          state.seenCommentIds = state.seenCommentIds.slice(-SEEN_COMMENT_LIMIT);
+          await persistState();
         }
-        state.seenCommentIds = state.seenCommentIds.slice(-SEEN_COMMENT_LIMIT);
-        await persistState();
-      }
-      for (const pending of [...state.pending]) {
-        const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
-        if (inFlightRuns.has(eventId)) continue;
-        try {
-          const pendingConfig = await configAt(
-            pending.sha,
-            state,
-            missingConfigShas,
-            markMissingConfig,
-          );
-          if (!pendingConfig) continue;
-          const config = applySecretPolicy(pendingConfig, bootstrap, defaultSha);
-          const context: EventContext & { id: string } = {
-            type: "comment" as const,
-            pullRequest: pending.pullRequest,
-            id: eventId,
-          };
-          const matches =
-            selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), context.branch)
-              .jobs.length > 0;
-          if (!matches) {
-            state.pending = state.pending.filter((item) => item.id !== pending.id);
-            await persistState();
-            continue;
+        for (const pending of [...state.pending]) {
+          const eventId = `pr:${pending.pullRequest.number}:comment:${pending.id}`;
+          if (inFlightRuns.has(eventId)) continue;
+          try {
+            const pendingConfig = await configAt(
+              pending.sha,
+              state,
+              missingConfigShas,
+              markMissingConfig,
+            );
+            if (!pendingConfig) continue;
+            const config = applySecretPolicy(pendingConfig, bootstrap, defaultSha);
+            const context: EventContext & { id: string } = {
+              type: "comment" as const,
+              pullRequest: pending.pullRequest,
+              id: eventId,
+            };
+            const matches =
+              selectTriggeredJobs(config, (rule) => triggerMatches(rule, context), context.branch)
+                .jobs.length > 0;
+            if (!matches) {
+              state.pending = state.pending.filter((item) => item.id !== pending.id);
+              await persistState();
+              continue;
+            }
+            if (options.signal?.aborted) {
+              await flushMissingConfigs();
+              await drainForShutdown();
+              return;
+            }
+            const controller = new AbortController();
+            const shutdownController = new AbortController();
+            const admissionController = new AbortController();
+            admissionControllers.add(admissionController);
+            const result = executeCommit(
+              executionGithub,
+              repository,
+              pending.sha,
+              `pull/${pending.pullRequest.number}`,
+              config,
+              undefined,
+              context,
+              controller.signal,
+              admissionSignal(admissionController),
+              shutdownController.signal,
+              options.claimScheduling,
+            );
+            shutdownControllers.add(shutdownController);
+            const run = result
+              .then((result) => {
+                if (result === false) retryDispatch = true;
+                else completedComments.add(pending.id);
+              })
+              .catch((error) => {
+                message(`comment ${pending.id} failed: ${errorDetail(error)}`);
+              })
+              .finally(() => {
+                inFlightRuns.delete(eventId);
+                shutdownControllers.delete(shutdownController);
+                admissionControllers.delete(admissionController);
+                idle();
+              });
+            inFlightRuns.set(eventId, run);
+          } catch (error) {
+            message(`comment ${pending.id} failed: ${errorDetail(error)}`);
           }
-          if (options.signal?.aborted) {
-            await flushMissingConfigs();
-            await drainForShutdown();
-            return;
-          }
-          const controller = new AbortController();
-          const shutdownController = new AbortController();
-          const admissionController = new AbortController();
-          admissionControllers.add(admissionController);
-          const result = executeCommit(
-            github,
-            repository,
-            pending.sha,
-            `pull/${pending.pullRequest.number}`,
-            config,
-            undefined,
-            context,
-            controller.signal,
-            admissionSignal(admissionController),
-            shutdownController.signal,
-            options.claimScheduling,
-          );
-          shutdownControllers.add(shutdownController);
-          const run = result
-            .then((result) => {
-              if (result === false) retryDispatch = true;
-              else completedComments.add(pending.id);
-            })
-            .catch((error) => {
-              message(`comment ${pending.id} failed: ${errorDetail(error)}`);
-            })
-            .finally(() => {
-              inFlightRuns.delete(eventId);
-              shutdownControllers.delete(shutdownController);
-              admissionControllers.delete(admissionController);
-              idle();
-            });
-          inFlightRuns.set(eventId, run);
-        } catch (error) {
-          message(`comment ${pending.id} failed: ${errorDetail(error)}`);
         }
+        await flushMissingConfigs();
       }
-      await flushMissingConfigs();
       lastPollError = undefined;
     } catch (error) {
       if (options.signal?.aborted) {

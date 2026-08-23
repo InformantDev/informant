@@ -29,6 +29,8 @@ const RETRYABLE_CLAIM_TITLES = new Set([
   "Stale worker claim",
 ]);
 const rateLimitGates = new Map<string, number>();
+const rateLimitBudgets = new Map<string, { limit: number; remaining: number; resetAt: number }>();
+const MAX_RECONCILIATION_RATE_LIMIT_RESERVE = 1_000;
 const RETRYABLE_CHECK_CONCLUSIONS = new Set([
   "action_required",
   "cancelled",
@@ -212,6 +214,13 @@ export class GitHubApiError extends Error {
   }
 }
 
+export class GitHubReconciliationDeferredError extends Error {
+  constructor(readonly retryAt: number) {
+    super(`GitHub API quota reserved for webhook work until ${new Date(retryAt).toISOString()}`);
+    this.name = "GitHubReconciliationDeferredError";
+  }
+}
+
 function rateLimitRetryAt(response: Response, body: string): number | undefined {
   const rateLimited =
     response.status === 429 ||
@@ -252,6 +261,7 @@ interface GitHubOptions {
   fetch?: typeof globalThis.fetch;
   repository?: Repository;
   requestTimeoutMs?: number;
+  reconciliation?: boolean;
   credentials?: {
     appId: string;
     installationId: string;
@@ -269,6 +279,7 @@ export class GitHubClient {
   private readonly repository?: Repository;
   private readonly rateLimitKey: string;
   private readonly requestTimeoutMs: number;
+  private readonly reconciliation: boolean;
   private githubClock?: { serverTime: number; observedAt: number };
 
   constructor(options: GitHubOptions = {}) {
@@ -279,11 +290,25 @@ export class GitHubClient {
     this.repository = options.repository;
     this.rateLimitKey = options.repository?.owner.toLowerCase() ?? "default";
     this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? GITHUB_REQUEST_TIMEOUT_MS);
+    this.reconciliation = options.reconciliation === true;
   }
 
   private requestSignal(signal?: AbortSignal): AbortSignal {
     const timeout = AbortSignal.timeout(this.requestTimeoutMs);
     return signal ? AbortSignal.any([signal, timeout]) : timeout;
+  }
+
+  priorityClient(): GitHubClient {
+    const client = new GitHubClient({
+      fetch: this.request,
+      repository: this.repository,
+      requestTimeoutMs: this.requestTimeoutMs,
+      credentials: this.credentials,
+    });
+    client.token = this.token;
+    client.tokenExpiresAt = this.tokenExpiresAt;
+    client.appId = this.appId;
+    return client;
   }
 
   async authenticate(signal?: AbortSignal): Promise<void> {
@@ -431,6 +456,48 @@ export class GitHubClient {
     }
   }
 
+  private observeRateLimit(response: Response): void {
+    const limit = Number(response.headers.get("x-ratelimit-limit"));
+    const remaining = Number(response.headers.get("x-ratelimit-remaining"));
+    const reset = Number(response.headers.get("x-ratelimit-reset"));
+    if (
+      Number.isSafeInteger(limit) &&
+      limit > 0 &&
+      Number.isSafeInteger(remaining) &&
+      remaining >= 0 &&
+      Number.isFinite(reset) &&
+      reset > 0
+    ) {
+      const next = { limit, remaining, resetAt: reset * 1_000 };
+      const previous = rateLimitBudgets.get(this.rateLimitKey);
+      if (!previous || next.resetAt > previous.resetAt) {
+        rateLimitBudgets.set(this.rateLimitKey, next);
+      } else if (next.resetAt === previous.resetAt) {
+        previous.limit = next.limit;
+        previous.remaining = Math.min(previous.remaining, next.remaining);
+      }
+    }
+  }
+
+  private reserveRateLimitRequest(): void {
+    const budget = rateLimitBudgets.get(this.rateLimitKey);
+    if (!budget) return;
+    if (budget.resetAt <= Date.now()) {
+      rateLimitBudgets.delete(this.rateLimitKey);
+      return;
+    }
+    const reserve = Math.min(
+      MAX_RECONCILIATION_RATE_LIMIT_RESERVE,
+      Math.max(50, Math.ceil(budget.limit * 0.2)),
+    );
+    if (this.reconciliation && budget.remaining <= reserve) {
+      throw new GitHubReconciliationDeferredError(budget.resetAt);
+    }
+    // Account for concurrent requests before their headers arrive. Response order is not
+    // guaranteed, so observeRateLimit only lowers this value within the same reset window.
+    budget.remaining = Math.max(0, budget.remaining - 1);
+  }
+
   private githubServerTime(): number | undefined {
     return this.githubClock
       ? this.githubClock.serverTime + (performance.now() - this.githubClock.observedAt)
@@ -460,6 +527,7 @@ export class GitHubClient {
       if (blockedUntil > Date.now()) {
         await abortableSleep(blockedUntil - Date.now(), requestSignal);
       }
+      this.reserveRateLimitRequest();
 
       // Build time-sensitive request bodies only after any shared rate-limit gate.
       const requestInit = typeof init === "function" ? init() : init;
@@ -475,6 +543,7 @@ export class GitHubClient {
         },
       });
       this.observeGitHubClock(response);
+      this.observeRateLimit(response);
       if (response.ok) return (await response.json()) as T;
 
       const body = await response.text();
@@ -736,40 +805,53 @@ export class GitHubClient {
     sha: string,
     claimId: number,
     conclusion: "success" | "failure" | "cancelled" = "cancelled",
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const aggregate = await this.api<CheckRun>(
       `/repos/${repository.fullName}/check-runs/${claimId}`,
+      {},
+      signal,
     );
     if (aggregate.status === "completed") return false;
 
-    const jobs = (await this.jobChecks(repository, sha, claimId)).filter(
+    const jobs = (await this.jobChecks(repository, sha, claimId, signal)).filter(
       (job) => job.status !== "completed",
     );
     await Promise.all(
       jobs.map((job) =>
-        this.updateCheck(repository, job.id, {
-          status: "completed",
-          conclusion: "cancelled",
-          title: "Interrupted worker job",
-          summary: "The worker stopped before this job completed.",
-        }),
+        this.updateCheck(
+          repository,
+          job.id,
+          {
+            status: "completed",
+            conclusion: "cancelled",
+            title: "Interrupted worker job",
+            summary: "The worker stopped before this job completed.",
+          },
+          signal,
+        ),
       ),
     );
-    await this.updateCheck(repository, claimId, {
-      status: "completed",
-      conclusion,
-      title:
-        conclusion === "success"
-          ? "All jobs passed"
-          : conclusion === "failure"
-            ? "A job failed"
-            : "Interrupted worker build",
-      summary:
-        conclusion === "cancelled"
-          ? "The worker stopped before this build completed."
-          : "Recovered the final build result after the worker stopped.",
-      text: aggregate.output?.text,
-    });
+    await this.updateCheck(
+      repository,
+      claimId,
+      {
+        status: "completed",
+        conclusion,
+        title:
+          conclusion === "success"
+            ? "All jobs passed"
+            : conclusion === "failure"
+              ? "A job failed"
+              : "Interrupted worker build",
+        summary:
+          conclusion === "cancelled"
+            ? "The worker stopped before this build completed."
+            : "Recovered the final build result after the worker stopped.",
+        text: aggregate.output?.text,
+      },
+      signal,
+    );
     return true;
   }
 

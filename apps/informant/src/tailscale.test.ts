@@ -32,6 +32,7 @@ import {
   retireAutomaticLaneUpdate,
   serveWithTailscale,
   startupRecoveryRequests,
+  supportsReconciliationPriority,
   TARGETED_SCAN_RETENTION_MS,
   type TailscaleStatus,
   tailscaleExecutable,
@@ -624,6 +625,45 @@ test("extracts and validates bounded automatic lane updates", () => {
       number: 42,
     }),
   ).toEqual([{ lane: "pr:42", closed: true }]);
+  expect(
+    webhookAutomaticLaneUpdates(
+      "check_suite",
+      {
+        action: "requested",
+        repository: { id: 10 },
+        check_suite: {
+          head_sha: newSha,
+          head_branch: "feature/fast",
+          updated_at: "2026-08-15T00:01:00Z",
+          pull_requests: [
+            { number: 42, head: { sha: newSha, repo: { id: 10 } } },
+            { number: 43, head: { sha: newSha, repo: { id: 11 } } },
+          ],
+        },
+      },
+      "delivery-suite",
+    ),
+  ).toEqual([
+    {
+      lane: "branch:feature/fast",
+      sha: newSha,
+      updatedAt: Date.parse("2026-08-15T00:01:00Z"),
+      revision: "delivery-suite",
+    },
+    {
+      lane: "pr:42",
+      sha: newSha,
+      updatedAt: Date.parse("2026-08-15T00:01:00Z"),
+      revision: "delivery-suite",
+    },
+  ]);
+  expect(
+    webhookAutomaticLaneUpdates("check_suite", {
+      action: "rerequested",
+      repository: { id: 10 },
+      check_suite: { head_sha: oldSha, head_branch: "feature/fast" },
+    }),
+  ).toBeUndefined();
   expect(parseAutomaticLaneUpdates([{ lane: "branch:main", sha: newSha }])).toEqual([
     { lane: "branch:main", sha: newSha },
   ]);
@@ -913,8 +953,8 @@ test("startup recovery forces a synchronization for every local repository", () 
   const repositories = [one, two];
 
   expect(startupRecoveryRequests(repositories)).toEqual([
-    { repository: one, forceTagPoll: true, fullScan: true },
-    { repository: two, forceTagPoll: true, fullScan: true },
+    { repository: one, forceTagPoll: true, fullScan: true, reconciliation: true },
+    { repository: two, forceTagPoll: true, fullScan: true, reconciliation: true },
   ]);
 });
 
@@ -944,7 +984,7 @@ test("repository refresh recovers only newly registered repositories", () => {
   const two = { owner: "owner", repo: "two", fullName: "OWNER/TWO" };
 
   expect(addedRepositoryRecoveryRequests([one], [one, two])).toEqual([
-    { repository: two, forceTagPoll: true, fullScan: true },
+    { repository: two, forceTagPoll: true, fullScan: true, reconciliation: true },
   ]);
   expect(addedRepositoryRecoveryRequests([one, two], [one, two])).toEqual([]);
 });
@@ -966,12 +1006,14 @@ test("periodic reconciliation covers local and remote-only repositories", () => 
       forceTagPoll: true,
       fullScan: true,
       retireSupersededScanUpdates: true,
+      reconciliation: true,
     },
     {
       repository: { owner: "owner", repo: "remote", fullName: "owner/remote" },
       forceTagPoll: true,
       fullScan: true,
       retireSupersededScanUpdates: true,
+      reconciliation: true,
     },
   ]);
 });
@@ -1039,6 +1081,48 @@ test("runs another dispatch with its latest claim plan during an active dispatch
 
   expect(requests).toEqual([false, false]);
   expect(plans).toEqual([undefined, 7]);
+  await queue.stop();
+});
+
+test("a webhook dispatch preempts an active reconciliation scan", async () => {
+  const repository = { owner: "owner", repo: "repo", fullName: "owner/repo" };
+  const requests: Array<{ reconciliation: boolean; lanes: string[] }> = [];
+  const signals: AbortSignal[] = [];
+  const queue = new DispatchRetryQueue(async (request, signal) => {
+    requests.push({
+      reconciliation: request.reconciliation === true,
+      lanes: request.scanUpdates?.map((update) => update.lane) ?? [],
+    });
+    if (signal) signals.push(signal);
+    if (request.reconciliation) {
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw signal?.reason;
+    }
+    return true;
+  });
+
+  queue.enqueue({
+    repository,
+    forceTagPoll: true,
+    fullScan: true,
+    reconciliation: true,
+  });
+  while (requests.length === 0) await Bun.sleep(0);
+  queue.enqueue({
+    repository,
+    forceTagPoll: false,
+    scanUpdates: [{ lane: "pr:90", sha: "a".repeat(40) }],
+  });
+  while (queue.size > 0) await Bun.sleep(0);
+
+  expect(signals[0]?.aborted).toBe(true);
+  expect(requests).toEqual([
+    { reconciliation: true, lanes: [] },
+    { reconciliation: false, lanes: ["pr:90"] },
+  ]);
   await queue.stop();
 });
 
@@ -1149,6 +1233,12 @@ test("periodic recovery expires permanently missed head assertions after a bound
 
   expect(scans).toEqual([[update.sha], [update.sha], []]);
   await queue.stop();
+});
+
+test("reconciliation priority is negotiated during rolling upgrades", () => {
+  expect(supportsReconciliationPriority(undefined)).toBe(false);
+  expect(supportsReconciliationPriority(["targeted-scan-v1"])).toBe(false);
+  expect(supportsReconciliationPriority(["reconciliation-priority-v1"])).toBe(true);
 });
 
 test("targeted scans remain retryable across older network workers", () => {
