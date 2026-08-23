@@ -5,4 +5,4 @@ set -eu
 bun run check
 """
 timeout_minutes = 15
-container = { image = "docker.io/oven/bun:1", cpu = 2, memory_mb = 4096, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = "bun install --frozen-lockfile --ignore-scripts" }
+container = { image = "docker.io/oven/bun:1", cpu = 1, memory_mb = 2560, prepareInputs = ["bun.lock", "bunfig.toml", "package.json", "apps/*/package.json"], prepare = "bun install --frozen-lockfile --ignore-scripts" }
