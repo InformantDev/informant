@@ -497,6 +497,7 @@ function github(options: {
   branches?: () => Promise<Array<{ name: string; sha: string }>>;
   tags?: () => Promise<Array<{ name: string; sha: string }>>;
   pullRequests?: () => Promise<PullRequest[]>;
+  pullRequest?: (number: number) => Promise<PullRequest>;
   manual?: (sha: string) => Promise<boolean>;
 }) {
   return {
@@ -505,6 +506,14 @@ function github(options: {
     branches: options.branches ?? (async () => []),
     tags: options.tags ?? (async () => []),
     pullRequests: options.pullRequests ?? (async () => []),
+    pullRequest: async (_repository: Repository, number: number) => {
+      if (options.pullRequest) return options.pullRequest(number);
+      const pullRequest = await options
+        .pullRequests?.()
+        .then((values) => values.find((value) => value.number === number));
+      if (!pullRequest) throw new Error(`missing pull request #${number}`);
+      return pullRequest;
+    },
     hasPendingManualTrigger: async (
       _repository: Repository,
       sha: string,
@@ -562,32 +571,57 @@ test("one-shot event scans propagate polling failures for delivery retry", async
   ).rejects.toThrow("temporary GitHub failure");
 });
 
-test("webhook scans run only the exact pull request head", async () => {
+test("webhook scans query only the exact pull request head", async () => {
   const changedSha = "a".repeat(40);
-  const unrelatedSha = "b".repeat(40);
   const changed = { ...pullRequest, number: 90, headSha: changedSha };
-  const unrelated = { ...pullRequest, number: 92, headSha: unrelatedSha };
   const attempts: Array<{ sha: string; branch: string }> = [];
+  const unrelatedMissingConfig = { sha: "b".repeat(40), checkedAt: new Date().toISOString() };
+  const state: PollState = {
+    pending: [],
+    seenCommentIds: [],
+    pendingTags: [],
+    missingConfigs: [unrelatedMissingConfig],
+  };
+  let recoveries = 0;
+  const client = github({
+    branches: async () => {
+      throw new Error("targeted scans must not list branches");
+    },
+    pullRequests: async () => {
+      throw new Error("targeted scans must not list pull requests");
+    },
+    pullRequest: async (number) => {
+      expect(number).toBe(90);
+      return changed;
+    },
+  });
+  client.latestPullRequestComments = async () => {
+    throw new Error("targeted scans must not poll comments");
+  };
+  const scanDependencies = dependencies(
+    client,
+    state,
+    async (_github, _repository, sha, branch) => {
+      attempts.push({ sha, branch });
+      return undefined;
+    },
+  );
+  scanDependencies.recoverInterruptedBuilds = async () => {
+    recoveries++;
+    return false;
+  };
 
   await serve(repository, {
     once: true,
     throwOnPollError: true,
     scanUpdates: [{ lane: "pr:90", sha: changedSha, revision: "delivery-90" }],
-    dependencies: dependencies(
-      github({
-        branches: async () => [{ name: "main", sha: "default-sha" }],
-        pullRequests: async () => [unrelated, changed],
-      }),
-      { pending: [], seenCommentIds: [], pendingTags: [] },
-      async (_github, _repository, sha, branch) => {
-        attempts.push({ sha, branch });
-        return undefined;
-      },
-    ),
+    dependencies: scanDependencies,
     onMessage: () => {},
   });
 
   expect(attempts).toEqual([{ sha: changedSha, branch: "pull/90" }]);
+  expect(state.missingConfigs).toEqual([unrelatedMissingConfig]);
+  expect(recoveries).toBe(0);
 });
 
 test("full scans continue to validate coalesced webhook heads", async () => {

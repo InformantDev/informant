@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { GitHubApiError, GitHubClient, MANUAL_TRIGGER_REQUEST_NAME } from "./github.ts";
+import {
+  GitHubApiError,
+  GitHubClient,
+  GitHubReconciliationDeferredError,
+  MANUAL_TRIGGER_REQUEST_NAME,
+} from "./github.ts";
 import type { CheckRun } from "./types.ts";
 
 function githubResponse(
@@ -60,6 +65,45 @@ test("rate limit errors preserve GitHub's reset time", async () => {
   expect(error).toBeInstanceOf(GitHubApiError);
   expect(error.status).toBe(403);
   expect(error.retryAt).toBe(reset * 1_000);
+});
+
+test("reconciliation preserves installation quota for webhook requests", async () => {
+  let requests = 0;
+  const reset = Math.floor(Date.now() / 1_000) + 3_600;
+  const fetch = (async (input: string | URL | Request) => {
+    requests++;
+    const url = new URL(String(input));
+    const value = url.pathname.includes("/git/ref/")
+      ? { object: { sha: "a".repeat(40) } }
+      : { default_branch: "main" };
+    return githubResponse(value, {
+      headers: {
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-remaining": "1000",
+        "x-ratelimit-reset": String(reset),
+      },
+    });
+  }) as typeof globalThis.fetch;
+  const repository = {
+    owner: "reconciliation-reserve-test",
+    repo: "widgets",
+    fullName: "reconciliation-reserve-test/widgets",
+  };
+  const reconciliation = new GitHubClient({
+    token: "installation-token",
+    fetch,
+    repository,
+    reconciliation: true,
+  });
+
+  expect(await reconciliation.defaultBranch(repository)).toBe("main");
+  expect(
+    await reconciliation.branchHead(repository, "main").catch((error) => error),
+  ).toBeInstanceOf(GitHubReconciliationDeferredError);
+
+  const priority = reconciliation.priorityClient();
+  expect(await priority.branchHead(repository, "main")).toBe("a".repeat(40));
+  expect(requests).toBe(2);
 });
 
 test("rate limited requests wait and retry once", async () => {
