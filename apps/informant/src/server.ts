@@ -578,9 +578,7 @@ export async function recoverInterruptedBuilds(
       build.status !== "running" &&
       (!build.checksCompletedAt ||
         build.retryManual !== undefined ||
-        (build.interrupted === true &&
-          build.event?.type === "manual_trigger" &&
-          !build.manualRetryRequeuedAt) ||
+        build.interrupted === true ||
         legacyInterrupted(build)) &&
       persistedCheckId(build) !== undefined,
   );
@@ -649,6 +647,7 @@ export async function recoverInterruptedBuilds(
           await (dependencies.savePollState ?? savePollState)(repository.fullName, state);
         }
       }
+      build.interrupted = undefined;
       build.checkId = checkId;
       build.checksCompletedAt = new Date().toISOString();
       await dependencies.saveBuild(build);
