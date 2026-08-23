@@ -570,6 +570,9 @@ export async function recoverInterruptedBuilds(
     build.interrupted = true;
     build.completedAt = new Date().toISOString();
     build.runningJobs = [];
+    build.jobs = build.jobs?.map((job) =>
+      job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
+    );
     await dependencies.saveBuild(build);
   }
   const builds = allBuilds.filter(
