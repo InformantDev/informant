@@ -1470,19 +1470,6 @@ export class GitHubClient {
           return legacyOrder || a.id - b.id;
         });
       if (!completed && contenders[0]?.id === candidate.id) {
-        await this.updateCheck(
-          repository,
-          candidate.id,
-          {
-            status: "in_progress",
-            externalId: candidateExternalId,
-            title: "Informant CI",
-            summary: `Claimed by ${hostname()}`,
-            text: candidate.output?.text,
-          },
-          executionSignal,
-        );
-        candidate = promotedClaim(candidate, candidateExternalId);
         const jobRequests = pendingRequests.map(requestedJobsFor);
         const requestedJobs = jobRequests.some((jobs) => jobs.length === 0)
           ? []
@@ -1495,15 +1482,31 @@ export class GitHubClient {
           const supported = requestedJobs.filter((job) => eligible.has(job));
           requestedJobs.splice(0, requestedJobs.length, ...supported);
         }
+        const promotedCheck = promotedClaim(candidate, candidateExternalId);
         const promoted = {
-          check: candidate,
+          check: promotedCheck,
           requestedJobs,
           manualTrigger,
           manualTriggerBranch: context?.branch,
           manualTriggerLabel: context?.label,
           originalPullRequest,
         } satisfies ClaimResult;
+        // Persist local recovery intent before the non-atomic remote promotion and request
+        // acceptance writes. A replacement can then reconcile any crash point below.
         await onPromoted?.(promoted);
+        await this.updateCheck(
+          repository,
+          candidate.id,
+          {
+            status: "in_progress",
+            externalId: candidateExternalId,
+            title: "Informant CI",
+            summary: `Claimed by ${hostname()}`,
+            text: candidate.output?.text,
+          },
+          executionSignal,
+        );
+        candidate = promotedCheck;
         await Promise.all(
           pendingRequests.map((check) =>
             this.updateCheck(

@@ -753,6 +753,34 @@ async function runCommitPartitionWithSlot(
       },
     );
   } catch (error) {
+    if (promotedRecord) {
+      promotedRecord.status = "cancelled";
+      promotedRecord.interrupted = true;
+      promotedRecord.completedAt = new Date().toISOString();
+      promotedRecord.runningJobs = [];
+      promotedRecord.jobs = promotedRecord.jobs?.map((job) =>
+        job.status === "queued" || job.status === "running" ? { ...job, status: "cancelled" } : job,
+      );
+      await dependencies.saveBuild(promotedRecord).catch(() => undefined);
+      const retryManual = promotedRecord.retryManual;
+      if (retryManual) {
+        await github
+          .ensureManualTrigger(
+            repository,
+            sha,
+            promotedRecord.id,
+            retryManual.jobs,
+            retryManual.branch,
+            retryManual.label,
+          )
+          .then(async () => {
+            promotedRecord.retryManual = undefined;
+            promotedRecord.manualRetryRequeuedAt = new Date().toISOString();
+            await dependencies.saveBuild(promotedRecord).catch(() => undefined);
+          })
+          .catch(() => undefined);
+      }
+    }
     if (admissionSignal?.aborted) return false;
     throw error;
   }
@@ -803,14 +831,30 @@ async function runCommitPartitionWithSlot(
         : config;
   }
   if (config.jobs.length === 0) {
-    await github.updateCheck(repository, check.id, {
-      status: "completed",
-      conclusion: "neutral",
-      title: "No jobs matched",
-      summary: `No jobs are configured for this ${event?.type ?? "manual"} event.`,
-      text: check.output?.text,
-    });
-    return undefined;
+    const emptyRecord = promotedRecord ?? recordForClaim(claim);
+    if (!emptyRecord) throw new Error("promoted claims require a persisted build record");
+    try {
+      await github.updateCheck(repository, check.id, {
+        status: "completed",
+        conclusion: "neutral",
+        title: "No jobs matched",
+        summary: `No jobs are configured for this ${event?.type ?? "manual"} event.`,
+        text: check.output?.text,
+      });
+      emptyRecord.status = "success";
+      emptyRecord.jobs = [];
+      emptyRecord.retryManual = undefined;
+      emptyRecord.completedAt = new Date().toISOString();
+      emptyRecord.checksCompletedAt = emptyRecord.completedAt;
+      await dependencies.saveBuild(emptyRecord);
+      return undefined;
+    } catch (error) {
+      emptyRecord.status = "failure";
+      emptyRecord.retryManual = undefined;
+      emptyRecord.completedAt = new Date().toISOString();
+      await dependencies.saveBuild(emptyRecord).catch(() => undefined);
+      throw error;
+    }
   }
 
   type CheckUpdate = Parameters<GitHubClient["updateCheck"]>[2];
