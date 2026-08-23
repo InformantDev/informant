@@ -18,6 +18,7 @@ import {
   currentProcessOwner,
   dataDirectory,
   monitorBuildCancellation,
+  persistClaim,
   saveBuild,
 } from "./store.ts";
 import { type JobOutcome, type RuntimeSecrets, runInTart } from "./tart/index.ts";
@@ -43,7 +44,7 @@ export interface ClaimScheduling {
 export interface CoordinatorDependencies {
   createBuild: typeof createBuild;
   saveBuild: typeof saveBuild;
-  persistClaim?: typeof saveBuild;
+  persistClaim?: typeof persistClaim;
   runInTart: typeof runInTart;
   readLogTail: (path: string) => Promise<string>;
   monitorBuildCancellation?: typeof monitorBuildCancellation;
@@ -204,6 +205,7 @@ export async function readLogTail(path: string): Promise<string> {
 const defaultDependencies: CoordinatorDependencies = {
   createBuild,
   saveBuild,
+  persistClaim,
   runInTart,
   readLogTail,
   acquireExecutionSlot,
@@ -953,7 +955,7 @@ async function runCommitPartitionWithSlot(
     }
     // Persist the promoted claim before waiting on housekeeping so a bounded worker replacement
     // can recover it even if the old process is killed while this barrier is held.
-    await (dependencies.persistClaim ?? dependencies.saveBuild)(record);
+    await (dependencies.persistClaim ?? persistClaim)(record);
     await (
       dependencies.housekeepingBarrier ?? ((callback) => withImageLock("housekeeping", callback))
     )(() => dependencies.createBuild(record));

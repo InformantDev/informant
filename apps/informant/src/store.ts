@@ -210,6 +210,11 @@ async function workspaceHasLiveOwner(workspace: string): Promise<boolean> {
   }
 }
 
+export async function persistClaim(record: BuildRecord): Promise<void> {
+  await mkdir(buildDirectory(record.id), { recursive: true });
+  await saveBuild(record);
+}
+
 export async function createBuild(record: BuildRecord): Promise<void> {
   await mkdir(buildDirectory(record.id), { recursive: true });
   await rm(cancellationDirectory(record.id), { recursive: true, force: true });
